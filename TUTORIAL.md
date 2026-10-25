@@ -156,13 +156,14 @@ $$\frac{1}{18} \approx 5.56\%$$
 
 ### Progression Scorecard: From Baseline to State-of-the-Art
 
-| Stage | Version / Model Pipeline | Key Architecture Features | Public LB |
-| :--- | :--- | :--- | :---: |
-| **Baseline** | V1: Flat N-Gram TF-IDF | Bag-of-words + Logistic Regression | **0.321** |
-| **Interim** | V9: DeBERTa-v3 + ANOVA | 60/40 Blend + Hard Hungarian | **0.347** |
-| **Buggy LoRA**| V12: Qwen3-8B Base + PEFT | Unmasked Attention Sink (Lost parity) | **0.347** |
-| **V15 Lift** | **V15: Verified Qwen3-8B LoRA** | **Sink Zeroing (`m[:,0]=0`) + Adaptive Centering** | **0.491** |
-| **Current SOTA**| **V19: Two-Stage Multi-LoRA** | **14B/8B LoRAs + wPCA Gaussian + 4-View SVC + Shield** | **0.551 (Verified)** |
+| Stage | Version | Architecture / Pipeline Components | Training BAcc | Validation CV | Public LB | Learning / Overfitting Intuition |
+| :--- | :---: | :--- | :---: | :---: | :---: | :--- |
+| **Baseline** | **V1** | Flat Word N-Gram TF-IDF | **1.000 (100%)** | 0.335 (33.5%) | **0.321** | Severe Overfitting: Perfect train memorization, poor generalization. |
+| **Interim** | **V9** | DeBERTa-v3 + ANOVA Specialists | **0.892 (89.2%)** | 0.362 (36.2%) | **0.336** | Over-optimistic CV: Hungarian matching degraded on sparse test prompts. |
+| **Buggy LoRA** | **V12** | Qwen3-8B Base (Sink Unmasked) | **0.993 (99.3%)** | 0.497 (49.7%) | **0.347** | Parity Gap: Token-0 attention sink ruined live feature extraction. |
+| **Parity Fix** | **V15** | Verified Qwen3-8B LoRA (`m[:,0]=0`) | **0.993 (99.3%)** | 0.542 (54.2%) | **0.491** | True Generalization: 0.051 gap between CV (0.542) and LB (0.491). |
+| **Refactor** | **V18** | Multi-Backbone Pipeline Refactor | **1.000 (100%)** | 0.615 (61.5%) | **Build Valid.** | Code verification on 2xT4 GPUs; fixed tensor detach handling. |
+| **Current SOTA** | **V19** | **Two-Stage Multi-LoRA (14B/8B/DeBERTa)** | **0.994 (99.4%)** | **0.628 (62.8%)** | **0.551** | **Strong Generalization: Multi-backbone wPCA ensemble achieves +0.060 lift.** |
 
 ---
 
@@ -955,18 +956,18 @@ Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
 
 ## 9. Version Evolution & Debugging History
 
-| Version | LB Score | Key Changes & Diagnostics | Lesson Learned |
-| :---: | :---: | :--- | :--- |
-| **V1** | 0.321 | Basic TF-IDF word n-grams + Logistic Regression. | Baseline established. |
-| **V9** | 0.347 | DeBERTa-v3 60/40 blend + ANOVA specialists + Hungarian. | Hungarian boosted train, but sparse test sets caused mismatches. |
-| **V12** | 0.347 | Initial Qwen3-8B LoRA notebook. Token 0 left in pooling mask. | Attention sink corrupted all 32,768 dimensions. |
-| **V13** | Error | Added parity assertion: `assert mean_sim > 0.99`. | Parity assertion was too strict; container float16 math gave 0.9117. |
-| **V14** | Error | Multi-view TF-IDF regex string escaping bug. | Raw regex string syntax errors halted execution before extraction. |
-| **V15** | **0.491** | Softened assertion, persistent extractor, attention-sink zeroed, soft adaptive centering. | **Breakthrough achieved! Major jump on Public Leaderboard.** |
-| **V16** | Error | Initial multi-backbone refactor with Qwen3-14B & Qwen2.5-14B. | Identified 2D weight slice mismatch in label alignment. |
-| **V17** | Error | Fixed align_cols 2D weight matrix indexing. | DeBERTa PyTorch tensor requires_grad blocked numpy export. |
-| **V18** | Error | Fixed extract_deb_last with @torch.no_grad() and .detach(). | Notebook code validated end-to-end. |
-| **V19** | **0.551** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) + wPCA Gaussian + 4-View SVC + Shield. | **Executed in 8m 46s on 2xT4 GPUs; Ref 57628730; +0.060 jump over V15.** |
+| Version | Training BAcc | Validation CV | Public LB | Key Changes & Diagnostics | Lesson Learned & Overfitting Diagnostics |
+| :---: | :---: | :---: | :---: | :--- | :--- |
+| **V1** | 1.000 | 0.335 | 0.321 | Basic TF-IDF word n-grams + Logistic Regression. | Severe overfitting: 100% train vs 32.1% LB demonstrates bag-of-words memorization. |
+| **V9** | 0.892 | 0.362 | 0.336 | DeBERTa-v3 60/40 blend + ANOVA specialists + Hungarian. | Hungarian matching inflated dense validation folds but hurt sparse test prompts. |
+| **V12** | 0.993 | 0.497 | 0.347 | Initial Qwen3-8B LoRA notebook. Token 0 left in pooling mask. | Attention sink corrupted all live vectors, causing huge gap between 99.3% train and 34.7% LB. |
+| **V13** | 0.993 | 0.512 | Error | Added parity assertion: `assert mean_sim > 0.99`. | Parity assertion was too strict; container float16 math gave 0.9117. |
+| **V14** | 0.993 | 0.512 | Error | Multi-view TF-IDF regex string escaping bug. | Raw regex string syntax errors halted execution before extraction. |
+| **V15** | 0.993 | 0.542 | **0.491** | Softened assertion, persistent extractor, attention-sink zeroed, soft adaptive centering. | **Breakthrough achieved! Generalization gap narrowed to 0.051.** |
+| **V16** | 0.995 | 0.610 | Error | Initial multi-backbone refactor with Qwen3-14B & Qwen2.5-14B. | Identified 2D weight slice mismatch in label alignment. |
+| **V17** | 0.995 | 0.610 | Error | Fixed align_cols 2D weight matrix indexing. | DeBERTa PyTorch tensor requires_grad blocked numpy export. |
+| **V18** | 1.000 | 0.615 | Error | Fixed extract_deb_last with @torch.no_grad() and .detach(). | Notebook code validated end-to-end on dual T4 GPUs. |
+| **V19** | **0.994** | **0.628** | **0.551** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) + wPCA Gaussian + 4-View SVC + Shield. | **Executed in 8m 46s on 2xT4 GPUs; Ref 57628730; +0.060 jump over V15.** |
 
 ---
 

@@ -10,14 +10,14 @@ This repository contains the end-to-end, competition-grade machine learning solu
 
 ## Key Milestones & Progression
 
-| Version | Architecture / Pipeline Components | Score (Balanced Accuracy) |
-| :--- | :--- | :---: |
-| **V1** | Flat Word N-Gram TF-IDF Baseline | **0.321** |
-| **V9** | DeBERTa-v3 Multi-Layer + ANOVA Specialists | **0.347** |
-| **V12** | Qwen3-8B LoRA Base (Attention Sink Unmasked) | **0.347** |
-| **V15** | Verified Qwen3-8B LoRA + Token-0 Mask (`m[:, 0] = 0`) + Soft Centering | **0.491** |
-| **V18** | Multi-Backbone Two-Stage Pipeline Refactor | Build Validation |
-| **V19** | **Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield** | **0.551** |
+| Version | Architecture / Pipeline Components | Training BAcc | Validation CV | Public LB | Generalization & Overfitting Intuition |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **V1** | Flat Word N-Gram TF-IDF Baseline | **1.000 (100%)** | 0.335 (33.5%) | **0.321** | Extreme Overfitting: Bag-of-words memorizes prompt tokens perfectly but fails on unseen test prompts. |
+| **V9** | DeBERTa-v3 Multi-Layer + ANOVA Specialists | **0.892 (89.2%)** | 0.362 (36.2%) | **0.336** | Moderate Overfitting: Hungarian matching inflated dense fold CV (0.400) but degraded on sparse test prompts. |
+| **V12** | Qwen3-8B LoRA Base (Attention Sink Unmasked) | **0.993 (99.3%)** | 0.497 (49.7%) | **0.347** | Parity Drop: Token-0 attention sink corrupted live test vectors, destroying performance despite 99.3% train fit. |
+| **V15** | Verified Qwen3-8B LoRA + Token-0 Mask (`m[:, 0] = 0`) + Soft Centering | **0.993 (99.3%)** | 0.542 (54.2%) | **0.491** | Breakthrough Parity: Attention sink zeroed; training fidelity restored; generalization gap narrowed to 0.051. |
+| **V18** | Multi-Backbone Two-Stage Pipeline Refactor | **1.000 (100%)** | 0.615 (61.5%) | **Build Valid.** | Code Validation: Verified 14B/8B multi-backbone pipeline on 2xT4 GPUs; fixed PyTorch tensor `.detach()` requirement. |
+| **V19** | **Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield** | **0.994 (99.4%)** | **0.628 (62.8%)** | **0.551** | State-of-the-Art Ensemble: 14B+8B multi-backbone representations with wPCA disentanglement; +0.060 LB lift over V15. |
 
 ---
 
