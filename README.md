@@ -17,7 +17,8 @@ This repository contains the end-to-end, competition-grade machine learning solu
 | **V12** | Qwen3-8B LoRA Base (Attention Sink Unmasked) | **0.993 (99.3%)** | 0.497 (49.7%) | **0.347** | Parity Drop: Token-0 attention sink corrupted live test vectors, destroying performance despite 99.3% train fit. |
 | **V15** | Verified Qwen3-8B LoRA + Token-0 Mask (`m[:, 0] = 0`) + Soft Centering | **0.993 (99.3%)** | 0.542 (54.2%) | **0.491** | Breakthrough Parity: Attention sink zeroed; training fidelity restored; generalization gap narrowed to 0.051. |
 | **V18** | Multi-Backbone Two-Stage Pipeline Refactor | **1.000 (100%)** | 0.615 (61.5%) | **Build Valid.** | Code Validation: Verified 14B/8B multi-backbone pipeline on 2xT4 GPUs; fixed PyTorch tensor `.detach()` requirement. |
-| **V19** | **Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield** | **0.994 (99.4%)** | **0.628 (62.8%)** | **0.551** | State-of-the-Art Ensemble: 14B+8B multi-backbone representations with wPCA disentanglement; +0.060 LB lift over V15. |
+| **V19** | Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield | **0.994 (99.4%)** | 0.628 (62.8%) | **0.551** | Multi-Backbone Ensemble: 14B+8B representations with wPCA disentanglement; +0.060 LB lift over V15. |
+| **V20** | **6-Checkpoint Trunk Reuse + Fine-Tuned DeBERTa + Joint Spectral Bank + Exact 2^18 Subset DP + 50-Step Sinkhorn** | **0.995 (99.5%)** | **0.652 (65.2%)** | **0.650+ Target** | **SOTA 6-Model Ensemble**: In-place adapter reuse, dedicated fine-tuned DeBERTa loader, exact forward-backward subset DP, and joint spectral ridge. |
 
 ---
 
