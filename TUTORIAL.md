@@ -66,62 +66,98 @@ $$\frac{1}{18} \approx 5.56\%$$
 
 ## 2. High-Level Architecture Overview
 
-Our winning architecture does not rely on a single classifier. It operates as a multi-stage, multi-branch forensic ensemble combining deep causal language models, bidirectional transformers, stylometrics, and hierarchical specialist classifiers.
+Our winning architecture operates as a 6-checkpoint, multi-backbone forensic ensemble combining deep causal language models, bidirectional encoders, stylometrics, exact dynamic programming, and hierarchical specialist classifiers.
 
 ```
-                  ┌──────────────────────────────┐
-                  │  Raw Mystery Text Passage    │
-                  └──────────────┬───────────────┘
-                                 │
-         ┌───────────────────────┼───────────────────────┐
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│  Branch 1 (50%)  │    │  Branch 2 (25%)  │    │  Branch 3 (25%)  │
-│  Qwen3-8B LoRA   │    │  DeBERTa-v3      │    │  Multi-View N-Gram│
-│  24-Layer Trunk  │    │  Large 5-Layer   │    │  + Stylometrics  │
-│  Attention-Sink  │    │  Representation  │    │  LinearSVC + LGBM│
-│  Zeroed Pooling  │    │  Transductive    │    │  107k Features   │
-└────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                                 ▼
-                 ┌───────────────────────────────┐
-                 │  Global Probability Logits    │
-                 └───────────────┬───────────────┘
-                                 │
-                                 ▼
-                 ┌───────────────────────────────┐
-                 │  Soft Adaptive Centering      │
-                 │  Topic Bias Subtracted on     │
-                 │  Clusters (2 <= |C| <= 18)    │
-                 └───────────────┬───────────────┘
-                                 │
-                                 ▼
-                 ┌───────────────────────────────┐
-                 │  Top-1 Gated Claude Head      │
-                 │  Resolves Sibling Confusion   │
-                 │  Without Touching Non-Claude  │
-                 └───────────────┬───────────────┘
-                                 │
-                                 ▼
-                 ┌───────────────────────────────┐
-                 │  Final Model Prediction       │
-                 │  submission.parquet           │
-                 └───────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│               MOUNTED DATASETS & PRE-TRAINED ASSETS                    │
+├────────────────────────────────────────────────────────────────────────┤
+│ • competitions/name-that-llm: train.csv (2,699 rows), test.csv         │
+│ • nishantdahal/ntl-handwriting-blend: pool_v4.parquet (75,783 rows),   │
+│   lora_qwen3_14b (Part 2), lora_qwen25_14b, deberta_v3_large/encoder   │
+│ • nishantdahal/ntl-two-stage-lora: lora14b_v1 (Part 1), lora8b_v1      │
+│ • zbigniewkirchner/ntl-qwen3-8b-lora-claude-head: Claude Head, readouts│
+│ • Base Models: Qwen3-14B-Base, Qwen2.5-14B, Qwen3-8B-Base, DeBERTa-v3  │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                  ┌─────────────────┴─────────────────┐
+                  │      Raw Mystery Text Passage     │
+                  └─────────────────┬─────────────────┘
+                                    │
+ ┌──────────────────────────────────┴──────────────────────────────────┐
+ │               SEQUENTIAL DUAL-T4 GPU FEATURE EXTRACTION             │
+ ├─────────────────────────────────────────────────────────────────────┤
+ │ Trunk 1: Qwen3-14B-Base (keep=27 layers, H=5120, max_len=447)      │
+ │   ├─ In-place +delta merge: lora_qwen3_14b (w=0.40/0.12/0.12)       │
+ │   ├─ In-place -delta unmerge: restores base trunk W0                │
+ │   └─ In-place +delta merge: lora14b_v1     (w=0.20/0.07/0.07)       │
+ │   └─ [Free Trunk 1 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Trunk 2: Qwen2.5-14B-Base (keep=32 layers, H=5120, max_len=447)    │
+ │   ├─ In-place +delta merge: lora_qwen25_14b (w=0.22/0.08/0.08)      │
+ │   └─ [Free Trunk 2 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Trunk 3: Qwen3-8B-Base (keep=24 layers, H=4096, max_len=384)       │
+ │   ├─ In-place +delta merge: ntl-qwen3-8b-claude (w=0.18/0.06/0.06)  │
+ │   ├─ In-place -delta unmerge: restores base trunk W0                │
+ │   └─ In-place +delta merge: lora8b_v1      (w=0.12/0.04/0.04)       │
+ │   └─ [Free Trunk 3 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Trunk 4: Fine-Tuned DeBERTa-v3 Encoder (1024-dim, max_len=384)      │
+ │   ├─ Dedicated encoder/model.safetensors loader (w=0.20/0.07/0.07)  │
+ │   └─ [Free Trunk 4 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Stylometric Branch: 4-View LinearSVC (weight=1.05)                  │
+ │   └─ Trained on train.csv + pool_v4.parquet (78,482 rows)           │
+ │      Char (3-5), Word (1-3), Word-Shape (2-6), Function Words       │
+ └──────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │       READOUT ENSEMBLE, EXACT SUBSET DP & PROBABILITY CALIBRATION   │
+ ├─────────────────────────────────────────────────────────────────────┤
+ │ 1. Plain & Centered Twin Heads (heads.safetensors / readouts.npz)   │
+ │    Topic bias subtracted on cluster groups_085 (2 <= |C| <= 18)     │
+ │                                                                     │
+ │ 2. Exact 2^18 Bitmask Subset DP (ExactAuthorPosterior)              │
+ │    Forward-backward dynamic programming over 262,144 author subsets │
+ │    enforcing 1-to-1 prompt uniqueness directly in log-probs         │
+ │                                                                     │
+ │ 3. Joint Cross-Backbone Spectral Readout Bank (0 extra GPU cost)    │
+ │    L2-normalized multi-backbone concatenation + 512-dim PCA Ridge   │
+ │                                                                     │
+ │ 4. 50-Step Log-Domain Sinkhorn-Knopp Marginal Balancing             │
+ │    Equalizes column marginals toward uniform 1/18 prior (alpha=0.5) │
+ │                                                                     │
+ │ 5. Sovereign Orthographic Bayesian Shield (-2.0 Log-Penalty)        │
+ │    Strict empirical rules: curly quotes (Claude/GLM), em-dash       │
+ │    (Gemini), straight apostrophes (gpt-5.6-sol)                     │
+ │                                                                     │
+ │ 6. Top-1 Gated Claude Specialist Head                               │
+ │    Disambiguates 5 sibling Claude variants without altering non-Cl  │
+ └──────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+                     ┌──────────────────────────────┐
+                     │   Final Attributed Model     │
+                     │    submission.parquet        │
+                     └──────────────────────────────┘
 ```
 
-### The 4 Foundational Pillars of Success
+### The 6 Foundational Pillars of Success
 
-1. **Pillar 1: 24-Layer Truncated Qwen3-8B Trunk with In-Place LoRA Fusion**
-   Running an 8-billion parameter model on dual Kaggle T4 GPUs (14.5 GB VRAM each) requires truncating the trunk to 24 layers and fusing LoRA adapter weights directly into linear layers in 28 seconds.
-2. **Pillar 2: The Attention-Sink Mask Discovery (`m[:, 0] = 0`)**
-   In causal generative transformers, the very first token acts as an attention sponge, absorbing activations 100x larger than normal words. Masking position 0 before mean-pooling is what unlocked **0.9688 (96.88%)** live validation accuracy.
-3. **Pillar 3: Soft Adaptive Prompt Centering**
-   Writing style is often overshadowed by prompt topic. By clustering test passages and subtracting the cluster mean representation, topic bias is removed without suffering from the distortion of hard Hungarian assignment.
-4. **Pillar 4: Top-1 Gated Claude Specialist & OpenRouter Tie-Breakers**
-   The 5 Claude models share identical safety guardrails and tonal phrasing. A dedicated 5-class linear head applied strictly when the top prediction is Claude disambiguates sibling models cleanly.
+1. **Pillar 1: Multi-Backbone Sequential Trunk Loading & In-Place LoRA Reuse**
+   Loads each base trunk (`Qwen3-14B`, `Qwen2.5-14B`, `Qwen3-8B`) once into dual T4 GPU memory. Adapters are merged and unmerged in-place (+delta, -delta) in under 25 seconds, running 6 neural models without reloading from disk or triggering OOM.
+2. **Pillar 2: Attention-Sink Zeroing (`m[:, 0] = 0`) & Tokenizer Parity**
+   In causal generative transformers, the very first token acts as an attention sponge, absorbing activations 100x larger than normal words. Zeroing position 0 before mean-pooling restored **96.88% live validation accuracy** and enabled the 0.491 -> 0.551+ breakthrough.
+3. **Pillar 3: Dedicated Full-Encoder Loader for Fine-Tuned DeBERTa-v3**
+   Directly loads the 0.546 solo CV fine-tuned DeBERTa encoder (`encoder/model.safetensors`, 868 MB) and dynamically verifies full vs. drop-first attention pooling on `train.csv`.
+4. **Pillar 4: Exact 2^18 Bitmask Subset DP (`ExactAuthorPosterior`)**
+   Replaces approximate mean-field and hard Hungarian post-processing with exact forward-backward dynamic programming over all 262,144 author subsets, enforcing 1-to-1 prompt uniqueness directly in log-probability space.
+5. **Pillar 5: 4-View Topic-Blind `LinearSVC` (78,482 Passages)**
+   Combines `train.csv` with `pool_v4.parquet` across character n-grams, word n-grams, word shape capitalization patterns, and content-masked function words.
+6. **Pillar 6: Sovereign Orthographic Bayesian Shield (-2.0) & Top-1 Claude Specialist**
+   Applies hard empirical penalties on invariant punctuation (curly quotes, em-dashes, straight apostrophes) and routes Claude candidates to a dedicated 5-way disambiguation classifier without modifying non-Claude predictions.
 
 ---
 

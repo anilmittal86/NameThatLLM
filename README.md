@@ -22,13 +22,91 @@ This repository contains the end-to-end, competition-grade machine learning solu
 
 ---
 
+## End-to-End System Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│               MOUNTED DATASETS & PRE-TRAINED ASSETS                    │
+├────────────────────────────────────────────────────────────────────────┤
+│ • competitions/name-that-llm: train.csv (2,699 rows), test.csv         │
+│ • nishantdahal/ntl-handwriting-blend: pool_v4.parquet (75,783 rows),   │
+│   lora_qwen3_14b (Part 2), lora_qwen25_14b, deberta_v3_large/encoder   │
+│ • nishantdahal/ntl-two-stage-lora: lora14b_v1 (Part 1), lora8b_v1      │
+│ • zbigniewkirchner/ntl-qwen3-8b-lora-claude-head: Claude Head, readouts│
+│ • Base Models: Qwen3-14B-Base, Qwen2.5-14B, Qwen3-8B-Base, DeBERTa-v3  │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                  ┌─────────────────┴─────────────────┐
+                  │      Raw Mystery Text Passage     │
+                  └─────────────────┬─────────────────┘
+                                    │
+ ┌──────────────────────────────────┴──────────────────────────────────┐
+ │               SEQUENTIAL DUAL-T4 GPU FEATURE EXTRACTION             │
+ ├─────────────────────────────────────────────────────────────────────┤
+ │ Trunk 1: Qwen3-14B-Base (keep=27 layers, H=5120, max_len=447)      │
+ │   ├─ In-place +delta merge: lora_qwen3_14b (w=0.40/0.12/0.12)       │
+ │   ├─ In-place -delta unmerge: restores base trunk W0                │
+ │   └─ In-place +delta merge: lora14b_v1     (w=0.20/0.07/0.07)       │
+ │   └─ [Free Trunk 1 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Trunk 2: Qwen2.5-14B-Base (keep=32 layers, H=5120, max_len=447)    │
+ │   ├─ In-place +delta merge: lora_qwen25_14b (w=0.22/0.08/0.08)      │
+ │   └─ [Free Trunk 2 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Trunk 3: Qwen3-8B-Base (keep=24 layers, H=4096, max_len=384)       │
+ │   ├─ In-place +delta merge: ntl-qwen3-8b-claude (w=0.18/0.06/0.06)  │
+ │   ├─ In-place -delta unmerge: restores base trunk W0                │
+ │   └─ In-place +delta merge: lora8b_v1      (w=0.12/0.04/0.04)       │
+ │   └─ [Free Trunk 3 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Trunk 4: Fine-Tuned DeBERTa-v3 Encoder (1024-dim, max_len=384)      │
+ │   ├─ Dedicated encoder/model.safetensors loader (w=0.20/0.07/0.07)  │
+ │   └─ [Free Trunk 4 VRAM] ──► 0 GB                                   │
+ │                                                                     │
+ │ Stylometric Branch: 4-View LinearSVC (weight=1.05)                  │
+ │   └─ Trained on train.csv + pool_v4.parquet (78,482 rows)           │
+ │      Char (3-5), Word (1-3), Word-Shape (2-6), Function Words       │
+ └──────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │       READOUT ENSEMBLE, EXACT SUBSET DP & PROBABILITY CALIBRATION   │
+ ├─────────────────────────────────────────────────────────────────────┤
+ │ 1. Plain & Centered Twin Heads (heads.safetensors / readouts.npz)   │
+ │    Topic bias subtracted on cluster groups_085 (2 <= |C| <= 18)     │
+ │                                                                     │
+ │ 2. Exact 2^18 Bitmask Subset DP (ExactAuthorPosterior)              │
+ │    Forward-backward dynamic programming over 262,144 author subsets │
+ │    enforcing 1-to-1 prompt uniqueness directly in log-probs         │
+ │                                                                     │
+ │ 3. Joint Cross-Backbone Spectral Readout Bank (0 extra GPU cost)    │
+ │    L2-normalized multi-backbone concatenation + 512-dim PCA Ridge   │
+ │                                                                     │
+ │ 4. 50-Step Log-Domain Sinkhorn-Knopp Marginal Balancing             │
+ │    Equalizes column marginals toward uniform 1/18 prior (alpha=0.5) │
+ │                                                                     │
+ │ 5. Sovereign Orthographic Bayesian Shield (-2.0 Log-Penalty)        │
+ │    Strict empirical rules: curly quotes (Claude/GLM), em-dash       │
+ │    (Gemini), straight apostrophes (gpt-5.6-sol)                     │
+ │                                                                     │
+ │ 6. Top-1 Gated Claude Specialist Head                               │
+ │    Disambiguates 5 sibling Claude variants without altering non-Cl  │
+ └──────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+                     ┌──────────────────────────────┐
+                     │   Final Attributed Model     │
+                     │    submission.parquet        │
+                     └──────────────────────────────┘
+```
+
 ## Architectural Highlights
 
-1. **Multi-Backbone Two-Stage LoRA Pool**:
-   - `Qwen3-14B-Base` (27-layer truncated trunk, 8-layer extraction).
-   - `Qwen2.5-14B` (32-layer truncated trunk, 8-layer extraction).
-   - `Qwen3-8B-Base` (24-layer truncated trunk, 8-layer extraction + Claude specialist head).
-   - `DeBERTa-v3-Large` (frozen and fine-tuned pooled representations).
+1. **Multi-Backbone Two-Stage LoRA Pool & In-Place Trunk Reuse**:
+   - `Qwen3-14B-Base` (27-layer trunk): Reversibly hosts `lora_qwen3_14b` (Part 2) and `lora14b_v1` (Part 1).
+   - `Qwen2.5-14B` (32-layer trunk): Hosts `lora_qwen25_14b` (Part 2).
+   - `Qwen3-8B-Base` (24-layer trunk): Reversibly hosts `ntl-qwen3-8b-claude` and `lora8b_v1` (Part 1).
+   - `DeBERTa-v3-Large`: Dedicated loader for the fine-tuned 868 MB encoder checkpoint (0.546 solo CV).
 
 2. **Universal 2xT4 Trunk Loader & In-Place LoRA Fusion**:
    - Direct PyTorch in-place matrix multiplication ($W_{\text{eff}} = W_0 + \frac{\alpha}{r} (B \times A)$) merging all adapter projections in under 30 seconds with 0 extra VRAM.
