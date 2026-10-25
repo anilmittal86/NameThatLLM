@@ -1,0 +1,27 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+
+# Kaggle / Model artifacts & caches
+artifacts/
+cache/
+scratch/
+temp_meta/
+checkpoints/
+*.parquet
+*.npz
+*.safetensors
+*.bin
+*.log
+download.txt
+powershell.exe
+
+# Git & OS
+.DS_Store
+Thumbs.db
