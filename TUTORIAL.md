@@ -104,7 +104,7 @@
 }
 </style>
 
-# The Mystery of the 18 Robots 🤖🔍
+# The Mystery of the 18 Robots
 ### *A Complete, Printable Master Guide to "Name That LLM" (From 0.32 to 0.491+ Public LB)*
 
 ---

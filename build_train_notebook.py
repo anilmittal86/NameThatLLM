@@ -32,7 +32,7 @@ def add_code(text):
     })
 
 
-add_md("""# Name That LLM: LoRA Sequence Classifier Training Pipeline 🚀
+add_md("""# Name That LLM: LoRA Sequence Classifier Training Pipeline 
 ### Fine-tuning DeBERTa-v3-large with PEFT LoRA on 18-Class Authorship Attribution
 
 **Key Highlights:**

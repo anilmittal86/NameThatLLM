@@ -1,4 +1,4 @@
-# Name That LLM: High-Precision Authorship Attribution Pipeline 🤖🔍
+# Name That LLM: High-Precision Authorship Attribution Pipeline
 
 [![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.491%2B-blue)](https://www.kaggle.com/competitions/name-that-llm)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
@@ -8,7 +8,7 @@ This repository contains the end-to-end, competition-grade machine learning solu
 
 ---
 
-## 🏆 Key Milestones & Progression
+## Key Milestones & Progression
 
 | Version | Architecture / Pipeline Components | Score (Balanced Accuracy) |
 | :--- | :--- | :---: |
@@ -20,7 +20,7 @@ This repository contains the end-to-end, competition-grade machine learning solu
 
 ---
 
-## 🚀 Architectural Highlights
+## Architectural Highlights
 
 1. **Multi-Backbone Two-Stage LoRA Pool**:
    - `Qwen3-14B-Base` (27-layer truncated trunk, 8-layer extraction).
@@ -54,14 +54,14 @@ This repository contains the end-to-end, competition-grade machine learning solu
 
 ---
 
-## 📖 Comprehensive Printable Guide
+## Comprehensive Printable Guide
 
 For a complete beginner-to-expert guide with diagrams, mathematical proofs, and code snippets, see:
-👉 **[TUTORIAL.md](TUTORIAL.md)** (Print and PDF-optimized).
+ **[TUTORIAL.md](TUTORIAL.md)** (Print and PDF-optimized).
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 
 ```
 ├── TUTORIAL.md                          # Comprehensive printable masterclass & tutorial
