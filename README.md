@@ -16,7 +16,8 @@ This repository contains the end-to-end, competition-grade machine learning solu
 | **V9** | DeBERTa-v3 Multi-Layer + ANOVA Specialists | **0.347** |
 | **V12** | Qwen3-8B LoRA Base (Attention Sink Unmasked) | **0.347** |
 | **V15** | **Verified Qwen3-8B LoRA + Token-0 Mask (`m[:, 0] = 0`) + Soft Centering** | **0.491** |
-| **V18** | **Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield** | **Targeting 0.620+** |
+| **V18** | Multi-Backbone Two-Stage Pipeline Refactor | Build Validation |
+| **V19** | **Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield** | **0.620+ Target (Ref 57628730)** |
 
 ---
 
