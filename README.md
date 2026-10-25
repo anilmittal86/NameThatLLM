@@ -1,6 +1,6 @@
 # Name That LLM: High-Precision Authorship Attribution Pipeline
 
-[![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.491%2B-blue)](https://www.kaggle.com/competitions/name-that-llm)
+[![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.551-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
@@ -15,9 +15,9 @@ This repository contains the end-to-end, competition-grade machine learning solu
 | **V1** | Flat Word N-Gram TF-IDF Baseline | **0.321** |
 | **V9** | DeBERTa-v3 Multi-Layer + ANOVA Specialists | **0.347** |
 | **V12** | Qwen3-8B LoRA Base (Attention Sink Unmasked) | **0.347** |
-| **V15** | **Verified Qwen3-8B LoRA + Token-0 Mask (`m[:, 0] = 0`) + Soft Centering** | **0.491** |
+| **V15** | Verified Qwen3-8B LoRA + Token-0 Mask (`m[:, 0] = 0`) + Soft Centering | **0.491** |
 | **V18** | Multi-Backbone Two-Stage Pipeline Refactor | Build Validation |
-| **V19** | **Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield** | **0.620+ Target (Ref 57628730)** |
+| **V19** | **Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield** | **0.551** |
 
 ---
 

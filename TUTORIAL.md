@@ -162,7 +162,7 @@ $$\frac{1}{18} \approx 5.56\%$$
 | **Interim** | V9: DeBERTa-v3 + ANOVA | 60/40 Blend + Hard Hungarian | **0.347** |
 | **Buggy LoRA**| V12: Qwen3-8B Base + PEFT | Unmasked Attention Sink (Lost parity) | **0.347** |
 | **V15 Lift** | **V15: Verified Qwen3-8B LoRA** | **Sink Zeroing (`m[:,0]=0`) + Adaptive Centering** | **0.491** |
-| **Current SOTA**| **V19: Two-Stage Multi-LoRA** | **14B/8B LoRAs + wPCA Gaussian + 4-View SVC + Shield** | **0.620+ Target** |
+| **Current SOTA**| **V19: Two-Stage Multi-LoRA** | **14B/8B LoRAs + wPCA Gaussian + 4-View SVC + Shield** | **0.551 (Verified)** |
 
 ---
 
@@ -948,7 +948,7 @@ Submission Reference: 57628730
 Notebook Version:     Version 19 (anilmittal/name-that-llm-v2-submission)
 Architecture:         Multi-Backbone Two-Stage LoRAs + wPCA + 4-View SVC + Shield
 Execution Status:     KernelWorkerStatus.COMPLETE (8 minutes 46 seconds)
-Target Score:         0.620+ Balanced Accuracy
+Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
 ```
 
 ---
@@ -966,7 +966,7 @@ Target Score:         0.620+ Balanced Accuracy
 | **V16** | Error | Initial multi-backbone refactor with Qwen3-14B & Qwen2.5-14B. | Identified 2D weight slice mismatch in label alignment. |
 | **V17** | Error | Fixed align_cols 2D weight matrix indexing. | DeBERTa PyTorch tensor requires_grad blocked numpy export. |
 | **V18** | Error | Fixed extract_deb_last with @torch.no_grad() and .detach(). | Notebook code validated end-to-end. |
-| **V19** | **0.620+ Target** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) + wPCA Gaussian + 4-View SVC + Shield. | **Executed in 8m 46s on 2xT4 GPUs; Ref 57628730.** |
+| **V19** | **0.551** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) + wPCA Gaussian + 4-View SVC + Shield. | **Executed in 8m 46s on 2xT4 GPUs; Ref 57628730; +0.060 jump over V15.** |
 
 ---
 
