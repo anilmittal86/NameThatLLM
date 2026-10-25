@@ -812,6 +812,8 @@ if BASE_DEBERTA is not None:
     deb_model.eval()
     
     dev_deb = next(deb_model.parameters()).device
+    
+    @torch.no_grad()
     def extract_deb_last(texts, bs=16):
         all_e = []
         for i in range(0, len(texts), bs):
@@ -819,7 +821,7 @@ if BASE_DEBERTA is not None:
             out = deb_model(**enc)
             m = enc['attention_mask'].unsqueeze(-1).float()
             pool = (out.last_hidden_state.float() * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
-            all_e.append(pool.cpu().numpy())
+            all_e.append(pool.detach().cpu().numpy())
         return np.vstack(all_e)
         
     E_te = extract_deb_last(test_texts)
@@ -828,12 +830,18 @@ if BASE_DEBERTA is not None:
     gc.collect()
     torch.cuda.empty_cache()
     
-    # Check if pre-trained head exists in deberta_blend
-    head_file = LORA_DIRS.get('deberta_blend', Path()).parent / 'deberta_v3_large' / 'head.safetensors'
-    if not head_file.exists():
-        head_file = Path('/kaggle/input/datasets/nishantdahal/ntl-handwriting-blend/deberta_v3_large/head.safetensors')
-        
-    if head_file.exists():
+    head_file = None
+    if 'deberta_blend' in LORA_DIRS:
+        c1 = LORA_DIRS['deberta_blend'] / 'head.safetensors'
+        if c1.exists():
+            head_file = c1
+    if head_file is None:
+        for p in Path('/kaggle/input').rglob('head.safetensors'):
+            if 'deberta' in str(p).lower():
+                head_file = p
+                break
+                
+    if head_file is not None and head_file.exists():
         head_sd = load_file(str(head_file))
         meta_deb = json.load(open(head_file.parent / 'meta.json'))
         w_deb = align_cols(head_sd['weight'].cpu().numpy(), meta_deb['labels'], LABELS)
@@ -910,7 +918,6 @@ if is_claude.any():
     claude_rows = np.where(is_claude)[0]
     print(f'\\n=== [Module 5] Top-1 Gated Claude Specialist on {len(claude_rows)} rows ===')
     
-    # Train Claude-only LinearSVC on train.csv
     ro_claude_classes = claude_classes
     df_claude = df_train[df_train['model'].isin(ro_claude_classes)].copy()
     y_c_tr = np.array([ro_claude_classes.index(m) for m in df_claude['model']])
@@ -926,7 +933,6 @@ if is_claude.any():
     
     if qwen3_8b_ro is not None and Z_test_qwen3_8b is not None:
         logits_c_lora = Z_test_qwen3_8b[claude_rows] @ qwen3_8b_ro['claude_coef'].T + qwen3_8b_ro['claude_intercept']
-        # Align ro claude classes to ro_claude_classes
         ro_src = list(qwen3_8b_ro['claude_classes'])
         logits_c_lora = align_cols(logits_c_lora, ro_src, ro_claude_classes)
         log_p_c_lora = log_softmax(logits_c_lora)
