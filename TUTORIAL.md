@@ -69,64 +69,65 @@ $$\frac{1}{18} \approx 5.56\%$$
 
 Our winning architecture operates as a 6-checkpoint, multi-backbone forensic ensemble combining deep causal language models, bidirectional encoders, stylometrics, exact dynamic programming, and hierarchical specialist classifiers.
 
-```
-┌───────────────────────────────────────────────────────────────────────────────────────────┐
-│                           MOUNTED DATASETS & PRE-TRAINED ASSETS                           │
-├───────────────────────────────────────────────────────────────────────────────────────────┤
-│ • competitions/name-that-llm: train.csv (2,699 rows), test.csv                            │
-│ • nishantdahal/ntl-handwriting-blend: pool_v4.parquet (75,783 rows), 14b, deberta         │
-│ • nishantdahal/ntl-two-stage-lora: lora14b_v1 (Part 1), lora8b_v1                         │
-│ • zbigniewkirchner/ntl-qwen3-8b-lora-claude-head: Claude Head, readouts.npz               │
-│ • Base Weights: Qwen3-14B-Base | Qwen2.5-14B-Base | Qwen3-8B-Base | DeBERTa-v3-Large      │
-└─────────────────────────────────────────────┬─────────────────────────────────────────────┘
-                                              │
-                               ┌─────────────────────────────┐
-                               │  Raw Mystery Text Passage   │
-                               └──────────────┬──────────────┘
-                                              │
-        ┌──────────────────┬──────────────────┼──────────────────┬──────────────────┐
-        │                  │                  │                  │                  │
-        ▼                  ▼                  ▼                  ▼                  ▼
-┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-│  Branch 1     │  │  Branch 2     │  │  Branch 3     │  │  Branch 4     │  │  Branch 5     │
-│  Qwen3-14B    │  │  Qwen2.5-14B  │  │   Qwen3-8B    │  │  DeBERTa-v3   │  │ Stylometrics  │
-│  Dual LoRA    │  │  LoRA Part 2  │  │  Dual LoRA    │  │  Fine-Tuned   │  │  4-View SVC   │
-│ (Part2 + v1)  │  │ (32L, H=5120) │  │ (Claude + v1) │  │  Full Encoder │  │ (78k Passages)│
-│ 27L Trunk H=5k│  │ 8-Layer Pool  │  │ 24L Sink-Mask │  │  1024-Dim CLS │  │ Char/Word/Func│
-└───────┬───────┘  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘
-        │                  │                  │                  │                  │
-        └──────────────────┴──────────────────┼──────────────────┴──────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │       Multi-Backbone Readout Ensemble       │
-                       │  Twin Plain/Centered Heads + Spectral Ridge │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │ Exact 2^18 Subset DP (ExactAuthorPosterior) │
-                       │   Enforces 1-to-1 Prompt Author Uniqueness  │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │         Marginal Balancing & Shield         │
-                       │   50-Step Sinkhorn-Knopp + Bayesian Rules   │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │           Top-1 Gated Claude Head           │
-                       │ 5-Way Disambiguation (Non-Claude Preserved) │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │            Final Attributed Model           │
-                       │              submission.parquet             │
-                       └─────────────────────────────────────────────┘
-```
+The pipeline is organized into two distinct phases:
+1. **Phase 1 (Offline Pre-Training & Dataset Lineage)**: How models were fine-tuned and packaged into Kaggle dataset bundles.
+2. **Phase 2 (Inference & Post-Processing Pipeline)**: How the submission notebook loads base trunks, applies in-place LoRA patches, fits live stylometrics and spectral banks, and post-processes logits to generate the final prediction.
+
+---
+
+### Phase 1: High-Level Design — Training & Dataset Lineage
+
+![High-Level Design: Offline Training Pipeline & Kaggle Dataset Bundles](assets/training_lineage_architecture.png)
+
+#### Training Phase Breakdown
+- **In-Repository Training (`train_lora.py`, `build_train_notebook.py`)**:
+  - Implements sequence classification fine-tuning with PEFT LoRA (`r=16`, `lora_alpha=32`, `target_modules=q/k/v/o/gate/up/down_proj`).
+  - Evaluated on `train.csv` (2,699 labeled passages) under strict 5-fold `GroupKFold` partitioned by `prompt_id` to guarantee 0 prompt leakage.
+  - The local Fold 0 adapter checkpoint is archived for ablation experiments; the final competition run directly consumes pre-trained models published in Kaggle datasets.
+- **External Dataset Bundles (Mounted via `kernel-metadata.json`)**:
+  - **Model 1 (`nishantdahal/ntl-handwriting-blend`)**:
+    - `pool_v4.parquet` (75,783 curated text passages driving live stylometrics).
+    - Part 2 LoRA weights: `lora_qwen3_14b` and `lora_qwen25_14b`.
+    - Dedicated fine-tuned `deberta_v3_large` encoder.
+  - **Model 2 (`nishantdahal/ntl-two-stage-lora`)**:
+    - Part 1 LoRA weights: `lora14b_v1` (Qwen3-14B) and `lora8b_v1` (Qwen3-8B).
+    - Older `pool_v1.parquet` is present in the dataset but explicitly ignored by the pipeline.
+  - **Model 3 (`zbigniewkirchner/ntl-qwen3-8b-lora-claude-head`)**:
+    - Qwen3-8B LoRA weights.
+    - Pre-computed readout heads (`readouts.npz`).
+    - Dedicated 5-way Claude specialist head (`claude_head.safetensors`).
+  - **Legacy Source (`willrice/name-that-llm-openrouter-harvest`)**:
+    - Contains raw CSV/JSONL files (`passages.csv`, `prompts.csv`) from older iterations (v12-v15). It remains mounted for backward compatibility but is no longer read by the current submission notebook.
+
+---
+
+### Phase 2: High-Level Design — Multi-Backbone Inference Pipeline
+
+![High-Level Design: Multi-Backbone Low-RAM Inference Pipeline](assets/inference_hld_architecture.png)
+
+#### Inference Pipeline Execution Flow
+- **5 Concurrent Feature Extraction Branches**:
+  1. **Reader A (Qwen3-14B Base, 27-Layer Trunk)**:
+     - Merges **M1 Part 2 LoRA** (weight = 0.40).
+     - Unmerges and merges **M2 Part 1 LoRA** (weight = 0.20).
+  2. **Reader B (Qwen2.5-14B Base, 32-Layer Trunk)**:
+     - Merges **M1 Part 2 LoRA** (weight = 0.22).
+  3. **Reader C (Qwen3-8B Base, 24-Layer Trunk)**:
+     - Merges **M3 Claude LoRA** (weight = 0.18).
+     - Unmerges and merges **M2 Part 1 LoRA** (weight = 0.12).
+  4. **Reader D (DeBERTa-v3-Large, Dedicated Encoder)**:
+     - Evaluates **M1 fine-tuned encoder** with dynamic attention mask check (weight = 0.20).
+  5. **Style Counter (4-View Topic-Blind `LinearSVC`)**:
+     - Trained live inside the notebook on 53,099 passages (`train.csv` + 2,800/class from **M1 `pool_v4.parquet`**).
+     - Single-copy streamed CSR matrix across Character (3-5), Word (1-3), Shape (2-6), and Function (1-3) n-grams (weight = 1.05).
+- **Sequential Post-Processing & Logit Refinement**:
+  1. **1. Combine Opinions**: Stack whitened pooled features into the Joint 384-Dim Compact Spectral Bank and apply plain/prompt-centered readout heads fit live on `train.csv`.
+  2. **2. Group Rule**: Apply exact $2^{18}$ Bitmask Dynamic Programming (`ExactAuthorPosterior`) inside each reader, then once globally across all multi-passage hybrid prompt clusters.
+  3. **3. Balance the Counts**: Apply 50-step log-domain Sinkhorn-Knopp marginal distribution balancing ($\alpha = 0.50$, active when test passages $\ge 50$).
+  4. **4. Punctuation Rulebook**: Apply calibrated Sovereign Orthographic Bayesian Shield ($-2.0$ log penalty on invariant curly quotes, em-dashes, and straight apostrophes).
+  5. **5. Claude Specialist**: Hard switch using **M3 Claude head** strictly on rows where the top predicted model is within the Anthropic Claude family (non-Claude predictions remain 100% untouched).
+
+---
 
 ### The 6 Foundational Pillars of Success
 

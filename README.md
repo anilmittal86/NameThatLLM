@@ -26,64 +26,39 @@ This repository contains the end-to-end, competition-grade machine learning solu
 
 ## End-to-End System Architecture
 
-```
-┌───────────────────────────────────────────────────────────────────────────────────────────┐
-│                           MOUNTED DATASETS & PRE-TRAINED ASSETS                           │
-├───────────────────────────────────────────────────────────────────────────────────────────┤
-│ • competitions/name-that-llm: train.csv (2,699 rows), test.csv                            │
-│ • nishantdahal/ntl-handwriting-blend: pool_v4.parquet (75,783 rows), 14b, deberta         │
-│ • nishantdahal/ntl-two-stage-lora: lora14b_v1 (Part 1), lora8b_v1                         │
-│ • zbigniewkirchner/ntl-qwen3-8b-lora-claude-head: Claude Head, readouts.npz               │
-│ • Base Weights: Qwen3-14B-Base | Qwen2.5-14B-Base | Qwen3-8B-Base | DeBERTa-v3-Large      │
-└─────────────────────────────────────────────┬─────────────────────────────────────────────┘
-                                              │
-                               ┌─────────────────────────────┐
-                               │  Raw Mystery Text Passage   │
-                               └──────────────┬──────────────┘
-                                              │
-        ┌──────────────────┬──────────────────┼──────────────────┬──────────────────┐
-        │                  │                  │                  │                  │
-        ▼                  ▼                  ▼                  ▼                  ▼
-┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-│  Branch 1     │  │  Branch 2     │  │  Branch 3     │  │  Branch 4     │  │  Branch 5     │
-│  Qwen3-14B    │  │  Qwen2.5-14B  │  │   Qwen3-8B    │  │  DeBERTa-v3   │  │ Stylometrics  │
-│  Dual LoRA    │  │  LoRA Part 2  │  │  Dual LoRA    │  │  Fine-Tuned   │  │  4-View SVC   │
-│ (Part2 + v1)  │  │ (32L, H=5120) │  │ (Claude + v1) │  │  Full Encoder │  │ (78k Passages)│
-│ 27L Trunk H=5k│  │ 8-Layer Pool  │  │ 24L Sink-Mask │  │  1024-Dim CLS │  │ Char/Word/Func│
-└───────┬───────┘  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘
-        │                  │                  │                  │                  │
-        └──────────────────┴──────────────────┼──────────────────┴──────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │       Multi-Backbone Readout Ensemble       │
-                       │  Twin Plain/Centered Heads + Spectral Ridge │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │ Exact 2^18 Subset DP (ExactAuthorPosterior) │
-                       │   Enforces 1-to-1 Prompt Author Uniqueness  │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │         Marginal Balancing & Shield         │
-                       │   50-Step Sinkhorn-Knopp + Bayesian Rules   │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │           Top-1 Gated Claude Head           │
-                       │ 5-Way Disambiguation (Non-Claude Preserved) │
-                       └──────────────────────┬──────────────────────┘
-                                              │
-                                              ▼
-                       ┌─────────────────────────────────────────────┐
-                       │            Final Attributed Model           │
-                       │              submission.parquet             │
-                       └─────────────────────────────────────────────┘
-```
+The architecture operates in two interconnected phases:
+
+### Phase 1: High-Level Design — Training & Dataset Lineage
+
+![High-Level Design: Offline Training Pipeline & Kaggle Dataset Bundles](assets/training_lineage_architecture.png)
+
+- **In-Repo PEFT Training**: Fold-0 sequence classification fine-tuning with PEFT LoRA (`train_lora.py`, `build_train_notebook.py`).
+- **External Kaggle Datasets**:
+  - **M1 (`ntl-handwriting-blend`)**: `pool_v4.parquet` (75,783 texts), Part 2 LoRAs (14B, 2.5-14B), fine-tuned DeBERTa encoder.
+  - **M2 (`ntl-two-stage-lora`)**: Part 1 LoRAs (14B, 8B).
+  - **M3 (`qwen3-8b-claude-head`)**: Qwen3-8B LoRA patch, readout heads, 5-way Claude head.
+  - **Legacy (`willrice/name-that-llm-openrouter-harvest`)**: Dashed, no longer read.
+
+---
+
+### Phase 2: High-Level Design — Multi-Backbone Inference Pipeline
+
+![High-Level Design: Multi-Backbone Low-RAM Inference Pipeline](assets/inference_hld_architecture.png)
+
+- **5 Feature Extraction Branches**:
+  - **Reader A (Qwen3-14B)**: M1 Part 2 LoRA (0.40) + M2 Part 1 LoRA (0.20).
+  - **Reader B (Qwen2.5-14B)**: M1 Part 2 LoRA (0.22).
+  - **Reader C (Qwen3-8B)**: M3 Claude LoRA (0.18) + M2 Part 1 LoRA (0.12).
+  - **Reader D (DeBERTa)**: M1 fine-tuned encoder (0.20).
+  - **Style Counter (LinearSVC)**: M1 `pool_v4.parquet` + `train.csv` (1.05).
+- **Post-Processing & Logit Refinement**:
+  - **1. Combine Opinions**: In-place float32 wPCA, Joint 384-Dim Compact Spectral Bank, plain/centered ridge readouts.
+  - **2. Group Rule**: Exact $2^{18}$ Bitmask DP (`ExactAuthorPosterior`) run in each reader and globally across hybrid clusters.
+  - **3. Balance Counts**: 50-Step log-domain Sinkhorn-Knopp marginal balancing ($\alpha = 0.50$, active when test $N \ge 50$).
+  - **4. Punctuation Rulebook**: Sovereign Orthographic Bayesian Shield ($-2.0$ log penalty on invariant curly quotes, em-dashes, straight apostrophes).
+  - **5. Claude Specialist**: Hard switch using M3 Claude head strictly on top-1 Claude rows.
+
+---
 
 ## Architectural Highlights
 
