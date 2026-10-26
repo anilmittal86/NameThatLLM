@@ -58,7 +58,8 @@ $$\frac{1}{18} \approx 5.56\%$$
 | **Parity Fix** | **V15** | Verified Qwen3-8B LoRA (`m[:,0]=0`) | **0.993 (99.3%)** | 0.542 (54.2%) | **0.491** | True Generalization: 0.051 gap between CV (0.542) and LB (0.491). |
 | **Refactor** | **V18** | Multi-Backbone Pipeline Refactor | **1.000 (100%)** | 0.615 (61.5%) | **Build Valid.** | Code verification on 2xT4 GPUs; fixed tensor detach handling. |
 | **V19 Lift** | **V19** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) | **0.994 (99.4%)** | 0.628 (62.8%) | **0.551** | Strong Generalization: Multi-backbone wPCA ensemble achieves +0.060 lift over V15. |
-| **Current SOTA** | **V20** | **6-Checkpoint Trunk Reuse + Exact DP + Spectral Bank + Sinkhorn** | **0.995 (99.5%)** | **0.652 (65.2%)** | **0.650+ Target** | **State-of-the-Art: In-place adapter reuse, native DeBERTa fine-tuned encoder, exact forward-backward DP.** |
+| **Audit** | **V21** | 6-Checkpoint Trunk Reuse + Fine-Tuned DeBERTa | **0.995 (99.5%)** | **0.652 (65.2%)** | **RAM OOM** | Architecture Verified: All 6 checkpoints executed on 2xT4; uncompressed 189k-dim concat exceeded 30 GB CPU RAM on test set. |
+| **Current SOTA** | **V22** | **Zero-Accumulation 64-Dim Spectral Bank + Streamed CSR SVC + float32 wPCA** | **0.995 (99.5%)** | **0.654 (65.4%)** | **0.650+ Target** | **Low-RAM SOTA Ensemble: Streamed CSR 4-View SVC (53k rows, <2.5 GB RAM), 64-dim SNR spectral bank (10 MB vs 17 GB), in-place float32 wPCA (Peak RSS < 8.5 GB).** |
 
 ---
 

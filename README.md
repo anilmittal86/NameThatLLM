@@ -18,7 +18,9 @@ This repository contains the end-to-end, competition-grade machine learning solu
 | **V15** | Verified Qwen3-8B LoRA + Token-0 Mask (`m[:, 0] = 0`) + Soft Centering | **0.993 (99.3%)** | 0.542 (54.2%) | **0.491** | Breakthrough Parity: Attention sink zeroed; training fidelity restored; generalization gap narrowed to 0.051. |
 | **V18** | Multi-Backbone Two-Stage Pipeline Refactor | **1.000 (100%)** | 0.615 (61.5%) | **Build Valid.** | Code Validation: Verified 14B/8B multi-backbone pipeline on 2xT4 GPUs; fixed PyTorch tensor `.detach()` requirement. |
 | **V19** | Multi-Backbone Two-Stage 14B/8B LoRAs + wPCA Gaussian Readout + 4-View SVC + Shield | **0.994 (99.4%)** | 0.628 (62.8%) | **0.551** | Multi-Backbone Ensemble: 14B+8B representations with wPCA disentanglement; +0.060 LB lift over V15. |
-| **V20** | **6-Checkpoint Trunk Reuse + Fine-Tuned DeBERTa + Joint Spectral Bank + Exact 2^18 Subset DP + 50-Step Sinkhorn** | **0.995 (99.5%)** | **0.652 (65.2%)** | **0.650+ Target** | **SOTA 6-Model Ensemble**: In-place adapter reuse, dedicated fine-tuned DeBERTa loader, exact forward-backward subset DP, and joint spectral ridge. |
+| **V21** | 6-Checkpoint Trunk Reuse + Fine-Tuned DeBERTa + Exact 2^18 Subset DP | **0.995 (99.5%)** | **0.652 (65.2%)** | **RAM OOM** | Architecture Verified: All 6 checkpoints executed on 2xT4; uncompressed 189k-dim concat exceeded 30 GB CPU RAM on test set. |
+| **V22** | **Zero-Accumulation 64-Dim Spectral Bank + Streamed CSR 4-View SVC + In-Place float32 wPCA** | **0.995 (99.5%)** | **0.654 (65.4%)** | **0.650+ Target** | **Low-RAM SOTA Ensemble**: Streamed CSR 4-View SVC (53k rows, <2.5 GB RAM), 64-dim SNR spectral bank (10 MB vs 17 GB), in-place float32 wPCA (Peak RSS < 8.5 GB). |
+
 
 ---
 
