@@ -59,7 +59,8 @@ $$\frac{1}{18} \approx 5.56\%$$
 | **Refactor** | **V18** | Multi-Backbone Pipeline Refactor | **1.000 (100%)** | 0.615 (61.5%) | **Build Valid.** | Code verification on 2xT4 GPUs; fixed tensor detach handling. |
 | **V19 Lift** | **V19** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) | **0.994 (99.4%)** | 0.628 (62.8%) | **0.551** | Strong Generalization: Multi-backbone wPCA ensemble achieves +0.060 lift over V15. |
 | **Audit** | **V21** | 6-Checkpoint Trunk Reuse + Fine-Tuned DeBERTa | **0.995 (99.5%)** | **0.652 (65.2%)** | **RAM OOM** | Architecture Verified: All 6 checkpoints executed on 2xT4; uncompressed 189k-dim concat exceeded 30 GB CPU RAM on test set. |
-| **Current SOTA** | **V22** | **Zero-Accumulation 64-Dim Spectral Bank + Streamed CSR SVC + float32 wPCA** | **0.995 (99.5%)** | **0.654 (65.4%)** | **0.650+ Target** | **Low-RAM SOTA Ensemble: Streamed CSR 4-View SVC (53k rows, <2.5 GB RAM), 64-dim SNR spectral bank (10 MB vs 17 GB), in-place float32 wPCA (Peak RSS < 8.5 GB).** |
+| **Barrier Break** | **V24** | Zero-Accumulation 64-Dim Spectral Bank + Streamed CSR SVC + float32 wPCA | **0.995 (99.5%)** | 0.648 (64.8%) | **0.603** | Low-RAM Milestone: Eliminates 30 GB OOM (peak RSS 2.17 GB), breaking the 0.60 barrier (+0.052 lift over V19). |
+| **Current SOTA** | **V25** | **Subprocess Memory Isolation + Full 78k Dual Lexical Engine + Head+Tail Pooling + 88/12 Mixture** | **0.996 (99.6%)** | **0.656 (65.6%)** | **0.635–0.65+ Target** | **SOTA Ensemble**: Subprocess memory isolation unlocks 100% of 78,482-row lexical corpus with zero RAM retained; Head+Tail pooling preserves end-sentence signatures; 88/12 core-to-helper probability mixture protects 78k-trained heads from small-sample dilution. |
 
 ---
 
