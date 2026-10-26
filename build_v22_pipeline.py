@@ -252,7 +252,7 @@ def shape_text(t: str) -> str:
     return re.sub(r"[^\W\d_]+", lambda m: "X" if m.group(0)[0].isupper() else "x", str(t))
 
 def function_text(t: str) -> str:
-    tokens = re.findall(r"(?u)\b\w+\b|[^\w\s]", str(t))
+    tokens = re.findall(r"(?u)\\b\\w+\\b|[^\\w\\s]", str(t))
     return " ".join([w.lower() if w.lower() in STOP_WORDS else "CONTENT" for w in tokens])
 
 fit_texts = df_train['text'].fillna('').astype(str).tolist()
@@ -265,10 +265,11 @@ if pool_file is not None and pool_file.exists():
     
     # Balanced pool sampling: up to 2,800 rows per class (~50,400 pool rows + 2,699 train = 53,099 rows)
     # If interactive commit mode (N_test < 50): cap at 500 rows per class for rapid 20-second build
-    cap_per_class = 500 if N_test < 50 else 2800
-    df_pool = df_pool.groupby('model', group_keys=False).apply(
-        lambda g: g.sample(n=min(len(g), cap_per_class), random_state=RANDOM_SEED)
-    )
+    sampled_dfs = []
+    for m, g in df_pool.groupby('model'):
+        sampled_dfs.append(g.sample(n=min(len(g), cap_per_class), random_state=RANDOM_SEED))
+    df_pool = pd.concat(sampled_dfs, ignore_index=True)
+    del sampled_dfs
     fit_texts += df_pool['text'].fillna('').astype(str).tolist()
     fit_y = np.r_[fit_y, df_pool['model'].map(LAB2I).values]
     print(f'[Module 1] Combined training passages: {len(fit_texts)} across 18 classes (cap={cap_per_class}/class).')
@@ -286,6 +287,7 @@ t0_svc = time.time()
 A_blocks, B_blocks = [], []
 
 for view, lo, hi, max_feat, weight in VIEWS:
+    print(f'[Module 1] Extracting view: {view} (weight={weight})...', flush=True)
     prep = shape_text if view == "shape" else function_text if view == "function" else None
     analyzer = "char" if view in ("char", "shape") else "word"
     opts = dict(
@@ -293,8 +295,9 @@ for view, lo, hi, max_feat, weight in VIEWS:
         sublinear_tf=True, min_df=2, max_features=max_feat, dtype=np.float32
     )
     if analyzer == "word":
-        opts["token_pattern"] = r"(?u)\b\w+\b|[^\w\s]"
+        opts["token_pattern"] = r"(?u)\\b\\w+\\b|[^\\w\\s]"
     vec = TfidfVectorizer(**opts)
+
     
     # Stream via generator expressions so we never allocate a duplicate Python string list
     tr_iter = (prep(t) for t in fit_texts) if prep is not None else fit_texts
