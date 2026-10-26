@@ -36,7 +36,7 @@ def create_v25_pipeline_notebook():
         })
 
     # Header Cell
-    add_md("""# Name That LLM: Version 25 (0.635-0.65+ Target) Pipeline
+    add_md("""# Name That LLM: Version 26 (0.635-0.65+ Target) Pipeline
 ### Subprocess Memory Isolation, Full 78,482-Row Dual Lexical Engine, Head+Tail Full-Text Pooling & Bounded 88/12 Core-to-Helper Mixture
 - **Subprocess Memory Isolation**: Full 78,482-row 5-view lexical engine (100% of `train.csv` + 100% of `pool_v4.parquet`) executed in an isolated Python subprocess that exits to reclaim 100.0% of memory before GPU models load.
 - **Dual Lexical Classifiers**: Combines `LinearSVC` (weight 0.80) + `SGDClassifier` L2 log-loss (weight 0.20) + prompt-centered sparse style twin (weight 0.12 on topic twins).
@@ -1139,10 +1139,18 @@ if 'deberta_p2' in CKPTS:
 
     heads_deb_sd = load_file(str(ckpt_deb / 'head.safetensors'))
     meta_deb = json.load(open(ckpt_deb / 'meta.json'))
-    w_d = align_cols(heads_deb_sd['plain.weight'].cpu().numpy(), meta_deb['labels'])
-    b_d = align_cols(heads_deb_sd['plain.bias'].cpu().numpy(), meta_deb['labels'])
-    w_cd = align_cols(heads_deb_sd['centered.weight'].cpu().numpy(), meta_deb['labels'])
-    b_cd = align_cols(heads_deb_sd['centered.bias'].cpu().numpy(), meta_deb['labels'])
+    if 'plain.weight' in heads_deb_sd:
+        w_d = align_cols(heads_deb_sd['plain.weight'].cpu().numpy(), meta_deb['labels'])
+        b_d = align_cols(heads_deb_sd['plain.bias'].cpu().numpy(), meta_deb['labels'])
+    else:
+        w_d = align_cols(heads_deb_sd['weight'].cpu().numpy(), meta_deb['labels'])
+        b_d = align_cols(heads_deb_sd['bias'].cpu().numpy(), meta_deb['labels'])
+
+    if 'centered.weight' in heads_deb_sd:
+        w_cd = align_cols(heads_deb_sd['centered.weight'].cpu().numpy(), meta_deb['labels'])
+        b_cd = align_cols(heads_deb_sd['centered.bias'].cpu().numpy(), meta_deb['labels'])
+    else:
+        w_cd, b_cd = None, None
 
     # Self-Verification on first 180 train passages
     with torch.no_grad():
@@ -1189,16 +1197,20 @@ if 'deberta_p2' in CKPTS:
     print(f'[CHECKPOINT VERIFY] deberta_v3_large: Train Top-1 BAcc = {bacc_tr:.4f}')
 
     log_p_plain = log_softmax(Z_test_bb @ w_d.T + b_d)
-    LOGIT_CORE += 0.22 * log_p_plain
-
-    if twin_rows_085.any():
-        Zc = Z_test_bb.copy()
-        for g in np.unique(groups_085[twin_rows_085]):
-            m_g = (groups_085 == g)
-            Zc[m_g] -= Zc[m_g].mean(axis=0, keepdims=True)
-        log_p_center = log_softmax(Zc[twin_rows_085] @ w_cd.T + b_cd)
-        LOGIT_CORE[twin_rows_085] += 0.10 * log_p_center
-        del Zc
+    if w_cd is not None:
+        LOGIT_CORE += 0.22 * log_p_plain
+        if twin_rows_085.any():
+            Zc = Z_test_bb.copy()
+            for g in np.unique(groups_085[twin_rows_085]):
+                m_g = (groups_085 == g)
+                Zc[m_g] -= Zc[m_g].mean(axis=0, keepdims=True)
+            log_p_center = log_softmax(Zc[twin_rows_085] @ w_cd.T + b_cd)
+            LOGIT_CORE[twin_rows_085] += 0.10 * log_p_center
+            del Zc
+        print('[Routing: deberta_v3_large] Core: Plain(0.22)+Twin(0.10) -> LOGIT_CORE | Helper: DP(0.20) -> LOGIT_HELPER.')
+    else:
+        LOGIT_CORE += 0.32 * log_p_plain
+        print('[Routing: deberta_v3_large] Core: Plain(0.32) -> LOGIT_CORE | Helper: DP(0.20) -> LOGIT_HELPER.')
 
     prm = fit_shared_gaussian_lowram(Z_train_bb, y_tr_eval, prompts_tr_eval, d_target=256)
     U_train = transform_lowram(Z_train_bb, prm)
@@ -1218,9 +1230,10 @@ if 'deberta_p2' in CKPTS:
         idx_g = np.where(groups_065 == g)[0]
         log_p_gauss[idx_g] = solver_deb.group(U_test[idx_g], temperature=prm["Tg"])
     LOGIT_HELPER += 0.20 * log_p_gauss
-    print('[Routing: deberta_v3_large] Core: Plain(0.22)+Twin(0.10) -> LOGIT_CORE | Helper: DP(0.20) -> LOGIT_HELPER.')
 
-    del Z_train_bb, Z_test_bb, solver_deb, prm, U_train, U_test, heads_deb_sd, w_d, b_d, w_cd, b_cd
+    del Z_train_bb, Z_test_bb, solver_deb, prm, U_train, U_test, heads_deb_sd, w_d, b_d
+    if w_cd is not None:
+        del w_cd, b_cd
     gc.collect()
     log_ram('After Trunk 4 (DeBERTa-v3) Full Cleanup')
 """)
