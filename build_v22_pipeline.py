@@ -265,6 +265,7 @@ if pool_file is not None and pool_file.exists():
     
     # Balanced pool sampling: up to 2,800 rows per class (~50,400 pool rows + 2,699 train = 53,099 rows)
     # If interactive commit mode (N_test < 50): cap at 500 rows per class for rapid 20-second build
+    cap_per_class = 500 if N_test < 50 else 2800
     sampled_dfs = []
     for m, g in df_pool.groupby('model'):
         sampled_dfs.append(g.sample(n=min(len(g), cap_per_class), random_state=RANDOM_SEED))
