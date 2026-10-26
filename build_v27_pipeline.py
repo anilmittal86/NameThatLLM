@@ -681,28 +681,23 @@ class ExactAuthorPosterior:
         cfg.num_hidden_layers = keep_layers
         cfg.use_cache = False
 
-        if torch.cuda.device_count() >= 2:
-            self.device_norms = torch.device("cuda:1")
-            split = keep_layers // 2
-            device_map = {"model.embed_tokens": 0}
-            for i in range(split):
-                device_map[f"model.layers.{i}"] = 0
-            for i in range(split, keep_layers):
-                device_map[f"model.layers.{i}"] = 1
-            device_map["model.norm"] = 1
+        n_gpus = torch.cuda.device_count()
+        if n_gpus >= 2:
+            max_memory = {0: "13.5GiB", 1: "13.5GiB"}
             self.model = AutoModel.from_pretrained(
-                str(base_dir), config=cfg, device_map=device_map,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                trust_remote_code=True
+                str(base_dir), config=cfg, device_map="auto", max_memory=max_memory,
+                torch_dtype=torch.float16, trust_remote_code=True
+            )
+        elif n_gpus == 1:
+            self.model = AutoModel.from_pretrained(
+                str(base_dir), config=cfg, device_map="auto",
+                torch_dtype=torch.float16, trust_remote_code=True
             )
         else:
-            self.device_norms = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            self.model = AutoModel.from_pretrained(
-                str(base_dir), config=cfg,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                trust_remote_code=True
-            ).to(self.device_norms)
+            self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32)
+
         self.model.eval()
+        self.device_norms = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         # Build GPU norms
         hidden_dim = self.model.config.hidden_size
