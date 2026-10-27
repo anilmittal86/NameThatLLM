@@ -919,8 +919,8 @@ if BASE_QWEN3_14B is not None and ('qwen3_14b_p2' in CKPTS or 'qwen3_14b_p1' in 
         meta = json.load(open(ckpt_14bp2 / 'meta.json')) if (ckpt_14bp2 / 'meta.json').exists() else {'labels': LABELS}
         plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
         plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
-        center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
-        center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels'])
+        center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels']) if 'centered.weight' in heads_sd else None
+        center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels']) if 'centered.bias' in heads_sd else None
 
         pred_tr = np.argmax(Z_train_bb @ plain_w.T + plain_b, axis=1)
         bacc_tr = balanced_accuracy_score(y_tr_eval, pred_tr)
@@ -969,8 +969,8 @@ if BASE_QWEN3_14B is not None and ('qwen3_14b_p2' in CKPTS or 'qwen3_14b_p1' in 
         meta = json.load(open(ckpt_14bp1 / 'meta.json')) if (ckpt_14bp1 / 'meta.json').exists() else {'labels': LABELS}
         plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
         plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
-        center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
-        center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels'])
+        center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels']) if 'centered.weight' in heads_sd else None
+        center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels']) if 'centered.bias' in heads_sd else None
 
         pred_tr = np.argmax(Z_train_bb @ plain_w.T + plain_b, axis=1)
         bacc_tr = balanced_accuracy_score(y_tr_eval, pred_tr)
@@ -1035,8 +1035,8 @@ if BASE_QWEN25_14B is not None and 'qwen25_14b_p2' in CKPTS:
     meta = json.load(open(ckpt_q25 / 'meta.json')) if (ckpt_q25 / 'meta.json').exists() else {'labels': LABELS}
     plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
     plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
-    center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
-    center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels'])
+    center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels']) if 'centered.weight' in heads_sd else None
+    center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels']) if 'centered.bias' in heads_sd else None
 
     pred_tr = np.argmax(Z_train_bb @ plain_w.T + plain_b, axis=1)
     bacc_tr = balanced_accuracy_score(y_tr_eval, pred_tr)
@@ -1101,12 +1101,33 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
         # Retain for Claude specialist gate & synthetic4404 hook
         Z_test_qwen3_8b = Z_test_bb.copy()
 
-        ro = np.load(ckpt_8bcl / 'readouts.npz')
-        meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
-        plain_w = align_cols(ro['W_plain'].T, meta['labels'])
-        plain_b = align_cols(ro['b_plain'], meta['labels'])
-        center_w = align_cols(ro['W_center'].T, meta['labels'])
-        center_b = align_cols(ro['b_center'], meta['labels'])
+        heads_sd_file = ckpt_8bcl / 'heads.safetensors'
+        if heads_sd_file.exists():
+            h_sd = load_file(str(heads_sd_file))
+            meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
+            src_labs = meta.get('labels', LABELS)
+            pw_k = 'plain.weight' if 'plain.weight' in h_sd else 'weight'
+            pb_k = 'plain.bias' if 'plain.bias' in h_sd else 'bias'
+            cw_k = 'centered.weight' if 'centered.weight' in h_sd else 'center.weight'
+            cb_k = 'centered.bias' if 'centered.bias' in h_sd else 'center.bias'
+            plain_w = align_cols(h_sd[pw_k].cpu().numpy(), src_labs)
+            plain_b = align_cols(h_sd[pb_k].cpu().numpy(), src_labs)
+            center_w = align_cols(h_sd[cw_k].cpu().numpy(), src_labs) if cw_k in h_sd else None
+            center_b = align_cols(h_sd[cb_k].cpu().numpy(), src_labs) if cb_k in h_sd else None
+        elif (ckpt_8bcl / 'readouts.npz').exists():
+            ro = np.load(ckpt_8bcl / 'readouts.npz', allow_pickle=True)
+            meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
+            src_labs = ro['classes'] if 'classes' in ro else meta.get('labels', LABELS)
+            pw = ro['plain_coef'] if 'plain_coef' in ro else ro['W_plain'].T if 'W_plain' in ro else ro['weight']
+            pb = ro['plain_intercept'] if 'plain_intercept' in ro else ro['b_plain'] if 'b_plain' in ro else ro['bias']
+            cw = ro['center_coef'] if 'center_coef' in ro else ro['W_center'].T if 'W_center' in ro else None
+            cb = ro['center_intercept'] if 'center_intercept' in ro else ro['b_center'] if 'b_center' in ro else None
+            plain_w = align_cols(pw, src_labs)
+            plain_b = align_cols(pb, src_labs)
+            center_w = align_cols(cw, src_labs) if cw is not None else None
+            center_b = align_cols(cb, src_labs) if cb is not None else None
+        else:
+            raise FileNotFoundError(f"No heads found in {ckpt_8bcl}")
 
         pred_tr = np.argmax(Z_train_bb @ plain_w.T + plain_b, axis=1)
         bacc_tr = balanced_accuracy_score(y_tr_eval, pred_tr)
@@ -1116,9 +1137,10 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
         if bacc_tr >= 0.48:
             log_p_plain = log_softmax(Z_test_bb @ plain_w.T + plain_b)
             LOGIT_CORE += 0.16 * log_p_plain
-            out_lp_twin, valid_twin = compute_centered_logits(Z_test_bb, groups_085, center_w, center_b, LABELS)
-            if valid_twin.any():
-                LOGIT_CORE[valid_twin] += 0.06 * out_lp_twin[valid_twin]
+            if center_w is not None:
+                out_lp_twin, valid_twin = compute_centered_logits(Z_test_bb, groups_085, center_w, center_b, LABELS)
+                if valid_twin.any():
+                    LOGIT_CORE[valid_twin] += 0.06 * out_lp_twin[valid_twin]
 
             prm = fit_shared_gaussian_lowram(Z_train_bb, y_tr_eval, prompts_tr_eval, d_target=256)
             U_train = transform_lowram(Z_train_bb, prm)
@@ -1155,8 +1177,8 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
         meta = json.load(open(ckpt_8bp1 / 'meta.json')) if (ckpt_8bp1 / 'meta.json').exists() else {'labels': LABELS}
         plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
         plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
-        center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
-        center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels'])
+        center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels']) if 'centered.weight' in heads_sd else None
+        center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta['labels']) if 'centered.bias' in heads_sd else None
 
         pred_tr = np.argmax(Z_train_bb @ plain_w.T + plain_b, axis=1)
         bacc_tr = balanced_accuracy_score(y_tr_eval, pred_tr)
