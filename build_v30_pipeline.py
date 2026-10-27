@@ -211,17 +211,25 @@ def find_checkpoints() -> Dict[str, Path]:
             ckpts['qwen3_8b_p1'] = p.parent
         elif 'instyle' in p_str:
             ckpts['instyle'] = p.parent
-    for p in INPUT_DIR.rglob('readouts.npz'):
-        if 'qwen3-8b' in str(p).lower() or 'claude-head' in str(p).lower():
-            ckpts['qwen3_8b_claude'] = p.parent
-            break
+
+    # Find claude-head specifically (must contain claude in filename or path)
+    for p in INPUT_DIR.rglob('claude_head.safetensors'):
+        ckpts['qwen3_8b_claude'] = p.parent
+        break
+    if 'qwen3_8b_claude' not in ckpts:
+        for p in INPUT_DIR.rglob('readouts.npz'):
+            if 'claude' in str(p).lower():
+                ckpts['qwen3_8b_claude'] = p.parent
+                break
+
     for p in INPUT_DIR.rglob('head.safetensors'):
         if 'deberta' in str(p).lower():
             ckpts['deberta_p2'] = p.parent
             break
     if 'instyle' not in ckpts:
         for p in INPUT_DIR.rglob('*'):
-            if 'instyle' in str(p).lower() and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists()):
+            p_s = str(p).lower().replace('\\\\', '/')
+            if 'instyle' in p_s and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists() or (p / 'heads.safetensors').exists()):
                 ckpts['instyle'] = p
                 break
     for p in INPUT_DIR.rglob('synthetic4404.joblib'):
@@ -908,7 +916,7 @@ if BASE_QWEN3_14B is not None and ('qwen3_14b_p2' in CKPTS or 'qwen3_14b_p1' in 
         Z_train_bb = Z_all[N_test:]
 
         heads_sd = load_file(str(ckpt_14bp2 / 'heads.safetensors'))
-        meta = json.load(open(ckpt_14bp2 / 'meta.json'))
+        meta = json.load(open(ckpt_14bp2 / 'meta.json')) if (ckpt_14bp2 / 'meta.json').exists() else {'labels': LABELS}
         plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
         plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
         center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
@@ -958,7 +966,7 @@ if BASE_QWEN3_14B is not None and ('qwen3_14b_p2' in CKPTS or 'qwen3_14b_p1' in 
         Z_train_bb = Z_all[N_test:]
 
         heads_sd = load_file(str(ckpt_14bp1 / 'heads.safetensors'))
-        meta = json.load(open(ckpt_14bp1 / 'meta.json'))
+        meta = json.load(open(ckpt_14bp1 / 'meta.json')) if (ckpt_14bp1 / 'meta.json').exists() else {'labels': LABELS}
         plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
         plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
         center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
@@ -1024,7 +1032,7 @@ if BASE_QWEN25_14B is not None and 'qwen25_14b_p2' in CKPTS:
     Z_train_bb = Z_all[N_test:]
 
     heads_sd = load_file(str(ckpt_q25 / 'heads.safetensors'))
-    meta = json.load(open(ckpt_q25 / 'meta.json'))
+    meta = json.load(open(ckpt_q25 / 'meta.json')) if (ckpt_q25 / 'meta.json').exists() else {'labels': LABELS}
     plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
     plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
     center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
@@ -1094,7 +1102,7 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
         Z_test_qwen3_8b = Z_test_bb.copy()
 
         ro = np.load(ckpt_8bcl / 'readouts.npz')
-        meta = json.load(open(ckpt_8bcl / 'meta.json'))
+        meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
         plain_w = align_cols(ro['W_plain'].T, meta['labels'])
         plain_b = align_cols(ro['b_plain'], meta['labels'])
         center_w = align_cols(ro['W_center'].T, meta['labels'])
@@ -1144,7 +1152,7 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
         Z_train_bb = Z_all[N_test:]
 
         heads_sd = load_file(str(ckpt_8bp1 / 'heads.safetensors'))
-        meta = json.load(open(ckpt_8bp1 / 'meta.json'))
+        meta = json.load(open(ckpt_8bp1 / 'meta.json')) if (ckpt_8bp1 / 'meta.json').exists() else {'labels': LABELS}
         plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta['labels'])
         plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta['labels'])
         center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta['labels'])
