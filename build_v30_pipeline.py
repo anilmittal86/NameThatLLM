@@ -248,6 +248,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from scipy import sparse
+
+working_dir = Path(r'{working_dir}')
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.svm import LinearSVC
@@ -419,7 +421,7 @@ np.save(r'{working_dir}/log_p_lex_twin.npy', log_p_lex_twin)
 np.save(r'{working_dir}/logit_lex_test.npy', log_p_svc)
 np.save(r'{working_dir}/logit_lex_twin_test.npy', log_p_lex_twin)
 
-print(f'[Subprocess Lexical] Completed in {{time.time() - t0:.2f}}s. Saved arrays to {{working_dir}}.', flush=True)
+print(f'[Subprocess Lexical] Completed in {{time.time() - t0:.2f}}s. Saved arrays to {working_dir}.', flush=True)
 sys.exit(0)
 \"\"\"
 
@@ -1624,3 +1626,4 @@ log_ram('Final Complete Notebook Execution')
 
 if __name__ == "__main__":
     create_v30_pipeline_notebook()
+
