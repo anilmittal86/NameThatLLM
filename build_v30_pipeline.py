@@ -108,7 +108,15 @@ K = len(LABELS)
 LAB2I = {l: i for i, l in enumerate(LABELS)}
 
 def align_cols(arr: np.ndarray, src_labels: list) -> np.ndarray:
-    idx = [list(src_labels).index(l) for l in LABELS]
+    src_list = list(src_labels)
+    idx = [src_list.index(l) for l in LABELS]
+    if arr.ndim == 1:
+        return arr[idx]
+    elif arr.ndim == 2:
+        if arr.shape[0] == len(src_list) and arr.shape[1] != len(src_list):
+            return arr[idx, :]
+        elif arr.shape[1] == len(src_list):
+            return arr[:, idx]
     return arr[..., idx]
 
 def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
