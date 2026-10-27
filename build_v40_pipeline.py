@@ -258,7 +258,8 @@ print(f"Discovered Passage Pool:     {pool_file}")
 
     # Cell 3: Module 1 — Subprocess 78,482-Row 5-View Lexical + BPE + Within-Family Refiners
     add_md("### Step 3: Module 1 — Subprocess 78,482-Row 5-View Lexical + BPE + Within-Family Specialist Engine")
-    add_code("""working_dir = Path('/kaggle/working') if Path('/kaggle/working').exists() else Path('.')
+    add_code("""# Write standalone script run_lexical.py and execute via subprocess for 100% OS RAM reclamation
+working_dir = Path('/kaggle/working') if Path('/kaggle/working').exists() else Path('.')
 lexical_script_path = working_dir / "run_lexical.py"
 
 qwen_tok_dir = str(BASE_QWEN3_8B or BASE_QWEN3_14B or '')
@@ -274,257 +275,235 @@ from pathlib import Path
 from scipy import sparse
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import SGDClassifier
-from sklearn.preprocessing import normalize
-from transformers import AutoTokenizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-t0 = time.time()
-print("=== [Subprocess Lexical Engine] Starting 78k Full Execution with BPE + Specialist Refiners ===", flush=True)
-
+working_dir = Path(r'{working_dir}')
 LABELS = {LABELS}
 K = len(LABELS)
 LAB2I = {{l: i for i, l in enumerate(LABELS)}}
 
-FAMILIES = {FAMILIES}
+FAMILIES = {{
+    "gpt": [0, 1, 2, 3, 4],
+    "gemini": [5, 6, 7, 8],
+    "claude": [9, 10, 11, 12, 13],
+    "glm": [15, 16],
+}}
 
-train_df = pd.read_csv(r"{train_path}")
-test_df = pd.read_csv(r"{test_path}")
-pool_path = r"{pool_file}"
-
-if pool_path and Path(pool_path).exists():
-    print(f"[Subprocess Lexical] Loading 100% of pool_v4 from {{pool_path}}...", flush=True)
-    pool_df = pd.read_parquet(pool_path)
-    combined_df = pd.concat([
-        train_df[['text', 'model']].dropna(),
-        pool_df[['text', 'model']].dropna()
-    ], ignore_index=True)
-    weights = np.concatenate([
-        np.full(len(train_df), 2.0, dtype=np.float32),
-        np.full(len(pool_df), 1.0, dtype=np.float32)
-    ])
-else:
-    print("[Subprocess Lexical] WARNING: pool_v4 not found! Training only on train.csv...", flush=True)
-    combined_df = train_df[['text', 'model']].dropna().reset_index(drop=True)
-    weights = np.full(len(combined_df), 1.0, dtype=np.float32)
-
-all_train_texts = combined_df['text'].fillna('').tolist()
-y_all = combined_df['model'].map(LAB2I).values
-test_texts = test_df['text'].fillna('').tolist()
-N_test = len(test_texts)
-print(f"[Subprocess Lexical] Full combined training corpus: {{len(all_train_texts)}} rows ({{len(train_df)}} train + {{len(combined_df)-len(train_df)}} pool)", flush=True)
+STOP_WORDS = set([
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't",
+    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+    "can't", "cannot", "could", "couldn't", "did", "didn't", "do", "does", "doesn't", "doing", "don't",
+    "down", "during", "each", "few", "for", "from", "further", "had", "hadn't", "has", "hasn't", "have",
+    "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here", "here's", "hers", "herself",
+    "him", "himself", "his", "how", "how's", "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into",
+    "is", "isn't", "it", "it's", "its", "itself", "let's", "me", "more", "most", "mustn't", "my",
+    "myself", "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "ought", "our",
+    "ours", "ourselves", "out", "over", "own", "same", "shan't", "she", "she'd", "she'll", "she's",
+    "should", "shouldn't", "so", "some", "such", "than", "that", "that's", "the", "their", "theirs",
+    "them", "themselves", "then", "there", "there's", "these", "they", "they'd", "they'll", "they're",
+    "they've", "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "wasn't",
+    "we", "we'd", "we'll", "we're", "we've", "were", "weren't", "what", "what's", "when", "when's",
+    "where", "where's", "which", "while", "who", "who's", "whom", "why", "why's", "with", "won't",
+    "would", "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours", "yourself"
+])
 
 def shape_text(t: str) -> str:
-    return re.sub(r"[^\\\\W\\\\d_]+", lambda m: "X" if m[0].isupper() else "x", t)
+    return re.sub(r"[^\\\\W\\\\d_]+", lambda m: "X" if m.group(0)[0].isupper() else "x", str(t))
 
-FUNCS = [
-    "the","be","to","of","and","a","in","that","have","i","it","for","not","on","with","he",
-    "as","you","do","at","this","but","his","by","from","they","we","say","her","she","or",
-    "an","will","my","one","all","would","there","their","what","so","up","out","if","about",
-    "who","get","which","go","me","when","make","can","like","time","no","just","him","know",
-    "take","people","into","year","your","good","some","could","them","see","other","than",
-    "then","now","look","only","come","its","over","think","also","back","after","use","two",
-    "how","our","work","first","well","way","even","new","want","because","any","these","give",
-    "day","most","us"
-]
-func_pat = re.compile(r"\\b(" + "|".join(FUNCS) + r")\\b", re.I)
 def function_text(t: str) -> str:
-    return " ".join(func_pat.findall(t.lower()))
-
-views = [
-    ("char", 3, 5, 250000, 1.0, {{'analyzer': 'char', 'sublinear_tf': True}}),
-    ("word", 1, 3, 180000, 0.7, {{'analyzer': 'word', 'sublinear_tf': True, 'token_pattern': r"(?u)\\\\b\\\\w+\\\\b|[^\\\\w\\\\s]"}}),
-    ("shape", 2, 6, 60000, 0.5, {{'analyzer': 'char', 'sublinear_tf': True}}),
-    ("function", 1, 3, 50000, 0.5, {{'analyzer': 'word', 'sublinear_tf': True}}),
-]
-
-qwen_tok_path = r"{qwen_tok_dir}"
-if qwen_tok_path and Path(qwen_tok_path).exists():
-    views.append(("bpe", 1, 3, 100000, 0.6, {{'analyzer': 'word', 'sublinear_tf': True}}))
-
-X_tr_blocks = []
-X_te_blocks = []
-
-for v_name, mn, mx, mf, w, kwargs in views:
-    print(f"[Subprocess Lexical] Extracting view: {{v_name}} (weight={{w}})...", flush=True)
-    if v_name == "shape":
-        tr_inp = [shape_text(t) for t in all_train_texts]
-        te_inp = [shape_text(t) for t in test_texts]
-    elif v_name == "function":
-        tr_inp = [function_text(t) for t in all_train_texts]
-        te_inp = [function_text(t) for t in test_texts]
-    elif v_name == "bpe":
-        tok = AutoTokenizer.from_pretrained(qwen_tok_path, trust_remote_code=True, use_fast=True)
-        def to_bpe_strings(texts, batch_size=2048):
-            res = []
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i : i + batch_size]
-                enc = tok(batch, add_special_tokens=False, truncation=True, max_length=447)["input_ids"]
-                res.extend([" ".join(str(tid) for tid in seq) for seq in enc])
-            return res
-        tr_inp = to_bpe_strings(all_train_texts)
-        te_inp = to_bpe_strings(test_texts)
-        del tok
-        gc.collect()
-    else:
-        tr_inp = all_train_texts
-        te_inp = test_texts
-
-    vec = TfidfVectorizer(ngram_range=(mn, mx), max_features=mf, dtype=np.float32, **kwargs)
-    X_tr_v = vec.fit_transform(tr_inp)
-    X_te_v = vec.transform(te_inp)
-    del tr_inp, te_inp, vec
-    gc.collect()
-
-    X_tr_v = normalize(X_tr_v, norm='l2', copy=False) * w
-    X_te_v = normalize(X_te_v, norm='l2', copy=False) * w
-    X_tr_blocks.append(X_tr_v)
-    X_te_blocks.append(X_te_v)
-
-X_tr_csr = sparse.hstack(X_tr_blocks, format='csr')
-X_te_csr = sparse.hstack(X_te_blocks, format='csr')
-del X_tr_blocks, X_te_blocks
-gc.collect()
-
-print(f"[Subprocess Lexical] Combined feature matrix: {{X_tr_csr.shape}} ({{X_tr_csr.nnz / 1e6:.1f}}M non-zeros)", flush=True)
-
-def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    c = np.max(x, axis=axis, keepdims=True)
-    return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
+    tokens = re.findall(r"(?u)\\\\b\\\\w+\\\\b|[^\\\\w\\\\s]", str(t))
+    return " ".join([w.lower() if w.lower() in STOP_WORDS else "CONTENT" for w in tokens])
 
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     c = np.max(x, axis=axis, keepdims=True)
     e = np.exp(x - c)
     return e / (np.sum(e, axis=axis, keepdims=True) + 1e-15)
 
-# Fit Dual Classifier: LinearSVC (0.82) + SGDClassifier log_loss (0.18)
-print("[Subprocess Lexical] Fitting LinearSVC(C=0.5, tol=1e-3)...", flush=True)
-svc = LinearSVC(C=0.5, tol=1e-3, max_iter=2500, random_state=42, class_weight='balanced')
-svc.fit(X_tr_csr, y_all, sample_weight=weights)
-log_p_svc = log_softmax(svc.decision_function(X_te_csr))
-del svc
-gc.collect()
+t0 = time.time()
+print('=== [Subprocess Lexical Engine] Starting 78k Full Execution with BPE + Specialist Refiners ===', flush=True)
 
-print("[Subprocess Lexical] Fitting SGDClassifier(log_loss, alpha=1e-5)...", flush=True)
-sgd = SGDClassifier(loss='log_loss', penalty='l2', alpha=1e-5, max_iter=1000, random_state=42, class_weight='balanced')
-sgd.fit(X_tr_csr, y_all, sample_weight=weights)
-log_p_sgd = sgd.predict_log_proba(X_te_csr)
-del sgd
-gc.collect()
+df_tr = pd.read_csv(r'{train_path}')
+df_te = pd.read_csv(r'{test_path}')
 
-log_p_lex = 0.82 * log_p_svc + 0.18 * log_p_sgd
+test_texts = df_te['text'].fillna('').astype(str).tolist()
+fit_texts = df_tr['text'].fillna('').astype(str).tolist()
+fit_y = np.array([LAB2I[m] for m in df_tr['model']])
+len_tr_raw = len(df_tr)
 
-# 4 Within-Family Specialist Refiners (gpt, claude, gemini, glm) on 78k passages with beta=0.20
-print("[Subprocess Lexical] Fitting 4 Within-Family Specialist LinearSVC Refiners (beta=0.20)...", flush=True)
-for fam_name, members in FAMILIES.items():
-    fam_mask = np.isin(y_all, members)
-    if fam_mask.sum() > 100:
-        y_fam_raw = y_all[fam_mask]
-        sub_map = {{m: i for i, m in enumerate(members)}}
-        y_fam = np.array([sub_map[m] for m in y_fam_raw])
-        w_fam = weights[fam_mask]
-
-        spec_svc = LinearSVC(C=0.4, tol=1e-3, max_iter=2000, random_state=42, class_weight='balanced')
-        spec_svc.fit(X_tr_csr[fam_mask], y_fam, sample_weight=w_fam)
-        spec_lp = log_softmax(spec_svc.decision_function(X_te_csr))
-
-        P_prior = np.array([(y_all == m).sum() for m in members], dtype=np.float64)
-        P_prior /= P_prior.sum()
-        log_P_prior = np.log(P_prior + 1e-12)[None, :]
-
-        log_ratio = spec_lp - log_P_prior
-        log_ratio -= log_ratio.mean(axis=1, keepdims=True)
-        log_p_lex[:, members] += 0.20 * log_ratio
-        del spec_svc
-        gc.collect()
-
-log_p_lex = log_softmax(log_p_lex)
-
-# Consensus TF-IDF distance on test
-print("[Subprocess Lexical] Computing TF-IDF distance and cluster groups at t=0.85...", flush=True)
-vec_sw = TfidfVectorizer(max_features=25000, stop_words="english", sublinear_tf=True)
-X_sw_te = vec_sw.fit_transform(test_texts)
-D_tfidf = np.clip(1.0 - (X_sw_te @ X_sw_te.T).toarray(), 0.0, None)
-np.fill_diagonal(D_tfidf, 0.0)
-
-if N_test >= 2:
-    cond_d = squareform(D_tfidf, checks=False)
-    groups_085 = fcluster(linkage(cond_d, method="average"), 0.85, criterion="distance")
+# Compute stopword TF-IDF Distance Matrix on Test
+Xt_tfidf = TfidfVectorizer(stop_words='english', sublinear_tf=True, max_features=100000, dtype=np.float32).fit_transform(test_texts)
+if len(test_texts) >= 2:
+    D = np.clip(1.0 - (Xt_tfidf @ Xt_tfidf.T).toarray(), 0.0, None)
+    np.fill_diagonal(D, 0.0)
 else:
-    groups_085 = np.ones(N_test, dtype=int)
+    D = np.zeros((1, 1), dtype=np.float32)
 
-sz = np.bincount(groups_085)[groups_085]
-twin_rows_085 = (sz >= 2) & (sz <= 18)
+np.save(r'{working_dir}/D_tfidf.npy', D)
+del Xt_tfidf
+gc.collect()
 
-# Prompt-Centered Style Twin on train.csv evaluated on twin_rows_085
-log_p_lex_twin = np.zeros_like(log_p_lex)
-if twin_rows_085.any():
-    print(f"[Subprocess Lexical] Fitting Prompt-Centered Style-Gram Twin on train.csv for {{twin_rows_085.sum()}} test passages...", flush=True)
-    N_tr = len(train_df)
-    X_train_csr = X_tr_csr[:N_tr]
-    y_tr = y_all[:N_tr]
-    prompts_tr = train_df['prompt_id'].values
-
-    unique_p, p_inv = np.unique(prompts_tr, return_inverse=True)
-    G = len(unique_p)
-    rows_g = np.arange(N_tr)
-    cols_g = p_inv
-    vals_g = 1.0 / np.sqrt(np.bincount(p_inv)[p_inv])
-    G_mat = sparse.csr_matrix((vals_g, (rows_g, cols_g)), shape=(N_tr, G))
-
-    X_tr_mean = G_mat @ (G_mat.T @ X_train_csr)
-    X_tr_centered = X_train_csr - X_tr_mean
-
-    svc_twin = LinearSVC(C=0.2, tol=1e-3, max_iter=2000, random_state=42, class_weight='balanced')
-    svc_twin.fit(X_tr_centered, y_tr)
-
-    X_te_twin = X_te_csr[twin_rows_085]
-    te_groups = groups_085[twin_rows_085]
-    u_te_g, te_inv = np.unique(te_groups, return_inverse=True)
-    G_te = len(u_te_g)
-    N_t_sub = len(te_groups)
-    vals_te = 1.0 / np.sqrt(np.bincount(te_inv)[te_inv])
-    G_t = sparse.csr_matrix((vals_te, (np.arange(N_t_sub), te_inv)), shape=(N_t_sub, G_te))
-    X_te_twin_c = X_te_twin - G_t @ (G_t.T @ X_te_twin)
-
-    log_p_lex_twin[twin_rows_085] = log_softmax(svc_twin.decision_function(X_te_twin_c))
-    del svc_twin, X_te_twin, G_t, X_te_twin_c
+# Load 100% of pool_v4.parquet
+pool_path = r'{pool_file}'
+if pool_path and os.path.exists(pool_path):
+    print(f'[Subprocess Lexical] Loading 100% of pool_v4 from {{pool_path}}...', flush=True)
+    df_pool = pd.read_parquet(pool_path, columns=['text', 'model'])
+    df_pool = df_pool[df_pool['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
+    fit_texts += df_pool['text'].fillna('').astype(str).tolist()
+    fit_y = np.r_[fit_y, df_pool['model'].map(LAB2I).values]
+    print(f'[Subprocess Lexical] Full combined training corpus: {{len(fit_texts)}} rows ({{len_tr_raw}} train + {{len(df_pool)}} pool)', flush=True)
+    del df_pool
     gc.collect()
 
-del X_tr_csr, X_te_csr
+# 5 Complementary Views (4 Canonical + Native BPE Subwords)
+VIEWS = [
+    ("char", 3, 5, 250000, 1.0),
+    ("word", 1, 3, 180000, 0.7),
+    ("shape", 2, 6, 60000, 0.5),
+    ("function", 1, 3, 50000, 0.5)
+]
+
+A_blocks, B_blocks = [], []
+for view, lo, hi, max_feat, weight in VIEWS:
+    print(f'[Subprocess Lexical] Extracting view: {{view}} (weight={{weight}})...', flush=True)
+    prep = shape_text if view == "shape" else function_text if view == "function" else None
+    analyzer = "char" if view in ("char", "shape") else "word"
+    opts = dict(
+        analyzer=analyzer, ngram_range=(lo, hi), lowercase=False,
+        sublinear_tf=True, min_df=2, max_features=max_feat, dtype=np.float32
+    )
+    if analyzer == "word":
+        opts["token_pattern"] = r"(?u)\\\\b\\\\w+\\\\b|[^\\\\w\\\\s]"
+    vec = TfidfVectorizer(**opts)
+    tr_iter = (prep(t) for t in fit_texts) if prep is not None else fit_texts
+    te_iter = (prep(t) for t in test_texts) if prep is not None else test_texts
+    X_tr_v = vec.fit_transform(tr_iter)
+    X_te_v = vec.transform(te_iter)
+    X_tr_v.data *= np.float32(weight)
+    X_te_v.data *= np.float32(weight)
+    A_blocks.append(X_tr_v)
+    B_blocks.append(X_te_v)
+    del vec, X_tr_v, X_te_v
+    gc.collect()
+
+# View 5: Native BPE Subword Token-ID N-Grams
+qwen_tok_path = r'{qwen_tok_dir}'
+print(f'[Subprocess Lexical] Extracting view: bpe subwords (weight=0.65)...', flush=True)
+bpe_loaded = False
+if qwen_tok_path and os.path.exists(qwen_tok_path):
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(qwen_tok_path, use_fast=True)
+        def to_bpe_strings(texts, batch_size=2048):
+            res = []
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                enc = tok(batch, add_special_tokens=False, truncation=True, max_length=450)["input_ids"]
+                for row in enc:
+                    res.append(" ".join(map(str, row)))
+            return res
+        bpe_tr = to_bpe_strings(fit_texts)
+        bpe_te = to_bpe_strings(test_texts)
+        bpe_loaded = True
+        del tok
+        gc.collect()
+    except Exception as e:
+        print(f'[Subprocess Lexical] Fast tokenizer load failed ({{e}}), using fallback hash BPE.', flush=True)
+
+if not bpe_loaded:
+    def hash_bpe_fallback(texts):
+        return [" ".join(f"w{{hash(w)%65536}}" for w in re.findall(r'\\\\b\\\\w+\\\\b', t.lower())) for t in texts]
+    bpe_tr = hash_bpe_fallback(fit_texts)
+    bpe_te = hash_bpe_fallback(test_texts)
+
+bpe_vec = TfidfVectorizer(token_pattern=r"\\\\S+", ngram_range=(1, 3), lowercase=False, sublinear_tf=True, min_df=5, max_features=80000, dtype=np.float32)
+X_tr_bpe = bpe_vec.fit_transform(bpe_tr)
+X_te_bpe = bpe_vec.transform(bpe_te)
+X_tr_bpe.data *= np.float32(0.65)
+X_te_bpe.data *= np.float32(0.65)
+A_blocks.append(X_tr_bpe)
+B_blocks.append(X_te_bpe)
+del bpe_vec, bpe_tr, bpe_te, X_tr_bpe, X_te_bpe
 gc.collect()
 
-np.save(r"{working_dir}/log_p_lex.npy", log_p_lex)
-np.save(r"{working_dir}/log_p_lex_twin.npy", log_p_lex_twin)
-np.save(r"{working_dir}/groups_085.npy", groups_085)
-np.save(r"{working_dir}/twin_rows_085.npy", twin_rows_085)
-np.save(r"{working_dir}/D_tfidf.npy", D_tfidf)
+del fit_texts
+gc.collect()
 
-print(f"[Subprocess Lexical] Completed successfully in {{time.time() - t0:.2f}}s. Saved arrays to {working_dir}.", flush=True)
-sys.exit(0)
+X_tr_csr = sparse.hstack(A_blocks, format="csr", dtype=np.float32)
+del A_blocks
+gc.collect()
+
+X_te_csr = sparse.hstack(B_blocks, format="csr", dtype=np.float32)
+del B_blocks
+gc.collect()
+
+print(f'[Subprocess Lexical] Built full 5-view CSR: X_tr={{X_tr_csr.shape}}, X_te={{X_te_csr.shape}} (nnz={{X_tr_csr.nnz}})', flush=True)
+
+# Sample weights: 2.0x for train.csv, 1.0x for pool_v4
+sample_weights = np.ones(len(fit_y), dtype=np.float32)
+sample_weights[:len_tr_raw] = 2.0
+
+# 1. Global Dual Linear Ensemble
+print('[Subprocess Lexical] Fitting LinearSVC on full 78k corpus...', flush=True)
+svc = LinearSVC(C=0.5, random_state=42, max_iter=2500, tol=1e-3, class_weight="balanced")
+svc.fit(X_tr_csr, fit_y, sample_weight=sample_weights)
+
+print('[Subprocess Lexical] Fitting SGDClassifier (log_loss) on full 78k corpus...', flush=True)
+lr = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=1000, tol=1e-3, random_state=42, class_weight="balanced")
+lr.fit(X_tr_csr, fit_y, sample_weight=sample_weights)
+
+P_svc = softmax(svc.decision_function(X_te_csr), axis=1)
+P_lr = softmax(lr.decision_function(X_te_csr), axis=1)
+P_global = 0.82 * P_svc + 0.18 * P_lr
+log_p_lex = np.log(np.clip(P_global, 1e-9, 1.0))
+
+# 2. Fit 4 Within-Family Specialist Refiners
+print('[Subprocess Lexical] Fitting 4 Within-Family Specialist Refiners...', flush=True)
+beta = 0.25
+for fam_name, fam_cols in FAMILIES.items():
+    fam_mask = np.isin(fit_y, fam_cols)
+    if fam_mask.sum() > 50:
+        sub_y = fit_y[fam_mask]
+        sub_lab2i = {{c: i for i, c in enumerate(fam_cols)}}
+        sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y])
+        sub_weights = sample_weights[fam_mask]
+
+        spec_svc = LinearSVC(C=0.5, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
+        spec_svc.fit(X_tr_csr[fam_mask], sub_y_mapped, sample_weight=sub_weights)
+        df_spec = spec_svc.decision_function(X_te_csr)
+        if df_spec.ndim == 1:
+            logits_spec = np.column_stack([-df_spec, df_spec])
+        else:
+            logits_spec = df_spec
+        P_spec = softmax(logits_spec, axis=1)
+
+        P_prior = P_global[:, fam_cols]
+        P_prior_norm = P_prior / (P_prior.sum(axis=1, keepdims=True) + 1e-12)
+        P_refined = (1.0 - beta) * P_prior_norm + beta * P_spec
+
+        log_ratio = np.log(np.clip(P_refined, 1e-9, 1.0)) - np.log(np.clip(P_prior_norm, 1e-9, 1.0))
+        log_p_lex[:, fam_cols] += log_ratio
+        print(f'[Subprocess Lexical] Refined family {{fam_name}} (cols={{fam_cols}}, train_rows={{fam_mask.sum()}}).', flush=True)
+
+np.save(r'{working_dir}/log_p_lex.npy', log_p_lex)
+print(f'[Subprocess Lexical] Completed in {{time.time() - t0:.2f}}s. Saved log_p_lex.npy and D_tfidf.npy to {working_dir}.', flush=True)
 \"\"\"
 
 with open(lexical_script_path, "w", encoding="utf-8") as f:
     f.write(lexical_code)
 
-print(f"[Main Process] Launching isolated lexical subprocess: {lexical_script_path}...")
-proc = subprocess.run([sys.executable, str(lexical_script_path)], capture_output=True, text=True)
-print(proc.stdout)
-if proc.returncode != 0:
-    print(proc.stderr)
-    raise RuntimeError(f"Subprocess run_lexical.py failed with return code {proc.returncode}!")
+print(f'[Main Process] Launching isolated lexical subprocess: {lexical_script_path}...')
+t_lex0 = time.time()
+subprocess.run([sys.executable, str(lexical_script_path)], check=True)
+print(f'[Main Process] Lexical subprocess completed in {time.time() - t_lex0:.2f}s.')
 
 log_p_lex = np.load(working_dir / 'log_p_lex.npy')
-log_p_lex_twin = np.load(working_dir / 'log_p_lex_twin.npy')
-groups_085 = np.load(working_dir / 'groups_085.npy')
-twin_rows_085 = np.load(working_dir / 'twin_rows_085.npy')
 D_tfidf = np.load(working_dir / 'D_tfidf.npy')
+print(f'Loaded log_p_lex: shape={log_p_lex.shape}, D_tfidf: shape={D_tfidf.shape}')
+log_ram("After Lexical Subprocess Memory Reclamation")
 
 LOGIT_CORE = 1.02 * log_p_lex
-if twin_rows_085.any():
-    LOGIT_CORE[twin_rows_085] += 0.10 * log_p_lex_twin[twin_rows_085]
-
 HELPER_LIST: List[Tuple[float, np.ndarray]] = []
 D_neural_sum = np.zeros((N_test, N_test), dtype=np.float64)
 D_neural_weight_total = 0.0
@@ -533,10 +512,10 @@ spectral_tr_blocks: List[np.ndarray] = []
 spectral_te_blocks: List[np.ndarray] = []
 
 print(f"[Main Process] Initialized LOGIT_CORE with 78k Lexical Engine: shape={LOGIT_CORE.shape}")
-log_ram("After Subprocess Memory Reclaim & Core Init")
+log_ram("Core and Helpers Initialized")
 """)
 
-    # Cell 4: Exact Training Extractor, Head Key Resolver & Math Solvers
+    # Cell 4: Universal Trunk Loader
     add_md("### Step 4: Universal Trunk Loader with `bfloat16` Batch Rescue, Head Resolver & Math Solvers")
     add_code("""def in_place_copy(dst: torch.Tensor, src: torch.Tensor):
     dst.data.copy_(src.to(device=dst.device, dtype=dst.dtype))
