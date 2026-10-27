@@ -658,7 +658,13 @@ class ExactAuthorPosterior:
                 if p > 0:
                     post_i[:, list(S)] += p
 
-        return np.log(np.maximum(post_i / np.sum(post_i, axis=1, keepdims=True), 1e-15))
+        row_sums = np.sum(post_i, axis=1, keepdims=True)
+        zero_rows = (row_sums.squeeze(axis=-1) <= 1e-12)
+        if np.any(zero_rows):
+            post_i[zero_rows] = 1.0 / self.K
+            row_sums[zero_rows] = 1.0
+        prob_i = np.clip(post_i / row_sums, 1e-15, 1.0)
+        return np.log(prob_i)
 """)
 
     # Cell 5: Exact Training Extractor (NO Z_tail)
@@ -1309,6 +1315,7 @@ lr_joint_plain.fit(X_spec_tr, y_tr_eval)
 lp_spec_plain = log_softmax(lr_joint_plain.decision_function(X_spec_te))
 LOGIT_PASS1 += 0.12 * lp_spec_plain
 
+lp_spec_center = None
 if twin_rows_085.any():
     pu, pinv = np.unique(prompts_tr_eval, return_inverse=True)
     Pm = np.zeros((len(pu), X_spec_tr.shape[1]), dtype=np.float32)
@@ -1414,8 +1421,8 @@ for name, ckpt_info in wpca_cache.items():
     LOGIT_FINAL += ckpt_info["w_wpca_dp"] * ckpt_info["lp_dp_final"]
 
 LOGIT_FINAL += 0.14 * lp_spec_plain_final
-if twin_rows_085.any():
-    LOGIT_FINAL[twin_rows_085] += 0.07 * lp_spec_center[twin_rows_085]
+if twin_rows_085.any() and lp_spec_center is not None:
+    LOGIT_FINAL[twin_rows_085] += 0.07 * lp_spec_center
 
 # Normalize by effective weight sum (1.85)
 LOGIT_NORM = log_softmax(LOGIT_FINAL / 1.85)
