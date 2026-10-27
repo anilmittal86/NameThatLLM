@@ -15,7 +15,9 @@
     "willrice/name-that-llm-openrouter-harvest",
     "zbigniewkirchner/ntl-qwen3-8b-lora-claude-head",
     "nishantdahal/ntl-two-stage-lora",
-    "nishantdahal/ntl-handwriting-blend"
+    "nishantdahal/ntl-handwriting-blend",
+    "zbigniewkirchner/ntl-qwen3-8b-lora-instyle",
+    "kirilltym/ntl-spectral-style-heads-paired-4404"
   ],
   "competition_sources": [
     "name-that-llm"
