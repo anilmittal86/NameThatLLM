@@ -108,7 +108,7 @@ K = len(LABELS)
 LAB2I = {l: i for i, l in enumerate(LABELS)}
 
 def align_cols(arr: np.ndarray, src_labels: list) -> np.ndarray:
-    src_list = list(src_labels)
+    src_list = [x.decode('utf-8') if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
     idx = [src_list.index(l) for l in LABELS]
     if arr.ndim == 1:
         return arr[idx]
@@ -1101,31 +1101,28 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
         # Retain for Claude specialist gate & synthetic4404 hook
         Z_test_qwen3_8b = Z_test_bb.copy()
 
-        heads_sd_file = ckpt_8bcl / 'heads.safetensors'
-        if heads_sd_file.exists():
-            h_sd = load_file(str(heads_sd_file))
-            meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
-            src_labs = meta.get('labels', LABELS)
-            pw_k = 'plain.weight' if 'plain.weight' in h_sd else 'weight'
-            pb_k = 'plain.bias' if 'plain.bias' in h_sd else 'bias'
-            cw_k = 'centered.weight' if 'centered.weight' in h_sd else 'center.weight'
-            cb_k = 'centered.bias' if 'centered.bias' in h_sd else 'center.bias'
-            plain_w = align_cols(h_sd[pw_k].cpu().numpy(), src_labs)
-            plain_b = align_cols(h_sd[pb_k].cpu().numpy(), src_labs)
-            center_w = align_cols(h_sd[cw_k].cpu().numpy(), src_labs) if cw_k in h_sd else None
-            center_b = align_cols(h_sd[cb_k].cpu().numpy(), src_labs) if cb_k in h_sd else None
-        elif (ckpt_8bcl / 'readouts.npz').exists():
+        ro = None
+        if (ckpt_8bcl / 'readouts.npz').exists():
             ro = np.load(ckpt_8bcl / 'readouts.npz', allow_pickle=True)
             meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
             src_labs = ro['classes'] if 'classes' in ro else meta.get('labels', LABELS)
-            pw = ro['plain_coef'] if 'plain_coef' in ro else ro['W_plain'].T if 'W_plain' in ro else ro['weight']
-            pb = ro['plain_intercept'] if 'plain_intercept' in ro else ro['b_plain'] if 'b_plain' in ro else ro['bias']
-            cw = ro['center_coef'] if 'center_coef' in ro else ro['W_center'].T if 'W_center' in ro else None
-            cb = ro['center_intercept'] if 'center_intercept' in ro else ro['b_center'] if 'b_center' in ro else None
-            plain_w = align_cols(pw, src_labs)
-            plain_b = align_cols(pb, src_labs)
-            center_w = align_cols(cw, src_labs) if cw is not None else None
-            center_b = align_cols(cb, src_labs) if cb is not None else None
+            plain_w = align_cols(ro['plain_coef'] if 'plain_coef' in ro else ro['W_plain'].T, src_labs)
+            plain_b = align_cols(ro['plain_intercept'] if 'plain_intercept' in ro else ro['b_plain'], src_labs)
+            center_w = align_cols(ro['center_coef'] if 'center_coef' in ro else ro['W_center'].T, src_labs) if ('center_coef' in ro or 'W_center' in ro) else None
+            center_b = align_cols(ro['center_intercept'] if 'center_intercept' in ro else ro['b_center'], src_labs) if ('center_intercept' in ro or 'b_center' in ro) else None
+        elif (ckpt_8bcl / 'heads.safetensors').exists():
+            h_sd = load_file(str(ckpt_8bcl / 'heads.safetensors'))
+            meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
+            src_labs = meta.get('labels', LABELS)
+            keys = list(h_sd.keys())
+            pw_k = next((k for k in ['plain.weight', 'plain_coef', 'weight', 'readout.weight'] if k in h_sd), keys[0])
+            pb_k = next((k for k in ['plain.bias', 'plain_intercept', 'bias', 'readout.bias'] if k in h_sd), keys[1] if len(keys) > 1 else keys[0])
+            cw_k = next((k for k in ['centered.weight', 'center.weight', 'center_coef'] if k in h_sd), None)
+            cb_k = next((k for k in ['centered.bias', 'center.bias', 'center_intercept'] if k in h_sd), None)
+            plain_w = align_cols(h_sd[pw_k].cpu().numpy(), src_labs)
+            plain_b = align_cols(h_sd[pb_k].cpu().numpy(), src_labs)
+            center_w = align_cols(h_sd[cw_k].cpu().numpy(), src_labs) if cw_k else None
+            center_b = align_cols(h_sd[cb_k].cpu().numpy(), src_labs) if cb_k else None
         else:
             raise FileNotFoundError(f"No heads found in {ckpt_8bcl}")
 
@@ -1160,7 +1157,9 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
             print('[Routing: ntl-qwen3-8b-lora-claude-head] Added Core Plain(0.16) + Twin(0.06), Helper DP(0.13).')
             del U_train, U_test, prm, lp_dp, P_dp
 
-        del Z_all, Z_train_bb, Z_test_bb, ro, plain_w, plain_b, center_w, center_b
+        del Z_all, Z_train_bb, Z_test_bb, plain_w, plain_b, center_w, center_b
+        if ro is not None:
+            del ro
         gc.collect()
         merge_lora(trunk_8b.model, ckpt_8bcl, sign=-1.0)
 
@@ -1226,16 +1225,32 @@ if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'qwen3_8b_p1' in
                 Z_train_bb = Z_all[N_test:]
 
                 heads_file = ckpt_inst / 'heads.safetensors' if (ckpt_inst / 'heads.safetensors').exists() else ckpt_inst / 'head.safetensors'
-                if heads_file.exists():
+                readouts_file = ckpt_inst / 'readouts.npz'
+                if readouts_file.exists():
+                    ro = np.load(readouts_file, allow_pickle=True)
+                    meta_inst = json.load(open(ckpt_inst / 'meta.json')) if (ckpt_inst / 'meta.json').exists() else {'labels': LABELS}
+                    src_labs = ro['classes'] if 'classes' in ro else meta_inst.get('labels', LABELS)
+                    plain_w = align_cols(ro['plain_coef'] if 'plain_coef' in ro else ro['W_plain'].T if 'W_plain' in ro else ro['weight'], src_labs)
+                    plain_b = align_cols(ro['plain_intercept'] if 'plain_intercept' in ro else ro['b_plain'] if 'b_plain' in ro else ro['bias'], src_labs)
+                    center_w = align_cols(ro['center_coef'] if 'center_coef' in ro else ro['W_center'].T, src_labs) if ('center_coef' in ro or 'W_center' in ro) else None
+                    center_b = align_cols(ro['center_intercept'] if 'center_intercept' in ro else ro['b_center'], src_labs) if ('center_intercept' in ro or 'b_center' in ro) else None
+                elif heads_file.exists():
                     h_sd = load_file(str(heads_file))
                     meta_inst = json.load(open(ckpt_inst / 'meta.json')) if (ckpt_inst / 'meta.json').exists() else {'labels': LABELS}
-                    pw_key = 'plain.weight' if 'plain.weight' in h_sd else 'weight'
-                    pb_key = 'plain.bias' if 'plain.bias' in h_sd else 'bias'
-                    plain_w = align_cols(h_sd[pw_key].cpu().numpy(), meta_inst['labels'])
-                    plain_b = align_cols(h_sd[pb_key].cpu().numpy(), meta_inst['labels'])
-                    center_w = align_cols(h_sd['centered.weight'].cpu().numpy(), meta_inst['labels']) if 'centered.weight' in h_sd else None
-                    center_b = align_cols(h_sd['centered.bias'].cpu().numpy(), meta_inst['labels']) if 'centered.bias' in h_sd else None
+                    src_labs = meta_inst.get('labels', LABELS)
+                    keys = list(h_sd.keys())
+                    pw_key = next((k for k in ['plain.weight', 'plain_coef', 'weight', 'readout.weight'] if k in h_sd), keys[0])
+                    pb_key = next((k for k in ['plain.bias', 'plain_intercept', 'bias', 'readout.bias'] if k in h_sd), keys[1] if len(keys) > 1 else keys[0])
+                    cw_key = next((k for k in ['centered.weight', 'center.weight', 'center_coef'] if k in h_sd), None)
+                    cb_key = next((k for k in ['centered.bias', 'center.bias', 'center_intercept'] if k in h_sd), None)
+                    plain_w = align_cols(h_sd[pw_key].cpu().numpy(), src_labs)
+                    plain_b = align_cols(h_sd[pb_key].cpu().numpy(), src_labs)
+                    center_w = align_cols(h_sd[cw_key].cpu().numpy(), src_labs) if cw_key else None
+                    center_b = align_cols(h_sd[cb_key].cpu().numpy(), src_labs) if cb_key else None
+                else:
+                    plain_w, plain_b, center_w, center_b = None, None, None, None
 
+                if plain_w is not None:
                     pred_tr = np.argmax(Z_train_bb @ plain_w.T + plain_b, axis=1)
                     bacc_tr = balanced_accuracy_score(y_tr_eval, pred_tr)
                     print(f'[CHECKPOINT GATE] instyle_qwen3_8b: train.csv BAcc = {bacc_tr:.4f}')
@@ -1583,28 +1598,31 @@ if len(claude_rows) > 0 and Z_test_qwen3_8b is not None:
             break
 
     if claude_head_file is not None and claude_head_file.exists():
-        ch_sd = load_file(str(claude_head_file))
-        ch_meta = json.load(open(claude_head_file.parent / 'meta.json')) if (claude_head_file.parent / 'meta.json').exists() else {'claude_labels': claude_classes}
-        ch_labs = ch_meta.get('claude_labels', claude_classes)
-        idx_ch = [ch_labs.index(c) for c in claude_classes]
-        w_k = 'weight' if 'weight' in ch_sd else 'claude_weight'
-        b_k = 'bias' if 'bias' in ch_sd else 'claude_bias'
-        ch_w = ch_sd[w_k].cpu().numpy()[idx_ch]
-        ch_b = ch_sd[b_k].cpu().numpy()[idx_ch]
+        try:
+            ch_sd = load_file(str(claude_head_file))
+            ch_meta = json.load(open(claude_head_file.parent / 'meta.json')) if (claude_head_file.parent / 'meta.json').exists() else {'claude_labels': claude_classes}
+            ch_labs = ch_meta.get('claude_labels', claude_classes)
+            idx_ch = [ch_labs.index(c) for c in claude_classes]
+            w_k = 'weight' if 'weight' in ch_sd else 'claude_weight'
+            b_k = 'bias' if 'bias' in ch_sd else 'claude_bias'
+            ch_w = ch_sd[w_k].cpu().numpy()[idx_ch]
+            ch_b = ch_sd[b_k].cpu().numpy()[idx_ch]
 
-        claude_scores = Z_test_qwen3_8b[claude_rows] @ ch_w.T + ch_b
-        P_claude_head = softmax(claude_scores, axis=1)
+            claude_scores = Z_test_qwen3_8b[claude_rows] @ ch_w.T + ch_b
+            P_claude_head = softmax(claude_scores, axis=1)
 
-        P_current = softmax(log_P[claude_rows], axis=1)
-        for r_local, r_global in enumerate(claude_rows):
-            mass_claude = np.sum(P_current[r_local, claude_idx])
-            if mass_claude > 1e-12:
-                P_claude_core = P_current[r_local, claude_idx] / mass_claude
-                P_claude_rel = 0.78 * P_claude_core + 0.22 * P_claude_head[r_local]
-                P_current[r_local, claude_idx] = mass_claude * P_claude_rel
-            log_P[r_global] = np.log(np.clip(P_current[r_local], 1e-12, 1.0))
+            P_current = softmax(log_P[claude_rows], axis=1)
+            for r_local, r_global in enumerate(claude_rows):
+                mass_claude = np.sum(P_current[r_local, claude_idx])
+                if mass_claude > 1e-12:
+                    P_claude_core = P_current[r_local, claude_idx] / mass_claude
+                    P_claude_rel = 0.78 * P_claude_core + 0.22 * P_claude_head[r_local]
+                    P_current[r_local, claude_idx] = mass_claude * P_claude_rel
+                log_P[r_global] = np.log(np.clip(P_current[r_local], 1e-12, 1.0))
 
-        print('[Module 4] Gated Claude head blended (0.78 core + 0.22 specialist) while preserving total Claude family mass.')
+            print('[Module 4] Gated Claude head blended (0.78 core + 0.22 specialist) while preserving total Claude family mass.')
+        except Exception as e:
+            print(f'[Module 4] Claude head specialist skipped due to error: {e}')
     else:
         print('[Module 4] Claude head file not found; skipped specialist blend.')
 
