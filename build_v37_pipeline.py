@@ -209,9 +209,9 @@ def find_checkpoints() -> Dict[str, Path]:
     ckpts = {}
     for p in INPUT_DIR.rglob('heads.safetensors'):
         p_str = str(p).lower().replace('\\\\', '/')
-        if 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
+        if 'lora_qwen3_14b' in p_str or 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
             ckpts['qwen3_14b_p2'] = p.parent
-        elif 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
+        elif 'lora_qwen25_14b' in p_str or 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
             ckpts['qwen25_14b_p2'] = p.parent
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
@@ -978,9 +978,9 @@ if 'deberta_p2' in CKPTS:
             batch_texts = [eval_texts[i] for i in b_idx]
             enc = deb_tok(batch_texts, padding=True, truncation=True, max_length=512, return_tensors='pt').to(dev_deb)
             out = deb_model(**enc)
-            # Pool token 0 [CLS] representation
-            cls_rep = out.last_hidden_state[:, 0, :].float().cpu().numpy()
-            Z_deb[b_idx] = cls_rep
+            m = enc['attention_mask'].unsqueeze(-1).float()
+            pool = (out.last_hidden_state.float() * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+            Z_deb[b_idx] = pool.detach().cpu().numpy()
 
     Z_test_deb = Z_deb[:N_test]
     Z_san_deb = Z_deb[N_test:]
