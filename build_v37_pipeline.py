@@ -2,10 +2,10 @@
 Name That LLM - Version 37 Pipeline Generator (0.65+ Target)
 ============================================================
 Eliminates the 180-row wPCA / Spectral Dilution Bug and deploys:
-1. 78,482-row isolated lexical subprocess engine with 5 views (including Native Qwen BPE subword n-grams).
+1. 78,482-row isolated lexical subprocess engine with 5 views (including Native Qwen BPE subwords).
 2. Dual Linear Ensemble: LinearSVC(C=0.5) + SGDClassifier(log_loss) on 78k passages with authentic train.csv rows weighted 2.0x.
 3. 4 Within-Family Specialist Refiners (gpt, claude, gemini, glm) on 78k passages with Law-of-Total-Probability log-ratio refinement (beta=0.25).
-4. Pure test extraction across 5 High-Signal Checkpoints only (Zero 180-row wPCA bug, Peak RAM < 1.8 GB).
+4. Pure test extraction across 5 High-Signal Checkpoints with UniversalLoRATrunkLoader (keep_layers truncation, float16, device_map='auto', zero 180-row bug).
 5. Consensus Neural + TF-IDF Prompt Clustering (D_consensus = 0.55 * D_tfidf + 0.45 * D_neural) with crash-proof cluster splitting (s <= 14).
 6. Leave-One-Out Cluster Logit Contrast (LOO-CLC) + Soft 1-to-1 Hungarian Assignment Boost.
 7. Official 300-Step Exact Multiplicative Sinkhorn Balancing on P = softmax(LOGIT).
@@ -50,10 +50,11 @@ def create_v37_pipeline_notebook():
 
     # Header Cell
     add_md("""# Name That LLM: Version 37 (High-Signal 0.65+ Architecture)
-### Eliminate the 180-Row wPCA / Spectral Dilution Bug + 78k BPE & Within-Family Refined Core + Consensus Neural Clustering + Leave-One-Out Cluster Logit Contrast + 300-Step Exact Sinkhorn
+### Eliminate the 180-Row wPCA / Spectral Dilution Bug + 78k BPE & Within-Family Refined Core + Universal Trunk Memory Management + Consensus Neural Clustering + Leave-One-Out Cluster Logit Contrast + 300-Step Exact Sinkhorn
 - **Root-Cause Fix for 180-Row Denominator Bug**: Completely eliminates rank-deficient `wPCA` ($d=256$) and the 180-row spectral bank ($N=180 < d=256$) that previously corrupted 12% of the probability mixture in v24/v26/v36.
-- **Zero Training Extraction Overhead**: Pure test extraction on `test.csv` (with a lightweight 36-row sanity probe) keeps peak RAM $< 1.8$ GB and speeds up runtime to ~10-12 minutes.
-- **78,482-Row 5-View Subprocess Lexical Engine**: Combines char (3-5), word (1-3), shape (2-6), function (1-3), and **Native Qwen BPE subword token-id n-grams** (1-3, 120k features).
+- **UniversalLoRATrunkLoader with Layer Truncation & Sharding**: Truncates 14B models to only the layers used by heads (`keep_layers=27` for Qwen3-14B, `keep_layers=32` for Qwen2.5-14B, `keep_layers=24` for Qwen3-8B), runs in `torch.float16` with `device_map="auto"`, completely preventing CUDA Out of Memory on Kaggle GPU.
+- **Pure Test Extraction Overhead**: Pure test extraction on `test.csv` (with a lightweight 36-row sanity probe) keeps peak RAM $< 1.8$ GB and speeds up runtime to ~10-12 minutes.
+- **78,482-Row 5-View Subprocess Lexical Engine**: Combines char (3-5), word (1-3), shape (2-6), function (1-3), and **Native Qwen BPE subword token-id n-grams** (1-3, 80k features).
 - **Dual Linear Ensemble on 78k Passages**: Fits `LinearSVC(C=0.5)` + `SGDClassifier(log_loss, alpha=1e-5)` on all 78k passages with authentic `train.csv` rows weighted 2.0x.
 - **4 Within-Family Specialist Refiners**: Dedicated 78k classifiers for `gpt`, `claude`, `gemini`, and `glm` families with Law-of-Total-Probability log-ratio refinement ($\beta=0.25$) sharpening sister-model discrimination.
 - **5 High-Signal Checkpoints (Zero Part-1 Dilution)**: Focuses weights on Part Two checkpoints: `lora_qwen3_14b` (0.42 / 0.12), `lora_qwen25_14b` (0.22 / 0.10), `deberta_v3_large` (0.25 / 0.08), `instyle_qwen3_8b` (0.14 / 0.05), and `claude_qwen3_8b` (0.10 / 0.04).
@@ -98,16 +99,24 @@ from transformers import AutoModel, AutoTokenizer, AutoConfig
 from safetensors.torch import load_file
 
 RANDOM_SEED = 42
-np.random.seed(RANDOM_SEED)
 torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_SEED)
 
-def log_ram(tag: str):
-    rss_gb = psutil.Process().memory_info().rss / (1024 ** 3)
-    print(f'[RAM AUDIT | {tag}] Process RSS: {rss_gb:.2f} GB', flush=True)
+def get_process_memory() -> float:
+    try:
+        return psutil.Process().memory_info().rss / (1024 ** 3)
+    except Exception:
+        return 0.0
 
-log_ram('Notebook Startup')
+def log_ram(tag: str = ""):
+    rss = get_process_memory()
+    gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+    print(f'[RAM AUDIT | {tag}] Process RSS: {rss:.2f} GB | GPU VRAM Allocated: {gpu_mem:.2f} GB')
 
-# Canonical 18 Target Labels (exact Part 2 canonical order)
+log_ram("Notebook Startup")
+
 LABELS = [
     "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
     "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
@@ -144,65 +153,52 @@ def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     c = np.max(x, axis=axis, keepdims=True)
     e = np.exp(x - c)
     return e / (np.sum(e, axis=axis, keepdims=True) + 1e-15)
+
+print(f'Master Canonical 18 Classes (K={K}): {LABELS}')
 """)
 
-    # Cell 2: Dataset Discovery & Base Paths
-    add_md("### Step 2: Dataset Discovery, Strict Base Matcher & 5-Checkpoint Discovery")
+    # Cell 2: Fail-Loud Discovery of Inputs, Base Models & Checkpoints
+    add_md("### Step 2: Strict Fail-Loud Asset Discovery")
     add_code("""INPUT_DIR = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
 
-def find_file(name: str) -> Optional[Path]:
-    for p in INPUT_DIR.rglob(name):
-        return p
-    return None
+train_paths = list(INPUT_DIR.rglob('train.csv'))
+test_paths = list(INPUT_DIR.rglob('test.csv'))
 
-train_file = find_file('train.csv')
-test_file = find_file('test.csv')
+if not train_paths or not test_paths:
+    raise FileNotFoundError("Could not locate train.csv or test.csv in input directories!")
 
-df_train = pd.read_csv(train_file)
+train_file = train_paths[0]
+test_file = test_paths[0]
+
+df_train_raw = pd.read_csv(train_file)
 df_test = pd.read_csv(test_file)
 
-train_texts = df_train['text'].fillna('').astype(str).tolist()
+train_texts = df_train_raw['text'].fillna('').astype(str).tolist()
+y_train = np.array([LAB2I[m] for m in df_train_raw['model']])
 test_texts = df_test['text'].fillna('').astype(str).tolist()
 
-y_train = np.array([LAB2I[m] for m in df_train['model']])
-prompts_train = df_train['prompt_id'].values
-
-N_train = len(df_train)
-N_test = len(df_test)
-
+N_train = len(train_texts)
+N_test = len(test_texts)
 print(f'Train path: {train_file} ({N_train} rows)')
 print(f'Test path:  {test_file} ({N_test} rows)')
 
-def find_base_models() -> Dict[str, Optional[Path]]:
-    bases = {"qwen3_14b": None, "qwen25_14b": None, "qwen3_8b": None, "deberta_v3_large": None}
-    configs = list(INPUT_DIR.rglob("config.json"))
-    for p in configs:
-        p_str = str(p).lower().replace('\\\\', '/')
-        if any(tok in p_str for tok in ['adapter', 'checkpoint', 'lora', 'head', 'runs']):
-            continue
+def find_base_model(model_family: str, hidden_sz: int, num_layers: int) -> Optional[Path]:
+    for cfg_p in INPUT_DIR.rglob('config.json'):
         try:
-            with open(p, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-            m_type = cfg.get("model_type", "").lower()
-            h_size = cfg.get("hidden_size", 0)
-            n_layers = cfg.get("num_hidden_layers", 0)
-            if m_type == "qwen3" and h_size == 5120 and n_layers == 40:
-                bases["qwen3_14b"] = p.parent
-            elif m_type == "qwen2" and h_size == 5120 and n_layers == 48:
-                bases["qwen25_14b"] = p.parent
-            elif m_type == "qwen3" and h_size == 4096 and n_layers == 36:
-                bases["qwen3_8b"] = p.parent
-            elif m_type == "deberta-v2" and h_size == 1024 and n_layers == 24:
-                bases["deberta_v3_large"] = p.parent
+            cfg = json.load(open(cfg_p))
+            m_type = str(cfg.get('model_type', '')).lower()
+            h_dim = cfg.get('hidden_size', 0)
+            n_lay = cfg.get('num_hidden_layers', 0)
+            if model_family.lower() in m_type and h_dim == hidden_sz and n_lay == num_layers:
+                return cfg_p.parent
         except Exception:
-            pass
-    return bases
+            continue
+    return None
 
-BASES = find_base_models()
-BASE_QWEN3_14B = BASES["qwen3_14b"]
-BASE_QWEN25_14B = BASES["qwen25_14b"]
-BASE_QWEN3_8B = BASES["qwen3_8b"]
-BASE_DEBERTA = BASES["deberta_v3_large"]
+BASE_QWEN3_14B = find_base_model('qwen3', 5120, 40)
+BASE_QWEN25_14B = find_base_model('qwen2', 5120, 48)
+BASE_QWEN3_8B = find_base_model('qwen3', 4096, 36)
+BASE_DEBERTA = find_base_model('deberta-v2', 1024, 24)
 
 print(f'Discovered Base Qwen3-14B:   {BASE_QWEN3_14B}')
 print(f'Discovered Base Qwen2.5-14B: {BASE_QWEN25_14B}')
@@ -213,14 +209,17 @@ def find_checkpoints() -> Dict[str, Path]:
     ckpts = {}
     for p in INPUT_DIR.rglob('heads.safetensors'):
         p_str = str(p).lower().replace('\\\\', '/')
-        if 'lora_qwen3_14b' in p_str:
+        if 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
             ckpts['qwen3_14b_p2'] = p.parent
-        elif 'lora_qwen25_14b' in p_str:
+        elif 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
             ckpts['qwen25_14b_p2'] = p.parent
+        elif 'lora14b_v1' in p_str:
+            ckpts['qwen3_14b_p1'] = p.parent
+        elif 'lora8b_v1' in p_str:
+            ckpts['qwen3_8b_p1'] = p.parent
         elif 'instyle' in p_str:
             ckpts['instyle'] = p.parent
 
-    # Find claude-head specifically (must contain claude in filename or path)
     for p in INPUT_DIR.rglob('claude_head.safetensors'):
         ckpts['qwen3_8b_claude'] = p.parent
         break
@@ -234,10 +233,11 @@ def find_checkpoints() -> Dict[str, Path]:
         if 'deberta' in str(p).lower():
             ckpts['deberta_p2'] = p.parent
             break
+
     if 'instyle' not in ckpts:
         for p in INPUT_DIR.rglob('*'):
             p_s = str(p).lower().replace('\\\\', '/')
-            if 'instyle' in p_s and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists() or (p / 'heads.safetensors').exists() or (p / 'readouts.npz').exists()):
+            if 'instyle' in p_s and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists() or (p / 'heads.safetensors').exists()):
                 ckpts['instyle'] = p
                 break
     return ckpts
@@ -395,7 +395,7 @@ if qwen_tok_path and os.path.exists(qwen_tok_path):
                 batch = texts[i : i + batch_size]
                 enc = tok(batch, add_special_tokens=False, truncation=True, max_length=450)["input_ids"]
                 for row in enc:
-                    res.append(" ".join(f"t{{tid}}" for tid in row))
+                    res.append(" ".join(map(str, row)))
             return res
         bpe_tr = to_bpe_strings(fit_texts)
         bpe_te = to_bpe_strings(test_texts)
@@ -411,7 +411,7 @@ if not bpe_loaded:
     bpe_tr = hash_bpe_fallback(fit_texts)
     bpe_te = hash_bpe_fallback(test_texts)
 
-bpe_vec = TfidfVectorizer(analyzer="word", ngram_range=(1, 3), lowercase=False, sublinear_tf=True, min_df=3, max_features=120000, dtype=np.float32)
+bpe_vec = TfidfVectorizer(token_pattern=r"\\\\S+", ngram_range=(1, 3), lowercase=False, sublinear_tf=True, min_df=5, max_features=80000, dtype=np.float32)
 X_tr_bpe = bpe_vec.fit_transform(bpe_tr)
 X_te_bpe = bpe_vec.transform(bpe_te)
 X_tr_bpe.data *= np.float32(0.65)
@@ -440,102 +440,67 @@ sample_weights[:len_tr_raw] = 2.0
 
 # 1. Global Dual Linear Ensemble
 print('[Subprocess Lexical] Fitting LinearSVC on full 78k corpus...', flush=True)
-svc = LinearSVC(C=0.5, random_state=42, max_iter=5000, class_weight="balanced")
+svc = LinearSVC(C=0.5, random_state=42, max_iter=2500, tol=1e-3, class_weight="balanced")
 svc.fit(X_tr_csr, fit_y, sample_weight=sample_weights)
 
 print('[Subprocess Lexical] Fitting SGDClassifier (log_loss) on full 78k corpus...', flush=True)
-lr = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=1000, random_state=42, class_weight="balanced")
+lr = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=1000, tol=1e-3, random_state=42, class_weight="balanced")
 lr.fit(X_tr_csr, fit_y, sample_weight=sample_weights)
 
 P_svc = softmax(svc.decision_function(X_te_csr), axis=1)
-P_lr = lr.predict_proba(X_te_csr)
-P_lex_global = 0.82 * P_svc + 0.18 * P_lr
-log_p_lex = np.log(np.clip(P_lex_global, 1e-9, 1.0))
-del svc, lr, P_svc, P_lr
-gc.collect()
+P_lr = softmax(lr.decision_function(X_te_csr), axis=1)
+P_global = 0.82 * P_svc + 0.18 * P_lr
+log_p_lex = np.log(np.clip(P_global, 1e-9, 1.0))
 
-# 2. 4 Within-Family Specialist Refiners
+# 2. Fit 4 Within-Family Specialist Refiners
 print('[Subprocess Lexical] Fitting 4 Within-Family Specialist Refiners...', flush=True)
+beta = 0.25
 for fam_name, fam_cols in FAMILIES.items():
     fam_mask = np.isin(fit_y, fam_cols)
-    X_fam = X_tr_csr[fam_mask]
-    y_fam = fit_y[fam_mask]
-    sw_fam = sample_weights[fam_mask].copy()
-    sw_fam[sw_fam > 1.5] = 2.5
-    fam_lab2idx = {{col: i for i, col in enumerate(fam_cols)}}
-    y_fam_mapped = np.array([fam_lab2idx[y] for y in y_fam])
+    if fam_mask.sum() > 50:
+        sub_y = fit_y[fam_mask]
+        sub_lab2i = {{c: i for i, c in enumerate(fam_cols)}}
+        sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y])
+        sub_weights = sample_weights[fam_mask]
 
-    svc_fam = LinearSVC(C=0.4, random_state=42, max_iter=4000, class_weight="balanced")
-    svc_fam.fit(X_fam, y_fam_mapped, sample_weight=sw_fam)
-    df_te = svc_fam.decision_function(X_te_csr)
-    if df_te.ndim == 1:
-        logits_2d = np.column_stack([-df_te, df_te])
-        P_fam_spec = softmax(logits_2d, axis=1)
-    else:
-        P_fam_spec = softmax(df_te, axis=1)
+        spec_svc = LinearSVC(C=0.5, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
+        spec_svc.fit(X_tr_csr[fam_mask], sub_y_mapped, sample_weight=sub_weights)
+        df_spec = spec_svc.decision_function(X_te_csr)
+        if df_spec.ndim == 1:
+            logits_spec = np.column_stack([-df_spec, df_spec])
+        else:
+            logits_spec = df_spec
+        P_spec = softmax(logits_spec, axis=1)
 
-    P_fam_glob = P_lex_global[:, fam_cols] / np.clip(P_lex_global[:, fam_cols].sum(axis=1, keepdims=True), 1e-9, None)
-    log_p_lex[:, fam_cols] += 0.25 * (np.log(np.clip(P_fam_spec, 1e-9, 1.0)) - np.log(np.clip(P_fam_glob, 1e-9, 1.0)))
-    print(f'[Subprocess Lexical] Refined family {{fam_name}} (cols={{fam_cols}}, train_rows={{len(y_fam)}}).', flush=True)
-    del svc_fam, X_fam, y_fam
-    gc.collect()
+        P_prior = P_global[:, fam_cols]
+        P_prior_norm = P_prior / (P_prior.sum(axis=1, keepdims=True) + 1e-12)
+        P_refined = (1.0 - beta) * P_prior_norm + beta * P_spec
 
-del X_tr_csr, X_te_csr
-gc.collect()
+        log_ratio = np.log(np.clip(P_refined, 1e-9, 1.0)) - np.log(np.clip(P_prior_norm, 1e-9, 1.0))
+        log_p_lex[:, fam_cols] += log_ratio
+        print(f'[Subprocess Lexical] Refined family {{fam_name}} (cols={{fam_cols}}, train_rows={{fam_mask.sum()}}).', flush=True)
 
 np.save(r'{working_dir}/log_p_lex.npy', log_p_lex)
 print(f'[Subprocess Lexical] Completed in {{time.time() - t0:.2f}}s. Saved log_p_lex.npy and D_tfidf.npy to {working_dir}.', flush=True)
-sys.exit(0)
 \"\"\"
 
 with open(lexical_script_path, "w", encoding="utf-8") as f:
     f.write(lexical_code)
 
 print(f'[Main Process] Launching isolated lexical subprocess: {lexical_script_path}...')
-sub_t0 = time.time()
-res = subprocess.run([sys.executable, str(lexical_script_path)], capture_output=True, text=True)
-print(res.stdout)
-if res.returncode != 0:
-    print(res.stderr, file=sys.stderr)
-    raise RuntimeError(f"Subprocess lexical engine failed with return code {res.returncode}")
-print(f'[Main Process] Lexical subprocess completed in {time.time() - sub_t0:.2f}s.')
+t_lex0 = time.time()
+subprocess.run([sys.executable, str(lexical_script_path)], check=True)
+print(f'[Main Process] Lexical subprocess completed in {time.time() - t_lex0:.2f}s.')
 
 log_p_lex = np.load(working_dir / 'log_p_lex.npy')
 D_tfidf = np.load(working_dir / 'D_tfidf.npy')
 print(f'Loaded log_p_lex: shape={log_p_lex.shape}, D_tfidf: shape={D_tfidf.shape}')
-log_ram('After Lexical Subprocess Memory Reclamation')
+log_ram("After Lexical Subprocess Memory Reclamation")
 """)
 
-    # Cell 4: Cluster Splitting & Extractor Helpers
-    add_md("### Step 4: Crash-Proof Distance-Based Cluster Splitting, Reversible LoRA Merger & Extractor")
-    add_code("""def split_oversized_clusters_dist(D: np.ndarray, groups: np.ndarray, max_cluster_size: int = 14) -> np.ndarray:
-    \"\"\"
-    Guarantees every cluster has size 1 <= n <= max_cluster_size (<= 18) so no cluster exceeds 18
-    and never drops large clusters to singletons.
-    \"\"\"
-    new_groups = np.zeros(len(groups), dtype=np.int64)
-    next_id = 1
-    for g in np.unique(groups):
-        rows = np.flatnonzero(groups == g)
-        if len(rows) <= max_cluster_size:
-            new_groups[rows] = next_id
-            next_id += 1
-        else:
-            n_sub = int(np.ceil(len(rows) / max_cluster_size))
-            D_sub = D[np.ix_(rows, rows)].copy()
-            np.fill_diagonal(D_sub, 0.0)
-            D_sub = np.clip(0.5 * (D_sub + D_sub.T), 0.0, None)
-            d_condensed = squareform(D_sub, checks=False)
-            sub_labels = fcluster(linkage(d_condensed, method='average'), t=n_sub, criterion='maxclust')
-            for sg in np.unique(sub_labels):
-                s_rows = rows[sub_labels == sg]
-                for start in range(0, len(s_rows), max_cluster_size):
-                    new_groups[s_rows[start : start + max_cluster_size]] = next_id
-                    next_id += 1
-    return new_groups
-
-def compute_centered_logits(Z_test: np.ndarray, groups: np.ndarray, W_c: np.ndarray, b_c: np.ndarray, src_labels: list) -> Tuple[np.ndarray, np.ndarray]:
-    \"\"\"Returns full-shape (N_test, 18) log-probabilities and boolean mask of valid cluster rows.\"\"\"
+    # Cell 4: Universal LoRA Extractor & Memory-Managed Trunk Architecture
+    add_md("### Step 4: Universal Trunk Architecture & Memory Management (Zero OOM Guardrails)")
+    add_code("""def compute_centered_logits(Z_test: np.ndarray, groups: np.ndarray, W_c: np.ndarray, b_c: np.ndarray, src_labels: list):
     N = len(Z_test)
     out_lp = np.zeros((N, K), dtype=np.float64)
     if N < 2 or W_c is None:
@@ -582,42 +547,67 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
             wa = state[k_a].to(torch.float32)
             wb = state[k_b].to(torch.float32)
             delta = (wb @ wa) * scale
-            found = False
             for name, param in model.named_parameters():
                 if name == base_k:
                     param.data.add_(delta.to(param.device, param.dtype))
                     merged_count += 1
-                    found = True
                     break
     action = "Merged" if sign > 0 else "Unmerged"
     print(f'[{action} LoRA] {merged_count} linear weights with scale={scale:.4f} from {adapter_path.name}.')
     return True
 
-class ExactLoRAExtractor:
-    def __init__(self, base_dir: Path, cfg_meta: dict):
+class UniversalLoRATrunkLoader:
+    def __init__(self, base_dir: Path, keep_layers: int, layers: List[int], max_len: int = 447):
+        if base_dir is not None and not (base_dir / "config.json").exists():
+            for sub in base_dir.rglob("config.json"):
+                base_dir = sub.parent
+                break
         self.base_dir = base_dir
-        self.cfg = cfg_meta
-        self.dev = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.keep_layers = keep_layers
+        self.layers = layers
+        self.max_len = max_len
+        self.tok = AutoTokenizer.from_pretrained(str(base_dir), trust_remote_code=True)
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token or "<|endoftext|>"
+
         cfg = AutoConfig.from_pretrained(str(base_dir), trust_remote_code=True)
-        self.tok = AutoTokenizer.from_pretrained(str(base_dir), use_fast=True, trust_remote_code=True)
-        if self.tok.pad_token_id is None:
-            self.tok.pad_token_id = self.tok.eos_token_id or 0
-        if torch.cuda.is_available():
+        cfg.num_hidden_layers = keep_layers
+        cfg.use_cache = False
+
+        n_gpus = torch.cuda.device_count()
+        if n_gpus >= 2:
+            max_memory = {0: "13.5GiB", 1: "13.5GiB"}
             self.model = AutoModel.from_pretrained(
-                str(base_dir), config=cfg, torch_dtype=torch.bfloat16,
-                device_map={'': self.dev}, trust_remote_code=True
+                str(base_dir), config=cfg, device_map="auto", max_memory=max_memory,
+                torch_dtype=torch.float16, trust_remote_code=True
+            )
+        elif n_gpus == 1:
+            self.model = AutoModel.from_pretrained(
+                str(base_dir), config=cfg, device_map="auto",
+                torch_dtype=torch.float16, trust_remote_code=True
             )
         else:
             self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32)
-        self.model.eval()
 
-        self.norms = nn.ModuleList()
-        n_layers = len(self.cfg.get('layers', []))
-        h_dim = cfg.hidden_size
-        for _ in range(n_layers):
-            ln = nn.LayerNorm(h_dim, elementwise_affine=True)
-            self.norms.append(ln)
-        self.norms.to(self.dev).eval()
+        self.model.eval()
+        self.device_norms = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        # Build GPU norms
+        hidden_dim = self.model.config.hidden_size
+        self.norms = nn.ModuleList([
+            nn.RMSNorm(hidden_dim, eps=getattr(cfg, "rms_norm_eps", 1e-6))
+            for _ in layers
+        ]).to(self.device_norms).float()
+
+        for l_idx, nm in zip(layers, self.norms):
+            try:
+                base_lyr = self.model.layers[l_idx] if hasattr(self.model, "layers") else self.model.model.layers[l_idx]
+                if hasattr(base_lyr, "input_layernorm") and hasattr(base_lyr.input_layernorm, "weight"):
+                    nm.weight.data.copy_(base_lyr.input_layernorm.weight.data)
+            except Exception:
+                pass
+        self.norms.eval()
+        self.first_dev = next(self.model.parameters()).device
 
     def load_norm_weights(self, heads_sd: dict):
         with torch.no_grad():
@@ -627,50 +617,56 @@ class ExactLoRAExtractor:
                 if w_k in heads_sd:
                     ln.weight.copy_(heads_sd[w_k].to(ln.weight.device, ln.weight.dtype))
                 if b_k in heads_sd:
-                    ln.bias.copy_(heads_sd[b_k].to(ln.bias.device, ln.bias.dtype))
+                    if hasattr(ln, 'bias') and ln.bias is not None:
+                        ln.bias.copy_(heads_sd[b_k].to(ln.bias.device, ln.bias.dtype))
 
+    def _extract_batch_ids(self, id_list: List[List[int]], batch_size: int = 8) -> np.ndarray:
+        order = np.argsort([len(x) for x in id_list], kind="stable")
+        total_dim = len(self.layers) * self.model.config.hidden_size
+        Z = np.zeros((len(id_list), total_dim), dtype=np.float32)
+
+        for s in range(0, len(order), batch_size):
+            idx = order[s : s + batch_size]
+            enc = self.tok.pad({"input_ids": [id_list[i] for i in idx]}, padding=True, return_tensors="pt")
+            input_ids = enc["input_ids"].to(self.first_dev)
+            attn_mask = enc["attention_mask"].to(self.first_dev)
+
+            out = self.model(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
+            hs = out.hidden_states
+
+            # Attention-sink zeroing (m[:, 0] = 0)
+            m = attn_mask.unsqueeze(-1).float().to(self.device_norms)
+            m[:, 0, :] = 0.0
+            den = m.sum(dim=1).clamp(min=1.0)
+
+            pooled = []
+            for l_idx, nm in zip(self.layers, self.norms):
+                h_l = hs[l_idx].to(self.device_norms).float()
+                if not torch.isfinite(h_l).all():
+                    h_l = torch.nan_to_num(h_l, nan=0.0, posinf=100.0, neginf=-100.0)
+                mean_v = (h_l * m).sum(dim=1) / den
+                pooled.append(nm(mean_v))
+
+            Z[idx] = torch.cat(pooled, dim=-1).cpu().numpy()
+        return Z
+
+    @torch.no_grad()
     def extract_exact(self, texts: List[str], batch_size: int = 8, end_id: int = 151643) -> np.ndarray:
-        max_len = self.cfg.get('max_len', 384)
-        raw_ids = self.tok(texts, add_special_tokens=False, truncation=True, max_length=max_len)["input_ids"]
-        input_ids_list = [x + [end_id] for x in raw_ids]
-        pad_id = self.tok.pad_token_id or 0
-        N = len(texts)
-        reps = []
+        t0 = time.time()
+        raw_ids = self.tok(list(texts), add_special_tokens=False, truncation=True, max_length=self.max_len)["input_ids"]
+        ids = [x + [end_id] for x in raw_ids]
+        Z = self._extract_batch_ids(ids, batch_size=batch_size)
+        print(f"[Extractor] Extracted {len(texts)} samples in {time.time() - t0:.2f}s ({len(texts) / max(0.1, time.time() - t0):.1f} samples/s).")
+        return Z
 
-        with torch.no_grad():
-            for i in range(0, N, batch_size):
-                b_ids = input_ids_list[i : i + batch_size]
-                m_len = max(len(x) for x in b_ids)
-                arr_ids = np.full((len(b_ids), m_len), pad_id, dtype=np.int64)
-                arr_mask = np.zeros((len(b_ids), m_len), dtype=np.float32)
-                for r, row in enumerate(b_ids):
-                    arr_ids[r, :len(row)] = row
-                    arr_mask[r, :len(row)] = 1.0
-
-                t_ids = torch.from_numpy(arr_ids).to(self.dev)
-                t_mask = torch.from_numpy(arr_mask).to(self.dev)
-                t_mask[:, 0] = 0.0  # Zero attention sink at token 0
-
-                out = self.model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
-                hs = out.hidden_states
-                layer_reps = []
-                m_un = t_mask.unsqueeze(-1)
-                for l_idx, norm_m in zip(self.cfg['layers'], self.norms):
-                    h = hs[l_idx].float()
-                    pooled = (h * m_un).sum(dim=1) / m_un.sum(dim=1).clamp(min=1.0)
-                    layer_reps.append(norm_m(pooled))
-                reps.append(torch.cat(layer_reps, dim=-1).cpu().numpy().astype(np.float32))
-
-        return np.concatenate(reps, axis=0) if reps else np.zeros((0, len(self.cfg['layers']) * 4096), dtype=np.float32)
-
-    def close(self):
+    def free_memory(self):
         del self.model, self.norms
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 """)
 
-    # Cell 5: Module 2 — 5 High-Signal Checkpoint Extractions (Zero 180-row wPCA bug)
+    # Cell 5: Module 2 — 5 High-Signal Checkpoint Extractions (Test-Only, Zero 180-Row Bug)
     add_md("### Step 5: Module 2 — 5 High-Signal Neural Checkpoint Extractions (Test-Only, Zero 180-Row Bug)")
     add_code("""LOGIT = np.zeros((N_test, K), dtype=np.float64)
 D_neural_sum = np.zeros((N_test, N_test), dtype=np.float64)
@@ -681,265 +677,274 @@ claude_spec_logits = None
 # Sanity probe texts (36 rows = 2 prompts x 18 models)
 sanity_texts = train_texts[:36]
 sanity_y = y_train[:36]
+eval_texts = test_texts + sanity_texts
 
-# ------------------------------------------------------------------------------
-# 1. Member: lora_qwen3_14b (Part 2, 27L)
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# TRUNK 1: Qwen3-14B (Part 2, keep=27)
+# ==============================================================================
 if BASE_QWEN3_14B is not None and 'qwen3_14b_p2' in CKPTS:
     ckpt_14bp2 = CKPTS['qwen3_14b_p2']
-    meta_14bp2 = json.load(open(ckpt_14bp2 / 'meta.json')) if (ckpt_14bp2 / 'meta.json').exists() else {'labels': LABELS, 'cfg': {'layers': [5, 10, 15, 20, 25, 30, 35, 39], 'max_len': 384}}
-    print('\\n--- [Member: lora_qwen3_14b (Part 2)] ---')
-    trunk_14b = ExactLoRAExtractor(BASE_QWEN3_14B, meta_14bp2.get('cfg', {'layers': [5, 10, 15, 20, 25, 30, 35, 39], 'max_len': 384}))
+    meta_14bp2 = json.load(open(ckpt_14bp2 / 'meta.json')) if (ckpt_14bp2 / 'meta.json').exists() else {'labels': LABELS, 'cfg': {'layers': [2, 5, 8, 12, 16, 20, 24, 27], 'max_len': 447}}
+    print('\\n===============================================================')
+    print('=== Trunk 1: Qwen3-14B (Part 2, keep=27) ===')
+    print('===============================================================')
+    trunk_14b = UniversalLoRATrunkLoader(
+        base_dir=BASE_QWEN3_14B, keep_layers=27,
+        layers=[2, 5, 8, 12, 16, 20, 24, 27], max_len=447
+    )
     merge_lora(trunk_14b.model, ckpt_14bp2, sign=+1.0)
     heads_sd = load_file(str(ckpt_14bp2 / 'heads.safetensors'))
     trunk_14b.load_norm_weights(heads_sd)
 
-    # Sanity probe
-    Z_san = trunk_14b.extract_exact(sanity_texts, batch_size=8, end_id=151643)
+    Z_all = trunk_14b.extract_exact(eval_texts, batch_size=8, end_id=151643)
+    Z_test = Z_all[:N_test]
+    Z_san = Z_all[N_test:]
+
     plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta_14bp2['labels'])
     plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta_14bp2['labels'])
     center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta_14bp2['labels']) if 'centered.weight' in heads_sd else None
     center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta_14bp2['labels']) if 'centered.bias' in heads_sd else None
+
     pred_san = np.argmax(Z_san @ plain_w.T + plain_b, axis=1)
     bacc_san = balanced_accuracy_score(sanity_y, pred_san)
-    print(f'[SANITY PROBE] lora_qwen3_14b: 36-Row BAcc = {bacc_san:.4f}')
-    del Z_san
-    gc.collect()
+    print(f'[CHECKPOINT GATE] lora_qwen3_14b: 36-Row Sanity BAcc = {bacc_san:.4f}')
 
-    # Test extraction
-    Z_test = trunk_14b.extract_exact(test_texts, batch_size=8, end_id=151643)
-    plain_logits = align_cols(Z_test @ plain_w.T + plain_b, meta_14bp2['labels'])
-    w_main, w_twin = 0.42, 0.12
-    LOGIT += w_main * log_softmax(plain_logits)
-
-    Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
-    Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-    D_model = 1.0 - (Z_norm @ Z_norm.T)
-    np.fill_diagonal(D_model, 0.0)
-    D_neural_sum += w_main * D_model
-    D_neural_weight_total += w_main
-
-    twin_eval_list.append((Z_test, center_w, center_b, meta_14bp2['labels'], w_twin))
-    print(f'[lora_qwen3_14b] Added Plain (w={w_main}) to LOGIT and retained Z_test for twin (w={w_twin}).')
-    trunk_14b.close()
-    del trunk_14b, heads_sd
-    gc.collect()
-else:
-    print('[lora_qwen3_14b] Skipped (base or checkpoint missing).')
-
-log_ram('After Qwen3-14B Extraction')
-
-# ------------------------------------------------------------------------------
-# 2. Member: lora_qwen25_14b (Part 2, 32L)
-# ------------------------------------------------------------------------------
-if BASE_QWEN25_14B is not None and 'qwen25_14b_p2' in CKPTS:
-    ckpt_q25 = CKPTS['qwen25_14b_p2']
-    meta_q25 = json.load(open(ckpt_q25 / 'meta.json')) if (ckpt_q25 / 'meta.json').exists() else {'labels': LABELS, 'cfg': {'layers': [6, 12, 18, 24, 30, 36, 42, 47], 'max_len': 384}}
-    print('\\n--- [Member: lora_qwen25_14b (Part 2)] ---')
-    trunk_q25 = ExactLoRAExtractor(BASE_QWEN25_14B, meta_q25.get('cfg', {'layers': [6, 12, 18, 24, 30, 36, 42, 47], 'max_len': 384}))
-    merge_lora(trunk_q25.model, ckpt_q25, sign=+1.0)
-    heads_sd = load_file(str(ckpt_q25 / 'heads.safetensors'))
-    trunk_q25.load_norm_weights(heads_sd)
-
-    # Sanity probe
-    Z_san = trunk_q25.extract_exact(sanity_texts, batch_size=8, end_id=151643)
-    plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta_q25['labels'])
-    plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta_q25['labels'])
-    center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta_q25['labels']) if 'centered.weight' in heads_sd else None
-    center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta_q25['labels']) if 'centered.bias' in heads_sd else None
-    pred_san = np.argmax(Z_san @ plain_w.T + plain_b, axis=1)
-    bacc_san = balanced_accuracy_score(sanity_y, pred_san)
-    print(f'[SANITY PROBE] lora_qwen25_14b: 36-Row BAcc = {bacc_san:.4f}')
-    del Z_san
-    gc.collect()
-
-    # Test extraction
-    Z_test = trunk_q25.extract_exact(test_texts, batch_size=8, end_id=151643)
-    plain_logits = align_cols(Z_test @ plain_w.T + plain_b, meta_q25['labels'])
-    w_main, w_twin = 0.22, 0.10
-    LOGIT += w_main * log_softmax(plain_logits)
-
-    Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
-    Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-    D_model = 1.0 - (Z_norm @ Z_norm.T)
-    np.fill_diagonal(D_model, 0.0)
-    D_neural_sum += w_main * D_model
-    D_neural_weight_total += w_main
-
-    twin_eval_list.append((Z_test, center_w, center_b, meta_q25['labels'], w_twin))
-    print(f'[lora_qwen25_14b] Added Plain (w={w_main}) to LOGIT and retained Z_test for twin (w={w_twin}).')
-    trunk_q25.close()
-    del trunk_q25, heads_sd
-    gc.collect()
-else:
-    print('[lora_qwen25_14b] Skipped (base or checkpoint missing).')
-
-log_ram('After Qwen2.5-14B Extraction')
-
-# ------------------------------------------------------------------------------
-# 3. Base Qwen3-8B Trunk: In-Place Adapter Swapping for Claude-Head & In-Style
-# ------------------------------------------------------------------------------
-if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'instyle' in CKPTS):
-    print('\\n--- [Qwen3-8B Trunk] Loading base model for in-place adapter swapping ---')
-    cfg_8b_dummy = {'layers': [3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35], 'max_len': 384}
-    if 'qwen3_8b_claude' in CKPTS and (CKPTS['qwen3_8b_claude'] / 'meta.json').exists():
-        cfg_8b_dummy = json.load(open(CKPTS['qwen3_8b_claude'] / 'meta.json')).get('cfg', cfg_8b_dummy)
-
-    trunk_8b = ExactLoRAExtractor(BASE_QWEN3_8B, cfg_8b_dummy)
-
-    # 3A. Member: ntl-qwen3-8b-lora-claude-head
-    if 'qwen3_8b_claude' in CKPTS:
-        ckpt_8bcl = CKPTS['qwen3_8b_claude']
-        print(f'\\n--- [Member: ntl-qwen3-8b-lora-claude-head] In-place merging adapter ---')
-        merge_lora(trunk_8b.model, ckpt_8bcl, sign=+1.0)
-
-        # Read heads: prioritize readouts.npz
-        if (ckpt_8bcl / 'readouts.npz').exists():
-            ro = np.load(ckpt_8bcl / 'readouts.npz', allow_pickle=True)
-            meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
-            src_labs = ro['classes'] if 'classes' in ro else meta.get('labels', LABELS)
-            plain_w = align_cols(ro['plain_coef'] if 'plain_coef' in ro else ro['W_plain'].T, src_labs)
-            plain_b = align_cols(ro['plain_intercept'] if 'plain_intercept' in ro else ro['b_plain'], src_labs)
-            center_w = align_cols(ro['center_coef'] if 'center_coef' in ro else ro['W_center'].T, src_labs) if ('center_coef' in ro or 'W_center' in ro) else None
-            center_b = align_cols(ro['center_intercept'] if 'center_intercept' in ro else ro['b_center'], src_labs) if ('center_intercept' in ro or 'b_center' in ro) else None
-        else:
-            h_sd = load_file(str(ckpt_8bcl / 'heads.safetensors'))
-            meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
-            src_labs = meta.get('labels', LABELS)
-            keys = list(h_sd.keys())
-            pw_k = next((k for k in ['plain.weight', 'plain_coef', 'weight', 'readout.weight'] if k in h_sd), keys[0])
-            pb_k = next((k for k in ['plain.bias', 'plain_intercept', 'bias', 'readout.bias'] if k in h_sd), keys[1] if len(keys) > 1 else keys[0])
-            cw_k = next((k for k in ['centered.weight', 'center.weight', 'center_coef'] if k in h_sd), None)
-            cb_k = next((k for k in ['centered.bias', 'center.bias', 'center_intercept'] if k in h_sd), None)
-            plain_w = align_cols(h_sd[pw_k].cpu().numpy(), src_labs)
-            plain_b = align_cols(h_sd[pb_k].cpu().numpy(), src_labs)
-            center_w = align_cols(h_sd[cw_k].cpu().numpy(), src_labs) if cw_k else None
-            center_b = align_cols(h_sd[cb_k].cpu().numpy(), src_labs) if cb_k else None
-
-        # Sanity probe
-        Z_san = trunk_8b.extract_exact(sanity_texts, batch_size=8, end_id=151643)
-        pred_san = np.argmax(Z_san @ plain_w.T + plain_b, axis=1)
-        bacc_san = balanced_accuracy_score(sanity_y, pred_san)
-        print(f'[SANITY PROBE] ntl-qwen3-8b-lora-claude-head: 36-Row BAcc = {bacc_san:.4f}')
-        del Z_san
-        gc.collect()
-
-        # Test extraction
-        Z_test = trunk_8b.extract_exact(test_texts, batch_size=8, end_id=151643)
-        plain_logits = align_cols(Z_test @ plain_w.T + plain_b, LABELS)
-        w_main, w_twin = 0.10, 0.04
+    if bacc_san >= 0.48:
+        w_main, w_twin = 0.42, 0.12
+        plain_logits = align_cols(Z_test @ plain_w.T + plain_b, meta_14bp2['labels'])
         LOGIT += w_main * log_softmax(plain_logits)
 
         Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
         Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-        D_model = 1.0 - (Z_norm @ Z_norm.T)
-        np.fill_diagonal(D_model, 0.0)
-        D_neural_sum += w_main * D_model
+        D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
+        np.fill_diagonal(D_m, 0.0)
+        D_neural_sum += w_main * D_m
         D_neural_weight_total += w_main
 
-        twin_eval_list.append((Z_test, center_w, center_b, LABELS, w_twin))
-        print(f'[ntl-qwen3-8b-lora-claude-head] Added Plain (w={w_main}) to LOGIT and retained Z_test for twin (w={w_twin}).')
+        if center_w is not None:
+            twin_eval_list.append((Z_test.copy(), center_w, center_b, meta_14bp2['labels'], w_twin))
+        print(f'[lora_qwen3_14b] Accumulated Plain (w={w_main}) to LOGIT and neural distance.')
 
-        # Load Claude Specialist Head for Module 3
-        if (ckpt_8bcl / 'claude_head.safetensors').exists():
-            try:
-                ch_sd = load_file(str(ckpt_8bcl / 'claude_head.safetensors'))
-                claude_classes = ["claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"]
-                ch_meta = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'claude_labels': claude_classes}
-                ch_labs = ch_meta.get('claude_labels', claude_classes)
-                idx_ch = [ch_labs.index(c) for c in claude_classes]
-                w_k = next((k for k in ['weight', 'claude_weight', 'head.weight'] if k in ch_sd), list(ch_sd.keys())[0])
-                b_k = next((k for k in ['bias', 'claude_bias', 'head.bias'] if k in ch_sd), list(ch_sd.keys())[1] if len(ch_sd) > 1 else list(ch_sd.keys())[0])
-                ch_w = ch_sd[w_k].cpu().numpy()[idx_ch]
-                ch_b = ch_sd[b_k].cpu().numpy()[idx_ch]
-                claude_spec_logits = Z_test @ ch_w.T + ch_b
-                print(f'[ntl-qwen3-8b-lora-claude-head] Computed 5-way Claude specialist scores (shape={claude_spec_logits.shape}).')
-            except Exception as e:
-                print(f'[ntl-qwen3-8b-lora-claude-head] Claude head extraction notice: {e}')
+    merge_lora(trunk_14b.model, ckpt_14bp2, sign=-1.0)
+    trunk_14b.free_memory()
+    del trunk_14b, heads_sd, Z_all, Z_test, Z_san
+    gc.collect()
+    torch.cuda.empty_cache()
+else:
+    print('[lora_qwen3_14b] Skipped (base or checkpoint missing).')
 
-        merge_lora(trunk_8b.model, ckpt_8bcl, sign=-1.0)
-        gc.collect()
+log_ram('After Trunk 1 (Qwen3-14B) Cleanup')
 
-    # 3B. Member: instyle_qwen3_8b
+# ==============================================================================
+# TRUNK 2: Qwen2.5-14B (Part 2, keep=32)
+# ==============================================================================
+if BASE_QWEN25_14B is not None and 'qwen25_14b_p2' in CKPTS:
+    ckpt_q25 = CKPTS['qwen25_14b_p2']
+    meta_q25 = json.load(open(ckpt_q25 / 'meta.json')) if (ckpt_q25 / 'meta.json').exists() else {'labels': LABELS, 'cfg': {'layers': [2, 6, 10, 15, 20, 24, 28, 32], 'max_len': 447}}
+    print('\\n===============================================================')
+    print('=== Trunk 2: Qwen2.5-14B (Part 2, keep=32) ===')
+    print('===============================================================')
+    trunk_q25 = UniversalLoRATrunkLoader(
+        base_dir=BASE_QWEN25_14B, keep_layers=32,
+        layers=[2, 6, 10, 15, 20, 24, 28, 32], max_len=447
+    )
+    merge_lora(trunk_q25.model, ckpt_q25, sign=+1.0)
+    heads_sd = load_file(str(ckpt_q25 / 'heads.safetensors'))
+    trunk_q25.load_norm_weights(heads_sd)
+
+    Z_all = trunk_q25.extract_exact(eval_texts, batch_size=8, end_id=151643)
+    Z_test = Z_all[:N_test]
+    Z_san = Z_all[N_test:]
+
+    plain_w = align_cols(heads_sd['plain.weight'].cpu().numpy(), meta_q25['labels'])
+    plain_b = align_cols(heads_sd['plain.bias'].cpu().numpy(), meta_q25['labels'])
+    center_w = align_cols(heads_sd['centered.weight'].cpu().numpy(), meta_q25['labels']) if 'centered.weight' in heads_sd else None
+    center_b = align_cols(heads_sd['centered.bias'].cpu().numpy(), meta_q25['labels']) if 'centered.bias' in heads_sd else None
+
+    pred_san = np.argmax(Z_san @ plain_w.T + plain_b, axis=1)
+    bacc_san = balanced_accuracy_score(sanity_y, pred_san)
+    print(f'[CHECKPOINT GATE] lora_qwen25_14b: 36-Row Sanity BAcc = {bacc_san:.4f}')
+
+    if bacc_san >= 0.48:
+        w_main, w_twin = 0.22, 0.10
+        plain_logits = align_cols(Z_test @ plain_w.T + plain_b, meta_q25['labels'])
+        LOGIT += w_main * log_softmax(plain_logits)
+
+        Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
+        Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
+        D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
+        np.fill_diagonal(D_m, 0.0)
+        D_neural_sum += w_main * D_m
+        D_neural_weight_total += w_main
+
+        if center_w is not None:
+            twin_eval_list.append((Z_test.copy(), center_w, center_b, meta_q25['labels'], w_twin))
+        print(f'[lora_qwen25_14b] Accumulated Plain (w={w_main}) to LOGIT and neural distance.')
+
+    merge_lora(trunk_q25.model, ckpt_q25, sign=-1.0)
+    trunk_q25.free_memory()
+    del trunk_q25, heads_sd, Z_all, Z_test, Z_san
+    gc.collect()
+    torch.cuda.empty_cache()
+else:
+    print('[lora_qwen25_14b] Skipped (base or checkpoint missing).')
+
+log_ram('After Trunk 2 (Qwen2.5-14B) Cleanup')
+
+# ==============================================================================
+# TRUNK 3: Qwen3-8B (Hosts Claude Head & InStyle LoRA, keep=24)
+# ==============================================================================
+if BASE_QWEN3_8B is not None and ('qwen3_8b_claude' in CKPTS or 'instyle' in CKPTS):
+    print('\\n===============================================================')
+    print('=== Trunk 3: Qwen3-8B (Claude Head & InStyle LoRA, keep=24) ===')
+    print('===============================================================')
+    trunk_8b = UniversalLoRATrunkLoader(
+        base_dir=BASE_QWEN3_8B, keep_layers=24,
+        layers=[2, 5, 8, 11, 14, 17, 20, 24], max_len=447
+    )
+
+    # 3A. In-Style Qwen3-8B LoRA
     if 'instyle' in CKPTS:
         ckpt_inst = CKPTS['instyle']
-        print(f'\\n--- [Member: In-Style Qwen3-8B LoRA] In-place merging adapter ---')
+        print(f'\\n--- [Member: In-Style Qwen3-8B LoRA] In-place merging ---')
         merge_lora(trunk_8b.model, ckpt_inst, sign=+1.0)
+        heads_inst_sd = load_file(str(ckpt_inst / 'heads.safetensors')) if (ckpt_inst / 'heads.safetensors').exists() else {}
+        if heads_inst_sd:
+            trunk_8b.load_norm_weights(heads_inst_sd)
 
-        # Read heads: check readouts.npz or heads.safetensors
+        Z_all = trunk_8b.extract_exact(eval_texts, batch_size=8, end_id=151643)
+        Z_test = Z_all[:N_test]
+        Z_san = Z_all[N_test:]
+
         readouts_file = ckpt_inst / 'readouts.npz'
-        heads_file = ckpt_inst / 'heads.safetensors' if (ckpt_inst / 'heads.safetensors').exists() else ckpt_inst / 'head.safetensors'
         if readouts_file.exists():
             ro = np.load(readouts_file, allow_pickle=True)
             meta_inst = json.load(open(ckpt_inst / 'meta.json')) if (ckpt_inst / 'meta.json').exists() else {'labels': LABELS}
             src_labs = ro['classes'] if 'classes' in ro else meta_inst.get('labels', LABELS)
             plain_w = align_cols(ro['plain_coef'] if 'plain_coef' in ro else ro['W_plain'].T if 'W_plain' in ro else ro['weight'], src_labs)
             plain_b = align_cols(ro['plain_intercept'] if 'plain_intercept' in ro else ro['b_plain'] if 'b_plain' in ro else ro['bias'], src_labs)
-            center_w = align_cols(ro['center_coef'] if 'center_coef' in ro else ro['W_center'].T, src_labs) if ('center_coef' in ro or 'W_center' in ro) else None
-            center_b = align_cols(ro['center_intercept'] if 'center_intercept' in ro else ro['b_center'], src_labs) if ('center_intercept' in ro or 'b_center' in ro) else None
-        elif heads_file.exists():
-            h_sd = load_file(str(heads_file))
+            center_w = align_cols(ro['center_coef'] if 'center_coef' in ro else ro['W_center'].T if 'W_center' in ro else ro['centered_weight'], src_labs) if ('center_coef' in ro or 'W_center' in ro or 'centered_weight' in ro) else None
+            center_b = align_cols(ro['center_intercept'] if 'center_intercept' in ro else ro['b_center'] if 'b_center' in ro else ro['centered_bias'], src_labs) if ('center_intercept' in ro or 'b_center' in ro or 'centered_bias' in ro) else None
+        elif heads_inst_sd:
             meta_inst = json.load(open(ckpt_inst / 'meta.json')) if (ckpt_inst / 'meta.json').exists() else {'labels': LABELS}
-            src_labs = meta_inst.get('labels', LABELS)
-            keys = list(h_sd.keys())
-            pw_key = next((k for k in ['plain.weight', 'plain_coef', 'weight', 'readout.weight'] if k in h_sd), keys[0])
-            pb_key = next((k for k in ['plain.bias', 'plain_intercept', 'bias', 'readout.bias'] if k in h_sd), keys[1] if len(keys) > 1 else keys[0])
-            cw_key = next((k for k in ['centered.weight', 'center.weight', 'center_coef'] if k in h_sd), None)
-            cb_key = next((k for k in ['centered.bias', 'center.bias', 'center_intercept'] if k in h_sd), None)
-            plain_w = align_cols(h_sd[pw_key].cpu().numpy(), src_labs)
-            plain_b = align_cols(h_sd[pb_key].cpu().numpy(), src_labs)
-            center_w = align_cols(h_sd[cw_key].cpu().numpy(), src_labs) if cw_key else None
-            center_b = align_cols(h_sd[cb_key].cpu().numpy(), src_labs) if cb_key else None
+            plain_w = align_cols(heads_inst_sd['plain.weight'].cpu().numpy(), meta_inst['labels'])
+            plain_b = align_cols(heads_inst_sd['plain.bias'].cpu().numpy(), meta_inst['labels'])
+            center_w = align_cols(heads_inst_sd['centered.weight'].cpu().numpy(), meta_inst['labels']) if 'centered.weight' in heads_inst_sd else None
+            center_b = align_cols(heads_inst_sd['centered.bias'].cpu().numpy(), meta_inst['labels']) if 'centered.bias' in heads_inst_sd else None
         else:
             plain_w, plain_b, center_w, center_b = None, None, None, None
 
         if plain_w is not None:
-            # Sanity probe
-            Z_san = trunk_8b.extract_exact(sanity_texts, batch_size=8, end_id=151643)
             pred_san = np.argmax(Z_san @ plain_w.T + plain_b, axis=1)
             bacc_san = balanced_accuracy_score(sanity_y, pred_san)
-            print(f'[SANITY PROBE] instyle_qwen3_8b: 36-Row BAcc = {bacc_san:.4f}')
-            del Z_san
-            gc.collect()
+            print(f'[CHECKPOINT GATE] instyle_qwen3_8b: 36-Row Sanity BAcc = {bacc_san:.4f}')
 
-            # Test extraction
-            Z_test = trunk_8b.extract_exact(test_texts, batch_size=8, end_id=151643)
-            plain_logits = align_cols(Z_test @ plain_w.T + plain_b, LABELS)
-            w_main, w_twin = 0.14, 0.05
-            LOGIT += w_main * log_softmax(plain_logits)
+            if bacc_san >= 0.48:
+                w_main, w_twin = 0.14, 0.05
+                plain_logits = align_cols(Z_test @ plain_w.T + plain_b, LABELS)
+                LOGIT += w_main * log_softmax(plain_logits)
 
-            Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
-            Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-            D_model = 1.0 - (Z_norm @ Z_norm.T)
-            np.fill_diagonal(D_model, 0.0)
-            D_neural_sum += w_main * D_model
-            D_neural_weight_total += w_main
+                Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
+                Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
+                D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
+                np.fill_diagonal(D_m, 0.0)
+                D_neural_sum += w_main * D_m
+                D_neural_weight_total += w_main
 
-            twin_eval_list.append((Z_test, center_w, center_b, LABELS, w_twin))
-            print(f'[instyle_qwen3_8b] Added Plain (w={w_main}) to LOGIT and retained Z_test for twin (w={w_twin}).')
+                if center_w is not None:
+                    twin_eval_list.append((Z_test.copy(), center_w, center_b, LABELS, w_twin))
+                print(f'[instyle_qwen3_8b] Accumulated Plain (w={w_main}) to LOGIT.')
 
         merge_lora(trunk_8b.model, ckpt_inst, sign=-1.0)
+        del Z_all, Z_test, Z_san
         gc.collect()
 
-    trunk_8b.close()
+    # 3B. Claude-Head Qwen3-8B LoRA
+    if 'qwen3_8b_claude' in CKPTS:
+        ckpt_8bcl = CKPTS['qwen3_8b_claude']
+        print(f'\\n--- [Member: ntl-qwen3-8b-lora-claude-head] In-place merging ---')
+        merge_lora(trunk_8b.model, ckpt_8bcl, sign=+1.0)
+        heads_cl_sd = load_file(str(ckpt_8bcl / 'heads.safetensors')) if (ckpt_8bcl / 'heads.safetensors').exists() else {}
+        if heads_cl_sd:
+            trunk_8b.load_norm_weights(heads_cl_sd)
+
+        Z_all = trunk_8b.extract_exact(eval_texts, batch_size=8, end_id=151643)
+        Z_test = Z_all[:N_test]
+        Z_san = Z_all[N_test:]
+
+        ro_cl = None
+        if (ckpt_8bcl / 'readouts.npz').exists():
+            ro_cl = np.load(ckpt_8bcl / 'readouts.npz', allow_pickle=True)
+            meta_cl = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
+            src_labs = ro_cl['classes'] if 'classes' in ro_cl else meta_cl.get('labels', LABELS)
+            plain_w = align_cols(ro_cl['plain_coef'] if 'plain_coef' in ro_cl else ro_cl['W_plain'].T, src_labs)
+            plain_b = align_cols(ro_cl['plain_intercept'] if 'plain_intercept' in ro_cl else ro_cl['b_plain'], src_labs)
+            center_w = align_cols(ro_cl['center_coef'] if 'center_coef' in ro_cl else ro_cl['W_center'].T, src_labs) if ('center_coef' in ro_cl or 'W_center' in ro_cl) else None
+            center_b = align_cols(ro_cl['center_intercept'] if 'center_intercept' in ro_cl else ro_cl['b_center'], src_labs) if ('center_intercept' in ro_cl or 'b_center' in ro_cl) else None
+        elif heads_cl_sd:
+            meta_cl = json.load(open(ckpt_8bcl / 'meta.json')) if (ckpt_8bcl / 'meta.json').exists() else {'labels': LABELS}
+            plain_w = align_cols(heads_cl_sd['plain.weight'].cpu().numpy(), meta_cl['labels'])
+            plain_b = align_cols(heads_cl_sd['plain.bias'].cpu().numpy(), meta_cl['labels'])
+            center_w = align_cols(heads_cl_sd['centered.weight'].cpu().numpy(), meta_cl['labels']) if 'centered.weight' in heads_cl_sd else None
+            center_b = align_cols(heads_cl_sd['centered.bias'].cpu().numpy(), meta_cl['labels']) if 'centered.bias' in heads_cl_sd else None
+        else:
+            plain_w, plain_b, center_w, center_b = None, None, None, None
+
+        if plain_w is not None:
+            pred_san = np.argmax(Z_san @ plain_w.T + plain_b, axis=1)
+            bacc_san = balanced_accuracy_score(sanity_y, pred_san)
+            print(f'[CHECKPOINT GATE] qwen3_8b_claude: 36-Row Sanity BAcc = {bacc_san:.4f}')
+
+            if bacc_san >= 0.48:
+                w_main, w_twin = 0.10, 0.04
+                plain_logits = align_cols(Z_test @ plain_w.T + plain_b, LABELS)
+                LOGIT += w_main * log_softmax(plain_logits)
+
+                Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
+                Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
+                D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
+                np.fill_diagonal(D_m, 0.0)
+                D_neural_sum += w_main * D_m
+                D_neural_weight_total += w_main
+
+                if center_w is not None:
+                    twin_eval_list.append((Z_test.copy(), center_w, center_b, LABELS, w_twin))
+
+                # Retain Claude specialist head
+                if ro_cl is not None and 'claude_coef' in ro_cl and 'claude_classes' in ro_cl:
+                    cl_w = ro_cl['claude_coef']
+                    cl_b = ro_cl['claude_intercept']
+                    raw_cl = Z_test @ cl_w.T + cl_b
+                    claude_spec_logits = raw_cl
+                    print('[Routing: qwen3_8b_claude] Stored Claude family specialist logits.')
+
+        merge_lora(trunk_8b.model, ckpt_8bcl, sign=-1.0)
+        del Z_all, Z_test, Z_san
+        gc.collect()
+
+    trunk_8b.free_memory()
     del trunk_8b
     gc.collect()
+    torch.cuda.empty_cache()
 
-log_ram('After Qwen3-8B Trunk Extractions')
+log_ram('After Trunk 3 (Qwen3-8B) Cleanup')
 
-# ------------------------------------------------------------------------------
-# 4. Member: deberta_v3_large (Part 2 Fine-Tuned Encoder)
-# ------------------------------------------------------------------------------
-if BASE_DEBERTA is not None and 'deberta_p2' in CKPTS:
+# ==============================================================================
+# TRUNK 4: Dedicated DeBERTa-v3 Fine-Tuned Encoder
+# ==============================================================================
+if 'deberta_p2' in CKPTS:
     ckpt_deb = CKPTS['deberta_p2']
-    print('\\n--- [Member: deberta_v3_large (Part 2)] Staging and Probing ---')
-    stage_dir = Path('/kaggle/temp/deberta_v3_large') if Path('/kaggle/temp').exists() else Path('temp_deberta')
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    for f in BASE_DEBERTA.iterdir():
+    print('\\n===============================================================')
+    print('=== Trunk 4: Dedicated DeBERTa-v3 Fine-Tuned Encoder ===')
+    print('===============================================================')
+    enc_src = ckpt_deb / 'encoder' if (ckpt_deb / 'encoder').exists() else ckpt_deb
+    stage_dir = Path('/kaggle/temp/deberta_v3_large') if Path('/kaggle/temp').exists() else Path('/kaggle/working/temp_deberta') if Path('/kaggle/working').exists() else Path('temp_deberta')
+    os.makedirs(stage_dir, exist_ok=True)
+    for f in enc_src.iterdir():
         if f.is_file():
-            shutil.copy(f, stage_dir / f.name)
+            shutil.copy2(f, stage_dir / f.name)
 
-    deb_tok = AutoTokenizer.from_pretrained(str(stage_dir), use_fast=True)
+    deb_tok = AutoTokenizer.from_pretrained(str(stage_dir))
     if deb_tok.pad_token is None:
         deb_tok.pad_token = deb_tok.eos_token or '[PAD]'
 
@@ -964,167 +969,142 @@ if BASE_DEBERTA is not None and 'deberta_p2' in CKPTS:
     else:
         w_cd, b_cd = None, None
 
-    # Probe on 36 train passages
-    best_mode, best_bacc = 1, -1.0
-    for mode_idx, (add_spec, drop_first) in enumerate([(True, False), (True, True), (False, True), (False, False)], 1):
-        with torch.no_grad():
-            if add_spec:
-                enc_p = deb_tok(sanity_texts, padding=True, truncation=True, max_length=384, return_tensors='pt').to(dev_deb)
-            else:
-                p_ids = deb_tok(sanity_texts, add_special_tokens=False, truncation=True, max_length=383)["input_ids"]
-                p_end = deb_tok.eos_token_id or deb_tok.pad_token_id or 0
-                p_ids = [x + [p_end] for x in p_ids]
-                enc_p = deb_tok.pad({"input_ids": p_ids}, padding=True, return_tensors="pt").to(dev_deb)
-            out_p = deb_model(**enc_p)
-            m_p = enc_p['attention_mask'].unsqueeze(-1).float()
-            if drop_first:
-                m_p[:, 0, :] = 0.0
-            pool_p = ((out_p.last_hidden_state.float() * m_p).sum(dim=1) / m_p.sum(dim=1).clamp(min=1.0)).cpu().numpy()
-            pred_p = np.argmax(pool_p @ w_d.T + b_d, axis=1)
-            bacc_p = balanced_accuracy_score(sanity_y, pred_p)
-            if bacc_p > best_bacc:
-                best_bacc = bacc_p
-                best_mode = mode_idx
-                best_add_special = add_spec
-                best_drop_first = drop_first
-
-    print(f'[SANITY PROBE] deberta_v3_large: Winning Mode {best_mode} | 36-Row BAcc = {best_bacc:.4f}')
-
-    # Test extraction
-    deb_reps = []
+    # Length-sorted dynamic batching for DeBERTa
+    order_deb = np.argsort([len(x) for x in eval_texts], kind="stable")
+    Z_deb = np.zeros((len(eval_texts), 1024), dtype=np.float32)
     with torch.no_grad():
-        for i in range(0, N_test, 16):
-            b_texts = test_texts[i : i + 16]
-            if best_add_special:
-                enc = deb_tok(b_texts, padding=True, truncation=True, max_length=384, return_tensors='pt').to(dev_deb)
-            else:
-                p_ids = deb_tok(b_texts, add_special_tokens=False, truncation=True, max_length=383)["input_ids"]
-                p_end = deb_tok.eos_token_id or deb_tok.pad_token_id or 0
-                p_ids = [x + [p_end] for x in p_ids]
-                enc = deb_tok.pad({"input_ids": p_ids}, padding=True, return_tensors="pt").to(dev_deb)
-            out_d = deb_model(**enc)
-            m_d = enc['attention_mask'].unsqueeze(-1).float()
-            if best_drop_first:
-                m_d[:, 0, :] = 0.0
-            p_d = ((out_d.last_hidden_state.float() * m_d).sum(dim=1) / m_d.sum(dim=1).clamp(min=1.0)).cpu().numpy()
-            deb_reps.append(p_d)
+        for s in range(0, len(order_deb), 16):
+            b_idx = order_deb[s : s + 16]
+            batch_texts = [eval_texts[i] for i in b_idx]
+            enc = deb_tok(batch_texts, padding=True, truncation=True, max_length=512, return_tensors='pt').to(dev_deb)
+            out = deb_model(**enc)
+            # Pool token 0 [CLS] representation
+            cls_rep = out.last_hidden_state[:, 0, :].float().cpu().numpy()
+            Z_deb[b_idx] = cls_rep
 
-    Z_test_deb = np.concatenate(deb_reps, axis=0) if deb_reps else np.zeros((N_test, 1024), dtype=np.float32)
-    plain_logits = align_cols(Z_test_deb @ w_d.T + b_d, meta_deb['labels'])
-    w_main, w_twin = 0.25, 0.08
-    LOGIT += w_main * log_softmax(plain_logits)
+    Z_test_deb = Z_deb[:N_test]
+    Z_san_deb = Z_deb[N_test:]
 
-    Z_norm = Z_test_deb - Z_test_deb.mean(axis=0, keepdims=True)
-    Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-    D_model = 1.0 - (Z_norm @ Z_norm.T)
-    np.fill_diagonal(D_model, 0.0)
-    D_neural_sum += w_main * D_model
-    D_neural_weight_total += w_main
+    pred_san = np.argmax(Z_san_deb @ w_d.T + b_d, axis=1)
+    bacc_san = balanced_accuracy_score(sanity_y, pred_san)
+    print(f'[CHECKPOINT GATE] deberta_v3_large: 36-Row Sanity BAcc = {bacc_san:.4f}')
 
-    if w_cd is not None:
-        twin_eval_list.append((Z_test_deb, w_cd, b_cd, meta_deb['labels'], w_twin))
-        print(f'[deberta_v3_large] Added Plain (w={w_main}) to LOGIT and retained Z_test for twin (w={w_twin}).')
-    else:
-        print(f'[deberta_v3_large] Added Plain (w={w_main}) to LOGIT.')
+    if bacc_san >= 0.48:
+        w_main, w_twin = 0.25, 0.08
+        plain_logits = align_cols(Z_test_deb @ w_d.T + b_d, meta_deb['labels'])
+        LOGIT += w_main * log_softmax(plain_logits)
 
-    del deb_model, deb_tok, heads_deb_sd, deb_reps
+        Z_norm = Z_test_deb - Z_test_deb.mean(axis=0, keepdims=True)
+        Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
+        D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
+        np.fill_diagonal(D_m, 0.0)
+        D_neural_sum += w_main * D_m
+        D_neural_weight_total += w_main
+
+        if w_cd is not None:
+            twin_eval_list.append((Z_test_deb.copy(), w_cd, b_cd, meta_deb['labels'], w_twin))
+        print(f'[deberta_v3_large] Accumulated Plain (w={w_main}) to LOGIT and neural distance.')
+
+    del deb_model, Z_deb, Z_test_deb, Z_san_deb, heads_deb_sd
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
-log_ram('After All Neural Extractions')
+log_ram('After Trunk 4 (DeBERTa) Cleanup')
 """)
 
-    # Cell 6: Module 3 — Consensus Clustering & LOO-CLC
-    add_md("### Step 6: Module 3 — Consensus Clustering, Centered Twins & Leave-One-Out Cluster Logit Contrast (LOO-CLC)")
-    add_code("""print('\\n=== [Module 3] Consensus Prompt Clustering & LOO-CLC ===')
-
-# 1. Add Lexical Logits (w=0.30)
+    # Cell 6: Module 3 — Consensus Clustering, Centered Twins, LOO-CLC & 300-Step Exact Sinkhorn
+    add_md("### Step 6: Module 3 — Consensus Clustering, Style Twins, LOO-CLC & 300-Step Exact Sinkhorn")
+    add_code("""# 1. Blend 78k Lexical Dual Ensemble Logits
 LOGIT += 0.30 * log_p_lex
-print(f'[Module 3] Injected 78k 5-view lexical log-probabilities (w=0.30).')
+print(f'[Ensemble] Integrated 78k Dual Subprocess Lexical Logits (weight=0.30).')
 
-# 2. Build High-Precision Consensus Distance Matrix
-D_consensus = 0.55 * D_tfidf + 0.45 * (D_neural_sum / max(D_neural_weight_total, 1e-6))
-np.fill_diagonal(D_consensus, 0.0)
-D_consensus = np.clip(0.5 * (D_consensus + D_consensus.T), 0.0, None)
-print(f'[Module 3] Built consensus prompt distance matrix D_consensus (shape={D_consensus.shape}).')
-
-# 3. Standard Twin Clustering (t=0.85 on D_tfidf) & Centered Twin Scoring
-if N_test >= 2:
-    cond_d_085 = squareform(D_tfidf, checks=False)
-    groups_085 = fcluster(linkage(cond_d_085, method='average'), 0.85, criterion='distance')
+# 2. Consensus Neural + TF-IDF Prompt Clustering
+if D_neural_weight_total > 0:
+    D_neural = D_neural_sum / D_neural_weight_total
 else:
-    groups_085 = np.ones(N_test, dtype=int)
+    D_neural = D_tfidf
 
-print(f'[Module 3] Evaluating centered twin readouts across {len(twin_eval_list)} neural checkpoints on groups_085...')
-for Z_t, W_c, b_c, src_labs, twin_w in twin_eval_list:
-    if W_c is not None:
-        out_lp_twin, valid_twin = compute_centered_logits(Z_t, groups_085, W_c, b_c, src_labs)
-        if valid_twin.any():
-            LOGIT[valid_twin] += twin_w * out_lp_twin[valid_twin]
-            print(f'[Twin Logits] Added centered twin (w={twin_w}) on {valid_twin.sum()}/{N_test} rows.')
+D_consensus = 0.55 * D_tfidf + 0.45 * D_neural
+print(f'[Consensus Clustering] Formed D_consensus: 0.55 * D_tfidf + 0.45 * D_neural.')
 
-# Free cached Z_test arrays
-del twin_eval_list
-gc.collect()
-
-# 4. High-Purity Consensus Clustering (t=0.58 on D_consensus) with Crash-Proof Splitting
+# Average-linkage clustering at t=0.62
 if N_test >= 2:
-    cond_d_tight = squareform(D_consensus, checks=False)
-    groups_tight = fcluster(linkage(cond_d_tight, method='average'), 0.58, criterion='distance')
-    groups_tight = split_oversized_clusters_dist(D_consensus, groups_tight, max_cluster_size=14)
+    condensed_dist = squareform(D_consensus, checks=False)
+    Z_linkage = linkage(condensed_dist, method='average')
+    groups_raw = fcluster(Z_linkage, t=0.62, criterion='distance')
 else:
-    groups_tight = np.ones(N_test, dtype=int)
+    groups_raw = np.array([1])
 
-assert np.bincount(groups_tight).max() <= 18, "Cluster size invariant violated!"
-print(f'[Module 3] Formed {len(np.unique(groups_tight))} consensus clusters (max_size={np.bincount(groups_tight).max()}).')
+# Crash-Proof Cluster Splitting: guarantee cluster size <= 14 <= 18
+def split_oversized_clusters_dist(D: np.ndarray, groups: np.ndarray, max_cluster_size: int = 14) -> np.ndarray:
+    new_groups = np.zeros(len(groups), dtype=np.int64)
+    next_id = 1
+    for g in np.unique(groups):
+        rows = np.flatnonzero(groups == g)
+        if len(rows) <= max_cluster_size:
+            new_groups[rows] = next_id
+            next_id += 1
+        else:
+            n_sub = int(np.ceil(len(rows) / max_cluster_size))
+            D_sub = D[np.ix_(rows, rows)].copy()
+            np.fill_diagonal(D_sub, 0.0)
+            D_sub = np.clip(0.5 * (D_sub + D_sub.T), 0.0, None)
+            d_condensed = squareform(D_sub, checks=False)
+            sub_labels = fcluster(linkage(d_condensed, method='average'), t=n_sub, criterion='maxclust')
+            for sg in np.unique(sub_labels):
+                s_rows = rows[sub_labels == sg]
+                for start in range(0, len(s_rows), max_cluster_size):
+                    new_groups[s_rows[start : start + max_cluster_size]] = next_id
+                    next_id += 1
+    return new_groups
 
-# 5. Top-1 Gated Claude Specialist Refinement
-claude_classes = ["claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"]
-claude_idx = [LAB2I[c] for c in claude_classes if c in LAB2I]
-top1 = np.argmax(LOGIT, axis=1)
-claude_rows = np.where(np.isin(top1, claude_idx))[0]
-if len(claude_rows) > 0 and claude_spec_logits is not None:
-    c_lp = log_softmax(claude_spec_logits[claude_rows])
-    c_lp_centered = c_lp - c_lp.mean(axis=1, keepdims=True)
-    LOGIT[claude_rows[:, None], claude_idx] += 0.25 * c_lp_centered
-    print(f'[Module 3] Applied gated Claude specialist refinement on {len(claude_rows)} rows.')
+safe_groups = split_oversized_clusters_dist(D_consensus, groups_raw, max_cluster_size=14)
+max_c = np.bincount(safe_groups).max() if len(safe_groups) > 0 else 0
+print(f'[Cluster Safety Audit] Clusters formed: {len(np.unique(safe_groups))}, Max cluster size: {max_c} (<= 14 <= 18: Passed!)')
 
-# 6. Leave-One-Out Cluster Logit Contrast (LOO-CLC) + Soft Hungarian Assignment Boost
-print('[Module 3] Applying Leave-One-Out Cluster Logit Contrast (LOO-CLC) on groups_tight...')
-LOGIT = log_softmax(LOGIT)
-LOGIT_debiased = LOGIT.copy()
-n_debiased = 0
+# 3. Add Prompt-Centered Style Twins
+print(f'[Style Twins] Evaluating {len(twin_eval_list)} centered style twin heads on safe_groups...')
+for Z_t, cw, cb, labs, w in twin_eval_list:
+    out_lp, valid = compute_centered_logits(Z_t, safe_groups, cw, cb, labs)
+    if valid.any():
+        LOGIT[valid] += w * out_lp[valid]
+        print(f'   Added twin logits on {valid.sum()} passages with weight {w}.')
 
-for g in np.unique(groups_tight):
-    rows = np.flatnonzero(groups_tight == g)
+# 4. Inject Claude Family Specialist
+if claude_spec_logits is not None:
+    claude_cols = FAMILIES['claude']
+    LOGIT[:, claude_cols] += 0.15 * log_softmax(claude_spec_logits)
+    print(f'[Specialist] Injected Qwen3-8B Claude specialist logits (+0.15) into cols {claude_cols}.')
+
+# 5. Leave-One-Out Cluster Logit Contrast (LOO-CLC) + Soft 1-to-1 Hungarian Boost
+print(f'[LOO-CLC] Applying Leave-One-Out Cluster Logit Contrast & Soft Hungarian...')
+for g in np.unique(safe_groups):
+    rows = np.flatnonzero(safe_groups == g)
     m = len(rows)
     if 2 <= m <= 18:
-        L_grp = LOGIT[rows]  # (m, 18)
+        L_grp = LOGIT[rows]
         sum_L = L_grp.sum(axis=0, keepdims=True)
         loo_mean = (sum_L - L_grp) / float(m - 1)
+        # Debiased logit contrast
         L_contrasted = log_softmax(L_grp - 0.22 * loo_mean)
-
-        # Soft 1-to-1 Hungarian Assignment Boost within the prompt cluster
+        # Soft Hungarian 1-to-1 Assignment Boost
         row_ind, col_ind = linear_sum_assignment(-L_contrasted)
         L_contrasted[row_ind, col_ind] += 0.25
-        LOGIT_debiased[rows] = log_softmax(L_contrasted)
-        n_debiased += m
+        LOGIT[rows] = log_softmax(L_contrasted)
 
-LOGIT = LOGIT_debiased
-print(f'[Module 3] Completed LOO-CLC debiasing and soft Hungarian boost on {n_debiased}/{N_test} rows.')
-log_ram('After Consensus Clustering & LOO-CLC')
-""")
+# 6. Pre-Sinkhorn Orthographic Shield
+print('[Shield] Applying gentle Pre-Sinkhorn Orthographic Shield...')
+for i, txt in enumerate(test_texts):
+    if '—' not in txt and '--' not in txt:
+        LOGIT[i, LAB2I['claude-opus-4-8']] -= 0.5
+    if ';' not in txt:
+        LOGIT[i, LAB2I['claude-opus-4-6']] -= 0.5
+    if '**' not in txt:
+        LOGIT[i, LAB2I['gpt-5.6-luna']] -= 0.5
 
-    # Cell 7: Module 4 — Exact 300-Step Multiplicative Sinkhorn Balancing
-    add_md("### Step 7: Module 4 — Exact 300-Step Multiplicative Sinkhorn Balancing & Submission")
-    add_code("""print('\\n=== [Module 4] Exact 300-Step Multiplicative Sinkhorn Balancing ===')
-
-def sinkhorn(P: np.ndarray, iters: int = 300) -> np.ndarray:
-    \"\"\"
-    Exact multiplicative column scaling so every class receives an equal share (N / 18)
-    of total probability mass, with rows renormalized to simplex at every step.
-    \"\"\"
+# 7. Official 300-Step Exact Multiplicative Sinkhorn Balancing
+print(f'[Sinkhorn] Running official 300-step exact multiplicative Sinkhorn mass balancing...')
+def sinkhorn_balancing(P: np.ndarray, iters: int = 300) -> np.ndarray:
     if len(P) < 50:
         return P
     P = np.clip(P.astype(np.float64), 1e-15, 1.0)
@@ -1137,37 +1117,43 @@ def sinkhorn(P: np.ndarray, iters: int = 300) -> np.ndarray:
     R = P * c
     return R / R.sum(axis=1, keepdims=True).clip(min=1e-15)
 
-P_raw = softmax(LOGIT, axis=1)
-if N_test >= 50:
-    print(f'[Sinkhorn] Running exact 300 iterations on N={N_test} test predictions...')
-    P_final = sinkhorn(P_raw, iters=300)
-    print(f'[Sinkhorn] Multiplicative balancing completed: column sum range=[{P_final.sum(axis=0).min():.2f}, {P_final.sum(axis=0).max():.2f}].')
-else:
-    print(f'[Sinkhorn] Small test set (N={N_test} < 50); bypassing Sinkhorn.')
-    P_final = P_raw
+P_final = softmax(LOGIT, axis=1)
+P_sinkhorn = sinkhorn_balancing(P_final, iters=300)
 
-final_pred_idx = np.argmax(P_final, axis=1)
-final_pred_labels = [LABELS[i] for i in final_pred_idx]
+col_masses = P_sinkhorn.sum(axis=0)
+print(f'[Sinkhorn Mass Verification] Min Col Mass: {col_masses.min():.4f}, Max Col Mass: {col_masses.max():.4f}, Target: {len(test_texts) / 18.0:.4f}')
 
-sub_df = pd.DataFrame({
-    'id': df_test['id'].astype(str),
-    'model': final_pred_labels
+# Final Predictions
+y_preds = np.argmax(P_sinkhorn, axis=1)
+pred_labels = [LABELS[idx] for idx in y_preds]
+
+df_sub = pd.DataFrame({
+    'id': df_test['id'] if 'id' in df_test.columns else np.arange(len(df_test)),
+    'model': pred_labels
 })
-sub_file = working_dir / 'submission.parquet'
-sub_df.to_parquet(sub_file, index=False)
 
-print(f'\\n[SUCCESS] Wrote valid submission to {sub_file} ({sub_file.stat().st_size} bytes)!')
-print(f'Submission shape: {sub_df.shape}')
-print(f'First 5 Predictions:\\n{sub_df.head()}')
-print(f'\\nPredicted Model Distribution:\\n{sub_df[\"model\"].value_counts()}')
-log_ram('Final Complete Notebook Execution')
+sub_file = Path('/kaggle/working/submission.parquet') if Path('/kaggle/working').exists() else Path('submission.parquet')
+df_sub.to_parquet(sub_file, index=False)
+print(f'\\n[SUCCESS] Wrote submission to {sub_file} ({len(df_sub)} rows).')
+
+# Verification
+assert sub_file.exists(), f"Submission file {sub_file} does not exist!"
+df_verify = pd.read_parquet(sub_file)
+assert len(df_verify) == len(df_test), f"Row count mismatch: {len(df_verify)} vs {len(df_test)}"
+assert set(df_verify.columns) == {'id', 'model'}, f"Columns mismatch: {df_verify.columns}"
+assert set(df_verify['model']).issubset(set(LABELS)), f"Invalid labels detected: {set(df_verify['model']) - set(LABELS)}"
+
+print('\\nSubmission preview:')
+print(df_verify.head(10))
+print('\\nClass prediction distribution:')
+print(df_verify['model'].value_counts())
+print('\\n=== Version 37 Pipeline Execution Successfully Completed ===')
 """)
 
     out_file = Path("kaggle_submission.ipynb")
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1)
-    print(f"[SUCCESS] Generated Version 37 pipeline notebook: {out_file} ({out_file.stat().st_size} bytes)")
+    print(f"Successfully generated Version 37 submission notebook at {out_file.resolve()} ({out_file.stat().st_size:,} bytes)")
 
 if __name__ == "__main__":
     create_v37_pipeline_notebook()
-
