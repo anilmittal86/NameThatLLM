@@ -2,12 +2,15 @@
 Universal Neural Trunk Loader & Feature Extractor
 =================================================
 Manages multi-GPU sharding (2xT4 GPUs, max 13.5 GiB), layer truncation (keep_layers),
-dynamic bfloat16 row-level retry for 14B fp16 overflow rescue, and head tensor resolution.
+dynamic bfloat16 row-level retry for 14B fp16 overflow rescue, LayerNorm heads,
+and bit-exact CPU fp16 snapshot/restore for shared trunks.
 """
 
 import gc
+import os
 import json
 import time
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -184,6 +187,8 @@ class UniversalLoRATrunkLoader:
 
         cfg = AutoConfig.from_pretrained(str(base_dir), trust_remote_code=True)
         cfg.num_hidden_layers = keep_layers
+        if getattr(cfg, "layer_types", None) is not None:
+            cfg.layer_types = cfg.layer_types[:keep_layers]
         cfg.use_cache = False
 
         n_gpus = torch.cuda.device_count()
@@ -201,26 +206,52 @@ class UniversalLoRATrunkLoader:
         else:
             self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32)
 
+        # Disable final trunk norm so last layer is not double normalized
+        if hasattr(self.model, "norm"):
+            self.model.norm = nn.Identity()
+        elif hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+            self.model.model.norm = nn.Identity()
+
         self.model.eval()
         self.device_norms = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+        # nn.LayerNorm with both weight and bias matching heads.safetensors
         hidden_dim = self.model.config.hidden_size
         self.norms = nn.ModuleList([
-            nn.RMSNorm(hidden_dim, eps=getattr(cfg, "rms_norm_eps", 1e-6))
+            nn.LayerNorm(hidden_dim)
             for _ in layers
         ]).to(self.device_norms).float()
 
-        for l_idx, nm in zip(layers, self.norms):
-            try:
-                base_lyr = self.model.layers[l_idx] if hasattr(self.model, "layers") else self.model.model.layers[l_idx]
-                if hasattr(base_lyr, "input_layernorm") and hasattr(base_lyr.input_layernorm, "weight"):
-                    nm.weight.data.copy_(base_lyr.input_layernorm.weight.data)
-            except Exception:
-                pass
         self.norms.eval()
         self.first_dev = next(self.model.parameters()).device
 
+    def snapshot_weights(self, adapter_path: Path) -> dict:
+        """Saves CPU fp16 copies of trunk modules modified by adapter."""
+        weights_path = adapter_path / "adapter_model.safetensors"
+        if not weights_path.exists():
+            weights_path = adapter_path / "adapter" / "adapter_model.safetensors"
+        if not weights_path.exists():
+            return {}
+        sd = load_file(str(weights_path))
+        state_dict = dict(self.model.named_modules())
+        backup = {}
+        for k in sd.keys():
+            if "lora_A" in k:
+                m_name = k.split(".lora_A")[0].replace("base_model.model.", "")
+                if m_name in state_dict and hasattr(state_dict[m_name], "weight"):
+                    backup[m_name] = state_dict[m_name].weight.detach().cpu().half().clone()
+        return backup
+
+    def restore_weights(self, backup: dict):
+        """Restores base trunk weights bit-for-bit without FP16 subtraction drift."""
+        state_dict = dict(self.model.named_modules())
+        with torch.no_grad():
+            for m_name, orig in backup.items():
+                if m_name in state_dict and hasattr(state_dict[m_name], "weight"):
+                    state_dict[m_name].weight.data.copy_(orig.to(state_dict[m_name].weight.device))
+
     def load_norm_weights(self, heads_sd: dict):
+        """Loads LayerNorm weights and biases from head state dict."""
         with torch.no_grad():
             for i, ln in enumerate(self.norms):
                 w_k = f'norms.{i}.weight'
@@ -261,3 +292,95 @@ class UniversalLoRATrunkLoader:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+def extract_deberta_checkpoint(
+    ckpt_dir: Path,
+    base_deb_dir: Optional[Path],
+    texts_test: List[str],
+    texts_train: List[str],
+    y_train: np.ndarray,
+    max_len: int = 512,
+    batch_size: int = 8
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], list]:
+    """
+    Dedicated feature extractor for DeBERTa-v3-large sequence classification checkpoints.
+    Probes drop_first_token and tokenization settings on train.csv to guarantee optimal accuracy.
+    """
+    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    tok_dir = str(base_deb_dir if base_deb_dir else ckpt_dir)
+    tok = AutoTokenizer.from_pretrained(tok_dir, use_fast=True)
+
+    head_p = ckpt_dir / "heads.safetensors"
+    if not head_p.exists():
+        head_p = ckpt_dir / "head.safetensors"
+    heads_sd = load_file(str(head_p))
+    W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+
+    meta_p = ckpt_dir / "meta.json"
+    ckpt_labels = LABELS
+    layers = [18, 20, 22, 24]
+    if meta_p.exists():
+        try:
+            m = json.load(open(meta_p))
+            if "labels" in m:
+                ckpt_labels = m["labels"]
+            if "layers" in m:
+                layers = m["layers"]
+        except Exception:
+            pass
+
+    model_src = str(ckpt_dir) if (ckpt_dir / "config.json").exists() else (str(base_deb_dir) if base_deb_dir else str(ckpt_dir))
+    model = AutoModel.from_pretrained(model_src, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(dev)
+    model.eval()
+
+    hidden_dim = model.config.hidden_size
+    norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in layers]).to(dev).float()
+    with torch.no_grad():
+        for i, ln in enumerate(norms):
+            w_k = f"norms.{i}.weight"
+            b_k = f"norms.{i}.bias"
+            if w_k in heads_sd:
+                ln.weight.copy_(heads_sd[w_k].to(dev, ln.weight.dtype))
+            if b_k in heads_sd:
+                ln.bias.copy_(heads_sd[b_k].to(dev, ln.bias.dtype))
+    norms.eval()
+
+    def pool_texts(txt_list: List[str], drop_first: bool = True) -> np.ndarray:
+        all_vecs = []
+        for s in range(0, len(txt_list), batch_size):
+            chunk = txt_list[s : s + batch_size]
+            enc = tok(chunk, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+            enc = {k: v.to(dev) for k, v in enc.items()}
+            with torch.no_grad():
+                hs = model(**enc, output_hidden_states=True).hidden_states
+                m = enc["attention_mask"].unsqueeze(-1).float()
+                if drop_first:
+                    m[:, 0, :] = 0.0
+                den = m.sum(dim=1).clamp(min=1.0)
+                pooled = [( (hs[l].float() * m).sum(dim=1) / den ) for l in layers]
+                out = torch.cat([norms[i](pooled[i]) for i in range(len(layers))], dim=-1)
+                all_vecs.append(out.cpu().numpy())
+        return np.vstack(all_vecs)
+
+    # Probe drop_first_token on train.csv[:180]
+    probe_n = min(180, len(texts_train))
+    best_drop = True
+    if probe_n > 0 and W_p is not None:
+        best_acc = -1.0
+        for cand_drop in [True, False]:
+            z_pr = pool_texts(texts_train[:probe_n], drop_first=cand_drop)
+            preds = align_cols(z_pr @ W_p.T + b_p, ckpt_labels).argmax(axis=1)
+            acc = float((preds == y_train[:probe_n]).mean())
+            if acc > best_acc:
+                best_acc = acc
+                best_drop = cand_drop
+        print(f"[DeBERTa Extractor] Probed drop_first={best_drop} (accuracy = {best_acc:.4f})")
+
+    Z_test = pool_texts(texts_test, drop_first=best_drop)
+    Z_train = pool_texts(texts_train, drop_first=best_drop) if len(texts_train) > 0 else np.zeros((0, len(layers) * hidden_dim), dtype=np.float32)
+
+    del model, norms
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return Z_test, Z_train, W_p, b_p, W_c, b_c, ckpt_labels

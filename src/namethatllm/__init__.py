@@ -14,7 +14,8 @@ from .neural_extractor import (
     merge_lora,
     in_place_copy,
     compute_centered_logits,
-    UniversalLoRATrunkLoader
+    UniversalLoRATrunkLoader,
+    extract_deberta_checkpoint
 )
 from .wpca_gaussian import (
     fit_shared_gaussian_lowram,
@@ -37,7 +38,7 @@ __all__ = [
     "LABELS", "K", "LAB2I", "FAMILIES", "align_cols", "log_softmax", "softmax",
     "run_lexical_engine",
     "forward_and_pool_batch", "resolve_head_tensors", "merge_lora", "in_place_copy",
-    "compute_centered_logits", "UniversalLoRATrunkLoader",
+    "compute_centered_logits", "UniversalLoRATrunkLoader", "extract_deberta_checkpoint",
     "fit_shared_gaussian_lowram", "transform_lowram", "ExactAuthorPosterior",
     "split_oversized_clusters_dist", "scores_exact_dp",
     "fit_joint_spectral_bank",

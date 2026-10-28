@@ -73,9 +73,9 @@ def shape_text(t: str) -> str:
     return re.sub(r"[^\W\d_]+", lambda m: "X" if m.group(0)[0].isupper() else "x", str(t))
 
 def function_text(t: str) -> str:
-    """Masks non-stopwords to CONTENT, preserving function syntax patterns."""
+    """Masks non-stopwords and non-punctuation to CONTENT, preserving function and punctuation syntax."""
     tokens = re.findall(r"(?u)\b\w+\b|[^\w\s]", str(t))
-    return " ".join([w.lower() if w.lower() in STOP_WORDS else "CONTENT" for w in tokens])
+    return " ".join([w.lower() if (w.lower() in STOP_WORDS or not w.isalnum()) else "CONTENT" for w in tokens])
 
 def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Path],
                        qwen_tok_dir: str, working_dir: Path) -> Dict[str, np.ndarray]:
@@ -142,6 +142,12 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
             v = TfidfVectorizer(analyzer="word", ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
             tr_m = v.fit_transform(fit_fn) * sc
             te_m = v.transform(test_fn) * sc
+        elif mode == "word":
+            v = TfidfVectorizer(analyzer="word", ngram_range=(mn, mx), max_features=mf,
+                                token_pattern=r"(?u)\b\w+\b|[^\w\s]", lowercase=False,
+                                sublinear_tf=True, dtype=np.float32)
+            tr_m = v.fit_transform(fit_texts) * sc
+            te_m = v.transform(test_texts) * sc
         else:
             v = TfidfVectorizer(analyzer=mode, ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
             tr_m = v.fit_transform(fit_texts) * sc
