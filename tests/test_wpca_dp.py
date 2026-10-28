@@ -90,6 +90,9 @@ class TestWPCAGaussian(unittest.TestCase):
         self.assertEqual(lp_group.shape, (4, K))
         row_sums = np.exp(lp_group).sum(axis=1)
         self.assertTrue(np.allclose(row_sums, 1.0, atol=1e-4))
+        # Differential assertion: distinct passages MUST have distinct marginal author posteriors
+        self.assertFalse(np.allclose(lp_group[0], lp_group[1]), "Mean collapse bug detected: rows must not be identical!")
+        self.assertFalse(np.allclose(lp_group[1], lp_group[2]), "Mean collapse bug detected: rows must not be identical!")
 
     def test_scores_exact_dp_guardrail(self):
         np.random.seed(42)

@@ -142,6 +142,14 @@ class TestCompilerAndIntegration(unittest.TestCase):
             finally:
                 os.environ.pop("NTL_SMOKE", None)
 
+    def test_neural_extractor_layernorm_specs(self):
+        import inspect
+        from namethatllm.neural_extractor import UniversalLoRATrunkLoader
+        src = inspect.getsource(UniversalLoRATrunkLoader.__init__)
+        self.assertIn("nn.LayerNorm", src, "Norms must be initialized with nn.LayerNorm to accept bias")
+        self.assertNotIn("nn.RMSNorm", src, "nn.RMSNorm lacks bias parameters present in heads.safetensors")
+        self.assertIn("nn.Identity", src, "Final trunk norm must be replaced with nn.Identity to prevent double norm")
+
 if __name__ == "__main__":
     unittest.main()
 

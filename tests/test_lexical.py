@@ -29,6 +29,14 @@ class TestLexicalEngine(unittest.TestCase):
         self.assertIn("the", tokens)
         self.assertIn("CONTENT", tokens)
 
+        # Strict check: punctuation marks must be preserved and NEVER masked to CONTENT
+        text_punct = "However, why was it done; exactly?"
+        ft_punct = function_text(text_punct)
+        tokens_punct = ft_punct.split()
+        self.assertIn(",", tokens_punct)
+        self.assertIn(";", tokens_punct)
+        self.assertIn("?", tokens_punct)
+
     def test_stopwords_integrity(self):
         self.assertGreater(len(STOP_WORDS), 50)
         self.assertIn("the", STOP_WORDS)
