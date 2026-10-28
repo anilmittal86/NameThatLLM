@@ -9,12 +9,12 @@ Automated Test -> Compile -> Kaggle Push CLI Runner
 import sys
 import subprocess
 from pathlib import Path
-from compile_notebook import compile_notebook
 
-def run_cmd(cmd: list):
-    print(f"[RUNNING] {' '.join(cmd)}")
-    res = subprocess.run(cmd, check=True)
-    return res
+scripts_dir = Path(__file__).resolve().parent
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+
+from compile_notebook import compile_notebook
 
 def main():
     root_dir = Path(__file__).resolve().parent.parent
@@ -35,4 +35,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
