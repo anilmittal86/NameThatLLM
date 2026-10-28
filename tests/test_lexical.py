@@ -71,11 +71,15 @@ class TestLexicalEngine(unittest.TestCase):
             self.assertIn("p_lex_comp", res)
             self.assertIn("D_tfidf", res)
             self.assertIn("groups_085", res)
+            self.assertIn("log_p_handwriting", res)
+            self.assertIn("rule_flags_test", res)
 
             self.assertEqual(res["log_p_svc_main"].shape, (18, 18))
             self.assertEqual(res["p_lex_comp"].shape, (18, 18))
             self.assertEqual(res["D_tfidf"].shape, (18, 18))
             self.assertEqual(len(res["groups_085"]), 18)
+            self.assertEqual(res["log_p_handwriting"].shape, (18, 18))
+            self.assertEqual(res["rule_flags_test"].shape, (18, 4))
 
             # Probability simplex
             self.assertTrue(np.allclose(res["p_lex_comp"].sum(axis=1), 1.0))
@@ -98,7 +102,7 @@ class TestLexicalEngine(unittest.TestCase):
         self.assertIn("it", vocab)
 
     def test_extract_handwriting_features_shape_and_contractions(self):
-        from namethatllm.lexical_engine import extract_handwriting_features
+        from namethatllm.lexical_engine import extract_handwriting_features, extract_handwriting_and_orthographic_features
 
         samples = [
             "It's a straight contraction — test with em-dash.",
@@ -111,6 +115,13 @@ class TestLexicalEngine(unittest.TestCase):
         self.assertEqual(feats[0, 15], 0.0)
         self.assertEqual(feats[1, 14], 0.0)
         self.assertGreater(feats[1, 15], 0.0)
+
+        f2, rules = extract_handwriting_and_orthographic_features(samples)
+        self.assertEqual(f2.shape, (2, 26))
+        self.assertEqual(rules.shape, (2, 4))
+        self.assertEqual(rules[0, 0], 0.0)  # No curly quotes in sample 0
+        self.assertEqual(rules[1, 0], 1.0)  # Curly apostrophe \u2019 triggers Rule 1
+        self.assertEqual(rules[1, 3], 1.0)  # Curly contraction triggers Rule 4
 
 if __name__ == "__main__":
     unittest.main()

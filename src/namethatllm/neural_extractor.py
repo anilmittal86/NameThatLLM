@@ -436,7 +436,7 @@ def extract_deberta_checkpoint(
                 if drop_first:
                     m[:, 0, :] = 0.0
                 den = m.sum(dim=1).clamp(min=1.0)
-                pooled = [((hs[l].float() * m).sum(dim=1) / den) for l in layers]
+                pooled = [((torch.nan_to_num(hs[l].float(), nan=0.0, posinf=1e4, neginf=-1e4) * m).sum(dim=1) / den) for l in layers]
                 out = torch.cat([norms[i](pooled[i]) for i in range(len(layers))], dim=-1)
                 all_vecs[idx] = out.cpu().numpy()
         return all_vecs

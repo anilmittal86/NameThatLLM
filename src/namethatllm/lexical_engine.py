@@ -20,7 +20,7 @@ from scipy import sparse
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.svm import LinearSVC
-from sklearn.linear_model import SGDClassifier
+from sklearn.linear_model import SGDClassifier, LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 
@@ -72,31 +72,51 @@ def function_text(t: str) -> str:
     tokens = re.findall(r"(?u)\b\w+\b|[^\w\s]", str(t))
     return " ".join([w.lower() if (w.lower() in STOP_WORDS or not w.isalnum()) else "CONTENT" for w in tokens])
 
+_RE_CODE_BLOCK = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
 _RE_STRAIGHT_CONTR = re.compile(r"[A-Za-z]'[A-Za-z]")
 _RE_CURLY_CONTR = re.compile(r"[A-Za-z]\u2019[A-Za-z]")
 
-def extract_handwriting_features(texts: List[str]) -> np.ndarray:
+def extract_handwriting_and_orthographic_features(texts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Extracts 26 continuous punctuation, orthographic, and structural density features:
-    - 14 per-word punctuation rates (colon, semicolon, em-dash, double-hyphen, curly/straight quotes, etc.)
-    - 2 explicit prose contraction ratios (straight ASCII apostrophe vs curly apostrophe inside words)
-    - 10 structural, casing, digit, sentence rhythm/burstiness, and type-token ratio features.
+    Single-pass extractor returning:
+    - feats: (N, 26) float32 continuous punctuation, contraction, and structural densities
+    - rules: (N, 4) float32 binary indicators for the 4 discrete orthographic invariants:
+        col 0: any curly quote (\u2018, \u2019, \u201c, \u201d)
+        col 1: >= 2 em-dashes (\u2014) in non-code prose
+        col 2: >= 2 straight contractions [A-Za-z]'[A-Za-z] in non-code prose AND 0 curly \u2019
+        col 3: >= 1 curly contraction [A-Za-z]\u2019[A-Za-z] in non-code prose
     """
-    feats = np.zeros((len(texts), 26), dtype=np.float32)
+    N = len(texts)
+    feats = np.zeros((N, 26), dtype=np.float32)
+    rules = np.zeros((N, 4), dtype=np.float32)
+
     for i, raw_t in enumerate(texts):
         t = str(raw_t)
+        prose = _RE_CODE_BLOCK.sub(" ", t)
         t_len = max(len(t), 1)
         words = t.split()
         n_words = max(len(words), 1)
 
-        # 14 Continuous Punctuation Frequencies per Word
+        raw_curly_sq = t.count("\u2018") + t.count("\u2019")
+        raw_curly_dq = t.count("\u201c") + t.count("\u201d")
+        prose_em_dash = prose.count("\u2014")
+        n_str_c = len(_RE_STRAIGHT_CONTR.findall(prose))
+        n_cur_c = len(_RE_CURLY_CONTR.findall(prose))
+
+        # 4 Discrete Structural Rule Flags
+        rules[i, 0] = 1.0 if (raw_curly_sq + raw_curly_dq) > 0 else 0.0
+        rules[i, 1] = 1.0 if prose_em_dash >= 2 else 0.0
+        rules[i, 2] = 1.0 if (n_str_c >= 2 and raw_curly_sq == 0) else 0.0
+        rules[i, 3] = 1.0 if n_cur_c >= 1 else 0.0
+
+        # 26 Continuous Density Features
         c_colon = t.count(":") / n_words
         c_semi = t.count(";") / n_words
         c_em_dash = t.count("\u2014") / n_words
         c_double_hyph = t.count("--") / n_words
-        c_curly_sq = (t.count("\u2018") + t.count("\u2019")) / n_words
+        c_curly_sq = raw_curly_sq / n_words
         c_straight_sq = t.count("'") / n_words
-        c_curly_dq = (t.count("\u201c") + t.count("\u201d")) / n_words
+        c_curly_dq = raw_curly_dq / n_words
         c_straight_dq = t.count('"') / n_words
         c_paren = (t.count("(") + t.count(")")) / n_words
         c_comma = t.count(",") / n_words
@@ -104,12 +124,9 @@ def extract_handwriting_features(texts: List[str]) -> np.ndarray:
         c_ques = t.count("?") / n_words
         c_ellipsis = (t.count("...") + t.count("\u2026")) / n_words
         c_hyphen = t.count("-") / n_words
+        n_straight_contr = n_str_c / n_words
+        n_curly_contr = n_cur_c / n_words
 
-        # Prose-specific Contraction Habits (separates gpt-5.6-sol curly contractions from straight)
-        n_straight_contr = len(_RE_STRAIGHT_CONTR.findall(t)) / n_words
-        n_curly_contr = len(_RE_CURLY_CONTR.findall(t)) / n_words
-
-        # Formatting, Casing, and Sentence Burstiness
         c_newline = t.count("\n") / n_words
         c_bullet = (t.count("\n- ") + t.count("\n* ")) / n_words
         c_upper = sum(1 for ch in t if ch.isupper()) / t_len
@@ -133,7 +150,47 @@ def extract_handwriting_features(texts: List[str]) -> np.ndarray:
             c_bullet, c_upper, c_digits, mean_w_len, std_w_len, mean_s_len,
             std_s_len, burstiness, ttr
         ]
+    return feats, rules
+
+def extract_handwriting_features(texts: List[str]) -> np.ndarray:
+    """Backward-compatible wrapper returning only the (N, 26) continuous matrix."""
+    feats, _ = extract_handwriting_and_orthographic_features(texts)
     return feats
+
+def fit_handwriting_model(
+    hw_tr: np.ndarray,
+    fit_y: np.ndarray,
+    hw_te: np.ndarray,
+    df_tr: pd.DataFrame,
+    groups_085: np.ndarray,
+    twin_rows_085: np.ndarray,
+    len_tr_raw: int
+) -> np.ndarray:
+    """
+    Fits dedicated LogisticRegression plain (C=0.25) and prompt-centered (C=0.15)
+    classifiers strictly on the 26 continuous handwriting features.
+    Returns log_p_handwriting (N_test, 18).
+    """
+    clf_hw_plain = LogisticRegression(C=0.25, max_iter=1000, random_state=42, class_weight="balanced")
+    clf_hw_plain.fit(hw_tr, fit_y)
+    lp_hw = log_softmax(clf_hw_plain.decision_function(hw_te))
+
+    if twin_rows_085.any() and len_tr_raw >= 18:
+        hw_tr_c = hw_tr[:len_tr_raw].copy()
+        for p in np.unique(df_tr["prompt_id"].values):
+            m_p = (df_tr["prompt_id"].values == p)
+            hw_tr_c[m_p] -= hw_tr_c[m_p].mean(axis=0, keepdims=True)
+        clf_hw_twin = LogisticRegression(C=0.15, max_iter=1000, random_state=42, class_weight="balanced")
+        clf_hw_twin.fit(hw_tr_c, fit_y[:len_tr_raw])
+
+        hw_te_c = hw_te.copy()
+        for g in np.unique(groups_085[twin_rows_085]):
+            m_g = (groups_085 == g)
+            hw_te_c[m_g] -= hw_te_c[m_g].mean(axis=0, keepdims=True)
+        lp_hw_twin = log_softmax(clf_hw_twin.decision_function(hw_te_c[twin_rows_085]))
+        lp_hw[twin_rows_085] = log_softmax(0.70 * lp_hw[twin_rows_085] + 0.30 * lp_hw_twin)
+
+    return lp_hw
 
 def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Path],
                        qwen_tok_dir: str, working_dir: Path) -> Dict[str, np.ndarray]:
@@ -228,14 +285,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     log_p_svc_main = log_softmax(logits_svc_main)
 
     # OUTPUT 2: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
-    # Continuous Handwriting & Punctuation Density Features
-    hw_tr_raw = extract_handwriting_features(fit_texts)
-    hw_te_raw = extract_handwriting_features(test_texts)
+    # Continuous Handwriting & Punctuation Density Features + Dedicated Classifier
+    hw_tr_raw, _ = extract_handwriting_and_orthographic_features(fit_texts)
+    hw_te_raw, rule_flags_te = extract_handwriting_and_orthographic_features(test_texts)
     scaler = StandardScaler()
     hw_tr = np.clip(scaler.fit_transform(hw_tr_raw), -5.0, 5.0).astype(np.float32)
     hw_te = np.clip(scaler.transform(hw_te_raw), -5.0, 5.0).astype(np.float32)
-    sp_hw_tr = sparse.csr_matrix(hw_tr * 0.15)
-    sp_hw_te = sparse.csr_matrix(hw_te * 0.15)
+
+    lp_hw = fit_handwriting_model(hw_tr, fit_y, hw_te, df_tr, groups_085, twin_rows_085, len_tr_raw)
 
     tok = None
     if qwen_tok_dir and os.path.exists(qwen_tok_dir):
@@ -268,14 +325,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         te_bpe = v_bpe.transform(test_bpe_strs) * 0.8
         del fit_bpe_strs, test_bpe_strs, v_bpe
         gc.collect()
-        X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe, sp_hw_tr], format="csr")
-        X_te_5v = sparse.hstack([X_te_4v, te_bpe, sp_hw_te], format="csr")
+        X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe], format="csr")
+        X_te_5v = sparse.hstack([X_te_4v, te_bpe], format="csr")
     else:
         v_cw = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=75000, sublinear_tf=True, dtype=np.float32)
         tr_cw = v_cw.fit_transform(fit_texts) * 0.8
         te_cw = v_cw.transform(test_texts) * 0.8
-        X_tr_5v = sparse.hstack([X_tr_4v, tr_cw, sp_hw_tr], format="csr")
-        X_te_5v = sparse.hstack([X_te_4v, te_cw, sp_hw_te], format="csr")
+        X_tr_5v = sparse.hstack([X_tr_4v, tr_cw], format="csr")
+        X_te_5v = sparse.hstack([X_te_4v, te_cw], format="csr")
 
     svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3)
     svc_comp.fit(X_tr_5v, fit_y)
@@ -343,12 +400,16 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     np.save(working_dir / 'p_lex_comp.npy', P_lex_comp_final)
     np.save(working_dir / 'D_tfidf.npy', D)
     np.save(working_dir / 'groups_085.npy', groups_085)
+    np.save(working_dir / 'log_p_handwriting.npy', lp_hw)
+    np.save(working_dir / 'rule_flags_test.npy', rule_flags_te)
 
     return {
         "log_p_svc_main": log_p_svc_main,
         "p_lex_comp": P_lex_comp_final,
         "D_tfidf": D,
-        "groups_085": groups_085
+        "groups_085": groups_085,
+        "log_p_handwriting": lp_hw,
+        "rule_flags_test": rule_flags_te
     }
 
 if __name__ == "__main__":

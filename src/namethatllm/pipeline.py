@@ -47,6 +47,7 @@ from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
 from .postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
+    apply_unified_handwriting_shield,
     apply_curly_quote_shield,
     sinkhorn_balancing,
     generate_submission
@@ -101,6 +102,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         p_lex_comp = np.load(working_dir / "p_lex_comp.npy")
         D_tfidf = np.load(working_dir / "D_tfidf.npy")
         groups_085 = np.load(working_dir / "groups_085.npy")
+        log_p_handwriting = np.load(working_dir / "log_p_handwriting.npy") if (working_dir / "log_p_handwriting.npy").exists() else None
+        rule_flags_test = np.load(working_dir / "rule_flags_test.npy") if (working_dir / "rule_flags_test.npy").exists() else None
     else:
         print("[Pipeline] Module 1: Executing run_lexical_engine directly...")
         tok_paths = list(input_dir.rglob("vocab.json"))
@@ -110,6 +113,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         p_lex_comp = lex_out["p_lex_comp"]
         D_tfidf = lex_out["D_tfidf"]
         groups_085 = lex_out["groups_085"]
+        log_p_handwriting = lex_out.get("log_p_handwriting")
+        rule_flags_test = lex_out.get("rule_flags_test")
 
     print(f"[Pipeline] Module 1 complete: log_p_svc_main shape = {log_p_svc_main.shape}")
 
@@ -217,6 +222,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 p2_dir = ckpts["qwen3_14b_p2"]
                 meta_p2 = read_checkpoint_meta(p2_dir, default_keep=27, default_layers=[2, 4, 6, 9, 13, 17, 22, 27], default_max_len=447)
                 trunk1.set_active_layers(meta_p2["layers"], meta_p2["max_len"])
+                backup_t1 = trunk1.snapshot_weights(p2_dir)
                 merge_lora(trunk1.model, p2_dir, sign=+1.0)
                 heads_sd = load_file(str(p2_dir / "heads.safetensors")) if (p2_dir / "heads.safetensors").exists() else {}
                 trunk1.load_norm_weights(heads_sd)
@@ -255,8 +261,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
 
-                merge_lora(trunk1.model, p2_dir, sign=-1.0)
-                del Z_all, Z_tr, Z_te, heads_sd, res_p2, U_te
+                trunk1.restore_weights(backup_t1)
+                del backup_t1, Z_all, Z_tr, Z_te, heads_sd, res_p2, U_te
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -373,6 +379,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 instyle_dir = ckpts["instyle"]
                 meta_ins = read_checkpoint_meta(instyle_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
                 trunk3.set_active_layers(meta_ins["layers"], meta_ins["max_len"])
+                backup_t3 = trunk3.snapshot_weights(instyle_dir)
                 merge_lora(trunk3.model, instyle_dir, sign=+1.0)
                 heads_sd = load_file(str(instyle_dir / "heads.safetensors")) if (instyle_dir / "heads.safetensors").exists() else {}
                 trunk3.load_norm_weights(heads_sd)
@@ -404,8 +411,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
 
-                merge_lora(trunk3.model, instyle_dir, sign=-1.0)
-                del Z_all, Z_tr, Z_te, heads_sd, res_ins, U_te
+                trunk3.restore_weights(backup_t3)
+                del backup_t3, Z_all, Z_tr, Z_te, heads_sd, res_ins, U_te
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -482,7 +489,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 res_cl = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_claude", 0.35))
                 U_te = transform_lowram(Z_te, res_cl)
                 lp_dp = scores_exact_dp(U_te, groups_065, res_cl, D_hybrid)
-                dp_posteriors.append((dp_weights.get("part1_14b", 0.08), softmax(lp_dp, axis=1)))
+                dp_posteriors.append((dp_weights.get("claude_8b", 0.04), softmax(lp_dp, axis=1)))
 
                 S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_cl, prior_scales.get("qwen3_8b_claude", 0.30))
                 spectral_blocks_tr.append(S_tr)
@@ -606,10 +613,25 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         gate_weight=gate_weight
     )
 
-    # Curly Quote Shield (gentle -1.0 penalty in log-space = exp(-1.0) probability multiplier)
+    # Unified Handwriting & Orthographic Shield (discrete Bayesian rules + continuous handwriting density)
     default_curly_multiplier = float(np.exp(-1.0))
     multiplier = post_cfg.get("curly_quote_multiplier", default_curly_multiplier)
-    P_mix = apply_curly_quote_shield(P_mix, test_texts, multiplier=multiplier)
+    multi_em_dash_log_pen = post_cfg.get("multi_em_dash_log_penalty", -0.45)
+    straight_contr_log_pen = post_cfg.get("straight_contr_log_penalty", -0.60)
+    curly_contr_log_pen = post_cfg.get("curly_contr_log_penalty", -0.40)
+    continuous_hw_weight = post_cfg.get("continuous_hw_weight", 0.04)
+
+    P_mix = apply_unified_handwriting_shield(
+        P_mix=P_mix,
+        test_texts=test_texts,
+        log_p_handwriting=log_p_handwriting,
+        rule_flags=rule_flags_test,
+        curly_quote_multiplier=multiplier,
+        multi_em_dash_log_penalty=multi_em_dash_log_pen,
+        straight_contr_log_penalty=straight_contr_log_pen,
+        curly_contr_log_penalty=curly_contr_log_pen,
+        continuous_hw_weight=continuous_hw_weight,
+    )
 
     # 300-Step Sinkhorn Mass Balancing
     sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 300)

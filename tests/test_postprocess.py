@@ -12,11 +12,13 @@ import tempfile
 from namethatllm.postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
+    apply_unified_handwriting_shield,
+    build_orthographic_penalty_matrix,
     apply_curly_quote_shield,
     sinkhorn_balancing,
     generate_submission
 )
-from namethatllm.config import LABELS, K, FAMILIES, softmax
+from namethatllm.config import LABELS, K, LAB2I, FAMILIES, softmax
 
 class TestPostprocess(unittest.TestCase):
     def test_two_tier_blend_simplex(self):
@@ -77,6 +79,56 @@ class TestPostprocess(unittest.TestCase):
         self.assertLess(P_shielded[1, claude_and_glm_idx[0]], P_shielded[1, 0])
         self.assertLess(P_shielded[2, claude_and_glm_idx[0]], P_shielded[2, 0])
         self.assertTrue(np.allclose(P_shielded.sum(axis=1), 1.0))
+
+    def test_unified_handwriting_shield_all_rules(self):
+        claude_and_glm_idx = FAMILIES["claude"] + FAMILIES["glm"]
+        gemini_idx = FAMILIES["gemini"]
+        sol_idx = LAB2I["gpt-5.6-sol"]
+
+        test_texts = [
+            "Text with \u201ccurly\u201d quotes.",
+            "First \u2014 second \u2014 third.",
+            "First \u2014 second.",
+            "It's clear that don't works.",
+            "```python\nx = 'hello'\ny = 'world'\n```",
+        ]
+        N = len(test_texts)
+        P_mix = np.ones((N, 18)) / 18.0
+
+        # Run with default discrete penalties
+        P_out = apply_unified_handwriting_shield(
+            P_mix,
+            test_texts,
+            log_p_handwriting=None,
+            rule_flags=None,
+            continuous_hw_weight=0.0
+        )
+        self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0))
+
+        # Check 1: Row 0 has curly quotes -> Claude and GLM dampened
+        self.assertLess(P_out[0, claude_and_glm_idx[0]], P_out[0, 0])
+
+        # Check 2: Row 1 has >= 2 prose em-dashes -> Gemini penalized
+        self.assertLess(P_out[1, gemini_idx[0]], P_out[1, 0])
+        # Row 2 has only 1 em-dash -> Gemini NOT penalized (uniform with class 0)
+        self.assertAlmostEqual(P_out[2, gemini_idx[0]], P_out[2, 0])
+
+        # Check 3: Row 3 has >= 2 straight contractions in prose -> gpt-5.6-sol penalized
+        self.assertLess(P_out[3, sol_idx], P_out[3, 0])
+        # Row 4 straight quotes are inside code block -> gpt-5.6-sol NOT penalized
+        self.assertAlmostEqual(P_out[4, sol_idx], P_out[4, 0])
+
+        # Check 4: Continuous log_p_handwriting integration and simplex preservation
+        np.random.seed(42)
+        mock_lp_hw = np.random.randn(N, 18)
+        P_out_cont = apply_unified_handwriting_shield(
+            P_mix,
+            test_texts,
+            log_p_handwriting=mock_lp_hw,
+            continuous_hw_weight=0.04
+        )
+        self.assertTrue(np.allclose(P_out_cont.sum(axis=1), 1.0))
+        self.assertFalse(np.allclose(P_out, P_out_cont))
 
     def test_sinkhorn_exact_mass_equalization(self):
         np.random.seed(42)

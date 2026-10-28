@@ -10,6 +10,8 @@ from .config import LABELS, K, LAB2I, FAMILIES, align_cols, log_softmax, softmax
 from .lexical_engine import (
     run_lexical_engine,
     extract_handwriting_features,
+    extract_handwriting_and_orthographic_features,
+    fit_handwriting_model,
     shape_text,
     function_text,
     FUNCTION_WORDS,
@@ -36,22 +38,26 @@ from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
 from .postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
+    build_orthographic_penalty_matrix,
+    apply_unified_handwriting_shield,
     apply_curly_quote_shield,
-    sinkhorn_balancing
+    sinkhorn_balancing,
+    generate_submission
 )
 from .pipeline import run_submission_pipeline
 
 __all__ = [
     "__version__",
     "LABELS", "K", "LAB2I", "FAMILIES", "align_cols", "log_softmax", "softmax",
-    "run_lexical_engine", "extract_handwriting_features", "shape_text", "function_text",
-    "FUNCTION_WORDS", "STOP_WORDS",
+    "run_lexical_engine", "extract_handwriting_features", "extract_handwriting_and_orthographic_features",
+    "fit_handwriting_model", "shape_text", "function_text", "FUNCTION_WORDS", "STOP_WORDS",
     "forward_and_pool_batch", "resolve_head_tensors", "merge_lora", "in_place_copy",
     "compute_centered_logits", "UniversalLoRATrunkLoader", "read_checkpoint_meta", "extract_deberta_checkpoint",
     "fit_shared_gaussian_lowram", "transform_lowram", "ExactAuthorPosterior",
     "split_oversized_clusters_dist", "scores_exact_dp",
     "fit_joint_spectral_bank", "make_spectral_blocks",
     "blend_main_and_complementary", "apply_claude_specialist_gate",
-    "apply_curly_quote_shield", "sinkhorn_balancing",
+    "build_orthographic_penalty_matrix", "apply_unified_handwriting_shield",
+    "apply_curly_quote_shield", "sinkhorn_balancing", "generate_submission",
     "run_submission_pipeline"
 ]
