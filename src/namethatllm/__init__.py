@@ -30,6 +30,7 @@ from .postprocess import (
     apply_curly_quote_shield,
     sinkhorn_balancing
 )
+from .pipeline import run_submission_pipeline
 
 __all__ = [
     "__version__",
@@ -41,5 +42,6 @@ __all__ = [
     "split_oversized_clusters_dist", "scores_exact_dp",
     "fit_joint_spectral_bank",
     "blend_main_and_complementary", "apply_claude_specialist_gate",
-    "apply_curly_quote_shield", "sinkhorn_balancing"
+    "apply_curly_quote_shield", "sinkhorn_balancing",
+    "run_submission_pipeline"
 ]

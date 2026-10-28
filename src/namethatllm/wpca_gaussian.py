@@ -216,3 +216,4 @@ def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: n
         else:
             lp_dp[idx_g] = solver.group(U_test[idx_g], temperature=Tg)
     return lp_dp
+

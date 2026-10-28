@@ -36,31 +36,37 @@ def apply_claude_specialist_gate(
     P_mix: np.ndarray,
     R_main: np.ndarray,
     claude_spec_logits: Optional[np.ndarray],
-    claude_classes: Optional[list],
-    weight: float = 0.15
+    claude_classes: Optional[list] = None,
+    labels: list = LABELS,
+    claude_cols: list = FAMILIES["claude"],
+    gate_weight: float = 0.15,
+    weight: Optional[float] = None,
 ) -> np.ndarray:
     """
     Refines passages predicted in Claude family using specialist head logits.
     Mass-preserving within the Claude family (preserves exact marginal family mass).
+    Vectorized NumPy implementation.
     """
     if claude_spec_logits is None:
         return P_mix
+    if weight is not None:
+        gate_weight = weight
 
-    claude_cols = FAMILIES["claude"]
+    P_out = P_mix.copy()
     P_claude_head = softmax(claude_spec_logits, axis=-1)
     if claude_classes is not None:
-        src_c = [x.decode('utf-8') if isinstance(x, (bytes, np.bytes_)) else str(x) for x in claude_classes]
-        c_idx = [src_c.index(LABELS[c]) for c in claude_cols]
+        src_c = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in claude_classes]
+        c_idx = [src_c.index(labels[c]) for c in claude_cols]
         P_claude_head = P_claude_head[:, c_idx]
 
-    pred_main = R_main.argmax(axis=1)
-    claude_mask = np.isin(pred_main, claude_cols)
+    claude_mask = np.isin(R_main.argmax(axis=1), claude_cols)
     if claude_mask.any():
-        for i in np.where(claude_mask)[0]:
-            tot_mass = P_mix[i, claude_cols].sum()
-            blended = (1.0 - weight) * P_mix[i, claude_cols] + weight * (tot_mass * P_claude_head[i])
-            P_mix[i, claude_cols] = blended
-    return P_mix
+        rows = np.flatnonzero(claude_mask)
+        sub_mix = P_out[np.ix_(rows, claude_cols)]
+        tot_mass = sub_mix.sum(axis=1, keepdims=True)
+        blended = (1.0 - gate_weight) * sub_mix + gate_weight * (tot_mass * P_claude_head[rows])
+        P_out[np.ix_(rows, claude_cols)] = blended
+    return P_out
 
 def apply_curly_quote_shield(
     P_mix: np.ndarray,

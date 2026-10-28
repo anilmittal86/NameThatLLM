@@ -23,7 +23,32 @@ from sklearn.svm import LinearSVC
 from sklearn.linear_model import SGDClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from .config import LABELS, K, LAB2I, FAMILIES, log_softmax, softmax
+LABELS = [
+    "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
+    "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
+    "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+    "qwen3.8-max", "glm-5.3", "glm-5.3-flash", "kimi-k3"
+]
+K = len(LABELS)
+LAB2I = {l: i for i, l in enumerate(LABELS)}
+
+FAMILIES = {
+    "gpt": [0, 1, 2, 3, 4],
+    "gemini": [5, 6, 7, 8],
+    "claude": [9, 10, 11, 12, 13],
+    "glm": [15, 16],
+}
+
+def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable softmax."""
+    c = np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x - c)
+    return e / (np.sum(e, axis=axis, keepdims=True) + 1e-15)
+
+def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable log-softmax."""
+    c = np.max(x, axis=axis, keepdims=True)
+    return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
 
 STOP_WORDS = set([
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't",
@@ -84,7 +109,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     sz_085 = np.bincount(groups_085)[groups_085]
     twin_rows_085 = (sz_085 >= 2) & (sz_085 <= 18)
 
-    # 2. Load 100% of pool_v4.parquet
+    # 2. Load pool_v4.parquet if present
     if pool_file and os.path.exists(pool_file):
         df_pool = pd.read_parquet(pool_file, columns=['text', 'model'])
         df_pool = df_pool[df_pool['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
@@ -98,105 +123,82 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         ("char", 3, 5, 250000, 1.0),
         ("word", 1, 3, 180000, 0.7),
         ("shape", 2, 6, 60000, 0.5),
-        ("function", 1, 3, 50000, 0.5)
+        ("function", 1, 3, 40000, 0.5),
     ]
 
-    A_blocks_4v, B_blocks_4v = [], []
-    for view, lo, hi, max_feat, weight in VIEWS_4V:
-        prep = shape_text if view == "shape" else function_text if view == "function" else None
-        analyzer = "char" if view in ("char", "shape") else "word"
-        opts = dict(
-            analyzer=analyzer, ngram_range=(lo, hi), lowercase=False,
-            sublinear_tf=True, min_df=2, max_features=max_feat, dtype=np.float32
-        )
-        if analyzer == "word":
-            opts["token_pattern"] = r"(?u)\b\w+\b|[^\w\s]"
-        vec = TfidfVectorizer(**opts)
-        tr_iter = (prep(t) for t in fit_texts) if prep is not None else fit_texts
-        te_iter = (prep(t) for t in test_texts) if prep is not None else test_texts
-        X_tr_v = vec.fit_transform(tr_iter)
-        X_te_v = vec.transform(te_iter)
-        X_tr_v.data *= np.float32(weight)
-        X_te_v.data *= np.float32(weight)
-        A_blocks_4v.append(X_tr_v)
-        B_blocks_4v.append(X_te_v)
-        del vec, X_tr_v, X_te_v
-        gc.collect()
+    fit_sh = [shape_text(t) for t in fit_texts]
+    test_sh = [shape_text(t) for t in test_texts]
+    fit_fn = [function_text(t) for t in fit_texts]
+    test_fn = [function_text(t) for t in test_texts]
 
-    X_tr_4v = sparse.hstack(A_blocks_4v, format="csr", dtype=np.float32)
-    X_te_4v = sparse.hstack(B_blocks_4v, format="csr", dtype=np.float32)
+    tr_mats_4v = []
+    te_mats_4v = []
+    for mode, mn, mx, mf, sc in VIEWS_4V:
+        if mode == "shape":
+            v = TfidfVectorizer(analyzer="char", ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
+            tr_m = v.fit_transform(fit_sh) * sc
+            te_m = v.transform(test_sh) * sc
+        elif mode == "function":
+            v = TfidfVectorizer(analyzer="word", ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
+            tr_m = v.fit_transform(fit_fn) * sc
+            te_m = v.transform(test_fn) * sc
+        else:
+            v = TfidfVectorizer(analyzer=mode, ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
+            tr_m = v.fit_transform(fit_texts) * sc
+            te_m = v.transform(test_texts) * sc
+        tr_mats_4v.append(tr_m)
+        te_mats_4v.append(te_m)
 
-    # OUTPUT 1: Pure 4-View LinearSVC with uniform 1.0 sample weights
-    sample_weights_uniform = np.ones(len(fit_y), dtype=np.float32)
-    svc_main = LinearSVC(C=0.5, random_state=42, max_iter=3500, tol=1e-3, class_weight="balanced")
-    svc_main.fit(X_tr_4v, fit_y, sample_weight=sample_weights_uniform)
-    log_p_svc_main = log_softmax(svc_main.decision_function(X_te_4v), axis=1)
-    del svc_main
-    gc.collect()
+    X_tr_4v = sparse.hstack(tr_mats_4v, format="csr")
+    X_te_4v = sparse.hstack(te_mats_4v, format="csr")
 
-    # 4. View 5: Native BPE Subword Token-ID N-Grams
-    bpe_loaded = False
+    # OUTPUT 1: Pure 4-View LinearSVC (C=0.5, uniform 1.0 sample weights)
+    svc_main = LinearSVC(C=0.5, random_state=42, max_iter=3000, tol=1e-3)
+    svc_main.fit(X_tr_4v, fit_y)
+    logits_svc_main = svc_main.decision_function(X_te_4v)
+    log_p_svc_main = log_softmax(logits_svc_main)
+
+    # OUTPUT 2: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
+    tok = None
     if qwen_tok_dir and os.path.exists(qwen_tok_dir):
         try:
             from transformers import AutoTokenizer
             tok = AutoTokenizer.from_pretrained(qwen_tok_dir, use_fast=True)
-            def to_bpe_strings(texts, batch_size=2048):
-                res = []
-                for i in range(0, len(texts), batch_size):
-                    batch = texts[i : i + batch_size]
-                    enc = tok(batch, add_special_tokens=False, truncation=True, max_length=450)["input_ids"]
-                    for row in enc:
-                        res.append(" ".join(map(str, row)))
-                return res
-            bpe_tr = to_bpe_strings(fit_texts)
-            bpe_te = to_bpe_strings(test_texts)
-            bpe_loaded = True
-            del tok
-            gc.collect()
         except Exception:
-            pass
+            tok = None
 
-    if not bpe_loaded:
-        def hash_bpe_fallback(texts):
-            return [" ".join("w" + str(hash(w) % 65536) for w in re.findall(r'\b\w+\b', t.lower())) for t in texts]
-        bpe_tr = hash_bpe_fallback(fit_texts)
-        bpe_te = hash_bpe_fallback(test_texts)
+    if tok is not None:
+        def bpe_tokenize(txt: str) -> List[str]:
+            return [str(tok_id) for tok_id in tok.encode(str(txt), truncation=True, max_length=512)]
+        v_bpe = TfidfVectorizer(tokenizer=bpe_tokenize, lowercase=False, token_pattern=None,
+                                ngram_range=(1, 3), max_features=75000, sublinear_tf=True, dtype=np.float32)
+        tr_bpe = v_bpe.fit_transform(fit_texts) * 0.8
+        te_bpe = v_bpe.transform(test_texts) * 0.8
+        X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe], format="csr")
+        X_te_5v = sparse.hstack([X_te_4v, te_bpe], format="csr")
+    else:
+        v_cw = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=75000, sublinear_tf=True, dtype=np.float32)
+        tr_cw = v_cw.fit_transform(fit_texts) * 0.8
+        te_cw = v_cw.transform(test_texts) * 0.8
+        X_tr_5v = sparse.hstack([X_tr_4v, tr_cw], format="csr")
+        X_te_5v = sparse.hstack([X_te_4v, te_cw], format="csr")
 
-    bpe_vec = TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 3), lowercase=False, sublinear_tf=True, min_df=5, max_features=80000, dtype=np.float32)
-    X_tr_bpe = bpe_vec.fit_transform(bpe_tr)
-    X_te_bpe = bpe_vec.transform(bpe_te)
-    X_tr_bpe.data *= np.float32(0.65)
-    X_te_bpe.data *= np.float32(0.65)
-    del bpe_vec, bpe_tr, bpe_te
-    gc.collect()
-
-    X_tr_5v = sparse.hstack([X_tr_4v, X_tr_bpe], format="csr", dtype=np.float32)
-    X_te_5v = sparse.hstack([X_te_4v, X_te_bpe], format="csr", dtype=np.float32)
-    del X_tr_4v, X_te_4v, X_tr_bpe, X_te_bpe, A_blocks_4v, B_blocks_4v
-    gc.collect()
-
-    # OUTPUT 2: Complementary Lexical Ensemble (LinearSVC + SGDClassifier + Style Twin + Specialists)
-    svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=2500, tol=1e-3, class_weight="balanced")
-    svc_comp.fit(X_tr_5v, fit_y, sample_weight=sample_weights_uniform)
+    svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3)
+    svc_comp.fit(X_tr_5v, fit_y)
     P_svc_comp = softmax(svc_comp.decision_function(X_te_5v), axis=1)
-    del svc_comp
-    gc.collect()
 
-    sgd_comp = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=1000, tol=1e-3, random_state=42, class_weight="balanced")
-    sgd_comp.fit(X_tr_5v, fit_y, sample_weight=sample_weights_uniform)
-    P_sgd_comp = softmax(sgd_comp.decision_function(X_te_5v), axis=1)
-    del sgd_comp
-    gc.collect()
+    sgd_comp = SGDClassifier(loss='log_loss', alpha=1e-4, max_iter=1500, random_state=42)
+    sgd_comp.fit(X_tr_5v, fit_y)
+    P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
 
-    # Prompt-Centered Style Twin on train.csv
-    P_twin_comp = np.copy(P_svc_comp)
-    if twin_rows_085.any():
+    # Style Twin on groups_085
+    P_twin_comp = P_svc_comp.copy()
+    if twin_rows_085.any() and len_tr_raw >= 18:
         X_train_only = X_tr_5v[:len_tr_raw]
-        pu, pinv = np.unique(df_tr['prompt_id'].values, return_inverse=True)
-        n_p = len(pu)
-        counts = np.bincount(pinv)
-        vals = (1.0 / counts[pinv]).astype(np.float32)
-        G = sparse.csr_matrix((vals, (np.arange(len_tr_raw), pinv)), shape=(len_tr_raw, n_p), dtype=np.float32)
+        u_tr, inv_tr = np.unique(df_tr['prompt_id'].values, return_inverse=True)
+        counts_tr = np.bincount(inv_tr)
+        vals_tr = (1.0 / counts_tr[inv_tr]).astype(np.float32)
+        G = sparse.csr_matrix((vals_tr, (np.arange(len(inv_tr)), inv_tr)), shape=(len(inv_tr), len(u_tr)), dtype=np.float32)
         X_train_c = X_train_only - G @ (G.T @ X_train_only)
 
         svc_twin = LinearSVC(C=0.30, random_state=42, max_iter=2500)
@@ -254,3 +256,41 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         "D_tfidf": D,
         "groups_085": groups_085
     }
+
+if __name__ == "__main__":
+    working_dir = Path("/kaggle/working")
+    if not working_dir.exists():
+        working_dir = Path("local_data")
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    input_dir = Path("/kaggle/input")
+    if not input_dir.exists():
+        input_dir = Path(".")
+
+    candidates = [
+        input_dir / 'competitions' / 'name-that-llm',
+        input_dir / 'name-that-llm',
+        Path('local_data'),
+        Path('.')
+    ]
+    train_path = None
+    test_path = None
+    for c in candidates:
+        if (c / 'train.csv').exists() and train_path is None:
+            train_path = c / 'train.csv'
+        if (c / 'test.csv').exists() and test_path is None:
+            test_path = c / 'test.csv'
+    if train_path is None:
+        train_path = Path('local_data') / 'train.csv'
+    if test_path is None:
+        test_path = Path('local_data') / 'test.csv'
+
+    pool_paths = list(input_dir.rglob('pool_v4.parquet'))
+    pool_file = pool_paths[0] if pool_paths else None
+
+    tok_paths = list(input_dir.rglob("vocab.json"))
+    qwen_tok_dir = str(tok_paths[0].parent) if tok_paths else ""
+
+    print(f"[Module 1 CLI] Running lexical engine: train={train_path}, test={test_path}")
+    run_lexical_engine(train_path, test_path, pool_file, qwen_tok_dir, working_dir)
+    print("[Module 1 CLI] Lexical engine finished successfully.")

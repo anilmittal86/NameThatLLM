@@ -67,14 +67,24 @@ def resolve_dataset_paths(input_dir: Optional[Path] = None) -> Tuple[Path, Path,
         if not input_dir.exists():
             input_dir = Path('.')
 
-    dataset_dir = input_dir / 'competitions' / 'name-that-llm'
-    if not dataset_dir.exists():
-        dataset_dir = input_dir / 'name-that-llm'
-    if not dataset_dir.exists():
-        dataset_dir = Path('.')
+    candidates = [
+        input_dir / 'competitions' / 'name-that-llm',
+        input_dir / 'name-that-llm',
+        Path('local_data'),
+        Path('.')
+    ]
+    train_path = None
+    test_path = None
+    for c in candidates:
+        if (c / 'train.csv').exists() and train_path is None:
+            train_path = c / 'train.csv'
+        if (c / 'test.csv').exists() and test_path is None:
+            test_path = c / 'test.csv'
 
-    train_path = dataset_dir / 'train.csv'
-    test_path = dataset_dir / 'test.csv'
+    if train_path is None:
+        train_path = Path('local_data') / 'train.csv'
+    if test_path is None:
+        test_path = Path('local_data') / 'test.csv'
 
     pool_paths = list(input_dir.rglob('pool_v4.parquet'))
     pool_file = pool_paths[0] if pool_paths else None
