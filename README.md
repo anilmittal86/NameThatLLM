@@ -1,6 +1,6 @@
 # Name That LLM: High-Precision Authorship Attribution Pipeline
 
-[![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.604%20%7C%200.602-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
+[![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.612%20(SOTA)-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
 [![Architecture Version](https://img.shields.io/badge/Production%20Version-Version%2040%20(Full--Rank%20wPCA%20%2B%20Spectral%20Bank)-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
@@ -26,7 +26,7 @@ This repository contains the end-to-end, competition-grade machine learning solu
 | **V29** | Pure Log-Space + TTCA + Logit `/ 1.85` + Double DP | **0.996 (99.6%)** | 0.612 (61.2%) | **0.549** | Severe Regression: TTCA confirmation bias collapsed sister-class centroids; logit divisor flattened predictions. |
 | **V30 / v36** | Restored 88/12 Mixture + Crash-Proof Cluster Splitting + Pre-Sinkhorn Shield + In-Style LoRA | **0.996 (99.6%)** | **0.658 (65.8%)** | **0.604** | Complete Recovery: +0.055 lift over V29; 0 exceptions on hidden test set; 7 checkpoints verified ($\text{BAcc} \ge 0.67$). |
 | **V37** | Eliminate 180-Row Bug + 78k BPE & Within-Family Refined Core + Universal Trunk Loader + LOO-CLC + 300-Step Sinkhorn | **0.997 (99.7%)** | **0.672 (67.2%)** | **0.602** | Complete: Zero 180-row wPCA dilution, pure test neural extraction, `keep_layers` truncation on 14B models, 5-view BPE lexical engine, within-family specialists, leave-one-out logit contrast, exact 300-step multiplicative Sinkhorn. |
-| **V40 (Current)** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank (OOF=0.9142)** | **0.998 (99.8%)** | **0.914 (91.4%)** | **Evaluating (Ref 57707605)** | **Current Benchmark Architecture**: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores true full-rank wPCA on 90 balanced prompts ($N=1,620 \gg d=256$), achieves 91.42% 5-fold OOF BAcc on 384-dim Joint Spectral Bank, pools centered twin logits at 3 resolutions ($t=0.85, 0.72, 0.60$), and applies pre-Sinkhorn Claude specialist gate with mass preservation. |
+| **V40 (Current)** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank (OOF=0.9142)** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | **Current Benchmark Architecture**: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores true full-rank wPCA on 90 balanced prompts ($N=1,620 \gg d=256$), achieves 91.42% 5-fold OOF BAcc on 384-dim Joint Spectral Bank, pools centered twin logits at 3 resolutions ($t=0.85, 0.72, 0.60$), and applies pre-Sinkhorn Claude specialist gate with mass preservation. |
 
 ---
 
