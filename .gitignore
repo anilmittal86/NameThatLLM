@@ -1,26 +1,41 @@
-# Python & Bytecode
+# Byte-compiled / caches
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
 .env
 .venv
 env/
 venv/
 
-# Kaggle / Model artifacts & caches
+# Local data, logs, and scratch directories
+local_data/
 artifacts/
 cache/
+checkpoints/
 scratch/
 temp_meta/
-checkpoints/
-*.parquet
-*.npz
-*.safetensors
-*.bin
+archive/
 *.log
+*.tmp
 download.txt
 powershell.exe
+
+# Accidental OS/shell binaries & weights
+*.exe
+*.dll
+*.whl
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.npy
+*.npz
+*.parquet
+*.joblib
 
 # Git & OS
 .DS_Store

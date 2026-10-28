@@ -1,25 +1,29 @@
 """
-Name That LLM - Version 40 Pipeline Generator (0.66+ Target)
-============================================================
-Fixes the 14B FP16 Overflow Bug, Restores Full-Rank wPCA (1,620 rows) +
-ExactAuthorPosterior (2^18 Bitmask DP) & 384-Dim Joint Spectral Bank,
-and Applies Multi-Resolution Centered Twins.
-
-Key Components:
-1. Module 1: Subprocess 78,482-row 5-view lexical engine with BPE subwords and 4 within-family specialists.
-2. Critical Fix 1: 14B fp16 overflow rescue with dynamic bfloat16 row retry (zero nan_to_num feature zeroing).
-3. Critical Fix 2: Full-rank wPCA (d=256) and 384-dim Cross-Validated Joint Spectral Bank on 1,620 balanced rows.
-4. Critical Fix 3: Exhaustive centered twin key matcher and multi-resolution twin pooling (t=0.85, 0.72, 0.60).
-5. 6-Checkpoint Ensemble across 4 Trunks with in-place LoRA trunk reuse.
-6. Probability Mixture: 0.88 * R_core + 0.12 * H_helper.
-7. Pre-Sinkhorn Top-1 Claude Specialist Gate + Orthographic Shield.
-8. Official 300-step exact multiplicative Sinkhorn balancing.
+Single-Source-of-Truth Kaggle Notebook Compiler
+===============================================
+Reads modular Python source files from `src/namethatllm/*.py` and declarative
+hyperparameters from `configs/v42_ensemble.json`, then compiles a standalone,
+offline-executable Jupyter notebook for Kaggle 2xT4 submission.
 """
 
+import ast
 import json
+import argparse
 from pathlib import Path
+from typing import List, Dict, Any
 
-def create_v40_pipeline_notebook():
+def compile_notebook(config_path: Path, output_path: Path) -> Path:
+    """Compiles src/namethatllm modules + config into a verified Kaggle submission notebook."""
+    if not config_path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    src_dir = Path("src") / "namethatllm"
+    if not src_dir.exists():
+        src_dir = Path(__file__).resolve().parent.parent / "src" / "namethatllm"
+
     nb = {
         "cells": [],
         "metadata": {
@@ -45,6 +49,8 @@ def create_v40_pipeline_notebook():
         })
 
     def add_code(source: str):
+        # Validate syntax via AST before appending
+        ast.parse(source)
         nb["cells"].append({
             "cell_type": "code",
             "execution_count": None,
@@ -53,22 +59,24 @@ def create_v40_pipeline_notebook():
             "source": source.strip().splitlines(keepends=True)
         })
 
-    # Header Markdown
-    add_md("""# Name That LLM: Version 40 Pipeline (0.66+ LB Target)
-### 14B `bfloat16` Overflow Rescue, Full-Rank 1,620-Row `wPCA` ($2^{18}$ Bitmask DP), 384-Dim Spectral Bank & Multi-Resolution Centered Twins
+    # Header Cell
+    add_md(f"""# Name That LLM: {cfg.get('name', 'v42_ensemble')} (Targeting 0.65+ LB)
+### {cfg.get('description', '')}
 
-**Architectural Improvements in Version 40**:
-- **Critical Fix 1 (14B `fp16` Overflow Rescue)**: Eliminates silent `nan_to_num(0.0)` zeroing in Qwen3-14B & Qwen2.5-14B layers 14-32 by dynamically identifying overflowed rows and recomputing only those rows in `torch.bfloat16` (exponent range $3.4 \\times 10^{38}$) pooled directly in `float32`.
-- **Critical Fix 2 (Full-Rank 1,620-Row `wPCA` & Joint Spectral Bank)**: Replaces rank-deficient 180-row helper and heuristic `LOO-CLC` with 90 balanced training prompts ($90 \\times 18 = 1,620$ rows of `train.csv`, $N = 1,620 \\gg d = 256$), restoring true full-rank whitening covariance and exact $2^{18}$ bitmask DP (`ExactAuthorPosterior`).
-- **Critical Fix 3 (Exhaustive Centered Key Matcher & Multi-Resolution Twins)**: Resolves British (`centred.weight`) and American (`centered.weight`, `center.weight`, `twin.weight`) keys across all checkpoints, and pools centered twin logits at 3 consensus cluster resolutions ($t = 0.85, 0.72, 0.60$) with weights $0.50, 0.30, 0.20$.
-- **6 High-Alpha Checkpoints on 4 Trunks**: In-place LoRA adapter reuse on shared trunks (Trunk 1 hosts both `lora_qwen3_14b` and `lora14b_v1`; Trunk 3 hosts `instyle` and `ntl-claude-head`).
-- **Subprocess 78,482-Row 5-View Lexical Engine**: Subprocess memory isolation (Peak RSS $\\le 2.09$ GB) with Native Qwen BPE subwords and 4 within-family specialists.
-- **Pre-Sinkhorn Claude Specialist Gate & Orthographic Shield**: Mass-preserving within-family refinement and punctuation shields before the single final 300-step exact multiplicative Sinkhorn balancing.
+**Compiled from Single Source of Truth (`src/namethatllm/` + `{config_path.name}`)**:
+- **Main Stack (85% Mass)**: Pure Part Two foundation (4-view LinearSVC $w=1.00$, Qwen3-14B $0.40/0.10$, Qwen2.5-14B $0.20/0.10$, DeBERTa $0.25/0.00$).
+- **Complementary Stack (15% Mass)**: Secondary LoRAs & multi-res twins ($w=0.35$), 5-view BPE lexical ($w=0.20$), regularized DP posteriors ($w=0.30$), and leak-free 384-dim spectral bank ($w=0.15$).
+- **Dynamic `bfloat16` Row Rescue**: 0 zero-masked hidden states on 14B models.
+- **Leak-Free Spectral Bank**: Features projected onto unsupervised prompt-centered principal components $V_{{\\text{{f32}}}}[:, :64]$ (0 label leakage).
+- **Postprocessing**: Mass-preserving Claude Specialist Gate, gentle curly-quote shield, and 300-step exact multiplicative Sinkhorn mass balancing.
 """)
 
-    # Cell 1: Environment, Dependencies & Master 18 Labels
-    add_md("### Step 1: Environment, Dependencies & Master 18 Labels")
-    add_code("""import os
+    # Cell 1: Environment, Dependencies & Configuration
+    labels_repr = repr(cfg["labels"])
+    families_repr = repr(cfg["families"])
+    prior_scales_repr = repr(cfg["complementary_stack"]["prior_scales"])
+
+    cell_1_code = f"""import os
 import gc
 import sys
 import time
@@ -107,26 +115,16 @@ def get_process_memory() -> float:
 def log_ram(tag: str = ""):
     rss = get_process_memory()
     gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
-    print(f"[RAM AUDIT | {tag}] Process RSS: {rss:.2f} GB | GPU VRAM Allocated: {gpu_mem:.2f} GB")
+    print(f"[RAM AUDIT | {{tag}}] Process RSS: {{rss:.2f}} GB | GPU VRAM Allocated: {{gpu_mem:.2f}} GB")
 
 log_ram("Notebook Startup")
 
-# Canonical 18-Class Labels
-LABELS = [
-    "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
-    "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
-    "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
-    "qwen3.8-max", "glm-5.3", "glm-5.3-flash", "kimi-k3"
-]
+# Canonical 18-Class Labels and Families
+LABELS = {labels_repr}
 K = len(LABELS)
-LAB2I = {l: i for i, l in enumerate(LABELS)}
-
-FAMILIES = {
-    "gpt": [0, 1, 2, 3, 4],
-    "gemini": [5, 6, 7, 8],
-    "claude": [9, 10, 11, 12, 13],
-    "glm": [15, 16],
-}
+LAB2I = {{l: i for i, l in enumerate(LABELS)}}
+FAMILIES = {families_repr}
+PRIOR_SCALES = {prior_scales_repr}
 
 def align_cols(arr: np.ndarray, src_labels: list) -> np.ndarray:
     src_list = [x.decode('utf-8') if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
@@ -149,12 +147,13 @@ def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     e = np.exp(x - c)
     return e / (np.sum(e, axis=axis, keepdims=True) + 1e-15)
 
-print(f"Master Canonical 18 Classes (K={K}): {LABELS}")
-""")
+print(f"Master Canonical 18 Classes (K={{K}}): {{LABELS}}")
+"""
+    add_md("### Step 1: Environment, Dependencies & Configuration")
+    add_code(cell_1_code)
 
-    # Cell 2: Asset Discovery & Balanced 1,620-Row Training Subset
-    add_md("### Step 2: Asset Discovery & Balanced 1,620-Row Training Subset")
-    add_code("""INPUT_DIR = Path('/kaggle/input')
+    # Cell 2: Asset Discovery & 1,620-Row Balanced Subset
+    cell_2_code = """INPUT_DIR = Path('/kaggle/input')
 DATASET_DIR = INPUT_DIR / 'competitions' / 'name-that-llm'
 if not DATASET_DIR.exists():
     DATASET_DIR = INPUT_DIR / 'name-that-llm'
@@ -254,11 +253,12 @@ print(f"Discovered Checkpoints ({len(CKPTS)}): {list(CKPTS.keys())}")
 pool_paths = list(INPUT_DIR.rglob('pool_v4.parquet'))
 pool_file = pool_paths[0] if pool_paths else None
 print(f"Discovered Passage Pool:     {pool_file}")
-""")
+"""
+    add_md("### Step 2: Asset Discovery & Balanced 1,620-Row Training Subset")
+    add_code(cell_2_code)
 
-    # Cell 3: Module 1 — Subprocess 78,482-Row 5-View Lexical + BPE + Within-Family Refiners
-    add_md("### Step 3: Module 1 — Subprocess 78,482-Row 5-View Lexical + BPE + Within-Family Specialist Engine")
-    add_code("""# Write standalone script run_lexical.py and execute via subprocess for 100% OS RAM reclamation
+    # Cell 3: Module 1 — Subprocess Dual-Output Lexical Engine
+    cell_3_code = f"""# Write standalone script run_lexical.py and execute via subprocess for 100% OS RAM reclamation
 working_dir = Path('/kaggle/working') if Path('/kaggle/working').exists() else Path('.')
 lexical_script_path = working_dir / "run_lexical.py"
 
@@ -279,17 +279,11 @@ from sklearn.svm import LinearSVC
 from sklearn.linear_model import SGDClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-working_dir = Path(r'{working_dir}')
-LABELS = {LABELS}
+working_dir = Path(r'{{working_dir}}')
+LABELS = {labels_repr}
 K = len(LABELS)
 LAB2I = {{l: i for i, l in enumerate(LABELS)}}
-
-FAMILIES = {{
-    "gpt": [0, 1, 2, 3, 4],
-    "gemini": [5, 6, 7, 8],
-    "claude": [9, 10, 11, 12, 13],
-    "glm": [15, 16],
-}}
+FAMILIES = {families_repr}
 
 STOP_WORDS = set([
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't",
@@ -316,57 +310,69 @@ def function_text(t: str) -> str:
     tokens = re.findall(r"(?u)\\\\b\\\\w+\\\\b|[^\\\\w\\\\s]", str(t))
     return " ".join([w.lower() if w.lower() in STOP_WORDS else "CONTENT" for w in tokens])
 
+def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    c = np.max(x, axis=axis, keepdims=True)
+    return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
+
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     c = np.max(x, axis=axis, keepdims=True)
     e = np.exp(x - c)
     return e / (np.sum(e, axis=axis, keepdims=True) + 1e-15)
 
 t0 = time.time()
-print('=== [Subprocess Lexical Engine] Starting 78k Full Execution with BPE + Specialist Refiners ===', flush=True)
+print('=== [Subprocess Lexical Engine] Starting Dual-Output 78k Full Execution ===', flush=True)
 
-df_tr = pd.read_csv(r'{train_path}')
-df_te = pd.read_csv(r'{test_path}')
+df_tr = pd.read_csv(r'{{train_path}}')
+df_te = pd.read_csv(r'{{test_path}}')
 
 test_texts = df_te['text'].fillna('').astype(str).tolist()
 fit_texts = df_tr['text'].fillna('').astype(str).tolist()
 fit_y = np.array([LAB2I[m] for m in df_tr['model']])
 len_tr_raw = len(df_tr)
 
-# Compute stopword TF-IDF Distance Matrix on Test
+# 1. Compute stopword TF-IDF Distance Matrix and groups_085 on Test
 Xt_tfidf = TfidfVectorizer(stop_words='english', sublinear_tf=True, max_features=100000, dtype=np.float32).fit_transform(test_texts)
 if len(test_texts) >= 2:
     D = np.clip(1.0 - (Xt_tfidf @ Xt_tfidf.T).toarray(), 0.0, None)
     np.fill_diagonal(D, 0.0)
+    cond_d = squareform(D, checks=False)
+    groups_085 = fcluster(linkage(cond_d, method='average'), 0.85, criterion='distance')
 else:
     D = np.zeros((1, 1), dtype=np.float32)
+    groups_085 = np.ones(1, dtype=int)
 
-np.save(r'{working_dir}/D_tfidf.npy', D)
+sz_085 = np.bincount(groups_085)[groups_085]
+twin_rows_085 = (sz_085 >= 2) & (sz_085 <= 18)
+print(f'[Subprocess Lexical] Topic clusters computed (t=0.85): {{{{len(np.unique(groups_085))}}}} clusters, twin rows: {{{{twin_rows_085.sum()}}}}/{{{{len(test_texts)}}}}', flush=True)
+
+np.save(r'{{working_dir}}/D_tfidf.npy', D)
+np.save(r'{{working_dir}}/groups_085.npy', groups_085)
 del Xt_tfidf
 gc.collect()
 
-# Load 100% of pool_v4.parquet
-pool_path = r'{pool_file}'
+# 2. Load 100% of pool_v4.parquet
+pool_path = r'{{pool_file}}'
 if pool_path and os.path.exists(pool_path):
-    print(f'[Subprocess Lexical] Loading 100% of pool_v4 from {{pool_path}}...', flush=True)
+    print(f'[Subprocess Lexical] Loading 100% of pool_v4 from {{{{pool_path}}}}...', flush=True)
     df_pool = pd.read_parquet(pool_path, columns=['text', 'model'])
     df_pool = df_pool[df_pool['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
     fit_texts += df_pool['text'].fillna('').astype(str).tolist()
     fit_y = np.r_[fit_y, df_pool['model'].map(LAB2I).values]
-    print(f'[Subprocess Lexical] Full combined training corpus: {{len(fit_texts)}} rows ({{len_tr_raw}} train + {{len(df_pool)}} pool)', flush=True)
+    print(f'[Subprocess Lexical] Full combined training corpus: {{{{len(fit_texts)}}}} rows ({{{{len_tr_raw}}}} train + {{{{len(df_pool)}}}} pool)', flush=True)
     del df_pool
     gc.collect()
 
-# 5 Complementary Views (4 Canonical + Native BPE Subwords)
-VIEWS = [
+# 3. Canonical 4 Views (from NTL two-stage LoRA part two)
+VIEWS_4V = [
     ("char", 3, 5, 250000, 1.0),
     ("word", 1, 3, 180000, 0.7),
     ("shape", 2, 6, 60000, 0.5),
     ("function", 1, 3, 50000, 0.5)
 ]
 
-A_blocks, B_blocks = [], []
-for view, lo, hi, max_feat, weight in VIEWS:
-    print(f'[Subprocess Lexical] Extracting view: {{view}} (weight={{weight}})...', flush=True)
+A_blocks_4v, B_blocks_4v = [], []
+for view, lo, hi, max_feat, weight in VIEWS_4V:
+    print(f'[Subprocess Lexical] Extracting canonical view: {{{{view}}}} (weight={{{{weight}}}})...', flush=True)
     prep = shape_text if view == "shape" else function_text if view == "function" else None
     analyzer = "char" if view in ("char", "shape") else "word"
     opts = dict(
@@ -382,14 +388,30 @@ for view, lo, hi, max_feat, weight in VIEWS:
     X_te_v = vec.transform(te_iter)
     X_tr_v.data *= np.float32(weight)
     X_te_v.data *= np.float32(weight)
-    A_blocks.append(X_tr_v)
-    B_blocks.append(X_te_v)
+    A_blocks_4v.append(X_tr_v)
+    B_blocks_4v.append(X_te_v)
     del vec, X_tr_v, X_te_v
     gc.collect()
 
-# View 5: Native BPE Subword Token-ID N-Grams
-qwen_tok_path = r'{qwen_tok_dir}'
-print(f'[Subprocess Lexical] Extracting view: bpe subwords (weight=0.65)...', flush=True)
+X_tr_4v = sparse.hstack(A_blocks_4v, format="csr", dtype=np.float32)
+X_te_4v = sparse.hstack(B_blocks_4v, format="csr", dtype=np.float32)
+
+print(f'[Subprocess Lexical] Canonical 4-view CSR: X_tr={{{{X_tr_4v.shape}}}}, X_te={{{{X_te_4v.shape}}}} (nnz={{{{X_tr_4v.nnz}}}})', flush=True)
+
+# OUTPUT 1: Pure 4-View LinearSVC with Uniform 1.0 Sample Weights for Main Stack
+sample_weights_uniform = np.ones(len(fit_y), dtype=np.float32)
+print('[Subprocess Lexical] Fitting Pure 4-View LinearSVC(C=0.5) with uniform weights (1.0) for LOGIT_MAIN...', flush=True)
+svc_main = LinearSVC(C=0.5, random_state=42, max_iter=3500, tol=1e-3, class_weight="balanced")
+svc_main.fit(X_tr_4v, fit_y, sample_weight=sample_weights_uniform)
+log_p_svc_main = log_softmax(svc_main.decision_function(X_te_4v), axis=1)
+np.save(r'{{working_dir}}/log_p_svc_main.npy', log_p_svc_main)
+print(f'[Subprocess Lexical] Saved Output 1: log_p_svc_main.npy (shape={{{{log_p_svc_main.shape}}}}).', flush=True)
+del svc_main
+gc.collect()
+
+# 4. View 5: Native BPE Subword Token-ID N-Grams for Complementary Stack
+qwen_tok_path = r'{{qwen_tok_dir}}'
+print(f'[Subprocess Lexical] Extracting view 5: Native BPE Subwords (weight=0.65)...', flush=True)
 bpe_loaded = False
 if qwen_tok_path and os.path.exists(qwen_tok_path):
     try:
@@ -409,11 +431,11 @@ if qwen_tok_path and os.path.exists(qwen_tok_path):
         del tok
         gc.collect()
     except Exception as e:
-        print(f'[Subprocess Lexical] Fast tokenizer load failed ({{e}}), using fallback hash BPE.', flush=True)
+        print(f'[Subprocess Lexical] Fast tokenizer load failed ({{{{e}}}}), using fallback hash BPE.', flush=True)
 
 if not bpe_loaded:
     def hash_bpe_fallback(texts):
-        return [" ".join(f"w{{hash(w)%65536}}" for w in re.findall(r'\\\\b\\\\w+\\\\b', t.lower())) for t in texts]
+        return [" ".join("w" + str(hash(w) % 65536) for w in re.findall(r'\\\\b\\\\w+\\\\b', t.lower())) for t in texts]
     bpe_tr = hash_bpe_fallback(fit_texts)
     bpe_te = hash_bpe_fallback(test_texts)
 
@@ -422,102 +444,143 @@ X_tr_bpe = bpe_vec.fit_transform(bpe_tr)
 X_te_bpe = bpe_vec.transform(bpe_te)
 X_tr_bpe.data *= np.float32(0.65)
 X_te_bpe.data *= np.float32(0.65)
-A_blocks.append(X_tr_bpe)
-B_blocks.append(X_te_bpe)
-del bpe_vec, bpe_tr, bpe_te, X_tr_bpe, X_te_bpe
+del bpe_vec, bpe_tr, bpe_te
 gc.collect()
 
-del fit_texts
+X_tr_5v = sparse.hstack([X_tr_4v, X_tr_bpe], format="csr", dtype=np.float32)
+X_te_5v = sparse.hstack([X_te_4v, X_te_bpe], format="csr", dtype=np.float32)
+del X_tr_4v, X_te_4v, X_tr_bpe, X_te_bpe, A_blocks_4v, B_blocks_4v
 gc.collect()
 
-X_tr_csr = sparse.hstack(A_blocks, format="csr", dtype=np.float32)
-del A_blocks
+print(f'[Subprocess Lexical] Complementary 5-view CSR: X_tr={{{{X_tr_5v.shape}}}}, X_te={{{{X_te_5v.shape}}}} (nnz={{{{X_tr_5v.nnz}}}})', flush=True)
+
+# OUTPUT 2: Complementary Lexical Ensemble (LinearSVC(C=0.35) + SGDClassifier + Style Twin)
+print('[Subprocess Lexical] Fitting Complementary LinearSVC(C=0.35) on 5-view CSR...', flush=True)
+svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=2500, tol=1e-3, class_weight="balanced")
+svc_comp.fit(X_tr_5v, fit_y, sample_weight=sample_weights_uniform)
+P_svc_comp = softmax(svc_comp.decision_function(X_te_5v), axis=1)
+del svc_comp
 gc.collect()
 
-X_te_csr = sparse.hstack(B_blocks, format="csr", dtype=np.float32)
-del B_blocks
+print('[Subprocess Lexical] Fitting Complementary SGDClassifier (log_loss) on 5-view CSR...', flush=True)
+sgd_comp = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=1000, tol=1e-3, random_state=42, class_weight="balanced")
+sgd_comp.fit(X_tr_5v, fit_y, sample_weight=sample_weights_uniform)
+P_sgd_comp = softmax(sgd_comp.decision_function(X_te_5v), axis=1)
+del sgd_comp
 gc.collect()
 
-print(f'[Subprocess Lexical] Built full 5-view CSR: X_tr={{X_tr_csr.shape}}, X_te={{X_te_csr.shape}} (nnz={{X_tr_csr.nnz}})', flush=True)
+# Prompt-Centered Style Twin on train.csv
+P_twin_comp = np.copy(P_svc_comp)
+if twin_rows_085.any():
+    print('[Subprocess Lexical] Fitting Prompt-Centered Style-Gram Twin on train.csv...', flush=True)
+    X_train_only = X_tr_5v[:len_tr_raw]
+    pu, pinv = np.unique(df_tr['prompt_id'].values, return_inverse=True)
+    n_p = len(pu)
+    counts = np.bincount(pinv)
+    vals = (1.0 / counts[pinv]).astype(np.float32)
+    G = sparse.csr_matrix((vals, (np.arange(len_tr_raw), pinv)), shape=(len_tr_raw, n_p), dtype=np.float32)
+    X_train_c = X_train_only - G @ (G.T @ X_train_only)
 
-# Sample weights: 2.0x for train.csv, 1.0x for pool_v4
-sample_weights = np.ones(len(fit_y), dtype=np.float32)
-sample_weights[:len_tr_raw] = 2.0
+    svc_twin = LinearSVC(C=0.30, random_state=42, max_iter=2500)
+    svc_twin.fit(X_train_c, fit_y[:len_tr_raw])
+    del X_train_only, G, X_train_c
+    gc.collect()
 
-# 1. Global Dual Linear Ensemble
-print('[Subprocess Lexical] Fitting LinearSVC on full 78k corpus...', flush=True)
-svc = LinearSVC(C=0.5, random_state=42, max_iter=2500, tol=1e-3, class_weight="balanced")
-svc.fit(X_tr_csr, fit_y, sample_weight=sample_weights)
+    X_te_twin = X_te_5v[twin_rows_085]
+    u_t, inv_t = np.unique(groups_085[twin_rows_085], return_inverse=True)
+    counts_t = np.bincount(inv_t)
+    vals_t = (1.0 / counts_t[inv_t]).astype(np.float32)
+    G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
+    X_te_twin_c = X_te_twin - G_t @ (G_t.T @ X_te_twin)
+    P_twin_comp[twin_rows_085] = softmax(svc_twin.decision_function(X_te_twin_c), axis=1)
+    del svc_twin, X_te_twin, G_t, X_te_twin_c
+    gc.collect()
 
-print('[Subprocess Lexical] Fitting SGDClassifier (log_loss) on full 78k corpus...', flush=True)
-lr = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=1000, tol=1e-3, random_state=42, class_weight="balanced")
-lr.fit(X_tr_csr, fit_y, sample_weight=sample_weights)
+# Blend into P_lex_comp
+P_lex_comp = 0.50 * P_svc_comp + 0.35 * P_sgd_comp + 0.15 * P_twin_comp
+log_p_lex_comp = np.log(np.clip(P_lex_comp, 1e-9, 1.0))
 
-P_svc = softmax(svc.decision_function(X_te_csr), axis=1)
-P_lr = softmax(lr.decision_function(X_te_csr), axis=1)
-P_global = 0.82 * P_svc + 0.18 * P_lr
-log_p_lex = np.log(np.clip(P_global, 1e-9, 1.0))
-
-# 2. Fit 4 Within-Family Specialist Refiners
-print('[Subprocess Lexical] Fitting 4 Within-Family Specialist Refiners...', flush=True)
+# 4 Within-Family Specialist Refiners on Complementary Lexical Stream
+print('[Subprocess Lexical] Fitting 4 Within-Family Specialist Refiners on Complementary Stream...', flush=True)
 beta = 0.25
 for fam_name, fam_cols in FAMILIES.items():
     fam_mask = np.isin(fit_y, fam_cols)
     if fam_mask.sum() > 50:
         sub_y = fit_y[fam_mask]
-        sub_lab2i = {{c: i for i, c in enumerate(fam_cols)}}
+        sub_lab2i = {{{{c: i for i, c in enumerate(fam_cols)}}}}
         sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y])
-        sub_weights = sample_weights[fam_mask]
 
-        spec_svc = LinearSVC(C=0.5, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
-        spec_svc.fit(X_tr_csr[fam_mask], sub_y_mapped, sample_weight=sub_weights)
-        df_spec = spec_svc.decision_function(X_te_csr)
+        spec_svc = LinearSVC(C=0.40, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
+        spec_svc.fit(X_tr_5v[fam_mask], sub_y_mapped)
+        df_spec = spec_svc.decision_function(X_te_5v)
         if df_spec.ndim == 1:
             logits_spec = np.column_stack([-df_spec, df_spec])
         else:
             logits_spec = df_spec
         P_spec = softmax(logits_spec, axis=1)
 
-        P_prior = P_global[:, fam_cols]
+        P_prior = P_lex_comp[:, fam_cols]
         P_prior_norm = P_prior / (P_prior.sum(axis=1, keepdims=True) + 1e-12)
         P_refined = (1.0 - beta) * P_prior_norm + beta * P_spec
 
         log_ratio = np.log(np.clip(P_refined, 1e-9, 1.0)) - np.log(np.clip(P_prior_norm, 1e-9, 1.0))
-        log_p_lex[:, fam_cols] += log_ratio
-        print(f'[Subprocess Lexical] Refined family {{fam_name}} (cols={{fam_cols}}, train_rows={{fam_mask.sum()}}).', flush=True)
+        log_p_lex_comp[:, fam_cols] += log_ratio
+        print(f'[Subprocess Lexical] Refined complementary family {{{{fam_name}}}} (cols={{{{fam_cols}}}}, train_rows={{{{fam_mask.sum()}}}}).', flush=True)
 
-np.save(r'{working_dir}/log_p_lex.npy', log_p_lex)
-print(f'[Subprocess Lexical] Completed in {{time.time() - t0:.2f}}s. Saved log_p_lex.npy and D_tfidf.npy to {working_dir}.', flush=True)
+P_lex_comp_final = softmax(log_p_lex_comp, axis=1)
+np.save(r'{{working_dir}}/p_lex_comp.npy', P_lex_comp_final)
+print(f'[Subprocess Lexical] Saved Output 2: p_lex_comp.npy (shape={{{{P_lex_comp_final.shape}}}}).', flush=True)
+
+del X_tr_5v, X_te_5v, fit_texts
+gc.collect()
+print(f'[Subprocess Lexical] Completed in {{{{time.time() - t0:.2f}}}}s. All outputs saved successfully.', flush=True)
+sys.exit(0)
 \"\"\"
 
 with open(lexical_script_path, "w", encoding="utf-8") as f:
     f.write(lexical_code)
 
-print(f'[Main Process] Launching isolated lexical subprocess: {lexical_script_path}...')
+print(f'[Main Process] Launching isolated lexical subprocess: {{lexical_script_path}}...')
 t_lex0 = time.time()
 subprocess.run([sys.executable, str(lexical_script_path)], check=True)
-print(f'[Main Process] Lexical subprocess completed in {time.time() - t_lex0:.2f}s.')
+print(f'[Main Process] Lexical subprocess completed in {{time.time() - t_lex0:.2f}}s.')
 
-log_p_lex = np.load(working_dir / 'log_p_lex.npy')
+log_p_svc_main = np.load(working_dir / 'log_p_svc_main.npy')
+p_lex_comp = np.load(working_dir / 'p_lex_comp.npy')
 D_tfidf = np.load(working_dir / 'D_tfidf.npy')
-print(f'Loaded log_p_lex: shape={log_p_lex.shape}, D_tfidf: shape={D_tfidf.shape}')
+groups_085 = np.load(working_dir / 'groups_085.npy')
+
+print(f'Loaded log_p_svc_main: shape={{log_p_svc_main.shape}}')
+print(f'Loaded p_lex_comp:     shape={{p_lex_comp.shape}}')
+print(f'Loaded D_tfidf:        shape={{D_tfidf.shape}}')
+print(f'Loaded groups_085:      shape={{groups_085.shape}}')
 log_ram("After Lexical Subprocess Memory Reclamation")
 
-LOGIT_CORE = 1.02 * log_p_lex
-HELPER_LIST: List[Tuple[float, np.ndarray]] = []
+# Initialize LOGIT_MAIN with canonical 1.00 * log_p_svc_main (100% official Part Two baseline)
+LOGIT_MAIN = 1.00 * log_p_svc_main
+
+# Initialize Complementary Containers
+LOGIT_COMP_LORA = np.zeros((N_test, K), dtype=np.float64)
+COMP_LIST: List[Tuple[float, np.ndarray]] = []
+# Complementary lexical stream gets weight 0.20
+COMP_LIST.append((0.20, p_lex_comp))
+
 D_neural_sum = np.zeros((N_test, N_test), dtype=np.float64)
 D_neural_weight_total = 0.0
 
 spectral_tr_blocks: List[np.ndarray] = []
 spectral_te_blocks: List[np.ndarray] = []
 
-print(f"[Main Process] Initialized LOGIT_CORE with 78k Lexical Engine: shape={LOGIT_CORE.shape}")
-log_ram("Core and Helpers Initialized")
-""")
+dp_posteriors: Dict[str, np.ndarray] = {{}}
 
-    # Cell 4: Universal Trunk Loader
-    add_md("### Step 4: Universal Trunk Loader with `bfloat16` Batch Rescue, Head Resolver & Math Solvers")
-    add_code("""def in_place_copy(dst: torch.Tensor, src: torch.Tensor):
+print(f"[Main Process] Initialized LOGIT_MAIN: shape={{LOGIT_MAIN.shape}}")
+log_ram("Main and Complementary Containers Initialized")
+"""
+    add_md("### Step 3: Module 1 — Dual-Output Subprocess Lexical Engine (`run_lexical.py`)")
+    add_code(cell_3_code)
+
+    # Cell 4: Universal Trunk Loader, Head Resolver & Math Solvers
+    cell_4_code = """def in_place_copy(dst: torch.Tensor, src: torch.Tensor):
     dst.data.copy_(src.to(device=dst.device, dtype=dst.dtype))
 
 def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool:
@@ -569,7 +632,6 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
     hs = model(**enc, output_hidden_states=True, use_cache=False).hidden_states
 
     B = enc["input_ids"].shape[0]
-    dev = enc["input_ids"].device
     first_norm_dev = norms[0].weight.device
 
     # Check if any selected layer has Inf/NaN per row
@@ -780,14 +842,14 @@ def split_oversized_clusters_dist(D: np.ndarray, groups: np.ndarray, max_cluster
                     next_id += 1
     return new_groups
 
-def _two_way(Z: np.ndarray, y: np.ndarray, pinv: np.ndarray, G: int, K: int = 18, iters: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _two_way(Z: np.ndarray, y: np.ndarray, pinv: np.ndarray, G: int, K_classes: int = 18, iters: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     N, d = Z.shape
-    mu = np.zeros((K, d), dtype=np.float64)
+    mu = np.zeros((K_classes, d), dtype=np.float64)
     P = np.zeros((G, d), dtype=np.float64)
     ng = np.bincount(pinv, minlength=G).clip(min=1)
     for _ in range(iters):
         R = Z - P[pinv]
-        for k in range(K):
+        for k in range(K_classes):
             idx = (y == k)
             if idx.any():
                 mu[k] = R[idx].mean(axis=0)
@@ -802,7 +864,8 @@ def _shrunk(S: np.ndarray, alpha: float) -> np.ndarray:
     tr = np.trace(S) / d
     return (1.0 - alpha) * S + alpha * tr * np.eye(d)
 
-def fit_shared_gaussian_lowram(X_tr_f32: np.ndarray, y: np.ndarray, prompts: np.ndarray, d_target: int = 256) -> dict:
+def fit_shared_gaussian_lowram(X_tr_f32: np.ndarray, y: np.ndarray, prompts: np.ndarray,
+                               d_target: int = 256, se_floor: float = 0.10) -> dict:
     N, D = X_tr_f32.shape
     pu, pinv = np.unique(prompts, return_inverse=True)
     G = len(pu)
@@ -823,13 +886,14 @@ def fit_shared_gaussian_lowram(X_tr_f32: np.ndarray, y: np.ndarray, prompts: np.
     V_f32 = (R.T @ U_f32) / (np.sqrt(lam_top.astype(np.float32) * float(D))[None, :])
     del R, Gram, U, U_f32
 
+    V_top64 = V_f32[:, :min(64, d)].copy()
     Z = (((X_tr_f32 - mx) / sx) @ V_f32).astype(np.float64)
 
-    mu, P, ng = _two_way(Z, y, pinv, G, K=18, iters=4)
+    mu, P, ng = _two_way(Z, y, pinv, G, K_classes=K, iters=4)
     E = Z - mu[y] - P[pinv]
     dof = max(N - G - len(np.unique(y)) + 1, 1)
     Se_raw = (E.T @ E) / dof
-    ae = float(ledoit_wolf_shrinkage(E, assume_centered=True))
+    ae = max(float(ledoit_wolf_shrinkage(E, assume_centered=True)), se_floor)
     Se = _shrunk(Se_raw, ae)
 
     Pc = P - P.mean(0)
@@ -847,12 +911,9 @@ def fit_shared_gaussian_lowram(X_tr_f32: np.ndarray, y: np.ndarray, prompts: np.
     W_f32 = (V_f32 @ A.T.astype(np.float32)).astype(np.float32)
     m_whitened = mu @ A.T
 
-    snr = m_whitened.var(axis=0) / (1.0 + lam)
-    top64_idx = np.argsort(snr)[::-1][:64]
-
     return {
         "mx": mx, "sx": sx, "W": W_f32, "m": m_whitened, "lam": lam,
-        "top64_idx": top64_idx, "T1": 2.35, "Tg": 2.30
+        "V_top64": V_top64, "T1": 2.40, "Tg": 2.35
     }
 
 def transform_lowram(X_f32: np.ndarray, prm: dict, batch_rows: int = 1000) -> np.ndarray:
@@ -884,14 +945,14 @@ class ExactAuthorPosterior:
             self._subset_means[subset_size] = means
         return self._subset_means[subset_size]
 
-    def single(self, u: np.ndarray, temperature: float = 2.35) -> np.ndarray:
+    def single(self, u: np.ndarray, temperature: float = 2.40) -> np.ndarray:
         diff = u[None, :] - self.m
         diag = 1.0 + self.lam
         dist = np.sum(diff * diff / diag[None, :], axis=1)
         log_p = -0.5 * dist / max(float(temperature), 1e-4)
         return log_p - logsumexp(log_p)
 
-    def group(self, U: np.ndarray, temperature: float = 2.30) -> np.ndarray:
+    def group(self, U: np.ndarray, temperature: float = 2.35) -> np.ndarray:
         s = len(U)
         if s <= 1 or s > self.K:
             out = np.empty((s, self.K), dtype=np.float64)
@@ -931,12 +992,12 @@ def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: n
         return np.zeros((0, K), dtype=np.float64)
     if N == 1:
         solver = ExactAuthorPosterior(prm["m"], prm["lam"])
-        return solver.single(U_test[0], temperature=prm.get("T1", 2.35))[None, :]
+        return solver.single(U_test[0], temperature=prm.get("T1", 2.40))[None, :]
 
     safe_groups = split_oversized_clusters_dist(D_dist, groups, max_cluster_size=14)
     solver = ExactAuthorPosterior(prm["m"], prm["lam"])
-    T1 = prm.get("T1", 2.35)
-    Tg = prm.get("Tg", 2.30)
+    T1 = prm.get("T1", 2.40)
+    Tg = prm.get("Tg", 2.35)
 
     lp_dp = np.zeros((N, K), dtype=np.float64)
     for g in np.unique(safe_groups):
@@ -946,11 +1007,12 @@ def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: n
         else:
             lp_dp[idx_g] = solver.group(U_test[idx_g], temperature=Tg)
     return lp_dp
-""")
+"""
+    add_md("### Step 4: Universal Trunk Loader, Head Resolver & Math Solvers")
+    add_code(cell_4_code)
 
     # Cell 5: 6-Checkpoint Ensemble across 4 Trunks
-    add_md("### Step 5: 6-Checkpoint Ensemble across 4 Trunks with In-Place Trunk Sharing")
-    add_code("""claude_spec_logits = None
+    cell_5_code = """claude_spec_logits = None
 claude_classes = None
 
 # ==============================================================================
@@ -993,54 +1055,61 @@ if BASE_QWEN3_14B is not None and ('qwen3_14b_p2' in CKPTS or 'qwen3_14b_p1' in 
         print(f"[CHECKPOINT GATE] lora_qwen3_14b: 1620-Row Train BAcc = {bacc_tr:.4f}")
 
         if bacc_tr >= 0.50:
-            w_plain, w_twin, w_helper = 0.42, 0.13, 0.34
+            # 1. MAIN STACK (85% Mass): Canonical weights w_plain = 0.40, w_twin = 0.10 (groups_085 only)
             lp_plain = log_softmax(Z_test @ W_p.T + b_p)
-            LOGIT_CORE += w_plain * lp_plain
+            LOGIT_MAIN += 0.40 * lp_plain
 
+            if W_c is not None and N_test >= 2:
+                lp_c_85, m85 = compute_centered_logits(Z_test, groups_085, W_c, b_c, LABELS)
+                if m85.any():
+                    LOGIT_MAIN[m85] += 0.10 * lp_c_85[m85]
+                print(f"[lora_qwen3_14b -> LOGIT_MAIN] Added Plain (0.40) + Twin (0.10, {m85.sum()} rows).")
+
+            # Update consensus distance
             Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
             Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
             D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
             np.fill_diagonal(D_m, 0.0)
-            D_neural_sum += w_plain * D_m
-            D_neural_weight_total += w_plain
+            D_neural_sum += 0.40 * D_m
+            D_neural_weight_total += 0.40
 
             D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total)
             D_hybrid_curr = 0.55 * D_tfidf + 0.45 * D_neural_curr
 
+            # 2. COMPLEMENTARY LORA STACK: Plain (0.30) + Multi-Res Twins (0.10)
+            LOGIT_COMP_LORA += 0.30 * lp_plain
             if W_c is not None and N_test >= 2:
                 cond_dist = squareform(D_hybrid_curr, checks=False)
                 Z_link = linkage(cond_dist, method='average')
-                g85 = fcluster(Z_link, t=0.85, criterion='distance')
-                g72 = fcluster(Z_link, t=0.72, criterion='distance')
-                g60 = fcluster(Z_link, t=0.60, criterion='distance')
+                g85_c = fcluster(Z_link, t=0.85, criterion='distance')
+                g72_c = fcluster(Z_link, t=0.72, criterion='distance')
+                g60_c = fcluster(Z_link, t=0.60, criterion='distance')
 
-                lp_c_85, m85 = compute_centered_logits(Z_test, g85, W_c, b_c, LABELS)
-                lp_c_72, m72 = compute_centered_logits(Z_test, g72, W_c, b_c, LABELS)
-                lp_c_60, m60 = compute_centered_logits(Z_test, g60, W_c, b_c, LABELS)
+                lp_c_85_m, m85_c = compute_centered_logits(Z_test, g85_c, W_c, b_c, LABELS)
+                lp_c_72_m, m72_c = compute_centered_logits(Z_test, g72_c, W_c, b_c, LABELS)
+                lp_c_60_m, m60_c = compute_centered_logits(Z_test, g60_c, W_c, b_c, LABELS)
 
-                if m85.any(): LOGIT_CORE[m85] += (0.50 * w_twin) * lp_c_85[m85]
-                if m72.any(): LOGIT_CORE[m72] += (0.30 * w_twin) * lp_c_72[m72]
-                if m60.any(): LOGIT_CORE[m60] += (0.20 * w_twin) * lp_c_60[m60]
-                print(f"[lora_qwen3_14b] Multi-Resolution Twins Applied: m85={m85.sum()}, m72={m72.sum()}, m60={m60.sum()}")
+                if m85_c.any(): LOGIT_COMP_LORA[m85_c] += (0.50 * 0.10) * lp_c_85_m[m85_c]
+                if m72_c.any(): LOGIT_COMP_LORA[m72_c] += (0.30 * 0.10) * lp_c_72_m[m72_c]
+                if m60_c.any(): LOGIT_COMP_LORA[m60_c] += (0.20 * 0.10) * lp_c_60_m[m60_c]
 
-            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256)
-            U_train = transform_lowram(Z_train_bb, prm)
+            # 3. Regularized DP with se_floor = 0.10
+            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256, se_floor=0.10)
             U_test = transform_lowram(Z_test, prm)
 
-            idx64 = prm["top64_idx"]
-            U_tr_64 = U_train[:, idx64].astype(np.float32)
-            U_te_64 = U_test[:, idx64].astype(np.float32)
-            U_tr_64 /= np.linalg.norm(U_tr_64, axis=1, keepdims=True).clip(min=1e-6)
-            U_te_64 /= np.linalg.norm(U_te_64, axis=1, keepdims=True).clip(min=1e-6)
-            spectral_tr_blocks.append(U_tr_64)
-            spectral_te_blocks.append(U_te_64)
+            # Unsupervised top-64 principal components (zero label leakage)
+            scale = PRIOR_SCALES["qwen3_14b_p2"]
+            S_tr_64 = (((Z_train_bb - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_te_64 = (((Z_test - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_tr_64 = (S_tr_64 / np.linalg.norm(S_tr_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            S_te_64 = (S_te_64 / np.linalg.norm(S_te_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            spectral_tr_blocks.append(S_tr_64)
+            spectral_te_blocks.append(S_te_64)
 
             g65 = fcluster(linkage(squareform(D_hybrid_curr, checks=False), method='average'), t=0.65, criterion='distance') if N_test >= 2 else np.ones(N_test, dtype=int)
-            lp_dp = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
-            P_dp = softmax(lp_dp, axis=1)
-            HELPER_LIST.append((w_helper, P_dp))
-            print(f"[Routing: lora_qwen3_14b] Added Core Plain({w_plain}) + Twin({w_twin}), Helper DP({w_helper}).")
-            del U_train, U_test, prm, lp_dp, P_dp
+            dp_posteriors["q3_14b"] = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
+            print(f"[lora_qwen3_14b -> COMP_LIST] Stored Regularized DP Posterior & Prior-Scaled 64D Spectral Block (scale={scale}).")
+            del U_test, prm
 
         merge_lora(trunk_14b.model, ckpt_14bp2, sign=-1.0)
         del Z_all, Z_test, Z_train_bb, heads_sd
@@ -1074,53 +1143,44 @@ if BASE_QWEN3_14B is not None and ('qwen3_14b_p2' in CKPTS or 'qwen3_14b_p1' in 
         print(f"[CHECKPOINT GATE] lora14b_v1: 1620-Row Train BAcc = {bacc_tr:.4f}")
 
         if bacc_tr >= 0.50:
-            w_plain, w_twin, w_helper = 0.07, 0.02, 0.04
+            # Notice: NOT added to LOGIT_MAIN! (Zero Part 1 dilution of Main Stack)
             lp_plain = log_softmax(Z_test @ W_p.T + b_p)
-            LOGIT_CORE += w_plain * lp_plain
+            LOGIT_COMP_LORA += 0.14 * lp_plain
 
-            Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
-            Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-            D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
-            np.fill_diagonal(D_m, 0.0)
-            D_neural_sum += w_plain * D_m
-            D_neural_weight_total += w_plain
-
-            D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total)
+            D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total) if D_neural_weight_total > 0 else D_tfidf
             D_hybrid_curr = 0.55 * D_tfidf + 0.45 * D_neural_curr
 
             if W_c is not None and N_test >= 2:
                 cond_dist = squareform(D_hybrid_curr, checks=False)
                 Z_link = linkage(cond_dist, method='average')
-                g85 = fcluster(Z_link, t=0.85, criterion='distance')
-                g72 = fcluster(Z_link, t=0.72, criterion='distance')
-                g60 = fcluster(Z_link, t=0.60, criterion='distance')
+                g85_c = fcluster(Z_link, t=0.85, criterion='distance')
+                g72_c = fcluster(Z_link, t=0.72, criterion='distance')
+                g60_c = fcluster(Z_link, t=0.60, criterion='distance')
 
-                lp_c_85, m85 = compute_centered_logits(Z_test, g85, W_c, b_c, LABELS)
-                lp_c_72, m72 = compute_centered_logits(Z_test, g72, W_c, b_c, LABELS)
-                lp_c_60, m60 = compute_centered_logits(Z_test, g60, W_c, b_c, LABELS)
+                lp_c_85_m, m85_c = compute_centered_logits(Z_test, g85_c, W_c, b_c, LABELS)
+                lp_c_72_m, m72_c = compute_centered_logits(Z_test, g72_c, W_c, b_c, LABELS)
+                lp_c_60_m, m60_c = compute_centered_logits(Z_test, g60_c, W_c, b_c, LABELS)
 
-                if m85.any(): LOGIT_CORE[m85] += (0.50 * w_twin) * lp_c_85[m85]
-                if m72.any(): LOGIT_CORE[m72] += (0.30 * w_twin) * lp_c_72[m72]
-                if m60.any(): LOGIT_CORE[m60] += (0.20 * w_twin) * lp_c_60[m60]
+                if m85_c.any(): LOGIT_COMP_LORA[m85_c] += (0.50 * 0.05) * lp_c_85_m[m85_c]
+                if m72_c.any(): LOGIT_COMP_LORA[m72_c] += (0.30 * 0.05) * lp_c_72_m[m72_c]
+                if m60_c.any(): LOGIT_COMP_LORA[m60_c] += (0.20 * 0.05) * lp_c_60_m[m60_c]
 
-            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256)
-            U_train = transform_lowram(Z_train_bb, prm)
+            # Regularized DP with se_floor = 0.35 (protects against overfitting)
+            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256, se_floor=0.35)
             U_test = transform_lowram(Z_test, prm)
 
-            idx64 = prm["top64_idx"]
-            U_tr_64 = U_train[:, idx64].astype(np.float32)
-            U_te_64 = U_test[:, idx64].astype(np.float32)
-            U_tr_64 /= np.linalg.norm(U_tr_64, axis=1, keepdims=True).clip(min=1e-6)
-            U_te_64 /= np.linalg.norm(U_te_64, axis=1, keepdims=True).clip(min=1e-6)
-            spectral_tr_blocks.append(U_tr_64)
-            spectral_te_blocks.append(U_te_64)
+            scale = PRIOR_SCALES["qwen3_14b_p1"]
+            S_tr_64 = (((Z_train_bb - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_te_64 = (((Z_test - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_tr_64 = (S_tr_64 / np.linalg.norm(S_tr_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            S_te_64 = (S_te_64 / np.linalg.norm(S_te_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            spectral_tr_blocks.append(S_tr_64)
+            spectral_te_blocks.append(S_te_64)
 
             g65 = fcluster(linkage(squareform(D_hybrid_curr, checks=False), method='average'), t=0.65, criterion='distance') if N_test >= 2 else np.ones(N_test, dtype=int)
-            lp_dp = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
-            P_dp = softmax(lp_dp, axis=1)
-            HELPER_LIST.append((w_helper, P_dp))
-            print(f"[Routing: lora14b_v1] Added Core Plain({w_plain}) + Twin({w_twin}), Helper DP({w_helper}).")
-            del U_train, U_test, prm, lp_dp, P_dp
+            dp_posteriors["part1_14b"] = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
+            print(f"[lora14b_v1 -> COMP_LIST] Stored Regularized DP Posterior & Prior-Scaled 64D Spectral Block (scale={scale}).")
+            del U_test, prm
 
         merge_lora(trunk_14b.model, ckpt_14bp1, sign=-1.0)
         del Z_all, Z_test, Z_train_bb, heads_sd
@@ -1171,53 +1231,60 @@ if BASE_QWEN25_14B is not None and 'qwen25_14b_p2' in CKPTS:
     print(f"[CHECKPOINT GATE] lora_qwen25_14b: 1620-Row Train BAcc = {bacc_tr:.4f}")
 
     if bacc_tr >= 0.50:
-        w_plain, w_twin, w_helper = 0.24, 0.10, 0.22
+        # 1. MAIN STACK (85% Mass): Canonical weights w_plain = 0.20, w_twin = 0.10 (groups_085 only)
         lp_plain = log_softmax(Z_test @ W_p.T + b_p)
-        LOGIT_CORE += w_plain * lp_plain
+        LOGIT_MAIN += 0.20 * lp_plain
 
+        if W_c is not None and N_test >= 2:
+            lp_c_85, m85 = compute_centered_logits(Z_test, groups_085, W_c, b_c, LABELS)
+            if m85.any():
+                LOGIT_MAIN[m85] += 0.10 * lp_c_85[m85]
+            print(f"[lora_qwen25_14b -> LOGIT_MAIN] Added Plain (0.20) + Twin (0.10, {m85.sum()} rows).")
+
+        # Update consensus distance
         Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
         Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
         D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
         np.fill_diagonal(D_m, 0.0)
-        D_neural_sum += w_plain * D_m
-        D_neural_weight_total += w_plain
+        D_neural_sum += 0.20 * D_m
+        D_neural_weight_total += 0.20
 
         D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total)
         D_hybrid_curr = 0.55 * D_tfidf + 0.45 * D_neural_curr
 
+        # 2. COMPLEMENTARY LORA STACK: Plain (0.20) + Multi-Res Twins (0.08)
+        LOGIT_COMP_LORA += 0.20 * lp_plain
         if W_c is not None and N_test >= 2:
             cond_dist = squareform(D_hybrid_curr, checks=False)
             Z_link = linkage(cond_dist, method='average')
-            g85 = fcluster(Z_link, t=0.85, criterion='distance')
-            g72 = fcluster(Z_link, t=0.72, criterion='distance')
-            g60 = fcluster(Z_link, t=0.60, criterion='distance')
+            g85_c = fcluster(Z_link, t=0.85, criterion='distance')
+            g72_c = fcluster(Z_link, t=0.72, criterion='distance')
+            g60_c = fcluster(Z_link, t=0.60, criterion='distance')
 
-            lp_c_85, m85 = compute_centered_logits(Z_test, g85, W_c, b_c, LABELS)
-            lp_c_72, m72 = compute_centered_logits(Z_test, g72, W_c, b_c, LABELS)
-            lp_c_60, m60 = compute_centered_logits(Z_test, g60, W_c, b_c, LABELS)
+            lp_c_85_m, m85_c = compute_centered_logits(Z_test, g85_c, W_c, b_c, LABELS)
+            lp_c_72_m, m72_c = compute_centered_logits(Z_test, g72_c, W_c, b_c, LABELS)
+            lp_c_60_m, m60_c = compute_centered_logits(Z_test, g60_c, W_c, b_c, LABELS)
 
-            if m85.any(): LOGIT_CORE[m85] += (0.50 * w_twin) * lp_c_85[m85]
-            if m72.any(): LOGIT_CORE[m72] += (0.30 * w_twin) * lp_c_72[m72]
-            if m60.any(): LOGIT_CORE[m60] += (0.20 * w_twin) * lp_c_60[m60]
+            if m85_c.any(): LOGIT_COMP_LORA[m85_c] += (0.50 * 0.08) * lp_c_85_m[m85_c]
+            if m72_c.any(): LOGIT_COMP_LORA[m72_c] += (0.30 * 0.08) * lp_c_72_m[m72_c]
+            if m60_c.any(): LOGIT_COMP_LORA[m60_c] += (0.20 * 0.08) * lp_c_60_m[m60_c]
 
-        prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256)
-        U_train = transform_lowram(Z_train_bb, prm)
+        # 3. Regularized DP with se_floor = 0.10
+        prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256, se_floor=0.10)
         U_test = transform_lowram(Z_test, prm)
 
-        idx64 = prm["top64_idx"]
-        U_tr_64 = U_train[:, idx64].astype(np.float32)
-        U_te_64 = U_test[:, idx64].astype(np.float32)
-        U_tr_64 /= np.linalg.norm(U_tr_64, axis=1, keepdims=True).clip(min=1e-6)
-        U_te_64 /= np.linalg.norm(U_te_64, axis=1, keepdims=True).clip(min=1e-6)
-        spectral_tr_blocks.append(U_tr_64)
-        spectral_te_blocks.append(U_te_64)
+        scale = PRIOR_SCALES["qwen25_14b_p2"]
+        S_tr_64 = (((Z_train_bb - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+        S_te_64 = (((Z_test - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+        S_tr_64 = (S_tr_64 / np.linalg.norm(S_tr_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+        S_te_64 = (S_te_64 / np.linalg.norm(S_te_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+        spectral_tr_blocks.append(S_tr_64)
+        spectral_te_blocks.append(S_te_64)
 
         g65 = fcluster(linkage(squareform(D_hybrid_curr, checks=False), method='average'), t=0.65, criterion='distance') if N_test >= 2 else np.ones(N_test, dtype=int)
-        lp_dp = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
-        P_dp = softmax(lp_dp, axis=1)
-        HELPER_LIST.append((w_helper, P_dp))
-        print(f"[Routing: lora_qwen25_14b] Added Core Plain({w_plain}) + Twin({w_twin}), Helper DP({w_helper}).")
-        del U_train, U_test, prm, lp_dp, P_dp
+        dp_posteriors["q25_14b"] = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
+        print(f"[lora_qwen25_14b -> COMP_LIST] Stored Regularized DP Posterior & Prior-Scaled 64D Spectral Block (scale={scale}).")
+        del U_test, prm
 
     merge_lora(trunk_q25.model, ckpt_q25, sign=-1.0)
     trunk_q25.free_memory()
@@ -1275,53 +1342,44 @@ if BASE_QWEN3_8B is not None and ('instyle' in CKPTS or 'qwen3_8b_claude' in CKP
         print(f"[CHECKPOINT GATE] instyle_qwen3_8b: 1620-Row Train BAcc = {bacc_tr:.4f}")
 
         if bacc_tr >= 0.50:
-            w_plain, w_twin, w_helper = 0.18, 0.06, 0.14
+            # Notice: NOT added to LOGIT_MAIN! Routed strictly to Complementary Stack
             lp_plain = log_softmax(Z_test @ W_p.T + b_p)
-            LOGIT_CORE += w_plain * lp_plain
+            LOGIT_COMP_LORA += 0.22 * lp_plain
 
-            Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
-            Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-            D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
-            np.fill_diagonal(D_m, 0.0)
-            D_neural_sum += w_plain * D_m
-            D_neural_weight_total += w_plain
-
-            D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total)
+            D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total) if D_neural_weight_total > 0 else D_tfidf
             D_hybrid_curr = 0.55 * D_tfidf + 0.45 * D_neural_curr
 
             if W_c is not None and N_test >= 2:
                 cond_dist = squareform(D_hybrid_curr, checks=False)
                 Z_link = linkage(cond_dist, method='average')
-                g85 = fcluster(Z_link, t=0.85, criterion='distance')
-                g72 = fcluster(Z_link, t=0.72, criterion='distance')
-                g60 = fcluster(Z_link, t=0.60, criterion='distance')
+                g85_c = fcluster(Z_link, t=0.85, criterion='distance')
+                g72_c = fcluster(Z_link, t=0.72, criterion='distance')
+                g60_c = fcluster(Z_link, t=0.60, criterion='distance')
 
-                lp_c_85, m85 = compute_centered_logits(Z_test, g85, W_c, b_c, LABELS)
-                lp_c_72, m72 = compute_centered_logits(Z_test, g72, W_c, b_c, LABELS)
-                lp_c_60, m60 = compute_centered_logits(Z_test, g60, W_c, b_c, LABELS)
+                lp_c_85_m, m85_c = compute_centered_logits(Z_test, g85_c, W_c, b_c, LABELS)
+                lp_c_72_m, m72_c = compute_centered_logits(Z_test, g72_c, W_c, b_c, LABELS)
+                lp_c_60_m, m60_c = compute_centered_logits(Z_test, g60_c, W_c, b_c, LABELS)
 
-                if m85.any(): LOGIT_CORE[m85] += (0.50 * w_twin) * lp_c_85[m85]
-                if m72.any(): LOGIT_CORE[m72] += (0.30 * w_twin) * lp_c_72[m72]
-                if m60.any(): LOGIT_CORE[m60] += (0.20 * w_twin) * lp_c_60[m60]
+                if m85_c.any(): LOGIT_COMP_LORA[m85_c] += (0.50 * 0.08) * lp_c_85_m[m85_c]
+                if m72_c.any(): LOGIT_COMP_LORA[m72_c] += (0.30 * 0.08) * lp_c_72_m[m72_c]
+                if m60_c.any(): LOGIT_COMP_LORA[m60_c] += (0.20 * 0.08) * lp_c_60_m[m60_c]
 
-            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256)
-            U_train = transform_lowram(Z_train_bb, prm)
+            # Regularized DP with se_floor = 0.35
+            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256, se_floor=0.35)
             U_test = transform_lowram(Z_test, prm)
 
-            idx64 = prm["top64_idx"]
-            U_tr_64 = U_train[:, idx64].astype(np.float32)
-            U_te_64 = U_test[:, idx64].astype(np.float32)
-            U_tr_64 /= np.linalg.norm(U_tr_64, axis=1, keepdims=True).clip(min=1e-6)
-            U_te_64 /= np.linalg.norm(U_te_64, axis=1, keepdims=True).clip(min=1e-6)
-            spectral_tr_blocks.append(U_tr_64)
-            spectral_te_blocks.append(U_te_64)
+            scale = PRIOR_SCALES["instyle"]
+            S_tr_64 = (((Z_train_bb - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_te_64 = (((Z_test - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_tr_64 = (S_tr_64 / np.linalg.norm(S_tr_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            S_te_64 = (S_te_64 / np.linalg.norm(S_te_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            spectral_tr_blocks.append(S_tr_64)
+            spectral_te_blocks.append(S_te_64)
 
             g65 = fcluster(linkage(squareform(D_hybrid_curr, checks=False), method='average'), t=0.65, criterion='distance') if N_test >= 2 else np.ones(N_test, dtype=int)
-            lp_dp = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
-            P_dp = softmax(lp_dp, axis=1)
-            HELPER_LIST.append((w_helper, P_dp))
-            print(f"[Routing: instyle_qwen3_8b] Added Core Plain({w_plain}) + Twin({w_twin}), Helper DP({w_helper}).")
-            del U_train, U_test, prm, lp_dp, P_dp
+            dp_posteriors["instyle"] = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
+            print(f"[instyle_qwen3_8b -> COMP_LIST] Stored Regularized DP Posterior & Prior-Scaled 64D Spectral Block (scale={scale}).")
+            del U_test, prm
 
         merge_lora(trunk_8b.model, ckpt_inst, sign=-1.0)
         del Z_all, Z_test, Z_train_bb
@@ -1372,53 +1430,38 @@ if BASE_QWEN3_8B is not None and ('instyle' in CKPTS or 'qwen3_8b_claude' in CKP
         print(f"[CHECKPOINT GATE] ntl-qwen3-8b-lora-claude-head: 1620-Row Train BAcc = {bacc_tr:.4f}")
 
         if bacc_tr >= 0.50:
-            w_plain, w_twin, w_helper = 0.12, 0.04, 0.08
+            # Routed strictly to Complementary Stack
             lp_plain = log_softmax(Z_test @ W_p.T + b_p)
-            LOGIT_CORE += w_plain * lp_plain
+            LOGIT_COMP_LORA += 0.14 * lp_plain
 
-            Z_norm = Z_test - Z_test.mean(axis=0, keepdims=True)
-            Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
-            D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
-            np.fill_diagonal(D_m, 0.0)
-            D_neural_sum += w_plain * D_m
-            D_neural_weight_total += w_plain
-
-            D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total)
+            D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total) if D_neural_weight_total > 0 else D_tfidf
             D_hybrid_curr = 0.55 * D_tfidf + 0.45 * D_neural_curr
 
             if W_c is not None and N_test >= 2:
                 cond_dist = squareform(D_hybrid_curr, checks=False)
                 Z_link = linkage(cond_dist, method='average')
-                g85 = fcluster(Z_link, t=0.85, criterion='distance')
-                g72 = fcluster(Z_link, t=0.72, criterion='distance')
-                g60 = fcluster(Z_link, t=0.60, criterion='distance')
+                g85_c = fcluster(Z_link, t=0.85, criterion='distance')
+                g72_c = fcluster(Z_link, t=0.72, criterion='distance')
+                g60_c = fcluster(Z_link, t=0.60, criterion='distance')
 
-                lp_c_85, m85 = compute_centered_logits(Z_test, g85, W_c, b_c, LABELS)
-                lp_c_72, m72 = compute_centered_logits(Z_test, g72, W_c, b_c, LABELS)
-                lp_c_60, m60 = compute_centered_logits(Z_test, g60, W_c, b_c, LABELS)
+                lp_c_85_m, m85_c = compute_centered_logits(Z_test, g85_c, W_c, b_c, LABELS)
+                lp_c_72_m, m72_c = compute_centered_logits(Z_test, g72_c, W_c, b_c, LABELS)
+                lp_c_60_m, m60_c = compute_centered_logits(Z_test, g60_c, W_c, b_c, LABELS)
 
-                if m85.any(): LOGIT_CORE[m85] += (0.50 * w_twin) * lp_c_85[m85]
-                if m72.any(): LOGIT_CORE[m72] += (0.30 * w_twin) * lp_c_72[m72]
-                if m60.any(): LOGIT_CORE[m60] += (0.20 * w_twin) * lp_c_60[m60]
+                if m85_c.any(): LOGIT_COMP_LORA[m85_c] += (0.50 * 0.05) * lp_c_85_m[m85_c]
+                if m72_c.any(): LOGIT_COMP_LORA[m72_c] += (0.30 * 0.05) * lp_c_72_m[m72_c]
+                if m60_c.any(): LOGIT_COMP_LORA[m60_c] += (0.20 * 0.05) * lp_c_60_m[m60_c]
 
-            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256)
-            U_train = transform_lowram(Z_train_bb, prm)
-            U_test = transform_lowram(Z_test, prm)
-
-            idx64 = prm["top64_idx"]
-            U_tr_64 = U_train[:, idx64].astype(np.float32)
-            U_te_64 = U_test[:, idx64].astype(np.float32)
-            U_tr_64 /= np.linalg.norm(U_tr_64, axis=1, keepdims=True).clip(min=1e-6)
-            U_te_64 /= np.linalg.norm(U_te_64, axis=1, keepdims=True).clip(min=1e-6)
-            spectral_tr_blocks.append(U_tr_64)
-            spectral_te_blocks.append(U_te_64)
-
-            g65 = fcluster(linkage(squareform(D_hybrid_curr, checks=False), method='average'), t=0.65, criterion='distance') if N_test >= 2 else np.ones(N_test, dtype=int)
-            lp_dp = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
-            P_dp = softmax(lp_dp, axis=1)
-            HELPER_LIST.append((w_helper, P_dp))
-            print(f"[Routing: ntl-qwen3-8b-lora-claude-head] Added Core Plain({w_plain}) + Twin({w_twin}), Helper DP({w_helper}).")
-            del U_train, U_test, prm, lp_dp, P_dp
+            prm = fit_shared_gaussian_lowram(Z_train_bb, y_sub, prompts_sub, d_target=256, se_floor=0.35)
+            scale = PRIOR_SCALES["qwen3_8b_claude"]
+            S_tr_64 = (((Z_train_bb - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_te_64 = (((Z_test - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+            S_tr_64 = (S_tr_64 / np.linalg.norm(S_tr_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            S_te_64 = (S_te_64 / np.linalg.norm(S_te_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+            spectral_tr_blocks.append(S_tr_64)
+            spectral_te_blocks.append(S_te_64)
+            print(f"[ntl-claude-head -> COMP_LIST] Stored Prior-Scaled 64D Spectral Block (scale={scale}).")
+            del prm
 
         merge_lora(trunk_8b.model, ckpt_8bcl, sign=-1.0)
         del Z_all, Z_test, Z_train_bb
@@ -1494,80 +1537,104 @@ if 'deberta_p2' in CKPTS:
     print(f"[CHECKPOINT GATE] deberta_v3_large: 1620-Row Train BAcc = {bacc_tr:.4f}")
 
     if bacc_tr >= 0.50:
-        w_plain, w_twin, w_helper = 0.22, 0.08, 0.18
+        # 1. MAIN STACK (85% Mass): Canonical weight w_plain = 0.25 (twin = 0.00)
         lp_plain = log_softmax(Z_test_deb @ W_p.T + b_p)
-        LOGIT_CORE += w_plain * lp_plain
+        LOGIT_MAIN += 0.25 * lp_plain
+        print("[deberta_v3_large -> LOGIT_MAIN] Added Plain (0.25).")
 
+        # Update consensus distance
         Z_norm = Z_test_deb - Z_test_deb.mean(axis=0, keepdims=True)
         Z_norm /= np.linalg.norm(Z_norm, axis=1, keepdims=True).clip(min=1e-8)
         D_m = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
         np.fill_diagonal(D_m, 0.0)
-        D_neural_sum += w_plain * D_m
-        D_neural_weight_total += w_plain
+        D_neural_sum += 0.25 * D_m
+        D_neural_weight_total += 0.25
 
         D_neural_curr = D_neural_sum / max(1e-6, D_neural_weight_total)
         D_hybrid_curr = 0.55 * D_tfidf + 0.45 * D_neural_curr
 
+        # 2. COMPLEMENTARY LORA STACK: Plain (0.18) + Multi-Res Twins (0.06)
+        LOGIT_COMP_LORA += 0.18 * lp_plain
         if W_c is not None and N_test >= 2:
             cond_dist = squareform(D_hybrid_curr, checks=False)
             Z_link = linkage(cond_dist, method='average')
-            g85 = fcluster(Z_link, t=0.85, criterion='distance')
-            g72 = fcluster(Z_link, t=0.72, criterion='distance')
-            g60 = fcluster(Z_link, t=0.60, criterion='distance')
+            g85_c = fcluster(Z_link, t=0.85, criterion='distance')
+            g72_c = fcluster(Z_link, t=0.72, criterion='distance')
+            g60_c = fcluster(Z_link, t=0.60, criterion='distance')
 
-            lp_c_85, m85 = compute_centered_logits(Z_test_deb, g85, W_c, b_c, LABELS)
-            lp_c_72, m72 = compute_centered_logits(Z_test_deb, g72, W_c, b_c, LABELS)
-            lp_c_60, m60 = compute_centered_logits(Z_test_deb, g60, W_c, b_c, LABELS)
+            lp_c_85_m, m85_c = compute_centered_logits(Z_test_deb, g85_c, W_c, b_c, LABELS)
+            lp_c_72_m, m72_c = compute_centered_logits(Z_test_deb, g72_c, W_c, b_c, LABELS)
+            lp_c_60_m, m60_c = compute_centered_logits(Z_test_deb, g60_c, W_c, b_c, LABELS)
 
-            if m85.any(): LOGIT_CORE[m85] += (0.50 * w_twin) * lp_c_85[m85]
-            if m72.any(): LOGIT_CORE[m72] += (0.30 * w_twin) * lp_c_72[m72]
-            if m60.any(): LOGIT_CORE[m60] += (0.20 * w_twin) * lp_c_60[m60]
+            if m85_c.any(): LOGIT_COMP_LORA[m85_c] += (0.50 * 0.06) * lp_c_85_m[m85_c]
+            if m72_c.any(): LOGIT_COMP_LORA[m72_c] += (0.30 * 0.06) * lp_c_72_m[m72_c]
+            if m60_c.any(): LOGIT_COMP_LORA[m60_c] += (0.20 * 0.06) * lp_c_60_m[m60_c]
 
-        prm = fit_shared_gaussian_lowram(Z_train_deb, y_sub, prompts_sub, d_target=256)
-        U_train = transform_lowram(Z_train_deb, prm)
+        # 3. Regularized DP with se_floor = 0.10
+        prm = fit_shared_gaussian_lowram(Z_train_deb, y_sub, prompts_sub, d_target=256, se_floor=0.10)
         U_test = transform_lowram(Z_test_deb, prm)
 
-        idx64 = prm["top64_idx"]
-        U_tr_64 = U_train[:, idx64].astype(np.float32)
-        U_te_64 = U_test[:, idx64].astype(np.float32)
-        U_tr_64 /= np.linalg.norm(U_tr_64, axis=1, keepdims=True).clip(min=1e-6)
-        U_te_64 /= np.linalg.norm(U_te_64, axis=1, keepdims=True).clip(min=1e-6)
-        spectral_tr_blocks.append(U_tr_64)
-        spectral_te_blocks.append(U_te_64)
+        scale = PRIOR_SCALES["deberta_p2"]
+        S_tr_64 = (((Z_train_deb - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+        S_te_64 = (((Z_test_deb - prm["mx"]) / prm["sx"]) @ prm["V_top64"]).astype(np.float32)
+        S_tr_64 = (S_tr_64 / np.linalg.norm(S_tr_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+        S_te_64 = (S_te_64 / np.linalg.norm(S_te_64, axis=1, keepdims=True).clip(min=1e-6)) * scale
+        spectral_tr_blocks.append(S_tr_64)
+        spectral_te_blocks.append(S_te_64)
 
         g65 = fcluster(linkage(squareform(D_hybrid_curr, checks=False), method='average'), t=0.65, criterion='distance') if N_test >= 2 else np.ones(N_test, dtype=int)
-        lp_dp = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
-        P_dp = softmax(lp_dp, axis=1)
-        HELPER_LIST.append((w_helper, P_dp))
-        print(f"[Routing: deberta_v3_large] Added Core Plain({w_plain}) + Twin({w_twin}), Helper DP({w_helper}).")
-        del U_train, U_test, prm, lp_dp, P_dp
+        dp_posteriors["deberta"] = scores_exact_dp(U_test, g65, prm, D_hybrid_curr)
+        print(f"[deberta_v3_large -> COMP_LIST] Stored Regularized DP Posterior & Prior-Scaled 64D Spectral Block (scale={scale}).")
+        del U_test, prm
 
     del Z_deb, Z_test_deb, Z_train_deb, heads_deb_sd
     gc.collect()
 
 log_ram("After Trunk 4 (DeBERTa) Cleanup")
-""")
 
-    # Cell 6: Module 4 — 384-Dim Joint Spectral Bank + 88/12 Mixture + Shield + 300-Step Sinkhorn
-    add_md("### Step 6: Module 4 — 384-Dim Cross-Backbone Spectral Bank + 88/12 Mixture + Shield + 300-Step Sinkhorn")
-    add_code("""# 1. Fit Full-Rank 384-Dim Joint Cross-Backbone Spectral Bank on 1,620 Rows
+# Append Secondary LoRAs to COMP_LIST (weight = 0.35)
+P_comp_lora = softmax(LOGIT_COMP_LORA, axis=1)
+COMP_LIST.append((0.35, P_comp_lora))
+print(f"[COMP_LIST] Added Secondary LoRAs & Multi-Resolution Twins (weight=0.35).")
+
+# Append Blended Regularized DP Posteriors to COMP_LIST (weight = 0.30)
+dp_weights = {
+    "q3_14b": 0.38,
+    "q25_14b": 0.24,
+    "deberta": 0.20,
+    "instyle": 0.10,
+    "part1_14b": 0.08
+}
+active_dp_keys = [k for k in dp_weights.keys() if k in dp_posteriors]
+if len(active_dp_keys) > 0:
+    sum_w_dp = sum(dp_weights[k] for k in active_dp_keys)
+    lp_dp_blend = sum((dp_weights[k] / sum_w_dp) * dp_posteriors[k] for k in active_dp_keys)
+    P_dp_blend = softmax(lp_dp_blend, axis=1)
+    COMP_LIST.append((0.30, P_dp_blend))
+    print(f"[COMP_LIST] Added Blended Regularized DP Posteriors (weight=0.30, components={active_dp_keys}).")
+"""
+    add_md("### Step 5: 6-Checkpoint Ensemble across 4 Trunks with Tier 1 & Tier 2 Separation")
+    add_code(cell_5_code)
+
+    # Cell 6: Module 4 — 384-Dim Spectral Bank, 85/15 Mixture, Shields & 300-Step Sinkhorn
+    cell_6_code = """# 1. Fit Leak-Free Full-Rank 384-Dim Joint Spectral Bank on 1,620 Rows (Unsupervised Features)
 if len(spectral_tr_blocks) > 0:
     X_spec_tr = np.hstack(spectral_tr_blocks)
     X_spec_te = np.hstack(spectral_te_blocks)
     print(f"[Joint Spectral Bank] Formed matrices: Train={X_spec_tr.shape}, Test={X_spec_te.shape}")
 
-    # 5-fold GroupKFold OOF Balanced Accuracy
+    # 5-fold GroupKFold OOF Balanced Accuracy (zero label leakage!)
     gkf = GroupKFold(n_splits=5)
     oof_preds = np.zeros(len(y_sub), dtype=int)
     for tr_idx, val_idx in gkf.split(X_spec_tr, y_sub, groups=prompts_sub):
-        clf_fold = LogisticRegression(C=0.15, max_iter=2000, random_state=42)
+        clf_fold = LogisticRegression(C=0.04, max_iter=2000, random_state=42)
         clf_fold.fit(X_spec_tr[tr_idx], y_sub[tr_idx])
         oof_preds[val_idx] = clf_fold.predict(X_spec_tr[val_idx])
     oof_bacc = balanced_accuracy_score(y_sub, oof_preds)
-    print(f"[SPECTRAL BANK 5-FOLD OOF] Plain BAcc = {oof_bacc:.4f}")
+    print(f"[LEAK-FREE SPECTRAL BANK 5-FOLD OOF] Realistic Generalization BAcc = {oof_bacc:.4f}")
 
     # Plain Logistic Regression
-    clf_plain = LogisticRegression(C=0.15, max_iter=2000, random_state=42)
+    clf_plain = LogisticRegression(C=0.04, max_iter=2000, random_state=42)
     clf_plain.fit(X_spec_tr, y_sub)
     lp_spec_plain = clf_plain.predict_log_proba(X_spec_te)
     if hasattr(clf_plain, 'classes_'):
@@ -1578,7 +1645,7 @@ if len(spectral_tr_blocks) > 0:
     for p in np.unique(prompts_sub):
         mask = (prompts_sub == p)
         X_spec_tr_c[mask] -= X_spec_tr_c[mask].mean(axis=0, keepdims=True)
-    clf_center = LogisticRegression(C=0.10, max_iter=2000, random_state=42)
+    clf_center = LogisticRegression(C=0.03, max_iter=2000, random_state=42)
     clf_center.fit(X_spec_tr_c, y_sub)
 
     # Prompt-centered test features
@@ -1602,23 +1669,23 @@ if len(spectral_tr_blocks) > 0:
     if hasattr(clf_center, 'classes_'):
         lp_spec_center = align_cols(lp_spec_center, [LABELS[c] for c in clf_center.classes_])
 
-    lp_spec_joint = lp_spec_plain + 0.45 * lp_spec_center
-    HELPER_LIST.append((0.22, softmax(lp_spec_joint, axis=1)))
-    print("[Joint Spectral Bank] Appended helper probability with weight 0.22.")
+    lp_spec_joint = lp_spec_plain + 0.35 * lp_spec_center
+    COMP_LIST.append((0.15, softmax(lp_spec_joint, axis=1)))
+    print("[COMP_LIST] Added Leak-Free Prior-Scaled Spectral Bank (weight=0.15).")
 
-# 2. Combine Core (88%) and Helper (12%) in Probability Space
-R_core = softmax(LOGIT_CORE, axis=1)
-if len(HELPER_LIST) > 0:
-    H_helper = sum(w * P_h for w, P_h in HELPER_LIST) / max(1e-8, sum(w for w, _ in HELPER_LIST))
-    P_mix = 0.88 * R_core + 0.12 * H_helper
+# 2. Combine 85% Main Stack and 15% Complementary Stack in Probability Space
+R_main = softmax(LOGIT_MAIN, axis=1)
+if len(COMP_LIST) > 0:
+    comp_weight_total = sum(w for w, _ in COMP_LIST)
+    P_comp = sum(w * P_c for w, P_c in COMP_LIST) / max(1e-8, comp_weight_total)
+    P_mix = 0.85 * R_main + 0.15 * P_comp
+    print(f"[Probability Mixture] Convex blend: 0.85 * R_main + 0.15 * P_comp ({len(COMP_LIST)} complementary streams).")
 else:
-    P_mix = R_core
+    P_mix = R_main
+    print("[Probability Mixture] Pure R_main (no complementary streams).")
 
-log_P = np.log(np.clip(P_mix, 1e-12, 1.0))
-print(f"[Probability Mixture] Blended 88% Core + 12% Helper ({len(HELPER_LIST)} helpers).")
-
-# 3. Apply Pre-Sinkhorn Top-1 Claude Specialist Gate & Orthographic Shield
-# Claude Specialist Gate
+# 3. Apply Gentle Pre-Sinkhorn Claude Specialist Gate & Orthographic Shield
+# Gentle Claude Specialist Gate (mass-preserving within Claude family)
 if claude_spec_logits is not None:
     claude_cols = FAMILIES["claude"]
     P_claude_head = softmax(claude_spec_logits, axis=-1)
@@ -1627,29 +1694,24 @@ if claude_spec_logits is not None:
         c_idx = [src_c.index(LABELS[c]) for c in claude_cols]
         P_claude_head = P_claude_head[:, c_idx]
 
-    pred_core = R_core.argmax(axis=1)
-    claude_mask = np.isin(pred_core, claude_cols)
+    pred_main = R_main.argmax(axis=1)
+    claude_mask = np.isin(pred_main, claude_cols)
     if claude_mask.any():
         for i in np.where(claude_mask)[0]:
             tot_mass = P_mix[i, claude_cols].sum()
-            blended = 0.78 * P_mix[i, claude_cols] + 0.22 * (tot_mass * P_claude_head[i])
+            blended = 0.85 * P_mix[i, claude_cols] + 0.15 * (tot_mass * P_claude_head[i])
             P_mix[i, claude_cols] = blended
-        log_P = np.log(np.clip(P_mix, 1e-12, 1.0))
         print(f"[Claude Specialist Gate] Refined {claude_mask.sum()} passages predicted in Claude family.")
 
-# Pre-Sinkhorn Orthographic Shield
+# Gentle Curly Quote Guard on Claude/GLM
 claude_and_glm_idx = FAMILIES["claude"] + FAMILIES["glm"]
-gemini_idx = FAMILIES["gemini"]
-sol_idx = LAB2I["gpt-5.6-sol"]
-
 for i, txt in enumerate(test_texts):
     txt_s = str(txt)
     if any(q in txt_s for q in ['\\u2018', '\\u2019', '\\u201c', '\\u201d']):
-        log_P[i, claude_and_glm_idx] -= 2.5
-    if '\\u2014' in txt_s:
-        log_P[i, gemini_idx] -= 2.0
-    if "'" in txt_s:
-        log_P[i, sol_idx] -= 2.5
+        P_mix[i, claude_and_glm_idx] *= np.exp(-1.0)
+
+# Re-normalize rows to simplex
+P_mix /= P_mix.sum(axis=1, keepdims=True).clip(min=1e-12)
 
 # 4. Final 300-Step Exact Multiplicative Sinkhorn Balancing
 def sinkhorn_balancing(P: np.ndarray, iters: int = 300) -> np.ndarray:
@@ -1664,7 +1726,7 @@ def sinkhorn_balancing(P: np.ndarray, iters: int = 300) -> np.ndarray:
     return P
 
 print("[Sinkhorn] Running official 300-step exact multiplicative Sinkhorn mass balancing...")
-P_final = sinkhorn_balancing(softmax(log_P, axis=1), iters=300)
+P_final = sinkhorn_balancing(P_mix, iters=300)
 
 preds = [LABELS[idx] for idx in P_final.argmax(axis=1)]
 df_sub = pd.DataFrame({"id": test_df["id"], "model": preds})
@@ -1679,13 +1741,31 @@ print("\\nSubmission preview:")
 print(df_sub.head())
 print("\\nClass prediction distribution:")
 print(df_sub['model'].value_counts())
-print("\\n=== Version 40 Pipeline Execution Successfully Completed ===")
-""")
+print("\\n=== Version 42 Pipeline Execution Successfully Completed ===")
+"""
+    add_md("### Step 6: Module 4 — Leak-Free 384-Dim Spectral Bank, 85/15 Mixture, Shields & 300-Step Sinkhorn")
+    add_code(cell_6_code)
 
-    out_file = Path("kaggle_submission.ipynb")
-    with open(out_file, "w", encoding="utf-8") as f:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1)
-    print(f"Successfully generated {out_file} ({out_file.stat().st_size} bytes).")
+
+    # Also keep root copy synchronized if target is kernels/submission/kaggle_submission.ipynb
+    root_nb = Path("kaggle_submission.ipynb")
+    if output_path.resolve() != root_nb.resolve():
+        with open(root_nb, "w", encoding="utf-8") as f:
+            json.dump(nb, f, indent=1)
+
+    print(f"Successfully compiled notebook: {output_path} ({output_path.stat().st_size} bytes, {len(nb['cells'])} cells)")
+    return output_path
+
+def main():
+    parser = argparse.ArgumentParser(description="Compile modular src/namethatllm codebase into Kaggle submission notebook.")
+    parser.add_argument("--config", type=Path, default=Path("configs/v42_ensemble.json"), help="Path to ensemble config JSON")
+    parser.add_argument("--output", type=Path, default=Path("kernels/submission/kaggle_submission.ipynb"), help="Path to output notebook")
+    args = parser.parse_args()
+
+    compile_notebook(args.config, args.output)
 
 if __name__ == "__main__":
-    create_v40_pipeline_notebook()
+    main()

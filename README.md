@@ -175,66 +175,79 @@ Every checkpoint is validated against a verification gate ($\text{BAcc} \ge 0.48
 
 ---
 
-## Repository Structure & Organization
+## Repository Structure & Organization (PyPA `src` Layout)
 
 ```
+NameThatLLM/
+├── pyproject.toml                       # PEP 621 package metadata, build config, and pytest settings
 ├── README.md                            # Executive overview, milestone scorecard, and SOTA architecture
 ├── TUTORIAL.md                          # Comprehensive 1,000+ line printable masterclass & mathematical guide
-├── build_v37_pipeline.py                # Production generator for Version 37 SOTA pipeline (0.65+ Target)
-├── build_v30_pipeline.py                # Generator for verified Version 30 / v36 pipeline (0.604 Score)
-├── kaggle_submission.ipynb              # Production inference notebook for Kaggle execution
-├── kernel-metadata.json                 # Kaggle notebook metadata, dataset mounts, and GPU config
-├── run_tests.py                         # Test runner executing all unit and integration test suites
-├── tests/                               # Comprehensive test suite (23 unit tests)
-│   ├── test_v37_pipeline.py             # Unit tests for Sinkhorn, LOO-CLC, cluster splitting, and align_cols
-│   ├── test_submission_pipeline.py      # Integration tests for end-to-end pipeline and schema validation
-│   └── test_lora_assignment_pipeline.py # Unit tests for canonical mapping, Hungarian matching, and guardrails
-├── src/                                 # Modular feature extraction & model library
-│   ├── adaptive_centering.py            # Prompt-topic chunk debiasing and centering
-│   ├── config.py                        # Master class labels, provider families, and hyperparameters
-│   ├── features_neural.py               # Deep transformer embedding extractors
-│   ├── features_stylo.py                # Stylometric, shape, and function word extractors
-│   ├── models_linear.py                 # Multi-view ridge and linear support vector classifiers
-│   ├── models_specialist.py             # Within-family specialist heads and ANOVA discriminators
-│   └── validation.py                    # Strict GroupKFold cross-validation partitioning
-├── archive/                             # Archived legacy generator scripts (v20 through v27)
-├── train.csv                            # Competition training dataset (2,699 passages)
-├── test.csv                             # Sample test dataset
-└── .gitignore                           # Optimized git ignore for ML artifacts and caches
+├── configs/                             # Declarative experiment and ensemble configurations
+│   └── v42_ensemble.json                # Production weights, regularizers, thresholds, and prior scales
+├── kernels/                             # Kaggle kernel build targets and metadata
+│   ├── submission/                      # Official competition submission kernel
+│   │   ├── kernel-metadata.json         # Kaggle GPU/dataset mount configuration
+│   │   └── kaggle_submission.ipynb      # Compiled production inference notebook
+│   └── training/                        # LoRA fine-tuning training kernel
+│       ├── kernel-metadata.json
+│       └── lora_training.ipynb
+├── scripts/                             # Automation tooling and compilers
+│   ├── compile_notebook.py              # Single-source-of-truth notebook compiler from src/ + configs/
+│   └── push_submission.py               # Automated test, compile, and Kaggle push CLI
+├── src/namethatllm/                     # Modular production Python package
+│   ├── __init__.py                      # Package version (0.42.0) and public exports
+│   ├── config.py                        # Canonical 18 classes, provider families, simplex helpers, paths
+│   ├── lexical_engine.py                # 78k 4-view Main SVC + 5-view BPE Complementary ensemble
+│   ├── neural_extractor.py              # Universal trunk loader, dynamic bfloat16 row rescue, head solvers
+│   ├── wpca_gaussian.py                 # Full-rank wPCA, safe cluster splitting (s <= 14), 2^18 Bitmask DP
+│   ├── spectral_bank.py                 # Unsupervised 384-dim Joint Spectral Bank (0 label leakage)
+│   └── postprocess.py                   # Two-tier convex blend, Claude specialist gate, 300-step Sinkhorn
+├── tests/                               # Comprehensive unit test suite (pytest)
+│   ├── __init__.py
+│   ├── test_lexical.py                  # Tokenizers, shape patterns, stopwords, and dual lexical outputs
+│   ├── test_wpca_dp.py                  # Two-way decomposition, Ledoit-Wolf shrinkage, ExactAuthorPosterior
+│   ├── test_spectral_bank.py            # Prior scaling, unsupervised V_f32 projection, OOF validation
+│   └── test_postprocess.py              # Two-tier blend, Claude gate, curly quote shield, Sinkhorn balancing
+└── local_data/                          # Git-ignored cache, logs, and downloaded weights
+    ├── cache/
+    ├── checkpoints/
+    └── logs/
 ```
 
 ---
 
-## Running the Verification Test Suite
+## Installation & Developer Setup
 
-To verify all algorithms, mathematical invariants, and pipeline components:
+Install the package in editable mode with development dependencies:
 
 ```powershell
-python run_tests.py
-```
+# 1. Install package in editable mode
+pip install -e . --no-deps
 
-Expected output:
-```
-Ran 36 tests in ~16s
-OK
+# 2. Run the full unit test suite
+python -m pytest tests -v
 ```
 
 ---
 
 ## Compiling & Submitting to Kaggle
 
-To build the production notebook and push it to Kaggle:
+The pipeline uses a **Single Source of Truth** architecture: all model code and logic live in `src/namethatllm/` and configurations in `configs/`. The compiler validates syntax on every cell using Python AST.
 
 ```powershell
-# 1. Compile the notebook
-python build_v37_pipeline.py
+# Option A: One-line test, compile, and push
+python scripts/push_submission.py
 
-# 2. Push kernel to Kaggle
-python -m kaggle kernels push -p .
+# Option B: Manual step-by-step
+# 1. Compile the production notebook from src/namethatllm/ + configs/v42_ensemble.json
+python scripts/compile_notebook.py --config configs/v42_ensemble.json
+
+# 2. Push the submission kernel to Kaggle
+python -m kaggle kernels push -p kernels/submission
 
 # 3. Monitor execution status
 python -m kaggle kernels status anilmittal/name-that-llm-v2-submission
 
 # 4. Submit to competition once complete
-python -m kaggle competitions submit -c name-that-llm -k anilmittal/name-that-llm-v2-submission -f submission.parquet -v <VERSION> -m "v37: 78k BPE & Within-Family Core + Consensus Neural Clustering + LOO-CLC + 300-Step Sinkhorn"
+python -m kaggle competitions submit -c name-that-llm -k anilmittal/name-that-llm-v2-submission -f submission.parquet -v <VERSION> -m "v42: Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Leak-Free Spectral Bank"
 ```
