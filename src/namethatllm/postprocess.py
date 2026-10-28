@@ -74,18 +74,18 @@ def apply_curly_quote_shield(
     multiplier: float = 0.36787944117144233  # np.exp(-1.0)
 ) -> np.ndarray:
     """
-    Gentle zero-occurrence guard on Claude and GLM curly quote absence.
-    Multiplies target columns by multiplier and re-normalizes rows to simplex.
+    Pre-Sinkhorn zero-occurrence guard on Claude and GLM when typographic curly quotes are present.
+    Multiplies target columns by multiplier and re-normalizes rows to the probability simplex.
     """
+    P_out = P_mix.copy()
     claude_and_glm_idx = FAMILIES["claude"] + FAMILIES["glm"]
     for i, txt in enumerate(test_texts):
         txt_s = str(txt)
         if any(q in txt_s for q in ['\u2018', '\u2019', '\u201c', '\u201d']):
-            P_mix[i, claude_and_glm_idx] *= multiplier
+            P_out[i, claude_and_glm_idx] *= multiplier
 
-    # Re-normalize rows to simplex
-    P_mix /= P_mix.sum(axis=1, keepdims=True).clip(min=1e-12)
-    return P_mix
+    P_out /= P_out.sum(axis=1, keepdims=True).clip(min=1e-12)
+    return P_out
 
 def sinkhorn_balancing(P: np.ndarray, iters: int = 300) -> np.ndarray:
     """Official 300-step exact multiplicative Sinkhorn column mass balancing."""

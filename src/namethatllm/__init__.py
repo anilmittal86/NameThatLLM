@@ -7,7 +7,14 @@ Ensemble package for LLM passage attribution.
 __version__ = "0.42.0"
 
 from .config import LABELS, K, LAB2I, FAMILIES, align_cols, log_softmax, softmax
-from .lexical_engine import run_lexical_engine
+from .lexical_engine import (
+    run_lexical_engine,
+    extract_handwriting_features,
+    shape_text,
+    function_text,
+    FUNCTION_WORDS,
+    STOP_WORDS
+)
 from .neural_extractor import (
     forward_and_pool_batch,
     resolve_head_tensors,
@@ -37,7 +44,8 @@ from .pipeline import run_submission_pipeline
 __all__ = [
     "__version__",
     "LABELS", "K", "LAB2I", "FAMILIES", "align_cols", "log_softmax", "softmax",
-    "run_lexical_engine",
+    "run_lexical_engine", "extract_handwriting_features", "shape_text", "function_text",
+    "FUNCTION_WORDS", "STOP_WORDS",
     "forward_and_pool_batch", "resolve_head_tensors", "merge_lora", "in_place_copy",
     "compute_centered_logits", "UniversalLoRATrunkLoader", "read_checkpoint_meta", "extract_deberta_checkpoint",
     "fit_shared_gaussian_lowram", "transform_lowram", "ExactAuthorPosterior",

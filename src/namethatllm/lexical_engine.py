@@ -22,6 +22,7 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import SGDClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
 
 LABELS = [
     "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
@@ -50,23 +51,17 @@ def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     c = np.max(x, axis=axis, keepdims=True)
     return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
 
-STOP_WORDS = set([
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't",
-    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
-    "can't", "cannot", "could", "couldn't", "did", "didn't", "do", "does", "doesn't", "doing", "don't",
-    "down", "during", "each", "few", "for", "from", "further", "had", "hadn't", "has", "hasn't", "have",
-    "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here", "here's", "hers", "herself",
-    "him", "himself", "his", "how", "how's", "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into",
-    "is", "isn't", "it", "it's", "its", "itself", "let's", "me", "more", "most", "mustn't", "my",
-    "myself", "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "ought", "our",
-    "ours", "ourselves", "out", "over", "own", "same", "shan't", "she", "she'd", "she'll", "she's",
-    "should", "shouldn't", "so", "some", "such", "than", "that", "that's", "the", "their", "theirs",
-    "them", "themselves", "then", "there", "there's", "these", "they", "they'd", "they'll", "they're",
-    "they've", "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "wasn't",
-    "we", "we'd", "we'll", "we're", "we've", "were", "weren't", "what", "what's", "when", "when's",
-    "where", "where's", "which", "while", "who", "who's", "whom", "why", "why's", "with", "won't",
-    "would", "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours", "yourself"
-])
+FUNCTION_WORDS = set(
+    "a an the and or but if while although because as so than that which who whom whose "
+    "this these those it its they them their theirs he him his she her hers we us our ours "
+    "you your yours i me my mine in on at to from with without for of by over under between "
+    "through into about is are was were be been being have has had do does did can could "
+    "will would shall should may might must not no nor all any some each every both either "
+    "neither other another such only also just very too more most less least here there "
+    "when where why how what whether then now still yet even much many few little "
+    "am having s t re ve ll d m don doesn didn isn aren wasn weren hasn haven hadn won wouldn couldn shouldn".split()
+)
+STOP_WORDS = FUNCTION_WORDS
 
 def shape_text(t: str) -> str:
     """Replaces alphabetic character blocks with X (uppercase) and x (lowercase)."""
@@ -76,6 +71,69 @@ def function_text(t: str) -> str:
     """Masks non-stopwords and non-punctuation to CONTENT, preserving function and punctuation syntax."""
     tokens = re.findall(r"(?u)\b\w+\b|[^\w\s]", str(t))
     return " ".join([w.lower() if (w.lower() in STOP_WORDS or not w.isalnum()) else "CONTENT" for w in tokens])
+
+_RE_STRAIGHT_CONTR = re.compile(r"[A-Za-z]'[A-Za-z]")
+_RE_CURLY_CONTR = re.compile(r"[A-Za-z]\u2019[A-Za-z]")
+
+def extract_handwriting_features(texts: List[str]) -> np.ndarray:
+    """
+    Extracts 26 continuous punctuation, orthographic, and structural density features:
+    - 14 per-word punctuation rates (colon, semicolon, em-dash, double-hyphen, curly/straight quotes, etc.)
+    - 2 explicit prose contraction ratios (straight ASCII apostrophe vs curly apostrophe inside words)
+    - 10 structural, casing, digit, sentence rhythm/burstiness, and type-token ratio features.
+    """
+    feats = np.zeros((len(texts), 26), dtype=np.float32)
+    for i, raw_t in enumerate(texts):
+        t = str(raw_t)
+        t_len = max(len(t), 1)
+        words = t.split()
+        n_words = max(len(words), 1)
+
+        # 14 Continuous Punctuation Frequencies per Word
+        c_colon = t.count(":") / n_words
+        c_semi = t.count(";") / n_words
+        c_em_dash = t.count("\u2014") / n_words
+        c_double_hyph = t.count("--") / n_words
+        c_curly_sq = (t.count("\u2018") + t.count("\u2019")) / n_words
+        c_straight_sq = t.count("'") / n_words
+        c_curly_dq = (t.count("\u201c") + t.count("\u201d")) / n_words
+        c_straight_dq = t.count('"') / n_words
+        c_paren = (t.count("(") + t.count(")")) / n_words
+        c_comma = t.count(",") / n_words
+        c_excl = t.count("!") / n_words
+        c_ques = t.count("?") / n_words
+        c_ellipsis = (t.count("...") + t.count("\u2026")) / n_words
+        c_hyphen = t.count("-") / n_words
+
+        # Prose-specific Contraction Habits (separates gpt-5.6-sol curly contractions from straight)
+        n_straight_contr = len(_RE_STRAIGHT_CONTR.findall(t)) / n_words
+        n_curly_contr = len(_RE_CURLY_CONTR.findall(t)) / n_words
+
+        # Formatting, Casing, and Sentence Burstiness
+        c_newline = t.count("\n") / n_words
+        c_bullet = (t.count("\n- ") + t.count("\n* ")) / n_words
+        c_upper = sum(1 for ch in t if ch.isupper()) / t_len
+        c_digits = sum(1 for ch in t if ch.isdigit()) / t_len
+
+        w_lens = [len(w) for w in words]
+        mean_w_len = float(np.mean(w_lens)) if w_lens else 0.0
+        std_w_len = float(np.std(w_lens)) if len(w_lens) > 1 else 0.0
+
+        sents = [s.strip() for s in t.replace("!", ".").replace("?", ".").split(".") if s.strip()]
+        s_lens = [len(s.split()) for s in sents]
+        mean_s_len = float(np.mean(s_lens)) if s_lens else 0.0
+        std_s_len = float(np.std(s_lens)) if len(s_lens) > 1 else 0.0
+        burstiness = float(std_s_len / max(mean_s_len, 1e-5))
+        ttr = float(len(set(words)) / n_words)
+
+        feats[i] = [
+            c_colon, c_semi, c_em_dash, c_double_hyph, c_curly_sq, c_straight_sq,
+            c_curly_dq, c_straight_dq, c_paren, c_comma, c_excl, c_ques,
+            c_ellipsis, c_hyphen, n_straight_contr, n_curly_contr, c_newline,
+            c_bullet, c_upper, c_digits, mean_w_len, std_w_len, mean_s_len,
+            std_s_len, burstiness, ttr
+        ]
+    return feats
 
 def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Path],
                        qwen_tok_dir: str, working_dir: Path) -> Dict[str, np.ndarray]:
@@ -123,7 +181,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         ("char", 3, 5, 250000, 1.0),
         ("word", 1, 3, 180000, 0.7),
         ("shape", 2, 6, 60000, 0.5),
-        ("function", 1, 3, 40000, 0.5),
+        ("function", 1, 3, 50000, 0.5),
     ]
 
     fit_sh = [shape_text(t) for t in fit_texts]
@@ -134,24 +192,29 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     tr_mats_4v = []
     te_mats_4v = []
     for mode, mn, mx, mf, sc in VIEWS_4V:
+        analyzer = "char" if mode == "shape" else ("word" if mode == "function" else mode)
+        opts = dict(
+            analyzer=analyzer,
+            ngram_range=(mn, mx),
+            lowercase=False,
+            sublinear_tf=True,
+            min_df=2 if len(fit_texts) >= 50 else 1,
+            max_features=mf,
+            dtype=np.float32,
+        )
+        if analyzer == "word":
+            opts["token_pattern"] = r"(?u)\b\w+\b|[^\w\s]"
+
+        v = TfidfVectorizer(**opts)
         if mode == "shape":
-            v = TfidfVectorizer(analyzer="char", ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
-            tr_m = v.fit_transform(fit_sh) * sc
-            te_m = v.transform(test_sh) * sc
+            tr_m = v.fit_transform(fit_sh) * np.float32(sc)
+            te_m = v.transform(test_sh) * np.float32(sc)
         elif mode == "function":
-            v = TfidfVectorizer(analyzer="word", ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
-            tr_m = v.fit_transform(fit_fn) * sc
-            te_m = v.transform(test_fn) * sc
-        elif mode == "word":
-            v = TfidfVectorizer(analyzer="word", ngram_range=(mn, mx), max_features=mf,
-                                token_pattern=r"(?u)\b\w+\b|[^\w\s]", lowercase=False,
-                                sublinear_tf=True, dtype=np.float32)
-            tr_m = v.fit_transform(fit_texts) * sc
-            te_m = v.transform(test_texts) * sc
+            tr_m = v.fit_transform(fit_fn) * np.float32(sc)
+            te_m = v.transform(test_fn) * np.float32(sc)
         else:
-            v = TfidfVectorizer(analyzer=mode, ngram_range=(mn, mx), max_features=mf, sublinear_tf=True, dtype=np.float32)
-            tr_m = v.fit_transform(fit_texts) * sc
-            te_m = v.transform(test_texts) * sc
+            tr_m = v.fit_transform(fit_texts) * np.float32(sc)
+            te_m = v.transform(test_texts) * np.float32(sc)
         tr_mats_4v.append(tr_m)
         te_mats_4v.append(te_m)
 
@@ -165,6 +228,15 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     log_p_svc_main = log_softmax(logits_svc_main)
 
     # OUTPUT 2: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
+    # Continuous Handwriting & Punctuation Density Features
+    hw_tr_raw = extract_handwriting_features(fit_texts)
+    hw_te_raw = extract_handwriting_features(test_texts)
+    scaler = StandardScaler()
+    hw_tr = np.clip(scaler.fit_transform(hw_tr_raw), -5.0, 5.0).astype(np.float32)
+    hw_te = np.clip(scaler.transform(hw_te_raw), -5.0, 5.0).astype(np.float32)
+    sp_hw_tr = sparse.csr_matrix(hw_tr * 0.15)
+    sp_hw_te = sparse.csr_matrix(hw_te * 0.15)
+
     tok = None
     if qwen_tok_dir and os.path.exists(qwen_tok_dir):
         try:
@@ -196,14 +268,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         te_bpe = v_bpe.transform(test_bpe_strs) * 0.8
         del fit_bpe_strs, test_bpe_strs, v_bpe
         gc.collect()
-        X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe], format="csr")
-        X_te_5v = sparse.hstack([X_te_4v, te_bpe], format="csr")
+        X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe, sp_hw_tr], format="csr")
+        X_te_5v = sparse.hstack([X_te_4v, te_bpe, sp_hw_te], format="csr")
     else:
         v_cw = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=75000, sublinear_tf=True, dtype=np.float32)
         tr_cw = v_cw.fit_transform(fit_texts) * 0.8
         te_cw = v_cw.transform(test_texts) * 0.8
-        X_tr_5v = sparse.hstack([X_tr_4v, tr_cw], format="csr")
-        X_te_5v = sparse.hstack([X_te_4v, te_cw], format="csr")
+        X_tr_5v = sparse.hstack([X_tr_4v, tr_cw, sp_hw_tr], format="csr")
+        X_te_5v = sparse.hstack([X_te_4v, te_cw, sp_hw_te], format="csr")
 
     svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3)
     svc_comp.fit(X_tr_5v, fit_y)

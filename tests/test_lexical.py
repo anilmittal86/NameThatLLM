@@ -80,5 +80,37 @@ class TestLexicalEngine(unittest.TestCase):
             # Probability simplex
             self.assertTrue(np.allclose(res["p_lex_comp"].sum(axis=1), 1.0))
 
+    def test_shape_and_function_vectorizers_preserve_case_and_punctuation(self):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from namethatllm.lexical_engine import shape_text, function_text
+
+        text = "Hello World! It's — great; test."
+        sh = shape_text(text)
+        v_shape = TfidfVectorizer(analyzer="char", ngram_range=(2, 6), lowercase=False)
+        v_shape.fit([sh])
+        self.assertTrue(any("X" in k for k in v_shape.vocabulary_), "Shape vectorizer must preserve uppercase X")
+
+        fn = function_text(text)
+        v_func = TfidfVectorizer(analyzer="word", ngram_range=(1, 3), lowercase=False, token_pattern=r"(?u)\b\w+\b|[^\w\s]")
+        v_func.fit([fn])
+        vocab = v_func.vocabulary_
+        self.assertTrue(any(punct in vocab for punct in [",", ";", "—", "'", "!"]), "Function vectorizer must preserve punctuation tokens")
+        self.assertIn("it", vocab)
+
+    def test_extract_handwriting_features_shape_and_contractions(self):
+        from namethatllm.lexical_engine import extract_handwriting_features
+
+        samples = [
+            "It's a straight contraction — test with em-dash.",
+            "It\u2019s a curly contraction; test without em-dash."
+        ]
+        feats = extract_handwriting_features(samples)
+        self.assertEqual(feats.shape, (2, 26))
+        # Feature 14 is straight contractions, Feature 15 is curly contractions
+        self.assertGreater(feats[0, 14], 0.0)
+        self.assertEqual(feats[0, 15], 0.0)
+        self.assertEqual(feats[1, 14], 0.0)
+        self.assertGreater(feats[1, 15], 0.0)
+
 if __name__ == "__main__":
     unittest.main()

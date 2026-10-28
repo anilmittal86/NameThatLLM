@@ -64,7 +64,9 @@ class TestPostprocess(unittest.TestCase):
             "Single \u2018curly\u2019 quote text.",
             "Another standard text."
         ]
+        P_mix_before = P_mix.copy()
         P_shielded = apply_curly_quote_shield(P_mix, test_texts)
+        self.assertTrue(np.allclose(P_mix, P_mix_before), "apply_curly_quote_shield must not mutate input array in-place")
 
         claude_and_glm_idx = FAMILIES["claude"] + FAMILIES["glm"]
         # Rows 0 and 3 are uniform
