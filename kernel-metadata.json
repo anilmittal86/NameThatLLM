@@ -17,7 +17,8 @@
     "nishantdahal/ntl-two-stage-lora",
     "nishantdahal/ntl-handwriting-blend",
     "zbigniewkirchner/ntl-qwen3-8b-lora-instyle",
-    "kirilltym/ntl-spectral-style-heads-paired-4404"
+    "kirilltym/ntl-spectral-style-heads-paired-4404",
+    "dhruvtibarewal/nlm-l24-adapters"
   ],
   "competition_sources": [
     "name-that-llm"

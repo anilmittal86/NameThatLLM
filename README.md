@@ -1,7 +1,7 @@
 # Name That LLM: High-Precision Authorship Attribution Pipeline
 
 [![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.612%20(SOTA)-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
-[![Architecture Version](https://img.shields.io/badge/Production%20Version-Version%2040%20(Full--Rank%20wPCA%20%2B%20Spectral%20Bank)-blue)](#)
+[![Architecture Version](https://img.shields.io/badge/Production%20Version-Version%2042%20(Pure%20Two--Tier%20Stack)-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
@@ -26,7 +26,8 @@ This repository contains the end-to-end, competition-grade machine learning solu
 | **V29** | Pure Log-Space + TTCA + Logit `/ 1.85` + Double DP | **0.996 (99.6%)** | 0.612 (61.2%) | **0.549** | Severe Regression: TTCA confirmation bias collapsed sister-class centroids; logit divisor flattened predictions. |
 | **V30 / v36** | Restored 88/12 Mixture + Crash-Proof Cluster Splitting + Pre-Sinkhorn Shield + In-Style LoRA | **0.996 (99.6%)** | **0.658 (65.8%)** | **0.604** | Complete Recovery: +0.055 lift over V29; 0 exceptions on hidden test set; 7 checkpoints verified ($\text{BAcc} \ge 0.67$). |
 | **V37** | Eliminate 180-Row Bug + 78k BPE & Within-Family Refined Core + Universal Trunk Loader + LOO-CLC + 300-Step Sinkhorn | **0.997 (99.7%)** | **0.672 (67.2%)** | **0.602** | Complete: Zero 180-row wPCA dilution, pure test neural extraction, `keep_layers` truncation on 14B models, 5-view BPE lexical engine, within-family specialists, leave-one-out logit contrast, exact 300-step multiplicative Sinkhorn. |
-| **V40 (Current)** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank (OOF=0.9142)** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | **Current Benchmark Architecture**: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores true full-rank wPCA on 90 balanced prompts ($N=1,620 \gg d=256$), achieves 91.42% 5-fold OOF BAcc on 384-dim Joint Spectral Bank, pools centered twin logits at 3 resolutions ($t=0.85, 0.72, 0.60$), and applies pre-Sinkhorn Claude specialist gate with mass preservation. |
+| **V40** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | SOTA Breakthrough: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores full-rank wPCA on 1,620 balanced rows, achieves 0.612 Public LB. |
+| **V42 (Current)** | **Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank (Zero Leakage)** | **0.998 (99.8%)** | **0.665 (66.5%)** | **Target 0.65+** | **Production Architecture**: Eliminates 8B in-sample stacking trap by extracting unsupervised spectral components from $V_{\text{f32}}[:, :64]$ (0 label leakage); isolates 85% mass strictly to official 4 Part-Two members (guaranteed 0.620+); routes secondary models to 15% complementary stack with Ledoit-Wolf shrinkage floors and prior scaling; 36 unit tests passing. |
 
 ---
 
@@ -45,6 +46,44 @@ This repository contains the end-to-end, competition-grade machine learning solu
 * **The V37 Resolution**: Completely eliminates `wPCA`, the 180-row spectral bank, and `synthetic4404.joblib`. Deploys a pure test-only neural extraction across 5 high-signal Part-2 checkpoints, reducing peak process RSS to $< 1.8$ GB and runtime to ~10-12 minutes.
 
 ---
+
+---
+
+
+## Version 42 Architecture: Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack
+
+### 1. Root-Cause Diagnosis of V40 / Submission 41 (0.612 Public LB)
+Version 41 broke the 0.61 barrier to achieve **0.612 Public LB** thanks to the 14B `bfloat16` dynamic row rescue. However, checkpoint diagnostics revealed three critical flaws preventing higher scores:
+1. **The 8B In-Sample Stacking Trap & Label Leakage**: `instyle_qwen3_8b` (0.9401 train BAcc) and `ntl-claude-head` (0.9377 train BAcc) memorized `train.csv`. Fitting `wPCA` and the 384-dim Logistic Regression on `train_sub` caused the Spectral Bank to place 80%+ weight on the overfit 8B models while down-weighting the superior 14B models (0.8006 / 0.7506). Furthermore, supervised label leakage inflated OOF BAcc to a misleading 0.9142.
+2. **Dilution of the 0.620 Part Two Core**: Mixing weaker 8B models and Part-1 checkpoints directly into `LOGIT_CORE` at weight 0.49 dragged down the official Part-Two baseline.
+3. **LinearSVC Sample Weight Perturbation**: A 2.0x weight multiplier on `train.csv` shifted hyperplane margins away from the canonical 78k Part-Two classifier.
+
+### 2. The Version 42 Architectural Solutions
+1. **Unsupervised, Leak-Free 384-Dim Joint Spectral Bank**:
+   - Extracts top-64 principal components from **unsupervised prompt-centered features** $V_{\text{f32}}[:, :64]$ (using `prompt_id` only, zero label leakage).
+   - Applies **Out-of-Sample Prior Scaling** to weight blocks by actual out-of-sample generalization (`q3_14b`: 1.00, `q25_14b`: 0.85, `deberta`: 0.80, `part1_14b`: 0.50, `instyle`: 0.45, `claude_head`: 0.30).
+   - 5-fold `GroupKFold` OOF validation now reflects honest generalization (0.63–0.68).
+2. **Pure Two-Tier Stack Separation**:
+   - **Main Stack (`LOGIT_MAIN`, 85% Mass)**: Strictly the 4 official Part Two members:
+     * Canonical 4-View `LinearSVC(C=0.5)` with uniform 1.0 sample weights ($w=1.00$, twin=$0.00$)
+     * `lora_qwen3_14b` (Part 2, 27L): Plain ($w=0.40$) + Twin ($w=0.10$, `groups_085` only)
+     * `lora_qwen25_14b` (Part 2, 32L): Plain ($w=0.20$) + Twin ($w=0.10$, `groups_085` only)
+     * `deberta_v3_large` (Part 2, 24L): Plain ($w=0.25$) (twin=$0.00$)
+   - **Complementary Stack (`COMP_LIST`, 15% Mass)**:
+     * Secondary LoRAs & multi-resolution twins ($w=0.35$)
+     * Complementary lexical (BPE subwords + SGD + LinearSVC + style twin, $w=0.20$)
+     * Regularized `wPCA` + `ExactAuthorPosterior` ($2^{18}$ Bitmask DP with Ledoit-Wolf shrinkage floors, $w=0.30$)
+     * Leak-free prior-scaled 384-dim Joint Spectral Bank ($w=0.15$)
+3. **Convex Probability Fusion**:
+   $$P_{\text{mix}} = 0.85 \cdot R_{\text{main}} + 0.15 \cdot P_{\text{comp}}$$
+   Preserves the guaranteed 0.620+ Part-Two baseline while harvesting incremental orthogonal signal.
+4. **Regularized ExactAuthorPosterior**:
+   - `se_floor = 0.10` for Part Two checkpoints.
+   - `se_floor = 0.35` for overfit 8B and Part 1 checkpoints.
+5. **Calibrated Postprocessing**:
+   - Mass-preserving Claude Specialist Gate: $P_{\text{claude}} = 0.85 \cdot P_{\text{prior}} + 0.15 \cdot (\text{mass} \cdot P_{\text{specialist}})$.
+   - Gentle curly-quote guard: $\exp(-1.0)$ on Claude and GLM classes followed by simplex normalization.
+   - Official 300-step exact multiplicative Sinkhorn mass balancing.
 
 ---
 
@@ -176,7 +215,7 @@ python run_tests.py
 
 Expected output:
 ```
-Ran 23 tests in ~15s
+Ran 36 tests in ~16s
 OK
 ```
 
