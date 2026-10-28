@@ -16,6 +16,17 @@ from sklearn.linear_model import LogisticRegression
 from .config import LABELS, K, align_cols, softmax
 from .wpca_gaussian import split_oversized_clusters_dist
 
+def make_spectral_blocks(Z_tr: np.ndarray, Z_te: np.ndarray, res: dict, prior_scale: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Projects train and test features onto V_top64 and scales by out-of-sample prior scale.
+    """
+    mx, sx, V64 = res["mx"], res["sx"], res["V_top64"]
+    S_tr = (((Z_tr - mx) / sx) @ V64).astype(np.float32)
+    S_te = (((Z_te - mx) / sx) @ V64).astype(np.float32)
+    S_tr = (S_tr / np.linalg.norm(S_tr, axis=1, keepdims=True).clip(min=1e-6)) * float(prior_scale)
+    S_te = (S_te / np.linalg.norm(S_te, axis=1, keepdims=True).clip(min=1e-6)) * float(prior_scale)
+    return S_tr, S_te
+
 def fit_joint_spectral_bank(
     spectral_tr_blocks: List[np.ndarray],
     spectral_te_blocks: List[np.ndarray],

@@ -174,12 +174,28 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
             tok = None
 
     if tok is not None:
-        def bpe_tokenize(txt: str) -> List[str]:
-            return [str(tok_id) for tok_id in tok.encode(str(txt), truncation=True, max_length=512)]
-        v_bpe = TfidfVectorizer(tokenizer=bpe_tokenize, lowercase=False, token_pattern=None,
-                                ngram_range=(1, 3), max_features=75000, sublinear_tf=True, dtype=np.float32)
-        tr_bpe = v_bpe.fit_transform(fit_texts) * 0.8
-        te_bpe = v_bpe.transform(test_texts) * 0.8
+        def batch_bpe_strings(texts: List[str], batch_sz: int = 4000) -> List[str]:
+            out_strs = []
+            for s in range(0, len(texts), batch_sz):
+                batch_ids = tok(
+                    texts[s : s + batch_sz],
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=512,
+                )["input_ids"]
+                out_strs.extend(" ".join(map(str, ids)) for ids in batch_ids)
+            return out_strs
+
+        fit_bpe_strs = batch_bpe_strings(fit_texts)
+        test_bpe_strs = batch_bpe_strings(test_texts)
+        v_bpe = TfidfVectorizer(
+            analyzer="word", token_pattern=r"\S+", lowercase=False,
+            ngram_range=(1, 3), max_features=75000, sublinear_tf=True, dtype=np.float32
+        )
+        tr_bpe = v_bpe.fit_transform(fit_bpe_strs) * 0.8
+        te_bpe = v_bpe.transform(test_bpe_strs) * 0.8
+        del fit_bpe_strs, test_bpe_strs, v_bpe
+        gc.collect()
         X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe], format="csr")
         X_te_5v = sparse.hstack([X_te_4v, te_bpe], format="csr")
     else:

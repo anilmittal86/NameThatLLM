@@ -6,11 +6,26 @@ Unit and Integration Tests for namethatllm.spectral_bank
 import unittest
 import numpy as np
 
-from namethatllm.spectral_bank import fit_joint_spectral_bank
+from namethatllm.spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
 from namethatllm.wpca_gaussian import fit_shared_gaussian_lowram
 from namethatllm.config import K, PRIOR_SCALES
 
 class TestSpectralBank(unittest.TestCase):
+    def test_make_spectral_blocks(self):
+        np.random.seed(42)
+        N_tr, N_te, D = 180, 18, 128
+        Z_tr = np.random.randn(N_tr, D).astype(np.float32)
+        Z_te = np.random.randn(N_te, D).astype(np.float32)
+        prompts = np.repeat(np.arange(10), 18)
+        y = np.tile(np.arange(18), 10)
+        res = fit_shared_gaussian_lowram(Z_tr, y, prompts, d_target=64, se_floor=0.10)
+
+        S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res, prior_scale=0.85)
+        self.assertEqual(S_tr.shape, (N_tr, 64))
+        self.assertEqual(S_te.shape, (N_te, 64))
+        self.assertTrue(np.allclose(np.linalg.norm(S_tr, axis=1), 0.85, atol=1e-5))
+        self.assertTrue(np.allclose(np.linalg.norm(S_te, axis=1), 0.85, atol=1e-5))
+
     def test_unsupervised_v_top64_zero_leakage(self):
         """Proof that unsupervised principal components are identical regardless of labels y."""
         np.random.seed(42)

@@ -15,6 +15,7 @@ from .neural_extractor import (
     in_place_copy,
     compute_centered_logits,
     UniversalLoRATrunkLoader,
+    read_checkpoint_meta,
     extract_deberta_checkpoint
 )
 from .wpca_gaussian import (
@@ -24,7 +25,7 @@ from .wpca_gaussian import (
     split_oversized_clusters_dist,
     scores_exact_dp
 )
-from .spectral_bank import fit_joint_spectral_bank
+from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
 from .postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
@@ -38,10 +39,10 @@ __all__ = [
     "LABELS", "K", "LAB2I", "FAMILIES", "align_cols", "log_softmax", "softmax",
     "run_lexical_engine",
     "forward_and_pool_batch", "resolve_head_tensors", "merge_lora", "in_place_copy",
-    "compute_centered_logits", "UniversalLoRATrunkLoader", "extract_deberta_checkpoint",
+    "compute_centered_logits", "UniversalLoRATrunkLoader", "read_checkpoint_meta", "extract_deberta_checkpoint",
     "fit_shared_gaussian_lowram", "transform_lowram", "ExactAuthorPosterior",
     "split_oversized_clusters_dist", "scores_exact_dp",
-    "fit_joint_spectral_bank",
+    "fit_joint_spectral_bank", "make_spectral_blocks",
     "blend_main_and_complementary", "apply_claude_specialist_gate",
     "apply_curly_quote_shield", "sinkhorn_balancing",
     "run_submission_pipeline"

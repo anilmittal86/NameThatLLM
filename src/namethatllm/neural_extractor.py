@@ -26,6 +26,18 @@ def in_place_copy(dst: torch.Tensor, src: torch.Tensor):
     """In-place weight copy."""
     dst.data.copy_(src.to(device=dst.device, dtype=dst.dtype))
 
+def _resolve_module_name(k: str, state_dict: dict) -> Optional[str]:
+    """Resolves module name across various AutoModel and PEFT naming schemes."""
+    raw = k.split(".lora_A")[0]
+    candidates = [raw, raw.replace("base_model.model.", "")]
+    if "layers." in raw:
+        rel = raw[raw.index("layers."):]
+        candidates.extend([rel, f"model.{rel}"])
+    for c in candidates:
+        if c in state_dict and hasattr(state_dict[c], "weight"):
+            return c
+    return None
+
 def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool:
     """In-place merges or unmerges (+1.0 or -1.0) a LoRA adapter directly into trunk weights."""
     weights_path = adapter_path / "adapter_model.safetensors"
@@ -49,8 +61,9 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
         if "lora_A" in k:
             b_key = k.replace("lora_A", "lora_B")
             if b_key in sd:
-                m_name = k.split(".lora_A")[0].replace("base_model.model.", "")
-                pairs[m_name] = (sd[k], sd[b_key])
+                m_name = _resolve_module_name(k, state_dict)
+                if m_name is not None:
+                    pairs[m_name] = (sd[k], sd[b_key])
 
     applied = 0
     with torch.no_grad():
@@ -196,15 +209,15 @@ class UniversalLoRATrunkLoader:
             max_memory = {0: "13.5GiB", 1: "13.5GiB"}
             self.model = AutoModel.from_pretrained(
                 str(base_dir), config=cfg, device_map="auto", max_memory=max_memory,
-                torch_dtype=torch.float16, trust_remote_code=True
+                torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
             )
         elif n_gpus == 1:
             self.model = AutoModel.from_pretrained(
                 str(base_dir), config=cfg, device_map="auto",
-                torch_dtype=torch.float16, trust_remote_code=True
+                torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
             )
         else:
-            self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32)
+            self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32, low_cpu_mem_usage=True)
 
         # Disable final trunk norm so last layer is not double normalized
         if hasattr(self.model, "norm"):
@@ -237,8 +250,8 @@ class UniversalLoRATrunkLoader:
         backup = {}
         for k in sd.keys():
             if "lora_A" in k:
-                m_name = k.split(".lora_A")[0].replace("base_model.model.", "")
-                if m_name in state_dict and hasattr(state_dict[m_name], "weight"):
+                m_name = _resolve_module_name(k, state_dict)
+                if m_name is not None and m_name in state_dict and hasattr(state_dict[m_name], "weight"):
                     backup[m_name] = state_dict[m_name].weight.detach().cpu().half().clone()
         return backup
 
@@ -249,6 +262,18 @@ class UniversalLoRATrunkLoader:
             for m_name, orig in backup.items():
                 if m_name in state_dict and hasattr(state_dict[m_name], "weight"):
                     state_dict[m_name].weight.data.copy_(orig.to(state_dict[m_name].weight.device))
+
+    def set_active_layers(self, layers: List[int], max_len: Optional[int] = None):
+        """Updates active pooled layers and instantiates LayerNorms matching the checkpoint."""
+        self.layers = list(layers)
+        if max_len is not None:
+            self.max_len = max_len
+        hidden_dim = self.model.config.hidden_size
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim)
+            for _ in self.layers
+        ]).to(self.device_norms).float()
+        self.norms.eval()
 
     def load_norm_weights(self, heads_sd: dict):
         """Loads LayerNorm weights and biases from head state dict."""
@@ -292,6 +317,30 @@ class UniversalLoRATrunkLoader:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List[int], default_max_len: int = 447) -> dict:
+    """Reads keep, layers, max_len, end_id, and labels dynamically from meta.json."""
+    meta_p = ckpt_dir / "meta.json"
+    labels = list(LABELS)
+    keep = default_keep
+    layers = list(default_layers)
+    max_len = default_max_len
+    end_id = 151643
+    if meta_p.exists():
+        try:
+            m = json.load(open(meta_p))
+            labels = m.get("labels", m.get("classes", labels))
+            cfg = m.get("cfg", m)
+            keep = int(cfg.get("keep", keep))
+            layers = list(cfg.get("layers", layers))
+            max_len = int(cfg.get("max_len", max_len))
+            for ek in ("end_token_id", "eos_id", "eos_token_id", "end_token"):
+                if ek in cfg and isinstance(cfg[ek], int):
+                    end_id = int(cfg[ek])
+                    break
+        except Exception:
+            pass
+    return {"keep": keep, "layers": layers, "max_len": max_len, "end_id": end_id, "labels": labels}
+
 def extract_deberta_checkpoint(
     ckpt_dir: Path,
     base_deb_dir: Optional[Path],
@@ -315,24 +364,51 @@ def extract_deberta_checkpoint(
     heads_sd = load_file(str(head_p))
     W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
 
-    meta_p = ckpt_dir / "meta.json"
-    ckpt_labels = LABELS
-    layers = [18, 20, 22, 24]
-    if meta_p.exists():
-        try:
-            m = json.load(open(meta_p))
-            if "labels" in m:
-                ckpt_labels = m["labels"]
-            if "layers" in m:
-                layers = m["layers"]
-        except Exception:
-            pass
+    meta = read_checkpoint_meta(ckpt_dir, default_keep=24, default_layers=[3, 6, 9, 12, 15, 18, 21, 24], default_max_len=max_len)
+    ckpt_labels = meta["labels"]
+    layers = meta["layers"]
+    max_len = meta["max_len"]
 
-    model_src = str(ckpt_dir) if (ckpt_dir / "config.json").exists() else (str(base_deb_dir) if base_deb_dir else str(ckpt_dir))
-    model = AutoModel.from_pretrained(model_src, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(dev)
+    if (ckpt_dir / "encoder" / "config.json").exists():
+        model_src = ckpt_dir / "encoder"
+    elif (ckpt_dir / "config.json").exists() and ((ckpt_dir / "model.safetensors").exists() or (ckpt_dir / "pytorch_model.bin").exists()):
+        model_src = ckpt_dir
+    elif base_deb_dir and (base_deb_dir / "config.json").exists():
+        model_src = base_deb_dir
+    else:
+        model_src = ckpt_dir
+
+    stage_dir = Path("/kaggle/temp/deberta_p2_stage")
+    staged = False
+    load_src = model_src
+    if Path("/kaggle/temp").exists() and os.access("/kaggle/temp", os.W_OK):
+        try:
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
+            shutil.copytree(model_src, stage_dir)
+            load_src = stage_dir
+            staged = True
+        except Exception:
+            load_src = model_src
+
+    try:
+        model = AutoModel.from_pretrained(str(load_src), torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(dev)
+    finally:
+        if staged and stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
     model.eval()
 
     hidden_dim = model.config.hidden_size
+    if W_p is not None and W_p.shape[1] > 0:
+        expected_layers = W_p.shape[1] // hidden_dim
+        if len(layers) != expected_layers:
+            norm_keys = [k for k in heads_sd if k.startswith("norms.") and k.endswith(".weight")]
+            if len(norm_keys) == expected_layers:
+                layers = layers[:expected_layers] if len(layers) > expected_layers else list(range(expected_layers))
+            elif len(layers) > expected_layers:
+                layers = layers[:expected_layers]
+
     norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in layers]).to(dev).float()
     with torch.no_grad():
         for i, ln in enumerate(norms):
@@ -345,9 +421,13 @@ def extract_deberta_checkpoint(
     norms.eval()
 
     def pool_texts(txt_list: List[str], drop_first: bool = True) -> np.ndarray:
-        all_vecs = []
-        for s in range(0, len(txt_list), batch_size):
-            chunk = txt_list[s : s + batch_size]
+        if len(txt_list) == 0:
+            return np.zeros((0, len(layers) * hidden_dim), dtype=np.float32)
+        order = np.argsort([len(t) for t in txt_list], kind="stable")
+        all_vecs = np.zeros((len(txt_list), len(layers) * hidden_dim), dtype=np.float32)
+        for s in range(0, len(order), batch_size):
+            idx = order[s : s + batch_size]
+            chunk = [txt_list[i] for i in idx]
             enc = tok(chunk, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
             enc = {k: v.to(dev) for k, v in enc.items()}
             with torch.no_grad():
@@ -356,10 +436,10 @@ def extract_deberta_checkpoint(
                 if drop_first:
                     m[:, 0, :] = 0.0
                 den = m.sum(dim=1).clamp(min=1.0)
-                pooled = [( (hs[l].float() * m).sum(dim=1) / den ) for l in layers]
+                pooled = [((hs[l].float() * m).sum(dim=1) / den) for l in layers]
                 out = torch.cat([norms[i](pooled[i]) for i in range(len(layers))], dim=-1)
-                all_vecs.append(out.cpu().numpy())
-        return np.vstack(all_vecs)
+                all_vecs[idx] = out.cpu().numpy()
+        return all_vecs
 
     # Probe drop_first_token on train.csv[:180]
     probe_n = min(180, len(texts_train))

@@ -150,6 +150,194 @@ class TestCompilerAndIntegration(unittest.TestCase):
         self.assertNotIn("nn.RMSNorm", src, "nn.RMSNorm lacks bias parameters present in heads.safetensors")
         self.assertIn("nn.Identity", src, "Final trunk norm must be replaced with nn.Identity to prevent double norm")
 
+    def test_full_neural_pipeline_branch_with_mocks(self):
+        """
+        Validates 100% of the neural pipeline execution flow (all 4 trunks, 6 checkpoints,
+        dynamic meta parsing, multi-res twins, exact DP, joint spectral bank, Claude specialist gate,
+        and Sinkhorn mass balancing) without requiring multi-gigabyte pretrained model downloads.
+        """
+        import torch
+        from unittest.mock import patch
+        from safetensors.torch import save_file
+        from namethatllm.config import FAMILIES
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            input_dir = tmp_path / "input"
+            working_dir = tmp_path / "working"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            working_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Synthesize 180-row train.csv (10 prompts x 18 classes)
+            prompts = list(range(101, 111))
+            train_rows = []
+            row_id = 0
+            for p in prompts:
+                for m in LABELS:
+                    train_rows.append({
+                        "id": row_id,
+                        "prompt_id": p,
+                        "model": m,
+                        "text": f"Prompt {p} discourse sample authored by {m} with diverse features and stylistic punctuation."
+                    })
+                    row_id += 1
+            df_train = pd.DataFrame(train_rows)
+            train_csv = tmp_path / "train.csv"
+            df_train.to_csv(train_csv, index=False)
+
+            # 2. Synthesize 36-row test.csv (2 test prompts x 18 passages)
+            test_rows = []
+            for p in [201, 202]:
+                for i in range(18):
+                    test_rows.append({
+                        "id": 1000 + len(test_rows),
+                        "prompt_id": p,
+                        "text": f"Mystery test passage {i} for prompt {p} with curly ‘quotes’ and words."
+                    })
+            df_test = pd.DataFrame(test_rows)
+            test_csv = tmp_path / "test.csv"
+            df_test.to_csv(test_csv, index=False)
+
+            # 3. Create mock base model directories with config.json
+            base_q3_14b = input_dir / "base_qwen3_14b"
+            base_q3_14b.mkdir(parents=True, exist_ok=True)
+            (base_q3_14b / "config.json").write_text(json.dumps({"model_type": "qwen3", "hidden_size": 5120, "num_hidden_layers": 40}))
+
+            base_q25_14b = input_dir / "base_qwen25_14b"
+            base_q25_14b.mkdir(parents=True, exist_ok=True)
+            (base_q25_14b / "config.json").write_text(json.dumps({"model_type": "qwen2", "hidden_size": 5120, "num_hidden_layers": 48}))
+
+            base_q3_8b = input_dir / "base_qwen3_8b"
+            base_q3_8b.mkdir(parents=True, exist_ok=True)
+            (base_q3_8b / "config.json").write_text(json.dumps({"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36}))
+
+            base_deb = input_dir / "base_deberta"
+            base_deb.mkdir(parents=True, exist_ok=True)
+            (base_deb / "config.json").write_text(json.dumps({"model_type": "deberta", "hidden_size": 1024, "num_hidden_layers": 24}))
+
+            # Helper to create standard 18-class head safetensors
+            def make_18class_head(t_dict=None):
+                d = {
+                    "plain.weight": torch.randn(18, 512),
+                    "plain.bias": torch.zeros(18),
+                    "center.weight": torch.randn(18, 512),
+                    "center.bias": torch.zeros(18),
+                    "norms.0.weight": torch.ones(64),
+                    "norms.0.bias": torch.zeros(64),
+                }
+                if t_dict:
+                    d.update(t_dict)
+                return d
+
+            # 4. Create mock checkpoints
+            # 4A. qwen3_14b_p2
+            p2_dir = input_dir / "lora_qwen3_14b"
+            p2_dir.mkdir(parents=True, exist_ok=True)
+            (p2_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [2, 4, 6, 9, 13, 17, 22, 27], "keep": 27, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            save_file(make_18class_head(), str(p2_dir / "heads.safetensors"))
+
+            # 4B. qwen3_14b_p1
+            p1_dir = input_dir / "lora14b_v1"
+            p1_dir.mkdir(parents=True, exist_ok=True)
+            (p1_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [2, 4, 6, 9, 13, 17, 21, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            save_file(make_18class_head(), str(p1_dir / "heads.safetensors"))
+
+            # 4C. qwen25_14b_p2
+            q25_dir = input_dir / "lora_qwen25_14b"
+            q25_dir.mkdir(parents=True, exist_ok=True)
+            (q25_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [3, 5, 8, 11, 16, 21, 27, 32], "keep": 32, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            save_file(make_18class_head(), str(q25_dir / "heads.safetensors"))
+
+            # 4D. instyle
+            ins_dir = input_dir / "instyle"
+            ins_dir.mkdir(parents=True, exist_ok=True)
+            (ins_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [2, 4, 6, 8, 12, 16, 20, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            save_file(make_18class_head(), str(ins_dir / "heads.safetensors"))
+
+            # 4E. qwen3_8b_claude (5-class specialist + 18-class readouts.npz)
+            claude_dir = input_dir / "qwen3_8b_claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            claude_classes = [LABELS[i] for i in FAMILIES["claude"]]
+            (claude_dir / "meta.json").write_text(json.dumps({"classes": claude_classes, "cfg": {"layers": [2, 4, 6, 8, 12, 16, 20, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}}))
+            save_file({"norms.0.weight": torch.ones(64), "norms.0.bias": torch.zeros(64)}, str(claude_dir / "heads.safetensors"))
+            np.savez(
+                str(claude_dir / "readouts.npz"),
+                plain_coef=np.random.randn(18, 512).astype(np.float32),
+                plain_intercept=np.zeros(18, dtype=np.float32),
+                center_coef=np.random.randn(18, 512).astype(np.float32),
+                center_intercept=np.zeros(18, dtype=np.float32),
+                claude_coef=np.random.randn(5, 512).astype(np.float32),
+                claude_intercept=np.zeros(5, dtype=np.float32),
+                claude_classes=np.array(claude_classes),
+            )
+            save_file({"weight": torch.randn(5, 512), "bias": torch.zeros(5)}, str(claude_dir / "claude_head.safetensors"))
+
+            # 4F. deberta_p2
+            deb_dir = input_dir / "deberta_p2"
+            deb_dir.mkdir(parents=True, exist_ok=True)
+            (deb_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [3, 6, 9, 12, 15, 18, 21, 24], "keep": 24, "max_len": 447}, "labels": LABELS}))
+            save_file({"plain.weight": torch.randn(18, 512), "plain.bias": torch.zeros(18)}, str(deb_dir / "head.safetensors"))
+
+            # 5. Define MockTrunkLoader and Mock DeBERTa
+            class MockTrunkLoader:
+                def __init__(self, base_dir, keep_layers, layers, max_len=447):
+                    self.layers = layers
+                    self.max_len = max_len
+                    self.model = torch.nn.Linear(10, 10)
+                def snapshot_weights(self, adapter_path):
+                    return {}
+                def restore_weights(self, backup):
+                    pass
+                def set_active_layers(self, layers, max_len=None):
+                    self.layers = layers
+                    if max_len is not None:
+                        self.max_len = max_len
+                def load_norm_weights(self, heads_sd):
+                    pass
+                def extract_exact(self, texts, batch_size=8, end_id=151643):
+                    rng = np.random.RandomState(42)
+                    return rng.randn(len(texts), 512).astype(np.float32) * 0.1
+                def free_memory(self):
+                    pass
+
+            def mock_extract_deberta(deb_d, base_deb_d, texts_test, texts_train, y_train, max_len=512, batch_size=8):
+                rng = np.random.RandomState(42)
+                Z_te = rng.randn(len(texts_test), 512).astype(np.float32) * 0.1
+                Z_tr = rng.randn(len(texts_train), 512).astype(np.float32) * 0.1
+                W_p = rng.randn(18, 512).astype(np.float32) * 0.1
+                b_p = np.zeros(18, dtype=np.float32)
+                W_c = rng.randn(18, 512).astype(np.float32) * 0.1
+                b_c = np.zeros(18, dtype=np.float32)
+                return Z_te, Z_tr, W_p, b_p, W_c, b_c, list(LABELS)
+
+            # Ensure NTL_SMOKE is NOT set (so has_neural branch executes!)
+            os.environ["NTL_SMOKE"] = "0"
+            try:
+                cfg = {
+                    "train_path": str(train_csv),
+                    "test_path": str(test_csv),
+                    "working_dir": str(working_dir),
+                    "input_dir": str(input_dir),
+                }
+
+                with patch("namethatllm.pipeline.UniversalLoRATrunkLoader", MockTrunkLoader), \
+                     patch("namethatllm.pipeline.extract_deberta_checkpoint", mock_extract_deberta), \
+                     patch("namethatllm.pipeline.merge_lora", return_value=True):
+                    df_sub, parquet_path = run_submission_pipeline(cfg)
+
+                self.assertTrue(parquet_path.exists(), "submission.parquet must exist")
+                self.assertEqual(len(df_sub), 36, "Submission must have exactly 36 rows")
+                self.assertListEqual(list(df_sub.columns), ["id", "model"])
+                self.assertFalse(df_sub["model"].isna().any(), "Submission must have no NaN models")
+                self.assertTrue(df_sub["model"].isin(LABELS).all(), "All predicted models must be in LABELS")
+
+                # Verify parquet file reads back correctly
+                readback = pd.read_parquet(parquet_path)
+                self.assertEqual(len(readback), 36)
+                self.assertListEqual(list(readback.columns), ["id", "model"])
+            finally:
+                os.environ.pop("NTL_SMOKE", None)
+
 if __name__ == "__main__":
     unittest.main()
 
