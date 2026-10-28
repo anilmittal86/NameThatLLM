@@ -110,7 +110,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     print(f"[Pipeline] Module 1 complete: log_p_svc_main shape = {log_p_svc_main.shape}")
 
-    # Read configuration hierarchies from configs/v42_ensemble.json
+    # Read configuration hierarchies from configs/production_ensemble.json
     main_cfg = cfg.get("main_stack", {})
     comp_cfg = cfg.get("complementary_stack", {})
     fusion_cfg = cfg.get("fusion", {})

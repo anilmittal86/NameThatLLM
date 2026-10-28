@@ -1,7 +1,7 @@
 {
-  "version": "42.0",
-  "name": "v42_ensemble",
-  "description": "Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Leak-Free Spectral Bank",
+  "version": "1.0.0",
+  "name": "production_ensemble",
+  "description": "Production Two-Tier Stack (85% Main Part-Two Baseline + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank)",
   "labels": [
     "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
     "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",

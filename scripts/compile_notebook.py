@@ -1,7 +1,7 @@
 """
 Single-Source-of-Truth Kaggle Notebook Compiler.
 Reads modular Python source files directly from `src/namethatllm/*.py` and
-`configs/v42_ensemble.json` to assemble `kernels/submission/kaggle_submission.ipynb`.
+`configs/production_ensemble.json` to assemble `kernels/submission/kaggle_submission.ipynb`.
 """
 
 import ast
@@ -85,7 +85,7 @@ def compile_notebook(config_path: Path, output_path: Path) -> Path:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compile Kaggle submission notebook from src/namethatllm")
-    parser.add_argument("--config", default="configs/v42_ensemble.json", help="Path to ensemble config")
+    parser.add_argument("--config", default="configs/production_ensemble.json", help="Path to ensemble config")
     parser.add_argument("--output", default="kernels/submission/kaggle_submission.ipynb", help="Output .ipynb path")
     args = parser.parse_args()
 

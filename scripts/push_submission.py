@@ -2,7 +2,7 @@
 Automated Test -> Compile -> Kaggle Push CLI Runner
 ==================================================
 1. Runs pytest to verify all unit/integration tests pass.
-2. Compiles notebook from src/namethatllm/ + configs/v42_ensemble.json.
+2. Compiles notebook from src/namethatllm/ + configs/production_ensemble.json.
 3. Pushes kernel to Kaggle via Kaggle CLI.
 """
 
@@ -18,7 +18,7 @@ from compile_notebook import compile_notebook
 
 def main():
     root_dir = Path(__file__).resolve().parent.parent
-    config_path = root_dir / "configs" / "v42_ensemble.json"
+    config_path = root_dir / "configs" / "production_ensemble.json"
     kernel_dir = root_dir / "kernels" / "submission"
     notebook_path = kernel_dir / "kaggle_submission.ipynb"
 

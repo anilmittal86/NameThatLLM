@@ -42,7 +42,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
             )
 
     def test_ast_parity_between_src_and_compiled_notebook(self):
-        cfg_path = self.repo_root / "configs" / "v42_ensemble.json"
+        cfg_path = self.repo_root / "configs" / "production_ensemble.json"
         out_nb_path = self.repo_root / "kernels" / "submission" / "kaggle_submission.ipynb"
 
         # Recompile notebook

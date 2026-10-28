@@ -183,7 +183,7 @@ NameThatLLM/
 ├── README.md                            # Executive overview, milestone scorecard, and SOTA architecture
 ├── TUTORIAL.md                          # Comprehensive 1,000+ line printable masterclass & mathematical guide
 ├── configs/                             # Declarative experiment and ensemble configurations
-│   └── v42_ensemble.json                # Production weights, regularizers, thresholds, and prior scales
+│   └── production_ensemble.json                # Production weights, regularizers, thresholds, and prior scales
 ├── kernels/                             # Kaggle kernel build targets and metadata
 │   ├── submission/                      # Official competition submission kernel
 │   │   ├── kernel-metadata.json         # Kaggle GPU/dataset mount configuration
@@ -239,8 +239,8 @@ The pipeline uses a **Single Source of Truth** architecture: all model code and 
 python scripts/push_submission.py
 
 # Option B: Manual step-by-step
-# 1. Compile the production notebook from src/namethatllm/ + configs/v42_ensemble.json
-python scripts/compile_notebook.py --config configs/v42_ensemble.json
+# 1. Compile the production notebook from src/namethatllm/ + configs/production_ensemble.json
+python scripts/compile_notebook.py --config configs/production_ensemble.json
 
 # 2. Push the submission kernel to Kaggle
 python -m kaggle kernels push -p kernels/submission
