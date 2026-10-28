@@ -65,7 +65,9 @@ $$\frac{1}{18} \approx 5.56\%$$
 | **Regression** | **V29** | Pure Log-Space + TTCA + Logit / 1.85 + Double DP | **0.996 (99.6%)** | 0.612 (61.2%) | **0.549** | Severe Regression: TTCA confirmation bias collapsed sister-class centroids; logit divisor flattened predictions. |
 | **Rebound** | **V30 / v36** | Restored 88/12 Mixture + Crash-Proof Cluster Splitting + Pre-Sinkhorn Shield + In-Style LoRA | **0.996 (99.6%)** | **0.658 (65.8%)** | **0.604** | Complete Recovery: +0.055 lift over V29; 0 exceptions on hidden test set; 7 checkpoints verified (BAcc >= 0.67). |
 | **Interim SOTA** | **V37** | Eliminate 180-Row Bug + 78k BPE & Within-Family Refined Core + Universal Trunk Loader + LOO-CLC + 300-Step Sinkhorn | **0.997 (99.7%)** | **0.672 (67.2%)** | **0.602** | Complete: Zero 180-row wPCA dilution, pure test neural extraction, `keep_layers` truncation on 14B models, 5-view BPE lexical engine, within-family specialists, leave-one-out logit contrast, exact 300-step multiplicative Sinkhorn. |
-| **Current SOTA** | **V40** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank (OOF=0.9142)** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | **Current Benchmark Architecture**: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores true full-rank wPCA on 90 balanced prompts ($N=1,620 \gg d=256$), achieves 91.42% 5-fold OOF BAcc on 384-dim Joint Spectral Bank, pools centered twin logits at 3 resolutions ($t=0.85, 0.72, 0.60$), and applies pre-Sinkhorn Claude specialist gate with mass preservation. |
+| **Prior SOTA** | **V40** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | SOTA Breakthrough: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores true full-rank wPCA on 90 balanced prompts ($N=1,620 \gg d=256$), achieves 0.612 Public LB. Diagnostic audit revealed in-sample 8B memorization trap in spectral bank. |
+| **Two-Tier SOTA** | **V42** | **Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank (Zero Leakage)** | **0.998 (99.8%)** | **0.665 (66.5%)** | **0.613** | Two-Tier Separation: Eliminates 8B in-sample stacking trap by extracting unsupervised spectral components from $V_{\text{f32}}[:, :64]$ (0 label leakage); isolates 85% mass strictly to official 4 Part-Two members; routes secondary models to 15% complementary stack with Ledoit-Wolf shrinkage floors and prior scaling; lifts LB to 0.613. |
+| **Current Production** | **V44** | **Modular PyPA Architecture + Zero-RAM In-Place Unmerge + Exact $2^{18}$ Forward-Backward Subset DP + LayerNorm Heads** | **0.998 (99.8%)** | **0.640 (64.0%)** | **Submitted (Ref 57725771)** | **Production Modular SOTA**: Eliminates 15GB CPU host memory leak via in-place zero-RAM LoRA subtraction (`sign=-1.0`); implements exact 18-step forward-backward bitmask DP over all $2^{18}$ states; restores prompt-centering to wPCA covariance; adds native LayerNorm projection heads; fully vectorized Claude gate with mass preservation; AST-validated single-source compiler; 24 unit tests passing. |
 
 ---
 
@@ -858,6 +860,54 @@ We compute a within-prompt whitened projection matrix $V_{\text{joint}}$ ($d = 5
 - When evaluating the test set ($N_{\text{test}} \ge 50$), 50 iterations of dampened log-domain Sinkhorn-Knopp ($\\alpha = 0.50$) balance class marginals toward the uniform prior ($1/18$).
 - Post-Sinkhorn calibrated log-penalties (`-2.0`) are applied strictly on curly quotes (Claude/GLM), em-dashes (Gemini), and straight apostrophes (`gpt-5.6-sol`), followed by the Top-1 gated Claude specialist head.
 
+---
+
+<div class="page-break"></div>
+
+## 7.7 Version 44: Zero-RAM Reversible Unmerging, Exact 2^18 Bitmask DP, Prompt-Centered wPCA & Two-Tier 85/15 Production Architecture
+
+Version 44 establishes the modular, single-source-of-truth production architecture in `src/namethatllm/`. It eliminates the 15GB CPU memory clone leak that threatened large-model inference, implements mathematically exact forward-backward subset dynamic programming under author uniqueness, and delivers honest out-of-fold generalization.
+
+### 1. Zero-RAM In-Place Reversible LoRA Unmerging
+In earlier attempts (e.g. V43), caching base model trunk weights into CPU host RAM via `snapshot_weights` duplicated 15 GB of unquantized float32 tensors in host memory, exceeding Kaggle's 30 GB cgroup memory limit (`DeadKernelError: exit code 137`).
+Version 44 resolves this permanently through exact in-place reversible weight arithmetic directly on GPU:
+1. Base trunks (`Qwen3-14B`, `Qwen2.5-14B`, `Qwen3-8B`, `DeBERTa-v3`) are loaded into GPU memory once with `low_cpu_mem_usage=True`.
+2. For each LoRA adapter, weights are merged directly into the base weights in-place:
+   $$W_{\text{eff}} = W_0 + \frac{\alpha}{r} (B A)$$
+3. Hidden states are extracted and pooled in float32 with dynamic `bfloat16` row overflow rescue.
+4. The adapter is unmerged by inverting the delta arithmetic directly on the parameter tensor:
+   $$W_0 = W_{\text{eff}} - \frac{\alpha}{r} (B A)$$
+   using `merge_lora(trunk.model, ckpt_dir, sign=-1.0)`.
+5. Explicit garbage collection (`gc.collect()`) and CUDA cache emptying (`torch.cuda.empty_cache()`) occur between checkpoints, ensuring peak system RAM stays well below container limits across all 4 trunks.
+
+### 2. Exact 18-Step Forward-Backward 2^18 Subset Dynamic Programming
+Approximate mean-field decoding or cluster-average approximations flatten probability peaks and degrade calibration.
+In `ExactAuthorPosterior`, Version 44 implements an exact forward-backward bitmask dynamic programming solver over all $2^{18} = 262,144$ author subset configurations:
+- Partitions bitmasks by Hamming weight $\sum_j b_j = m$ using fast bitwise operations.
+- The forward pass recursively accumulates log-likelihoods over valid partial assignments.
+- The backward pass propagates marginal evidence under the shared prompt effect with prompt variance $\lambda$, enforcing the author uniqueness constraint ($c_i \neq c_j$) for all clusters with $2 \le s \le 14 \le 18$.
+- Clusters exceeding 14 items are recursively split via average linkage cosine distance clustering (`split_oversized_clusters_dist`).
+
+### 3. Prompt-Centered Within-Class Covariance (`wPCA`)
+In `fit_shared_gaussian_lowram()`, training features from 90 balanced prompts ($1,620$ rows) are explicitly centered by prompt mean prior to computing the within-class covariance matrix $S_e$ and its SVD projection $V_{\text{top64}}$:
+$$Z_{\text{centered}} = Z - \bar{Z}_{\text{prompt}}$$
+This mathematically purges prompt topic semantics from the projection space, allowing the 64-dimensional principal components to capture pure stylometric and lexical authorship variance. Ledoit-Wolf shrinkage floors (`se_floor = 0.10` for Part-Two models, `0.35` for auxiliary models) prevent singular inverted variances.
+
+### 4. Two-Tier 85/15 Convex Fusion & Prior-Scaled 384D Spectral Bank
+To protect the high-scoring Part-Two core while integrating orthogonal signal:
+- **Main Stack ($85\%$ mass)**: The canonical 4-view `LinearSVC(C=0.5)` with uniform weights, `lora_qwen3_14b`, `lora_qwen25_14b`, and `deberta_v3_large`.
+- **Complementary Stack ($15\%$ mass)**: Secondary LoRA adapters, 5-view BPE lexical models, regularized wPCA DP posteriors, and the 384-dimensional Joint Spectral Bank.
+- **Unsupervised Spectral Bank**: Top-64 components per checkpoint are extracted without label leakage and weighted by out-of-sample prior scales (`q3_14b`: 1.00, `q25_14b`: 0.85, `deberta`: 0.80, `part1_14b`: 0.50, `instyle`: 0.45, `claude_head`: 0.30), achieving an honest **0.6398 OOF Balanced Accuracy**.
+- **Convex Blend**:
+  $$P_{\text{mix}} = 0.85 \cdot R_{\text{main}} + 0.15 \cdot P_{\text{comp}}$$
+
+### 5. Multi-Trunk LayerNorm, Vectorized Claude Gate & 300-Step Sinkhorn
+- Native `LayerNorm` projection heads are applied to pooled transformer embeddings before dot product evaluation, matching pre-trained head geometry.
+- The Claude Specialist Gate reallocates probability mass strictly within the Claude sub-family ($P_{\text{claude}} = 0.85 \cdot P_{\text{prior}} + 0.15 \cdot (\text{mass} \cdot P_{\text{specialist}})$) in a vectorized step, leaving non-Claude classes completely unaltered.
+- 300-step multiplicative Sinkhorn balancing equalizes class marginal distributions to $N / 18$ across all 18 classes.
+
+---
+
 ## 8. Live Verification Benchmarks & Leaderboard Proof
 
 Every component was validated through automated verification checks in the Kaggle GPU container prior to submission.
@@ -948,7 +998,8 @@ Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
 | **V30 / v36** | 0.996 | 0.658 | **0.604** | Restored 88/12 mixture + crash-proof cluster splitting (s <= 14) + pre-Sinkhorn shield + in-style adapter. | Full recovery (+0.055 lift over V29); 0 crashes on 4k hidden test set. |
 | **V37** | **0.997** | **0.672** | **0.602** | Elimination of 180-row wPCA bug + 78k BPE & within-family refined core. | SOTA high-signal architecture; peak RAM < 2.09 GB. |
 | **V40** | 0.998 | 0.914 | **0.612** | 14B BF16 dynamic row rescue + full-rank wPCA (1,620 rows) + 384-dim spectral bank. | Breakthrough to 0.612 LB; audit exposed 8B in-sample memorization trap. |
-| **V42 (Current)** | **0.998** | **0.665** | **Deploying** | Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + unsupervised spectral bank (zero leakage). | Pure two-tier separation guarantees >= 0.620 baseline while adding +0.030 complementary signal; 36 unit tests passing. |
+| **V42** | **0.998** | **0.665** | **0.613** | Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + unsupervised spectral bank (zero leakage). | Pure two-tier separation isolates Part-Two baseline (0.620) while adding orthogonal complementary signal; scored 0.613 Public LB. |
+| **V44 (Current)** | **0.998** | **0.640** | **Submitted (Ref 57725771)** | Zero-RAM in-place unmerge (`sign=-1.0`) + exact 18-step $2^{18}$ bitmask DP + prompt-centered wPCA covariance + LayerNorm heads. | Eliminates 15GB CPU host clone leak (fixing V43 host OOM); honest 0.6398 OOF BAcc; executed cleanly in 2,122s (~35 min) on Kaggle GPU worker; 24 unit/integration tests passing. |
 
 ---
 
@@ -968,13 +1019,18 @@ Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
 3. Soft Adaptive Centering:
    z_{i, centered} = z_i - (1 / |C|) * sum_{j in C} z_j            (for 2 <= |C| <= 18)
 
-4. Master Logit Blend:
-   LOGIT = 0.50 * log_P_{lora} + 0.25 * log_P_{deb} + 0.15 * log_P_{svc} + 0.10 * log_P_{lgb}
-   if |C| >= 2: LOGIT += 0.25 * log_P_{lora_center} + 0.12 * log_P_{deb_center}
+4. Reversible LoRA In-Place Weight Addition & Subtraction:
+   W_effective = W_0 + (alpha / r) * (B @ A)
+   W_0 = W_effective - (alpha / r) * (B @ A)    (Zero-RAM rollback on device)
 
-5. Top-1 Gated Claude Specialist:
-   if argmax(P) in Claude:
-       P_claude = 0.70 * P_{lora_claude} + 0.30 * P_{svc_claude}
+5. Two-Tier Convex Mixture (85/15):
+   P_mix = 0.85 * R_main + 0.15 * P_comp
+
+6. Vectorized Claude Specialist Gate (Mass-Preserving):
+   P_claude = 0.85 * P_prior + 0.15 * (mass * P_specialist)
+
+7. Exact Multiplicative Sinkhorn Equalization (300 Steps):
+   P^{(t+1)} = diag(u^{(t)}) @ P^{(t)} @ diag(v^{(t)})   (equalizing column sums to N / 18)
 ```
 
 ### Hyperparameter Reference Table
@@ -994,6 +1050,8 @@ Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
 
 ### Common Pitfalls & How to Avoid Them
 
+- [x] **Never snapshot large model weights into CPU host RAM:** Snapshotting 14B float32 weights on CPU exhausts Kaggle's 30 GB host memory limit (exit code 137). Use in-place mathematical subtraction `merge_lora(..., sign=-1.0)` with `low_cpu_mem_usage=True`.
+- [x] **Never leak training labels into stacking features:** Fitting PCA or classifiers across full training sets without prompt-group isolation creates severe in-sample memorization (e.g. V40's 0.9142 OOF trap). Extract unsupervised prompt-centered components ($V_{\text{f32}}[:, :64]$) and apply out-of-sample prior scaling.
 - [x] **Never load PEFT wrappers blindly on truncated causal models:** They introduce nested `.model` references that skip key adapter weights. Use direct in-place matrix addition.
 - [x] **Never include token 0 in causal model pooling:** Causal attention sinks store activations up to 1,000x larger than normal tokens. Always zero position 0: `m[:, 0, :] = 0.0`.
 - [x] **Never use hard Hungarian assignment when test prompt distributions are sparse:** In sparse settings, hard 1-to-1 matching forces catastrophic false assignments. Use soft adaptive centering instead.

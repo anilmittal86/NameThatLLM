@@ -1,7 +1,7 @@
 # Name That LLM: High-Precision Authorship Attribution Pipeline
 
-[![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.612%20(SOTA)-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
-[![Architecture Version](https://img.shields.io/badge/Production%20Version-Version%2042%20(Pure%20Two--Tier%20Stack)-blue)](#)
+[![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.613%20(SOTA)-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
+[![Architecture Version](https://img.shields.io/badge/Production%20Version-Version%2044%20(Two--Tier%20Modular%20Stack)-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
@@ -26,16 +26,17 @@ This repository contains the end-to-end, competition-grade machine learning solu
 | **V29** | Pure Log-Space + TTCA + Logit `/ 1.85` + Double DP | **0.996 (99.6%)** | 0.612 (61.2%) | **0.549** | Severe Regression: TTCA confirmation bias collapsed sister-class centroids; logit divisor flattened predictions. |
 | **V30 / v36** | Restored 88/12 Mixture + Crash-Proof Cluster Splitting + Pre-Sinkhorn Shield + In-Style LoRA | **0.996 (99.6%)** | **0.658 (65.8%)** | **0.604** | Complete Recovery: +0.055 lift over V29; 0 exceptions on hidden test set; 7 checkpoints verified ($\text{BAcc} \ge 0.67$). |
 | **V37** | Eliminate 180-Row Bug + 78k BPE & Within-Family Refined Core + Universal Trunk Loader + LOO-CLC + 300-Step Sinkhorn | **0.997 (99.7%)** | **0.672 (67.2%)** | **0.602** | Complete: Zero 180-row wPCA dilution, pure test neural extraction, `keep_layers` truncation on 14B models, 5-view BPE lexical engine, within-family specialists, leave-one-out logit contrast, exact 300-step multiplicative Sinkhorn. |
-| **V40** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | SOTA Breakthrough: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores full-rank wPCA on 1,620 balanced rows, achieves 0.612 Public LB. |
-| **V42 (Current)** | **Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank (Zero Leakage)** | **0.998 (99.8%)** | **0.665 (66.5%)** | **Target 0.65+** | **Production Architecture**: Eliminates 8B in-sample stacking trap by extracting unsupervised spectral components from $V_{\text{f32}}[:, :64]$ (0 label leakage); isolates 85% mass strictly to official 4 Part-Two members (guaranteed 0.620+); routes secondary models to 15% complementary stack with Ledoit-Wolf shrinkage floors and prior scaling; 36 unit tests passing. |
+| **V40** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | SOTA Breakthrough: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores full-rank wPCA on 1,620 balanced rows, achieves 0.612 Public LB. Diagnostic audit revealed in-sample 8B memorization trap in spectral bank. |
+| **V42** | **Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank (Zero Leakage)** | **0.998 (99.8%)** | **0.665 (66.5%)** | **0.613** | Two-Tier Separation: Eliminates 8B in-sample stacking trap by extracting unsupervised spectral components from $V_{\text{f32}}[:, :64]$ (0 label leakage); isolates 85% mass strictly to official 4 Part-Two members; routes secondary models to 15% complementary stack with Ledoit-Wolf shrinkage floors and prior scaling; lifts LB to 0.613. |
+| **V44 (Current)** | **Modular PyPA Architecture + Zero-RAM In-Place Unmerge + Exact $2^{18}$ Forward-Backward Subset DP + LayerNorm Heads** | **0.998 (99.8%)** | **0.640 (64.0%)** | **Submitted (Ref 57725771)** | **Production Architecture**: Eliminates 15GB CPU host memory leak via in-place zero-RAM LoRA subtraction (`sign=-1.0`); implements exact 18-step forward-backward bitmask DP over all $2^{18}$ states; restores prompt-centering to wPCA covariance; adds native LayerNorm projection heads; fully vectorized Claude gate with mass preservation; AST-validated single-source compiler; 24 unit/integration tests passing. |
 
 ---
 
-## Post-Mortem: Root Causes of V28/V29 Failures and the V30/V37 Solutions
+## Post-Mortem: Root Causes of Historical Failures and Their Architectural Solutions
 
 ### 1. The V28 Crash & The Crash-Proof Cluster Splitter
 * **The Bug**: `ExactAuthorPosterior.group(U)` precomputes bitmask DP combinations strictly up to $k = 18$ ($2^{18} = 262,144$). On the 4,000-row hidden test set, average linkage clustering at $t = 0.62$ generated clusters with $n > 18$, crashing the submission worker with an `IndexError`.
-* **The Permanent Solution**: [`split_oversized_clusters_dist(D, groups, max_cluster_size=14)`](build_v37_pipeline.py). Recursively splits any cluster exceeding 14 rows into balanced sub-clusters via average linkage distance clustering, followed by a hard safety slice. Max cluster size is mathematically guaranteed $\le 14 \le 18$.
+* **The Permanent Solution**: [`split_oversized_clusters_dist(D, groups, max_cluster_size=14)`](src/namethatllm/wpca_gaussian.py). Recursively splits any cluster exceeding 14 rows into balanced sub-clusters via average linkage distance clustering, followed by a hard safety slice. Max cluster size is mathematically guaranteed $\le 14 \le 18$.
 
 ### 2. The V29 Collapse (`0.549`) & The TTCA Confirmation Trap
 * **The Bug**: Transductive test-time adaptation (`TTCA`) shifted cluster centroids toward dominant sister classes (`gpt-5.6-luna/sol/terra` and `gemini-3.6/3.7/3.8-flash`), collapsing macro-recall by $-0.04$. Dividing logits by $1.85$ flattened sharp Two-Stage predictions, while applying orthographic penalties *after* Sinkhorn starved column margins.
@@ -47,8 +48,35 @@ This repository contains the end-to-end, competition-grade machine learning solu
 
 ---
 
----
+## Version 44 Architecture: Zero-RAM Reversible Unmerging & Modular Production Stack
 
+### 1. High-Level Architectural Foundations
+Version 44 represents the production consolidation of the forensic authorship engine into a clean, modular PyPA `src` layout with zero memory duplication, mathematically rigorous subset dynamic programming, and honest out-of-fold generalization:
+
+1. **Zero-RAM Reversible In-Place LoRA Arithmetic**:
+   - *The Bottleneck*: In earlier iterations (e.g. V43), snapshotting trunk weights to CPU memory duplicated 15 GB of unquantized float32 weights in host RAM, exceeding Kaggle's 30 GB cgroup memory limit (`DeadKernelError: exit code 137`).
+   - *The Architecture*: Base trunks are loaded directly to GPU memory once (`low_cpu_mem_usage=True`). LoRA adapter weights are merged in-place ($W_{\text{eff}} = W_0 + \frac{\alpha}{r} BA$) for inference and then restored to exact original base weights using in-place subtraction ($W_0 = W_{\text{eff}} - \frac{\alpha}{r} BA$) via `merge_lora(model, ckpt_dir, sign=-1.0)`. Explicit garbage collection and CUDA cache flushing eliminate host/device memory creep across all 4 trunks (`Qwen3-14B`, `Qwen2.5-14B`, `Qwen3-8B`, `DeBERTa-v3`).
+
+2. **Exact $2^{18}$ Forward-Backward Subset Dynamic Programming**:
+   - Rather than mean-collapsing cluster features or relying on heuristic approximations, `ExactAuthorPosterior` evaluates exact 18-step forward-backward bitmask dynamic programming over all $2^{18} = 262,144$ author subsets.
+   - Enforces the hard author uniqueness constraint ($c_i \neq c_j$) on cluster sizes $2 \le s \le 14 \le 18$ while integrating out shared prompt covariance.
+
+3. **Prompt-Centered Within-Class Covariance (`wPCA`)**:
+   - In `fit_shared_gaussian_lowram()`, explicit prompt-mean subtraction is enforced prior to SVD on the 1,620-row balanced training matrix. This projects features into a subspace isolating stylometric authorship variance from prompt topic semantics.
+
+4. **Multi-Trunk LayerNorm & Dimension Parity**:
+   - Native `LayerNorm` projection heads are applied to pooled transformer hidden states prior to computing dot-product logits, ensuring exact geometric alignment with pre-trained linear heads.
+
+5. **Two-Tier Convex Probability Mixture ($85 / 15$)**:
+   - **Main Stack ($85\%$)**: The 4 official Part-Two models (`LinearSVC(C=0.5)`, `lora_qwen3_14b`, `lora_qwen25_14b`, `deberta_v3_large`) guaranteeing a robust baseline.
+   - **Complementary Stack ($15\%$)**: Secondary LoRAs, 5-view BPE lexical models, regularized wPCA DP posteriors, and the leak-free 384-dimensional Joint Spectral Bank.
+   - $$P_{\text{mix}} = 0.85 \cdot R_{\text{main}} + 0.15 \cdot P_{\text{comp}}$$
+
+6. **Vectorized Claude Specialist Gate & 300-Step Sinkhorn Balancing**:
+   - Fully vectorized probability reassignment within the Claude sibling sub-simplex preserves overall class mass while sharpening intra-family resolution.
+   - Official 300-step multiplicative Sinkhorn-Knopp algorithm equalizes marginal probabilities to $N/18$ across all 18 classes.
+
+---
 
 ## Version 42 Architecture: Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack
 
@@ -105,22 +133,9 @@ Version 41 broke the 0.61 barrier to achieve **0.612 Public LB** thanks to the 1
 * **Full-Rank Covariance**: With $N=1,620 \gg d=256$, the shared covariance matrix $S_e$ is strictly full rank.
 * **ExactAuthorPosterior**: Evaluates the $2^{18}$ subset dynamic programming on safe clusters ($s \le 14 \le 18$), achieving zero `IndexError` exceptions.
 
-### 3. 384-Dim Joint Cross-Backbone Spectral Bank (5-Fold OOF BAcc = 91.42%)
-* Each of the 6 checkpoints extracts its top-64 highest-SNR whitened dimensions.
-* The $6 \times 64 = 384$-dimensional joint representation achieves **91.42% Balanced Accuracy** on 5-fold cross-validation (`GroupKFold` across 90 prompts), contributing a high-signal helper probability ($w=0.22$) into the 88/12 mixture.
+---
 
-### Version 40 Checkpoint Gate Verification Audit (Kernel v41 Execution)
-| Checkpoint | Trunk | Layers | Plain Train BAcc (1,620 Rows) | Centered Twin Keys | Core Weight | Helper DP Weight | Status |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **lora_qwen3_14b** (Part 2) | Qwen3-14B | 27L | **0.8006** | `(18, 40960)` | 0.42 / 0.13 | 0.34 | **PASSED** |
-| **lora14b_v1** (Part 1) | Qwen3-14B | 24L | **0.7975** | `(18, 40960)` | 0.07 / 0.02 | 0.04 | **PASSED** |
-| **lora_qwen25_14b** (Part 2) | Qwen2.5-14B | 32L | **0.7506** | `(18, 40960)` | 0.24 / 0.10 | 0.22 | **PASSED** |
-| **instyle_qwen3_8b** | Qwen3-8B | 24L | **0.9401** | `(18, 32768)` | 0.18 / 0.06 | 0.14 | **PASSED** |
-| **ntl-claude-head** | Qwen3-8B | 24L | **0.9377** | `(18, 32768)` | 0.12 / 0.04 | 0.08 | **PASSED** |
-| **deberta_v3_large** (Part 2) | DeBERTa-v3 | 24L | **0.8395** | Plain Only | 0.22 / 0.08 | 0.18 | **PASSED** |
-| **Joint Spectral Bank** | Cross-Backbone | 384D | **0.9142 (OOF)** | Centered LogReg | N/A | 0.22 | **PASSED** |
-
-## Version 37 SOTA System Architecture
+## SOTA System Architecture Flow
 
 ```
                           [ 4,000 Mystery Passages (test.csv) ]
@@ -128,50 +143,33 @@ Version 41 broke the 0.61 barrier to achieve **0.612 Public LB** thanks to the 1
         ┌───────────────────────────────────┴───────────────────────────────────┐
         ▼                                                                       ▼
 ┌──────────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
-│  MODULE 1: SUBPROCESS 78k LEXICAL ENGINE     │        │  MODULE 2: 5 HIGH-SIGNAL NEURAL CHECKPOINTS  │
-│  - 78,482 Passages (train.csv + pool_v4)     │        │  (Zero Z_train extraction, Peak RAM < 1.8GB) │
-│  - 5 Views: Char, Word, Shape, Function,     │        │  - lora_qwen3_14b (0.42 / 0.12)              │
-│    and Native Qwen BPE Subword N-Grams       │        │  - lora_qwen25_14b (0.22 / 0.10)             │
-│  - Dual Linear Ensemble (SVC + SGD log_loss) │        │  - deberta_v3_large (0.25 / 0.08)            │
-│  - 4 Within-Family Specialist Refiners       │        │  - instyle_qwen3_8b (0.14 / 0.05)            │
-│    (GPT, Claude, Gemini, GLM)                │        │  - claude_qwen3_8b (0.10 / 0.04)             │
-│  - Stopword TF-IDF Distance Matrix D_tfidf   │        │  - Neural Cosine Distance D_neural           │
+│  MODULE 1: SUBPROCESS 78k LEXICAL ENGINE     │        │  MODULE 2: 4-TRUNK NEURAL CHECKPOINTS        │
+│  - 78,482 Passages (train.csv + pool_v4)     │        │  (Zero-RAM In-Place Unmerge, Peak RAM Safe)  │
+│  - 4-View Main LinearSVC (C=0.5)             │        │  - Trunk 1: Qwen3-14B (Part 2 + Part 1)      │
+│  - 5-View Complementary Ensemble (BPE + SGD) │        │  - Trunk 2: Qwen2.5-14B (Part 2)             │
+│  - Stopword TF-IDF Distance Matrix D_tfidf   │        │  - Trunk 3: Qwen3-8B (In-Style + Claude Head)│
+│  - Prompt Clusters: groups_085 (t=0.85)      │        │  - Trunk 4: DeBERTa-v3-large                 │
 └──────────────────────┬───────────────────────┘        └──────────────────────┬───────────────────────┘
                        │                                                       │
                        └───────────────────────┬───────────────────────────────┘
                                                ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  MODULE 3: CONSENSUS NEURAL CLUSTERING & LEAVE-ONE-OUT LOGIT CONTRAST (LOO-CLC)                      │
-│  - Consensus Distance: D_consensus = 0.55 * D_tfidf + 0.45 * D_neural                                │
-│  - Centered Twin Scoring on groups_085 (t = 0.85)                                                    │
-│  - High-Purity Consensus Clustering on groups_tight (t = 0.58, s <= 14 via split_oversized_clusters) │
-│  - Top-1 Gated Claude Specialist Refinement                                                          │
-│  - Leave-One-Out Cluster Logit Contrast (LOO-CLC): cancels prompt-topic bias                         │
-│  - Soft 1-to-1 Hungarian Assignment Boost (+0.25 on optimal matching)                               │
+│  MODULE 3: WITHIN-PROMPT wPCA & EXACT 2^18 BITMASK DP + 384-DIM JOINT SPECTRAL BANK                  │
+│  - 1,620-Row Balanced Training Set (90 prompts x 18 classes, full-rank covariance)                   │
+│  - Prompt-Centered Within-Class Covariance S_e with Ledoit-Wolf Shrinkage Floors                     │
+│  - ExactAuthorPosterior: Exact forward-backward dynamic programming over 2^18 author subsets         │
+│  - Unsupervised 384-Dim Joint Spectral Bank: Top-64 components per checkpoint with Prior Scaling     │
 └──────────────────────────────────────────────┬───────────────────────────────────────────────────────┘
                                                ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  MODULE 4: OFFICIAL 300-STEP EXACT MULTIPLICATIVE SINKHORN BALANCING                                 │
-│  - Multiplicative column scaling: P = clip(softmax(LOGIT), 1e-15, 1.0)                               │
-│  - Exactly equalizes class marginal mass to N / 18 across all 18 classes                             │
+│  MODULE 4: TWO-TIER CONVEX FUSION, VECTORIZED CLAUDE GATE & 300-STEP SINKHORN BALANCING              │
+│  - Two-Tier Convex Fusion: P_mix = 0.85 * R_main + 0.15 * P_comp                                     │
+│  - Vectorized Claude Specialist Gate with overall probability simplex mass preservation             │
+│  - Sovereign Orthographic Bayesian Shield (curly-quote penalty on Claude/GLM)                         │
+│  - Official 300-step multiplicative Sinkhorn mass equalization (column sums = N / 18)                │
 │  - Output: /kaggle/working/submission.parquet                                                        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## Checkpoint Verification Gate Summary (From Version 37 Execution)
-
-Every checkpoint is validated against a verification gate ($\text{BAcc} \ge 0.48$). In our benchmark audit on Kaggle GPU, all 5 checkpoints passed with high balanced accuracy:
-
-| Checkpoint Identifier | Model Trunk | Measured Sanity BAcc | Status | Routing & Weight in Ensemble |
-| :--- | :--- | :---: | :---: | :--- |
-| **`instyle_qwen3_8b`** | Qwen3-8B | **0.9833** | **PASSED** | Core Plain (0.14) + Twin (0.05) |
-| **`ntl-qwen3-8b-lora-claude-head`** | Qwen3-8B | **0.8889** | **PASSED** | Core Plain (0.10) + Twin (0.04) + Claude Specialist (+0.15) |
-| **`deberta_v3_large`** | DeBERTa-v3-large | **0.8556** | **PASSED** | Core Plain (0.25) + Twin (0.08) |
-| **`lora_qwen3_14b`** | Qwen3-14B (keep=27) | **0.8500** | **PASSED** | Core Plain (0.42) + Twin (0.12) |
-| **`lora_qwen25_14b`** | Qwen2.5-14B (keep=32) | **0.7722** | **PASSED** | Core Plain (0.22) + Twin (0.10) |
-| **`78k Dual Lexical Engine`** | 5-View CSR (603k feat) | **High Macro** | **PASSED** | Subprocess-Isolated Core Logits (0.30) |
 
 ---
 
@@ -183,7 +181,7 @@ NameThatLLM/
 ├── README.md                            # Executive overview, milestone scorecard, and SOTA architecture
 ├── TUTORIAL.md                          # Comprehensive 1,000+ line printable masterclass & mathematical guide
 ├── configs/                             # Declarative experiment and ensemble configurations
-│   └── production_ensemble.json                # Production weights, regularizers, thresholds, and prior scales
+│   └── production_ensemble.json         # Production weights, regularizers, thresholds, and prior scales
 ├── kernels/                             # Kaggle kernel build targets and metadata
 │   ├── submission/                      # Official competition submission kernel
 │   │   ├── kernel-metadata.json         # Kaggle GPU/dataset mount configuration
@@ -195,15 +193,17 @@ NameThatLLM/
 │   ├── compile_notebook.py              # Single-source-of-truth notebook compiler from src/ + configs/
 │   └── push_submission.py               # Automated test, compile, and Kaggle push CLI
 ├── src/namethatllm/                     # Modular production Python package
-│   ├── __init__.py                      # Package version (0.42.0) and public exports
+│   ├── __init__.py                      # Package version and public exports
 │   ├── config.py                        # Canonical 18 classes, provider families, simplex helpers, paths
 │   ├── lexical_engine.py                # 78k 4-view Main SVC + 5-view BPE Complementary ensemble
-│   ├── neural_extractor.py              # Universal trunk loader, dynamic bfloat16 row rescue, head solvers
+│   ├── neural_extractor.py              # Universal trunk loader, reversible in-place unmerging, LayerNorm heads
 │   ├── wpca_gaussian.py                 # Full-rank wPCA, safe cluster splitting (s <= 14), 2^18 Bitmask DP
 │   ├── spectral_bank.py                 # Unsupervised 384-dim Joint Spectral Bank (0 label leakage)
-│   └── postprocess.py                   # Two-tier convex blend, Claude specialist gate, 300-step Sinkhorn
+│   ├── postprocess.py                   # Two-tier convex blend, vectorized Claude gate, 300-step Sinkhorn
+│   └── pipeline.py                      # Top-level orchestration of Modules 1 through 4
 ├── tests/                               # Comprehensive unit test suite (pytest)
 │   ├── __init__.py
+│   ├── test_compiler_and_integration.py # End-to-end AST validation, compiler checks, mock-neural tests
 │   ├── test_lexical.py                  # Tokenizers, shape patterns, stopwords, and dual lexical outputs
 │   ├── test_wpca_dp.py                  # Two-way decomposition, Ledoit-Wolf shrinkage, ExactAuthorPosterior
 │   ├── test_spectral_bank.py            # Prior scaling, unsupervised V_f32 projection, OOF validation
@@ -224,7 +224,7 @@ Install the package in editable mode with development dependencies:
 # 1. Install package in editable mode
 pip install -e . --no-deps
 
-# 2. Run the full unit test suite
+# 2. Run the full unit and integration test suite (24 tests)
 python -m pytest tests -v
 ```
 
@@ -249,5 +249,5 @@ python -m kaggle kernels push -p kernels/submission
 python -m kaggle kernels status anilmittal/name-that-llm-v2-submission
 
 # 4. Submit to competition once complete
-python -m kaggle competitions submit -c name-that-llm -k anilmittal/name-that-llm-v2-submission -f submission.parquet -v <VERSION> -m "v42: Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Leak-Free Spectral Bank"
+python -m kaggle competitions submit -c name-that-llm -k anilmittal/name-that-llm-v2-submission -f submission.parquet -v 44 -m "v44: Fix 8 bugs + Zero-RAM In-Place Unmerge + Multi-Res Twins + 384D Spectral Bank"
 ```
