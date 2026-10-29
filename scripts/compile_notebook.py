@@ -1,7 +1,7 @@
 """
 Single-Source-of-Truth Kaggle Notebook Compiler.
 Reads modular Python source files directly from `src/namethatllm/*.py` and
-`configs/production_ensemble.json` to assemble `kernels/submission/kaggle_submission.ipynb`.
+config JSONs to assemble `kaggle_submission.ipynb` and `lora_training.ipynb`.
 """
 
 import ast
@@ -9,8 +9,9 @@ import json
 import re
 import argparse
 from pathlib import Path
+from typing import List
 
-MODULE_ORDER = [
+SUBMISSION_MODULES = [
     "config.py",
     "wpca_gaussian.py",
     "spectral_bank.py",
@@ -19,48 +20,29 @@ MODULE_ORDER = [
     "pipeline.py",
 ]
 
+TRAINING_MODULES = [
+    "config.py",
+    "wpca_gaussian.py",
+    "neural_extractor.py",
+    "trainer.py",
+]
+
 def strip_internal_imports(source: str) -> str:
     """Removes internal `from namethatllm... import ...` or `from .xxx import ...` lines, including multi-line."""
-    lines = []
-    in_paren_import = False
+    lines, in_paren = [], False
     for line in source.splitlines():
-        if in_paren_import:
+        if in_paren:
             if ")" in line:
-                in_paren_import = False
+                in_paren = False
             continue
         if re.match(r"^\s*(from\s+(\.|namethatllm)\S*\s+import\s+|import\s+namethatllm)", line):
             if "(" in line and ")" not in line:
-                in_paren_import = True
+                in_paren = True
             continue
         lines.append(line)
     return "\n".join(lines).strip() + "\n"
 
-def compile_notebook(config_path: Path, output_path: Path) -> Path:
-    repo_root = Path(__file__).resolve().parents[1]
-    pkg_dir = repo_root / "src" / "namethatllm"
-    cfg_data = json.loads(config_path.read_text(encoding="utf-8"))
-
-    # Cell 1: Write isolated subprocess script `/kaggle/working/run_lexical.py` directly from `lexical_engine.py`
-    lex_src = strip_internal_imports((pkg_dir / "lexical_engine.py").read_text(encoding="utf-8"))
-    ast.parse(lex_src, filename="lexical_engine.py")
-    cell_lexical = f"%%writefile /kaggle/working/run_lexical.py\n{lex_src}"
-
-    # Cell 2+: Read each package module in dependency order
-    cells_code = [cell_lexical]
-    for mod_name in MODULE_ORDER:
-        mod_path = pkg_dir / mod_name
-        raw_src = strip_internal_imports(mod_path.read_text(encoding="utf-8"))
-        if mod_name == "config.py":
-            raw_src = f"ENSEMBLE_CONFIG = {repr(cfg_data)}\n\n" + raw_src
-        ast.parse(raw_src, filename=mod_name)
-        cells_code.append(f"# === MODULE: src/namethatllm/{mod_name} ===\n{raw_src}")
-
-    # Final Cell: Entrypoint call
-    entry_code = "if __name__ == '__main__':\n    run_submission_pipeline(ENSEMBLE_CONFIG)\n"
-    ast.parse(entry_code, filename="entrypoint")
-    cells_code.append(entry_code)
-
-    # Build Jupyter .ipynb JSON structure
+def _build_notebook(cells_code: List[str], output_path: Path) -> Path:
     nb = {
         "cells": [
             {
@@ -68,7 +50,7 @@ def compile_notebook(config_path: Path, output_path: Path) -> Path:
                 "execution_count": None,
                 "metadata": {},
                 "outputs": [],
-                "source": [line + "\n" for line in code.splitlines()],
+                "source": [line + "\n" for line in code.splitlines()]
             }
             for code in cells_code
         ],
@@ -83,14 +65,60 @@ def compile_notebook(config_path: Path, output_path: Path) -> Path:
     output_path.write_text(json.dumps(nb, indent=2), encoding="utf-8")
     return output_path
 
+def compile_submission_notebook(config_path: Path, output_path: Path) -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    pkg_dir = repo_root / "src" / "namethatllm"
+    cfg_data = json.loads(config_path.read_text(encoding="utf-8"))
+
+    lex_src = strip_internal_imports((pkg_dir / "lexical_engine.py").read_text(encoding="utf-8"))
+    ast.parse(lex_src, filename="lexical_engine.py")
+    cells = [f"%%writefile /kaggle/working/run_lexical.py\n{lex_src}"]
+
+    for mod in SUBMISSION_MODULES:
+        raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
+        if mod == "config.py":
+            raw = f"ENSEMBLE_CONFIG = {repr(cfg_data)}\n\n" + raw
+        ast.parse(raw, filename=mod)
+        cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
+
+    entry = "if __name__ == '__main__':\n    run_submission_pipeline(ENSEMBLE_CONFIG)\n"
+    ast.parse(entry, filename="entrypoint")
+    cells.append(entry)
+    return _build_notebook(cells, output_path)
+
+compile_notebook = compile_submission_notebook
+
+def compile_training_notebook(config_path: Path, output_path: Path) -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    pkg_dir = repo_root / "src" / "namethatllm"
+    cfg_data = json.loads(config_path.read_text(encoding="utf-8"))
+
+    cells = []
+    for mod in TRAINING_MODULES:
+        raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
+        if mod == "config.py":
+            raw = f"TRAINING_CONFIG = {repr(cfg_data)}\n\n" + raw
+        ast.parse(raw, filename=mod)
+        cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
+
+    entry = "if __name__ == '__main__':\n    run_training_pipeline(TRAINING_CONFIG)\n"
+    ast.parse(entry, filename="entrypoint_training")
+    cells.append(entry)
+    return _build_notebook(cells, output_path)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compile Kaggle submission notebook from src/namethatllm")
-    parser.add_argument("--config", default="configs/production_ensemble.json", help="Path to ensemble config")
-    parser.add_argument("--output", default="kernels/submission/kaggle_submission.ipynb", help="Output .ipynb path")
+    parser = argparse.ArgumentParser(description="Compile Kaggle notebooks from src/namethatllm")
+    parser.add_argument("--target", choices=["submission", "training", "all"], default="all")
+    parser.add_argument("--config", default="configs/production_ensemble.json")
+    parser.add_argument("--output", default="kernels/submission/kaggle_submission.ipynb")
+    parser.add_argument("--training-config", default="configs/training_lora.json")
+    parser.add_argument("--training-output", default="kernels/training/lora_training.ipynb")
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parents[1]
-    cfg_p = Path(args.config) if Path(args.config).is_absolute() else repo / args.config
-    out_p = Path(args.output) if Path(args.output).is_absolute() else repo / args.output
-    out = compile_notebook(cfg_p, out_p)
-    print(f"[Compiler] Successfully compiled notebook to {out}")
+    if args.target in ("submission", "all"):
+        out_sub = compile_submission_notebook(repo / args.config, repo / args.output)
+        print(f"[Compiler] Successfully compiled submission notebook to {out_sub}")
+    if args.target in ("training", "all"):
+        out_trn = compile_training_notebook(repo / args.training_config, repo / args.training_output)
+        print(f"[Compiler] Successfully compiled training notebook to {out_trn}")

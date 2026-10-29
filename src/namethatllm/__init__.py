@@ -36,6 +36,13 @@ from .wpca_gaussian import (
     scores_exact_dp
 )
 from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
+from .trainer import (
+    MultiLayerLoRAClassifier,
+    compute_two_stage_loss,
+    PromptGroupBatchSampler,
+    export_compatible_checkpoint,
+    run_training_pipeline
+)
 from .postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
@@ -57,6 +64,8 @@ __all__ = [
     "fit_shared_gaussian_lowram", "transform_lowram", "ExactAuthorPosterior",
     "split_oversized_clusters_dist", "scores_exact_dp",
     "fit_joint_spectral_bank", "make_spectral_blocks",
+    "MultiLayerLoRAClassifier", "compute_two_stage_loss", "PromptGroupBatchSampler",
+    "export_compatible_checkpoint", "run_training_pipeline",
     "blend_main_and_complementary", "apply_claude_specialist_gate",
     "build_orthographic_penalty_matrix", "apply_unified_handwriting_shield",
     "apply_curly_quote_shield", "sinkhorn_balancing", "generate_submission",

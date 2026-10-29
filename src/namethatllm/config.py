@@ -125,20 +125,25 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
     head_candidates = list(input_dir.rglob('heads.safetensors')) + list(input_dir.rglob('heads.pt'))
     for p in head_candidates:
         p_str = str(p).lower().replace('\\', '/')
+        is_fold = ('_f0' in p_str or '_f1' in p_str or '_f2' in p_str or '_f3' in p_str or '_f4' in p_str)
+
         if 'lora_qwen3_14b' in p_str or 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
             ckpts['qwen3_14b_p2'] = p.parent
         elif 'lora_qwen25_14b' in p_str or 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
             ckpts['qwen25_14b_p2'] = p.parent
-        elif 'q14v5' in p_str or 'ts_q3b14' in p_str:
-            ckpts['qwen3_14b_ts'] = p.parent
+        elif 'ts_q3b14' in p_str or 'q14v5' in p_str:
+            if 'qwen3_14b_ts' not in ckpts or (not is_fold):
+                ckpts['qwen3_14b_ts'] = p.parent
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
-        elif 'l24x_q3b8' in p_str or 'ts8_s7' in p_str or 'ts_q3b8' in p_str or 'll8v5' in p_str:
-            ckpts['qwen3_8b_ts'] = p.parent
+        elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'q8v5' in p_str or 'l24x_q3b8' in p_str or 'll8v5' in p_str:
+            if 'qwen3_8b_ts' not in ckpts or (not is_fold):
+                ckpts['qwen3_8b_ts'] = p.parent
         elif 'lora8b_v1' in p_str:
             ckpts['qwen3_8b_p1'] = p.parent
-        elif 'l24x_q25_7b' in p_str or 'ts_q25_7b' in p_str:
-            ckpts['qwen25_7b_ts'] = p.parent
+        elif 'ts_q25_7b' in p_str or 'l24x_q25_7b' in p_str:
+            if 'qwen25_7b_ts' not in ckpts or (not is_fold):
+                ckpts['qwen25_7b_ts'] = p.parent
         elif 'instyle' in p_str:
             ckpts['instyle'] = p.parent
 

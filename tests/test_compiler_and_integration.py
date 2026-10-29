@@ -53,7 +53,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
         pkg_dir = self.repo_root / "src" / "namethatllm"
         src_defs = set()
         for py_file in pkg_dir.glob("*.py"):
-            if py_file.name == "__init__.py":
+            if py_file.name in ("__init__.py", "trainer.py"):
                 continue
             tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=py_file.name)
             for node in tree.body:

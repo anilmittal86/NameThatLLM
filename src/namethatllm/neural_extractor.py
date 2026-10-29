@@ -176,6 +176,8 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
     for wk, bk in [
         ("plain.weight", "plain.bias"),
         ("plain_coef", "plain_intercept"),
+        ("head.weight", "head.bias"),
+        ("W_plain", "b_plain"),
         ("weight", "bias"),
         ("W", "b"),
     ]:
@@ -189,6 +191,7 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
         ("twin.weight", "twin.bias"),
         ("center_coef", "center_intercept"),
         ("centred_coef", "centred_intercept"),
+        ("W_center", "b_center"),
     ]:
         if wk in heads_dict and bk in heads_dict:
             W_c, b_c = heads_dict[wk], heads_dict[bk]

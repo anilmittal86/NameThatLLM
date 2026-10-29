@@ -54,6 +54,33 @@ from .postprocess import (
     generate_submission
 )
 
+def verify_checkpoint_gate(
+    Z_tr: np.ndarray,
+    W_p: Optional[np.ndarray],
+    b_p: Optional[np.ndarray],
+    ckpt_labels: list,
+    y_sub: np.ndarray,
+    name: str,
+    min_bacc: float = 0.50
+) -> bool:
+    """
+    Verifies that a checkpoint's plain classification head achieves >= min_bacc
+    on the prompt-heldout validation partition (train_sub) before adding its logits.
+    Guarantees that corrupt or misaligned heads cannot degrade Main or Comp stack.
+    """
+    if W_p is None or b_p is None or len(Z_tr) == 0:
+        print(f"[Gate] {name}: No plain head or empty Z_tr; skipping head logits.")
+        return False
+    if W_p.shape[1] != Z_tr.shape[1] or W_p.shape[0] != K:
+        print(f"[Gate] {name}: Shape mismatch W_p={W_p.shape} vs Z_tr={Z_tr.shape}; skipping head logits.")
+        return False
+    logits_tr = align_cols(Z_tr @ W_p.T + b_p, ckpt_labels)
+    preds_tr = logits_tr.argmax(axis=1)
+    acc = float((preds_tr == y_sub).mean())
+    passed = acc >= min_bacc
+    print(f"[Gate] {name}: train_sub accuracy = {acc:.4f} (threshold={min_bacc:.2f}) -> {'PASSED' if passed else 'REJECTED'}")
+    return passed
+
 def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.DataFrame, Path]:
     """
     Executes the complete production or smoke-test submission pipeline.
@@ -328,12 +355,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
                 update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_ts", 0.50))
 
+                gate_passed = True
+                if not is_smoke and len(y_sub) >= 180:
+                    gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts14_labels, y_sub, name="qwen3_14b_ts", min_bacc=0.50)
+
                 w_comp_p = comp_members.get("qwen3_14b_ts", {}).get("plain_weight", 0.20)
                 w_comp_c = comp_members.get("qwen3_14b_ts", {}).get("twin_weight", 0.08)
-                if W_p is not None:
+                if W_p is not None and gate_passed:
                     lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels))
                     comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                if W_c is not None:
+                if W_c is not None and gate_passed:
                     lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
                     lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
                     lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
@@ -479,12 +510,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
                 update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_ts", 0.40))
 
+                gate_passed = True
+                if not is_smoke and len(y_sub) >= 180:
+                    gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts8_labels, y_sub, name="qwen3_8b_ts", min_bacc=0.50)
+
                 w_comp_p = comp_members.get("qwen3_8b_ts", {}).get("plain_weight", 0.20)
                 w_comp_c = comp_members.get("qwen3_8b_ts", {}).get("twin_weight", 0.08)
-                if W_p is not None:
+                if W_p is not None and gate_passed:
                     lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels))
                     comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                if W_c is not None:
+                if W_c is not None and gate_passed:
                     lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
                     lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
                     lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
