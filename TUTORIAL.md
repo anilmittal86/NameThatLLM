@@ -1,9 +1,9 @@
-# The Mystery of the 18 Robots
-### *A Complete, Printable Master Guide to "Name That LLM" (From 0.32 to 0.650+ SOTA Ensemble)*
+# The Mystery of the 18 Robots: Technical Masterclass & Mathematical Guide
+### *A Complete Guide to the Production Authorship Attribution Architecture*
 
 ---
 
-## 1. Executive Summary & The Problem
+## 1. Executive Summary & The Attribution Problem
 
 Imagine a room with **18 distinct Artificial Intelligence models** (the "robots"). A human gives them various prompts—such as writing essays, answering riddles, coding algorithms, or composing emails.
 
@@ -12,17 +12,17 @@ Each robot writes an answer. The answers are shuffled, the prompt is separated o
 **The Competition Goal:** Given a mystery passage of text, accurately identify **which of the 18 specific AI models** generated it.
 
 ```
-       [ Mystery Text Passage ]
-                  │
-                  ▼
-┌───────────────────────────────────┐
-│     WHICH ROBOT WROTE THIS?       │
-└───────────────────────────────────┘
-                  │
-  ┌───────────────┼───────────────┬───────────────┐
-  ▼               ▼               ▼               ▼
-Claude Family   GPT Family     Gemini Family   Solo Artists
-(5 Models)      (5 Models)     (4 Models)      (4 Models)
+                       [ Mystery Text Passage ]
+                                  │
+                                  ▼
+               ┌─────────────────────────────────────┐
+               │       WHICH ROBOT WROTE THIS?       │
+               └─────────────────────────────────────┘
+                                  │
+     ┌────────────────┬───────────┴────┬───────────────┐
+     ▼                ▼                ▼               ▼
+Claude Family    GPT Family      Gemini Family    Solo Artists
+  (5 Models)     (5 Models)       (4 Models)       (4 Models)
 ```
 
 ### The 18 Target Models Across Families
@@ -38,9 +38,9 @@ Claude Family   GPT Family     Gemini Family   Solo Artists
 5. Solo Artists (2):      kimi-k3 (Moonshot), qwen3.8-max (Alibaba)
 ```
 
-### The Evaluation Metric: Balanced Accuracy
+### The Evaluation Metric: Balanced Multi-Class Accuracy
 
-Because classes may be imbalanced, Kaggle evaluates submissions using **Balanced Multi-Class Accuracy**:
+Because test prompt distributions may produce class imbalance, the competition evaluates submissions using **Balanced Multi-Class Accuracy**:
 
 $$\text{Balanced Accuracy} = \frac{1}{K} \sum_{k=1}^{K} \frac{\text{True Positives}_k}{\text{Total Actual}_k}$$
 
@@ -48,1016 +48,350 @@ Where $K = 18$. A completely random guess yields:
 
 $$\frac{1}{18} \approx 5.56\%$$
 
-### Progression Scorecard: From Baseline to State-of-the-Art
+The production ensemble achieves **0.622 Balanced Accuracy** on the public test set.
 
-| Stage | Version | Architecture / Pipeline Components | Training BAcc | Validation CV | Public LB | Learning / Overfitting Intuition |
-| :--- | :---: | :--- | :---: | :---: | :---: | :--- |
-| **Baseline** | **V1** | Flat Word N-Gram TF-IDF | **1.000 (100%)** | 0.335 (33.5%) | **0.321** | Severe Overfitting: Perfect train memorization, poor generalization. |
-| **Interim** | **V9** | DeBERTa-v3 + ANOVA Specialists | **0.892 (89.2%)** | 0.362 (36.2%) | **0.336** | Over-optimistic CV: Hungarian matching degraded on sparse test prompts. |
-| **Buggy LoRA** | **V12** | Qwen3-8B Base (Sink Unmasked) | **0.993 (99.3%)** | 0.497 (49.7%) | **0.347** | Parity Gap: Token-0 attention sink ruined live feature extraction. |
-| **Parity Fix** | **V15** | Verified Qwen3-8B LoRA (`m[:,0]=0`) | **0.993 (99.3%)** | 0.542 (54.2%) | **0.491** | True Generalization: 0.051 gap between CV (0.542) and LB (0.491). |
-| **Refactor** | **V18** | Multi-Backbone Pipeline Refactor | **1.000 (100%)** | 0.615 (61.5%) | **Build Valid.** | Code verification on 2xT4 GPUs; fixed tensor detach handling. |
-| **V19 Lift** | **V19** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) | **0.994 (99.4%)** | 0.628 (62.8%) | **0.551** | Strong Generalization: Multi-backbone wPCA ensemble achieves +0.060 lift over V15. |
-| **Audit** | **V21** | 6-Checkpoint Trunk Reuse + Fine-Tuned DeBERTa | **0.995 (99.5%)** | **0.652 (65.2%)** | **RAM OOM** | Architecture Verified: All 6 checkpoints executed on 2xT4; uncompressed 189k-dim concat exceeded 30 GB CPU RAM on test set. |
-| **Barrier Break** | **V24** | Zero-Accumulation 64-Dim Spectral Bank + Streamed CSR SVC + float32 wPCA | **0.995 (99.5%)** | 0.648 (64.8%) | **0.603** | Low-RAM Milestone: Eliminates 30 GB OOM (peak RSS 2.17 GB), breaking the 0.60 barrier (+0.052 lift over V19). |
-| **Proven Baseline** | **V26** | Subprocess Memory Isolation + Head-Tail Pooling + 88/12 Mixture | **0.996 (99.6%)** | **0.656 (65.6%)** | **0.605** | Stable Foundation: 88/12 core-to-helper probability mixture protects 78k-trained heads from small-sample dilution. |
-| **Hidden Crash** | **V28** | Pure Log-Space Fusion + TTCA | **0.996 (99.6%)** | 0.654 (65.4%) | **Exception** | Crash on Hidden Test Set: Hierarchical clustering created cluster n > 18, raising IndexError in bitmask DP. |
-| **Regression** | **V29** | Pure Log-Space + TTCA + Logit / 1.85 + Double DP | **0.996 (99.6%)** | 0.612 (61.2%) | **0.549** | Severe Regression: TTCA confirmation bias collapsed sister-class centroids; logit divisor flattened predictions. |
-| **Rebound** | **V30 / v36** | Restored 88/12 Mixture + Crash-Proof Cluster Splitting + Pre-Sinkhorn Shield + In-Style LoRA | **0.996 (99.6%)** | **0.658 (65.8%)** | **0.604** | Complete Recovery: +0.055 lift over V29; 0 exceptions on hidden test set; 7 checkpoints verified (BAcc >= 0.67). |
-| **Interim SOTA** | **V37** | Eliminate 180-Row Bug + 78k BPE & Within-Family Refined Core + Universal Trunk Loader + LOO-CLC + 300-Step Sinkhorn | **0.997 (99.7%)** | **0.672 (67.2%)** | **0.602** | Complete: Zero 180-row wPCA dilution, pure test neural extraction, `keep_layers` truncation on 14B models, 5-view BPE lexical engine, within-family specialists, leave-one-out logit contrast, exact 300-step multiplicative Sinkhorn. |
-| **Prior SOTA** | **V40** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | SOTA Breakthrough: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores true full-rank wPCA on 90 balanced prompts ($N=1,620 \gg d=256$), achieves 0.612 Public LB. Diagnostic audit revealed in-sample 8B memorization trap in spectral bank. |
-| **Two-Tier SOTA** | **V42** | **Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank (Zero Leakage)** | **0.998 (99.8%)** | **0.665 (66.5%)** | **0.613** | Two-Tier Separation: Eliminates 8B in-sample stacking trap by extracting unsupervised spectral components from $V_{\text{f32}}[:, :64]$ (0 label leakage); isolates 85% mass strictly to official 4 Part-Two members; routes secondary models to 15% complementary stack with Ledoit-Wolf shrinkage floors and prior scaling; lifts LB to 0.613. |
-| **Production SOTA** | **V44 / V45** | **Modular PyPA Architecture + Reversible LoRA Unmerging + Snapshot Trunk Isolation + Unified Orthographic Shield** | **0.998 (99.8%)** | **0.640 (64.0%)** | **0.622 (SOTA)** | **Production SOTA**: +0.009 LB lift to 0.622; eliminates 15GB CPU host memory leak via in-place zero-RAM LoRA subtraction (`sign=-1.0`); implements exact 18-step forward-backward bitmask DP over all $2^{18}$ states; adds native LayerNorm projection heads; snapshot weight caches eliminate cumulative FP16 subtraction drift; single-pass non-code prose extractor with centralized discrete/continuous handwriting shield; 27 unit tests passing. |
+### The Fundamental Machine Learning Challenge
+
+The primary challenge in LLM authorship attribution is **Prompt Semantic Entanglement**:
+1. When multiple models answer the same prompt (e.g. "Explain photosynthesis"), their responses share heavy semantic overlap (e.g. words like *chloroplast*, *sunlight*, *glucose*).
+2. A standard bag-of-words or un-centered classifier will memorize the prompt topic rather than learning the subtle **stylometric signature** ("handwriting") of the author.
+3. On unseen test prompts, a model that learned topics collapses.
+
+The production codebase solves this through **Within-Prompt Covariance Analysis (`wPCA`)**, **Adaptive Prompt-Mean Centering**, **Exact $2^{18}$ Subset Dynamic Programming**, and **Unified Orthographic Rule Postprocessing**.
 
 ---
 
-<div class="page-break"></div>
+## 2. End-to-End System Architecture
 
-## 2. High-Level Architecture Overview
+The production pipeline is organized into 4 decoupled, memory-isolated modules executing sequentially within Kaggle's 30 GB RAM and 2-hour GPU limits:
 
-Our winning architecture operates as a 6-checkpoint, multi-backbone forensic ensemble combining deep causal language models, bidirectional encoders, stylometrics, exact dynamic programming, and hierarchical specialist classifiers.
-
-The pipeline is organized into two distinct phases:
-1. **Phase 1 (Offline Pre-Training & Dataset Lineage)**: How models were fine-tuned and packaged into Kaggle dataset bundles.
-2. **Phase 2 (Inference & Post-Processing Pipeline)**: How the submission notebook loads base trunks, applies in-place LoRA patches, fits live stylometrics and spectral banks, and post-processes logits to generate the final prediction.
-
----
-
-### Phase 1: High-Level Design — Training & Dataset Lineage
-
-![High-Level Design: Offline Training Pipeline & Kaggle Dataset Bundles](assets/training_lineage_architecture.png)
-
-#### Training Phase Breakdown
-- **In-Repository Training (`train_lora.py`, `build_train_notebook.py`)**:
-  - Implements sequence classification fine-tuning with PEFT LoRA (`r=16`, `lora_alpha=32`, `target_modules=q/k/v/o/gate/up/down_proj`).
-  - Evaluated on `train.csv` (2,699 labeled passages) under strict 5-fold `GroupKFold` partitioned by `prompt_id` to guarantee 0 prompt leakage.
-  - The local Fold 0 adapter checkpoint is archived for ablation experiments; the final competition run directly consumes pre-trained models published in Kaggle datasets.
-- **External Dataset Bundles (Mounted via `kernel-metadata.json`)**:
-  - **Model 1 (`nishantdahal/ntl-handwriting-blend`)**:
-    - `pool_v4.parquet` (75,783 curated text passages driving live stylometrics).
-    - Part 2 LoRA weights: `lora_qwen3_14b` and `lora_qwen25_14b`.
-    - Dedicated fine-tuned `deberta_v3_large` encoder.
-  - **Model 2 (`nishantdahal/ntl-two-stage-lora`)**:
-    - Part 1 LoRA weights: `lora14b_v1` (Qwen3-14B) and `lora8b_v1` (Qwen3-8B).
-    - Older `pool_v1.parquet` is present in the dataset but explicitly ignored by the pipeline.
-  - **Model 3 (`zbigniewkirchner/ntl-qwen3-8b-lora-claude-head`)**:
-    - Qwen3-8B LoRA weights.
-    - Pre-computed readout heads (`readouts.npz`).
-    - Dedicated 5-way Claude specialist head (`claude_head.safetensors`).
-  - **Legacy Source (`willrice/name-that-llm-openrouter-harvest`)**:
-    - Contains raw CSV/JSONL files (`passages.csv`, `prompts.csv`) from older iterations (v12-v15). It remains mounted for backward compatibility but is no longer read by the current submission notebook.
-
----
-
-### Phase 2: High-Level Design — Multi-Backbone Inference Pipeline
-
-![High-Level Design: Multi-Backbone Low-RAM Inference Pipeline](assets/inference_hld_architecture.png)
-
-#### Inference Pipeline Execution Flow
-- **5 Concurrent Feature Extraction Branches**:
-  1. **Reader A (Qwen3-14B Base, 27-Layer Trunk)**:
-     - Merges **M1 Part 2 LoRA** (weight = 0.40).
-     - Unmerges and merges **M2 Part 1 LoRA** (weight = 0.20).
-  2. **Reader B (Qwen2.5-14B Base, 32-Layer Trunk)**:
-     - Merges **M1 Part 2 LoRA** (weight = 0.22).
-  3. **Reader C (Qwen3-8B Base, 24-Layer Trunk)**:
-     - Merges **M3 Claude LoRA** (weight = 0.18).
-     - Unmerges and merges **M2 Part 1 LoRA** (weight = 0.12).
-  4. **Reader D (DeBERTa-v3-Large, Dedicated Encoder)**:
-     - Evaluates **M1 fine-tuned encoder** with dynamic attention mask check (weight = 0.20).
-  5. **Style Counter (4-View Topic-Blind `LinearSVC`)**:
-     - Trained live inside the notebook on 53,099 passages (`train.csv` + 2,800/class from **M1 `pool_v4.parquet`**).
-     - Single-copy streamed CSR matrix across Character (3-5), Word (1-3), Shape (2-6), and Function (1-3) n-grams (weight = 1.05).
-- **Sequential Post-Processing & Logit Refinement**:
-  1. **1. Combine Opinions**: Stack whitened pooled features into the Joint 384-Dim Compact Spectral Bank and apply plain/prompt-centered readout heads fit live on `train.csv`.
-  2. **2. Group Rule**: Apply exact $2^{18}$ Bitmask Dynamic Programming (`ExactAuthorPosterior`) inside each reader, then once globally across all multi-passage hybrid prompt clusters.
-  3. **3. Balance the Counts**: Apply 50-step log-domain Sinkhorn-Knopp marginal distribution balancing ($\alpha = 0.50$, active when test passages $\ge 50$).
-  4. **4. Punctuation Rulebook**: Apply calibrated Sovereign Orthographic Bayesian Shield ($-2.0$ log penalty on invariant curly quotes, em-dashes, and straight apostrophes).
-  5. **5. Claude Specialist**: Hard switch using **M3 Claude head** strictly on rows where the top predicted model is within the Anthropic Claude family (non-Claude predictions remain 100% untouched).
-
----
-
-### The 6 Foundational Pillars of Success
-
-1. **Pillar 1: Multi-Backbone Sequential Trunk Loading & In-Place LoRA Reuse**
-   Loads each base trunk (`Qwen3-14B`, `Qwen2.5-14B`, `Qwen3-8B`) once into dual T4 GPU memory. Adapters are merged and unmerged in-place (+delta, -delta) in under 25 seconds, running 6 neural models without reloading from disk or triggering OOM.
-2. **Pillar 2: Attention-Sink Zeroing (`m[:, 0] = 0`) & Tokenizer Parity**
-   In causal generative transformers, the very first token acts as an attention sponge, absorbing activations 100x larger than normal words. Zeroing position 0 before mean-pooling restored **96.88% live validation accuracy** and enabled the 0.491 -> 0.551+ breakthrough.
-3. **Pillar 3: Dedicated Full-Encoder Loader for Fine-Tuned DeBERTa-v3**
-   Directly loads the 0.546 solo CV fine-tuned DeBERTa encoder (`encoder/model.safetensors`, 868 MB) and dynamically verifies full vs. drop-first attention pooling on `train.csv`.
-4. **Pillar 4: Exact 2^18 Bitmask Subset DP (`ExactAuthorPosterior`)**
-   Replaces approximate mean-field and hard Hungarian post-processing with exact forward-backward dynamic programming over all 262,144 author subsets, enforcing 1-to-1 prompt uniqueness directly in log-probability space.
-5. **Pillar 5: 4-View Topic-Blind `LinearSVC` (78,482 Passages)**
-   Combines `train.csv` with `pool_v4.parquet` across character n-grams, word n-grams, word shape capitalization patterns, and content-masked function words.
-6. **Pillar 6: Sovereign Orthographic Bayesian Shield (-2.0) & Top-1 Claude Specialist**
-   Applies hard empirical penalties on invariant punctuation (curly quotes, em-dashes, straight apostrophes) and routes Claude candidates to a dedicated 5-way disambiguation classifier without modifying non-Claude predictions.
-
----
-
-<div class="page-break"></div>
-
-## 3. Pillar 1: Truncated Qwen3-8B Trunk & In-Place LoRA Fusion
-
-### Why Truncate to 24 Layers?
-A standard Qwen3-8B model contains 36 decoder layers. On dual T4 GPUs (each with ~14.5 GB of usable VRAM), running 36 layers alongside activation caches and downstream classifiers risks Out-Of-Memory (OOM) crashes.
-
-More importantly, the pre-trained LoRA adapter and linear classification heads in `zbigniewkirchner/ntl-qwen3-8b-lora-claude-head` were specifically optimized on the first 24 layers:
-- Truncating removes layers 24 through 35 (`model.layers[24:]`).
-- The final LayerNorm (`model.norm`) is replaced with `nn.Identity()`.
-- Layer activations are extracted at layers `[2, 4, 6, 8, 12, 16, 20, 24]`.
-
-### The PEFT Loading Trap: Why Standard PEFT Failed
-In Version 12, loading weights using standard Hugging Face PEFT (`PeftModel.from_pretrained`) produced silent failures:
 ```
-UserWarning: Found missing adapter keys while loading checkpoint:
-['base_model.model.model.layers.0.self_attn.q_proj...']
+                          [ 4,000 Mystery Passages (test.csv) ]
+                                            │
+        ┌───────────────────────────────────┴───────────────────────────────────┐
+        ▼                                                                       ▼
+┌──────────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
+│  MODULE 1: SUBPROCESS 78k LEXICAL ENGINE     │        │  MODULE 2: 4-TRUNK NEURAL EXTRACTORS         │
+│  - 78,482 Passages (train.csv + pool_v4)     │        │  - Base Trunks: Q3-14B, Q2.5-14B, Q3-8B, Deb │
+│  - Output 1: 4-View LinearSVC (C=0.50)       │        │  - Dynamic bfloat16 Overflow Rescue          │
+│  - Output 2: 5-View BPE + SGD + Style Twins  │        │  - Reversible In-Place LoRA Arithmetic       │
+│  - Dedicated 26-Feature Handwriting Model    │        │  - Snapshot Weight Isolation (Trunks 1 & 3)  │
+│  - Pure Sparse Matrices (100% Non-Zero Fast) │        │  - Native LayerNorm Readout Projections      │
+│  - Discrete Structural Rule Flags (N, 4)     │        │  - DeBERTa Token-0 Probing & NaN Guard       │
+└──────────────────────┬───────────────────────┘        └──────────────────────┬───────────────────────┘
+                       │                                                       │
+                       └───────────────────────┬───────────────────────────────┘
+                                               ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  MODULE 3: WITHIN-PROMPT wPCA & EXACT 2^18 BITMASK DP + 384-DIM JOINT SPECTRAL BANK                  │
+│  - 1,620-Row Balanced Training Set (90 prompts x 18 classes, full-rank covariance)                   │
+│  - Prompt-Centered Within-Class Covariance S_e with Ledoit-Wolf Shrinkage Floors                     │
+│  - ExactAuthorPosterior: Exact forward-backward dynamic programming over 2^18 author subsets         │
+│  - Crash-Proof Cluster Splitting: Guaranteed cluster size 2 <= s <= 14 <= 18                         │
+│  - Unsupervised 384-Dim Joint Spectral Bank: Top-64 components per checkpoint with Prior Scaling     │
+└──────────────────────────────────────────────┬───────────────────────────────────────────────────────┘
+                                               ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  MODULE 4: TWO-TIER CONVEX FUSION, SPECIALIST GATE & UNIFIED POSTPROCESSING                          │
+│  - Two-Tier Convex Fusion: P_mix = 0.85 * R_main + 0.15 * P_comp                                     │
+│  - Vectorized Claude Specialist Gate with overall probability simplex mass preservation             │
+│  - Unified Handwriting & Orthographic Shield:                                                        │
+│      * Code-block stripped non-code prose discrete rule subtraction: log P += rule_flags @ W_pen    │
+│      * Continuous 26-feature handwriting log-likelihood blend: log P += 0.04 * log_p_handwriting    │
+│  - Official 300-step multiplicative Sinkhorn-Knopp column mass balancing (column sums = N / 18)      │
+│  - Output: /kaggle/working/submission.parquet                                                        │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-Because `AutoModelForCausalLM` wraps `model` inside another `model` attribute, standard PEFT mismatched the key hierarchy and failed to merge all 168 target projection weights. As a result, the model ran on unadapted base weights, dropping public leaderboard accuracy to `0.347`.
 
-### The Fix: Direct In-Place Weight Merging
-LoRA decomposes a weight update $\Delta W$ into two low-rank matrices:
+---
 
-$$W_{\text{effective}} = W_0 + \left(\frac{\alpha}{r}\right) (B \times A)$$
+## 3. Module 1: Subprocess Dual-Output Lexical Engine (`lexical_engine.py`)
 
-Instead of relying on fragile wrapper libraries, we directly perform matrix multiplication in PyTorch and add the delta directly to `lin.weight.data`:
+### 1. Memory Isolation via Subprocess Execution
+The lexical engine processes 78,482 text passages (`train.csv` + `pool_v4.parquet`) across millions of n-gram combinations. Storing these large sparse matrices alongside active PyTorch CUDA contexts would exhaust host RAM.
 
+The pipeline executes `run_lexical.py` as an isolated subprocess:
 ```python
-# In-place LoRA Weight Addition
-delta = (B.to(dev, torch.float32) @ A.to(dev, torch.float32)) * scale
-lin.weight.data.add_(delta.to(lin.weight.dtype))
+subprocess.run([sys.executable, str(run_lex_script)], check=True)
 ```
+Upon completion, the subprocess terminates, immediately releasing ~8 GB of temporary RAM before Module 2 loads large transformer trunks into GPU memory.
 
-This bypasses all library wrapper bugs, uses zero extra memory, and fuses 168 weight tensors across 24 layers in just **28.5 seconds**.
+### 2. Dual Lexical Outputs
 
----
+The lexical engine generates two distinct probability distributions:
 
-### Python Implementation: Model Truncation & Weight Fusion
+#### Output 1: Pure 4-View LinearSVC (`log_p_svc_main`, Main Stack)
+Fitted with `LinearSVC(C=0.50, max_iter=3000, tol=1e-3)` with uniform sample weights across 4 complementary views:
+1. **Character N-Grams**: `ngram_range=(3, 5)`, `max_features=250000`, scale $1.0$. Captures sub-word morphological patterns and punctuation rhythms.
+2. **Word N-Grams**: `ngram_range=(1, 3)`, `max_features=180000`, scale $0.7$, `token_pattern=r"(?u)\b\w+\b|[^\w\s]"`. Captures lexical word choices and punctuation syntax.
+3. **Character Shape Text**: `ngram_range=(2, 6)`, `max_features=60000`, scale $0.5$, `lowercase=False`. `shape_text(t)` transforms words to blocks of `X` (uppercase) and `x` (lowercase), capturing capitalization habits (e.g. title-casing vs lowercased headers).
+4. **Function Words & Punctuation**: `ngram_range=(1, 3)`, `max_features=50000`, scale $0.5$, `token_pattern=r"(?u)\b\w+\b|[^\w\s]"`, `lowercase=False`. Masks non-stopwords and non-punctuation to `CONTENT`, isolating structural syntax over 115 canonical function words and all punctuation tokens.
 
+#### Output 2: 5-View BPE + SGD + Style Twin (`p_lex_comp`, Complementary Stack)
+- Adds a 5th view: 75,000 sublinear TF-IDF features over byte-pair encoding (BPE) subword tokens generated by the Qwen tokenizer.
+- Fits a calibrated `SGDClassifier(loss='log_loss', alpha=1e-4, max_iter=1500)`.
+- Fits an adaptive prompt-centered style twin on test topic clusters ($D_{\text{tfidf}} \le 0.85$).
+- Applies 4 within-family specialist linear refiners ($\beta = 0.25$) on GPT, Gemini, Claude, and GLM families.
+
+### 3. Dedicated Continuous Handwriting Model (`fit_handwriting_model`)
+Rather than stacking dense features into the 595,000-column sparse matrix (which would destroy CSR sparsity and slow down SVM training by 30%), the engine trains a dedicated model on **26 continuous stylometric density features**:
+- **14 Punctuation Frequencies per Word**: Colon, semicolon, em-dash, double-hyphen, curly single quote, straight single quote, curly double quote, straight double quote, parentheses, comma, exclamation, question, ellipsis, hyphen.
+- **2 Contraction Ratios in Prose**: Straight ASCII apostrophe contractions (`[A-Za-z]'[A-Za-z]`) vs curly contractions (`[A-Za-z]\u2019[A-Za-z]`).
+- **10 Structural Rhythm Features**: Newline rate, bullet rate, uppercase character density, digit density, mean word length, standard deviation of word length, mean sentence length, sentence length standard deviation, sentence burstiness, and type-token ratio (TTR).
+
+The features are standardized with `StandardScaler` and clipped to $[-5.0, 5.0]$. The dedicated classifier fits:
+- A plain model: `LogisticRegression(C=0.25, max_iter=1000, class_weight='balanced')`
+- A prompt-centered style twin: `LogisticRegression(C=0.15, max_iter=1000, class_weight='balanced')`
+- Blends predictions to save `log_p_handwriting.npy` for Module 4.
+
+### 4. Fenced Code-Block Stripping & Discrete Structural Rule Flags
+To prevent programming syntax (e.g. Python string literals `'...'` or bash flags `--all`) from triggering natural language stylometric rules, text is preprocessed with:
 ```python
-import os
-import json
-import torch
-import torch.nn as nn
-from transformers import AutoConfig, AutoModel
-from safetensors.torch import load_file
-
-def load_truncated_qwen_trunk(base_dir: str, keep_layers: int = 24):
-    """Loads Qwen3-8B Base truncated to 24 layers across dual GPUs."""
-    cfg = AutoConfig.from_pretrained(base_dir, trust_remote_code=True)
-    cfg.num_hidden_layers = keep_layers
-    cfg.use_cache = False
-    if getattr(cfg, "layer_types", None) is not None:
-        cfg.layer_types = cfg.layer_types[:keep_layers]
-
-    # Partition cleanly across 2x T4 GPUs (13.5 GiB limit per device)
-    max_mem = {0: "13.5GiB", 1: "13.5GiB"} if torch.cuda.device_count() > 1 else None
-
-    model = AutoModel.from_pretrained(
-        base_dir,
-        config=cfg,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        max_memory=max_mem,
-        trust_remote_code=True
-    )
-    # The pre-trained heads expect unnormalized output from layer 24
-    model.norm = nn.Identity()
-    model.eval()
-    return model
-
-@torch.no_grad()
-def merge_lora_weights_inplace(model, adapter_dir: str):
-    """Fuses LoRA adapter weights directly into the truncated trunk."""
-    acfg_path = os.path.join(adapter_dir, "adapter_config.json")
-    with open(acfg_path, "r") as f:
-        acfg = json.load(f)
-    scale = float(acfg["lora_alpha"]) / float(acfg["r"])
-
-    weights_path = os.path.join(adapter_dir, "adapter_model.safetensors")
-    sd = load_file(weights_path)
-    modules = dict(model.named_modules())
-    n_merged = 0
-
-    for k, A in sd.items():
-        if ".lora_A." in k:
-            B_key = k.replace(".lora_A.", ".lora_B.")
-            if B_key not in sd:
-                continue
-            B = sd[B_key]
-
-            # Map checkpoint key to internal trunk layer path
-            mod_path = k.split(".lora_A.")[0]
-            if "layers." not in mod_path:
-                continue
-            rel_path = mod_path[mod_path.index("layers."):]
-
-            if rel_path in modules:
-                lin = modules[rel_path]
-                dev, dt = lin.weight.device, lin.weight.dtype
-                # Compute (B @ A) * scale and add directly
-                delta = (B.to(dev, torch.float32) @ A.to(dev, torch.float32)) * scale
-                lin.weight.data.add_(delta.to(dt))
-                n_merged += 1
-
-    print(f"Successfully fused {n_merged} LoRA projections into trunk!")
+_RE_CODE_BLOCK = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
+prose = _RE_CODE_BLOCK.sub(" ", text)
 ```
+The extractor outputs `rule_flags_test` with shape $(N, 4)$ for Module 4.
 
 ---
 
-<div class="page-break"></div>
+## 4. Module 2: Multi-Trunk Neural Extractors (`neural_extractor.py`)
 
-## 4. Pillar 2: The Attention-Sink Mask Discovery (`m[:, 0] = 0`)
+### 1. Trunk Reuse Across 6 Checkpoints
+Loading 6 distinct large language models into GPU memory simultaneously would require $> 80$ GB VRAM. Module 2 achieves zero-memory duplication by sequentially reusing 4 base model trunks:
 
-### The Mystery of the Broken Features
-In Version 12, our offline validation tests on Fold 0 showed stellar scores (over 72% accuracy), yet our live test score on Kaggle Leaderboard plummeted to `0.347`.
+| Trunk | Base Model | Truncated Depth | Active Layers | Checkpoints Served |
+| :--- | :--- | :---: | :--- | :--- |
+| **Trunk 1** | `Qwen3-14B` | 27 Layers | `[2, 4, 6, 9, 13, 17, 22, 27]` | **1A**: Part-2 LoRA (`lora_qwen3_14b`)<br>**1B**: Part-1 LoRA (`lora14b_v1`) |
+| **Trunk 2** | `Qwen2.5-14B` | 32 Layers | `[3, 5, 8, 11, 16, 21, 27, 32]` | **2**: Part-2 LoRA (`lora_qwen25_14b`) |
+| **Trunk 3** | `Qwen3-8B` | 24 Layers | `[2, 4, 6, 8, 12, 16, 20, 24]` | **3A**: In-Style LoRA (`instyle`)<br>**3B**: Claude Head LoRA (`qwen3_8b_claude`) |
+| **Trunk 4** | `DeBERTa-v3` | 24 Layers | `[3, 6, 9, 12, 15, 18, 21, 24]` | Dedicated Sequence Classification Encoder |
 
-Comparing live extracted features against reference vectors in `anchor_features.npz` revealed the problem:
+### 2. Attention-Sink Zeroing (`m[:, 0, :] = 0.0`)
+Causal transformers (such as Qwen) allocate massive attention weights to the first token ($position = 0$), creating an "attention sink" whose activation values can be 1,000x larger than normal tokens.
 
-```
-Version 12 (Buggy):  Cosine Similarity = 0.412  (Almost completely uncorrelated!)
-Version 15 (Fixed):  Cosine Similarity = 0.9117 (High-fidelity mathematical parity!)
-```
-
-### What is an Attention Sink?
-In Causal Autoregressive Transformers (like Qwen, Llama, and GPT), attention softmax requires probabilities across tokens to sum to 1. Because the first token (position 0, usually the sequence start token) is visible to every subsequent token during causal self-attention, the model uses it as a "dumping ground" for unneeded attention probability.
-
-As a consequence, **Token 0 develops activation values that are 100 to 1,000 times larger than ordinary text tokens**.
-
-```
-Activation Magnitude:
-Position 0 (Sink):    ████████████████████████████████████ (Magnitude: ~450.0)
-Position 1 ("The"):   █ (Magnitude: 2.1)
-Position 2 ("quick"): █ (Magnitude: 1.8)
-Position 3 ("brown"): █ (Magnitude: 2.4)
-```
-
-If you compute standard mean pooling over all tokens:
-
-$$\vec{z}_{\text{pooled}} = \frac{1}{L} \sum_{i=0}^{L-1} \vec{h}_i$$
-
-The massive vector at position 0 completely overwhelms the subtle stylistic nuances of all other words. The resulting 32,768-dimensional feature vector becomes 90% "attention sink noise" and only 10% actual author signal.
-
-### The Two-Part Solution
-
-1. **Zero Out Position 0 in the Attention Mask**:
-   ```python
-   m = attn_mask.unsqueeze(-1).float()
-   m[:, 0, :] = 0.0  # Zero out token 0!
-   den = m.sum(dim=1).clamp(min=1.0)
-   mean_vec = (h_l * m).sum(dim=1) / den
-   ```
-2. **Explicitly Append EOS Token**:
-   Tokenize with `add_special_tokens=False` and manually append `[tokenizer.eos_token_id]` to every input sequence to match pre-training representation bounds.
-
-### Live Proof: Fold 0 Balanced Accuracy Jumps to 96.88%
-
-When this fix was deployed in Version 15:
-- **Anchor Parity Mean Cosine Similarity:** **`0.9117`**
-- **Fold 0 Validation Accuracy (50 samples):** **`0.9688` (96.88%)**
-- **Public Leaderboard Balanced Accuracy:** **`0.491`** (+0.144 leap!)
-
----
-
-### Python Implementation: Complete Feature Extractor
-
+If included in average pooling, this single token crushes the semantic representation. Module 2 zeroes out position 0 before mean-pooling:
 ```python
-import time
-import numpy as np
-import torch
-import torch.nn as nn
-from typing import List
-
-class QwenLoRAExtractor:
-    """Extracts 32,768-dim author fingerprints across 8 trunk layers."""
-    def __init__(self, ckpt_dir: str, base_dir: str):
-        self.layers = [2, 4, 6, 8, 12, 16, 20, 24]
-        self.max_len = 384
-        
-        # Load tokenizer without automatic special tokens
-        self.tok = AutoTokenizer.from_pretrained(base_dir, trust_remote_code=True)
-        self.tok.padding_side = "right"
-        if self.tok.pad_token is None:
-            self.tok.pad_token = self.tok.eos_token or "<|endoftext|>"
-
-        # Load truncated trunk and fuse LoRA
-        self.model = load_truncated_qwen_trunk(base_dir, keep_layers=24)
-        merge_lora_weights_inplace(self.model, os.path.join(ckpt_dir, "adapter"))
-
-        # Load pre-trained LayerNorms for each extracted layer
-        H = self.model.config.hidden_size  # 4096
-        heads_sd = load_file(os.path.join(ckpt_dir, "heads.safetensors"))
-        self.device_norms = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.norms = nn.ModuleList([nn.LayerNorm(H) for _ in self.layers])
-        self.norms.to(self.device_norms).float()
-        
-        norm_weights = {
-            k[len("norms."):]: v for k, v in heads_sd.items() 
-            if k.startswith("norms.")
-        }
-        self.norms.load_state_dict(norm_weights)
-        self.norms.eval()
-        self.H = H
-        self.first_dev = next(self.model.parameters()).device
-
-    @torch.no_grad()
-    def extract(self, texts: List[str], batch_size: int = 8) -> np.ndarray:
-        # Tokenize without special tokens, then append EOS
-        raw_ids = self.tok(
-            list(texts),
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.max_len
-        )["input_ids"]
-        eos_id = self.tok.eos_token_id or 151643
-        ids = [x + [eos_id] for x in raw_ids]
-
-        # Sort sequences by length to minimize wasted padding tokens
-        order = np.argsort([len(x) for x in ids], kind="stable")
-        total_dim = self.H * len(self.layers)  # 4096 * 8 = 32,768
-        Z = np.zeros((len(ids), total_dim), dtype=np.float32)
-
-        for s in range(0, len(order), batch_size):
-            idx = order[s : s + batch_size]
-            enc = self.tok.pad(
-                {"input_ids": [ids[i] for i in idx]},
-                padding=True,
-                return_tensors="pt"
-            )
-            input_ids = enc["input_ids"].to(self.first_dev)
-            attn_mask = enc["attention_mask"].to(self.first_dev)
-
-            out = self.model(
-                input_ids=input_ids,
-                attention_mask=attn_mask,
-                output_hidden_states=True
-            )
-            hs = out.hidden_states
-
-            # CRITICAL ATTENTION SINK FIX: Zero out position 0
-            m = attn_mask.unsqueeze(-1).float().to(self.device_norms)
-            m[:, 0, :] = 0.0
-            den = m.sum(dim=1).clamp(min=1.0)
-
-            pooled_parts = []
-            for l_idx, nm in zip(self.layers, self.norms):
-                h_l = hs[l_idx].to(self.device_norms).float()
-                mean_vec = (h_l * m).sum(dim=1) / den
-                pooled_parts.append(nm(mean_vec))
-
-            # Concatenate all 8 normalized layer vectors
-            Z[idx] = torch.cat(pooled_parts, dim=-1).cpu().numpy()
-
-        return Z
+m = enc["attention_mask"].unsqueeze(-1).float()
+m[:, 0, :] = 0.0
+pooled = (hs[l].float() * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
 ```
 
----
+### 3. Dynamic `bfloat16` Overflow Rescue
+In 14B models, residual activations in deep layers (14–32) frequently exceed $65,504$ (the maximum representable value in float16), overflowing to `Inf` and rendering subsequent LayerNorm outputs `NaN`.
 
-<div class="page-break"></div>
-
-## 5. Pillar 3: Soft Adaptive Prompt Centering
-
-### The Prompt Bias Dilemma
-When an AI model answers a prompt about *"quantum computing"*, its word choice is heavily influenced by the subject matter (e.g., *"qubit"*, *"superposition"*, *"decoherence"*). 
-
-If a classifier isn't careful, it will confuse **topic features** with **author style features**.
-
-```
-Observed Passage = [ Topic Signal (What is said) ] + [ Style Signal (How it is said) ]
-```
-
-### Why Hard Hungarian Matching Broke
-In the competition training data (`train.csv`), every prompt was answered by **all 18 models**:
-- Exactly 1 response per model per prompt.
-- In this setting, the **Hungarian Algorithm** (`linear_sum_assignment`) works well because it forces a strict 1-to-1 matching:
-
-$$\max_{\pi} \sum_{i=1}^{18} \log P(m = \pi(i) \mid x_i)$$
-
-However, in the real hidden test set (`test.csv`):
-- Prompts have an **unequal, unknown number of answers** (averaging 2–3 answers per prompt, sometimes only 1).
-- The same model can answer multiple times, or not at all.
-- Applying hard 1-to-1 Hungarian matching forced false assignments onto unrelated models, severely degrading test performance.
-
-### The Solution: Soft Adaptive Prompt Centering
-Instead of forcing hard discrete 1-to-1 assignments, we remove the prompt topic bias directly in vector space:
-
-1. **Group Passages by Topic:** Compute a composite distance metric combining Content TF-IDF and DeBERTa semantic embeddings:
-   $$D = 0.5 \cdot D_{\text{tfidf}} + 0.5 \cdot D_{\text{embedding}}$$
-   Run agglomerative clustering with an average-linkage threshold of $t = 0.60$.
-2. **Eligibility Condition:** Only clusters with $2 \le |C| \le 18$ passages are eligible for centering. Singletons ($|C| = 1$) are left untouched.
-3. **Subtract Cluster Mean:** For every passage in an eligible cluster $C$:
-   $$\vec{z}_{i,\text{centered}} = \vec{z}_i - \frac{1}{|C|} \sum_{j \in C} \vec{z}_j$$
-4. **Log-Probability Twin Blending:**
-   $$\log P_{\text{final}} = \log P_{\text{plain}} + 0.25 \cdot \log P_{\text{lora\_center}} + 0.12 \cdot \log P_{\text{deberta\_center}}$$
-
-This cleanly subtracts the prompt topic signature while leaving the author's stylistic variance intact!
-
----
-
-### Python Implementation: Clustering & Soft Adaptive Centering
-
+Module 2 implements row-level overflow detection:
 ```python
-import numpy as np
-from scipy.spatial.distance import squareform
-from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-def apply_soft_adaptive_centering(test_texts, Z_test, E_test, ro, scaler_tr, lr_deb_center):
-    """Removes topic bias on shared-prompt clusters without hard assignment."""
-    # 1. Content TF-IDF Distance
-    tfidf = TfidfVectorizer(stop_words='english', sublinear_tf=True, max_features=50000)
-    X_tfidf = tfidf.fit_transform(test_texts)
-    D_tfidf = np.clip(1.0 - (X_tfidf @ X_tfidf.T).toarray(), 0.0, 1.0)
-
-    # 2. Semantic Embedding Distance (DeBERTa Layer 24)
-    E_last = E_test[:, -1024:]
-    norms = np.linalg.norm(E_last, axis=1, keepdims=True).clip(min=1e-9)
-    E_norm = E_last / norms
-    D_emb = np.clip(1.0 - (E_norm @ E_norm.T), 0.0, 1.0)
-
-    # Composite distance matrix
-    D = 0.5 * (D_tfidf + D_emb)
-    np.fill_diagonal(D, 0.0)
-
-    # 3. Agglomerative Clustering
-    if len(test_texts) > 1:
-        groups = fcluster(
-            linkage(squareform(D, checks=False), method="average"),
-            t=0.60,
-            criterion="distance"
-        )
-    else:
-        groups = np.array([1])
-
-    # Identify eligible clusters (2 <= size <= 18)
-    u_groups, counts = np.unique(groups, return_counts=True)
-    count_map = dict(zip(u_groups, counts))
-    sizes = np.array([count_map[g] for g in groups])
-    adapt_mask = (sizes >= 2) & (sizes <= 18)
-
-    # 4. Center Representations
-    log_p_lora_center = np.zeros((len(test_texts), 18), dtype=np.float32)
-    log_p_deb_center = np.zeros((len(test_texts), 18), dtype=np.float32)
-
-    if adapt_mask.any():
-        Zc = Z_test.copy()
-        Ec = E_test.copy()
-        for g in np.unique(groups[adapt_mask]):
-            m = (groups == g)
-            Zc[m] -= Zc[m].mean(axis=0, keepdims=True)
-            Ec[m] -= Ec[m].mean(axis=0, keepdims=True)
-
-        # Compute centered logits using pre-trained center weights
-        logits_c = Zc[adapt_mask] @ ro["center_coef"].T + ro["center_intercept"]
-        log_p_lora_center[adapt_mask] = log_softmax(logits_c)
-
-        Ec_scaled = scaler_tr.transform(Ec[adapt_mask])
-        scores_deb = lr_deb_center.decision_function(Ec_scaled)
-        log_p_deb_center[adapt_mask] = log_softmax(scores_deb)
-
-    return adapt_mask, log_p_lora_center, log_p_deb_center
+bad_mask = torch.zeros(B, dtype=torch.bool)
+for l in layers:
+    bad_mask |= ~torch.isfinite(hs[l]).all(dim=(1, 2)).cpu()
 ```
+- Non-overflowing rows are pooled in float32.
+- Only the offending rows are re-computed using `model.to(torch.bfloat16)` (exponent range up to $3.4 \times 10^{38}$), pooled in float32, and the model is restored to float16.
 
----
+### 4. Reversible LoRA Arithmetic & Snapshot Isolation
+Adapters are merged directly into base weights on GPU:
+$$W_{\text{eff}} = W_0 + \frac{\alpha}{r} (B \cdot A)$$
 
-<div class="page-break"></div>
-
-## 6. Pillar 4: Top-1 Gated Claude Specialist & OpenRouter Tie-Breakers
-
-### The Claude Sibling Dilemma
-Classifying across model families (Claude vs. GPT vs. Gemini) is relatively straightforward because each AI lab has distinct formatting and tone preferences.
-
-However, distinguishing between sibling models within the Claude family:
-- `claude-fable-5`
-- `claude-opus-4-6`
-- `claude-opus-4-8`
-- `claude-opus-5`
-- `claude-sonnet-5`
-
-is much more difficult. They share the same safety guardrails, system prompts, markdown list structures, and vocabulary.
-
-### The Top-1 Gating Mechanism
-If you run a specialist classifier across all 18 classes simultaneously, you risk generating false positives by misclassifying GPT or Gemini passages as Claude.
-
-To solve this, we implement **Top-1 Gating**:
-1. Check the ensemble's initial prediction: $\hat{y} = \arg\max P(m)$.
-2. If $\hat{y} \notin \{\text{Claude Models}\}$, **do not touch the prediction**.
-3. If $\hat{y} \in \{\text{Claude Models}\}$, pass the sample to the **Claude Specialist Sub-Network**:
-   $$\log P_{\text{claude\_comb}} = 0.70 \cdot \log P_{\text{lora\_claude}} + 0.30 \cdot \log P_{\text{svc\_claude}}$$
-4. Replace the prediction with the specialist's top choice within the Claude family.
-
-```
-Initial Prediction = argmax P(m)
-         │
-         ▼
- Is initial prediction in Claude family?
-         │
-    ┌────┴────┐
-   YES        NO ───► Keep Initial Prediction (100% Untouched)
-    │
-    ▼
- Pass to Claude Specialist Head:
- 70% Qwen LoRA Claude Head + 30% Claude-Only LinearSVC
-    │
-    ▼
- Assign Best Claude Sibling
-```
-
-**Crucial Invariant:** Non-Claude predictions are mathematically guaranteed to remain 100% untouched.
-
----
-
-### Python Implementation: Top-1 Gated Specialist
-
+On Trunks 1 and 3 (where two consecutive checkpoints run on the same trunk), in-place subtraction ($W_0 = W_{\text{eff}} - \frac{\alpha}{r} BA$) suffers from small float16 precision drift. To guarantee exact base weights for the second checkpoint, Module 2 snapshots the original weights on CPU:
 ```python
-def apply_top1_claude_gate(pred_idx, Z_test, test_texts, ro, char_vec, word_vec, df_train, LABELS):
-    """Disambiguates Claude models without altering any non-Claude predictions."""
-    claude_classes = list(ro["claude_classes"])
-    claude_indices = [LABELS.index(c) for c in claude_classes]
-    
-    # Identify samples initially predicted as Claude
-    is_claude = np.isin(pred_idx, claude_indices)
-    initial_preds = pred_idx.copy()
-
-    if not is_claude.any():
-        return pred_idx
-
-    claude_rows = np.where(is_claude)[0]
-    print(f"Refining {len(claude_rows)} Claude predictions with specialist head...")
-
-    # 1. Specialist Qwen LoRA Head (5-class linear projection)
-    logits_lora = Z_test[claude_rows] @ ro["claude_coef"].T + ro["claude_intercept"]
-    log_p_lora = log_softmax(logits_lora)
-
-    # 2. Specialist LinearSVC trained exclusively on Claude passages
-    df_c = df_train[df_train['model'].isin(claude_classes)].copy()
-    y_c_tr = np.array([claude_classes.index(m) for m in df_c['model']])
-    X_c_tr = sparse.hstack([
-        char_vec.transform(df_c['text']),
-        word_vec.transform(df_c['text'])
-    ], format='csr')
-
-    svc_claude = LinearSVC(C=0.5, class_weight='balanced', random_state=42)
-    svc_claude.fit(X_c_tr, y_c_tr)
-
-    X_c_te = sparse.hstack([
-        char_vec.transform([test_texts[i] for i in claude_rows]),
-        word_vec.transform([test_texts[i] for i in claude_rows])
-    ], format='csr')
-    log_p_svc = log_softmax(svc_claude.decision_function(X_c_te))
-
-    # Blend specialists: 70% LoRA Head + 30% N-Gram SVC
-    log_p_comb = 0.70 * log_p_lora + 0.30 * log_p_svc
-    best_claude = np.argmax(log_p_comb, axis=1)
-
-    # Update predictions
-    for r_idx, c_idx in zip(claude_rows, best_claude):
-        pred_idx[r_idx] = claude_indices[c_idx]
-
-    # Verify safety assertion
-    assert np.array_equal(
-        pred_idx[~is_claude], initial_preds[~is_claude]
-    ), "Safety check failed: Non-Claude prediction was modified!"
-
-    return pred_idx
+backup = trunk.snapshot_weights(adapter_path)
+merge_lora(trunk.model, adapter_path, sign=+1.0)
+# ... feature extraction ...
+trunk.restore_weights(backup)
+del backup
 ```
+
+### 5. Native LayerNorm Projection Heads & DeBERTa NaN Guard
+- Transformer pooled outputs are passed through LayerNorm modules matching `heads.safetensors` before computing dot-product logits, ensuring exact geometric parity with pre-trained heads.
+- DeBERTa hidden states are protected against overflow with:
+  `torch.nan_to_num(hs[l].float(), nan=0.0, posinf=1e4, neginf=-1e4)`
 
 ---
 
-<div class="page-break"></div>
+## 5. Module 3: Stylometric wPCA, $2^{18}$ Bitmask DP & Spectral Bank
 
-## 7. The Multi-Branch Ensemble
+### 1. Full-Rank Within-Prompt Covariance Analysis (`wPCA`)
+To disentangle prompt topic from author stylometry, Module 3 selects a balanced training matrix of 90 prompts $\times$ 18 models ($N=1,620$ rows of `train.csv`).
 
-To guard against the blind spots of any single architecture, the final submission aggregates four independent representations:
+For each prompt $p$, the prompt centroid is subtracted:
+$$Z_{\text{centered}} = Z_i - \bar{Z}_{p(i)}$$
+Singular Value Decomposition (SVD) on $Z_{\text{centered}}$ extracts $d=256$ principal directions of authorial variance:
+$$U_{\text{test}} = (Z_{\text{test}} - \mu) \cdot V[:, :256]$$
+Because $N=1,620 \gg d=256$, the shared within-prompt covariance matrix $S_e$ is guaranteed to be full-rank.
 
-### Summary of Ensemble Branches
+### 2. Crash-Proof Cluster Splitting (`split_oversized_clusters_dist`)
+Test prompts are grouped into topic clusters using a hybrid distance metric:
+$$D_{\text{hybrid}} = 0.55 \cdot D_{\text{tfidf}} + 0.45 \cdot D_{\text{neural}}$$
 
-| Branch | Architecture | Features Extracted | Weight |
-| :--- | :--- | :--- | :---: |
-| **Branch 1** | Qwen3-8B Truncated Trunk + LoRA | 32,768-dim pooled representations across 8 layers | **50%** |
-| **Branch 2** | DeBERTa-v3-large (Frozen Encoder) | 5,120-dim pooled hidden states across 5 layers | **25%** |
-| **Branch 3** | Multi-View N-Gram LinearSVC | 107,220 sparse character (2–5) & word (1–3) tokens | **15%** |
-| **Branch 4** | Stylometric LightGBM | 24 fine-grained punctuation, length, and case statistics | **10%** |
+Because exact dynamic programming operates over author subsets of size $s \le 18$, any cluster with $s > 18$ would cause an `IndexError`. The recursive cluster splitter guarantees:
+$$2 \le s \le 14 \le 18$$
+Every cluster exceeding 14 rows is split using average-linkage hierarchical distance clustering.
 
-### Stylometric Feature Extraction: The Author's "Handwriting"
-Linear classifiers and GBDTs look at explicit punctuation habits, whitespace patterns, and text structure:
+### 3. Exact $2^{18}$ Forward-Backward Subset Dynamic Programming (`ExactAuthorPosterior`)
+Within a detected prompt cluster, multiple passages were authored by different models. Under the competition rules, **no model can appear twice in the same prompt**:
+$$c_i \neq c_j \quad \forall i \neq j$$
 
-```python
-def extract_stylometric_features(texts: List[str]) -> np.ndarray:
-    """Extracts 24 fine-grained formatting habits and punctuation ratios."""
-    feats = []
-    for t in texts:
-        t_len = max(len(t), 1)
-        words = t.split()
-        n_words = max(len(words), 1)
+Rather than making independent predictions, `ExactAuthorPosterior` evaluates exact forward-backward dynamic programming over all $2^{18} = 262,144$ author state bitmasks:
+$$P(\mathbf{c} \mid \mathbf{U}) \propto \prod_{i=1}^{s} \mathcal{N}(U_i \mid \mu_{c_i}, S_e) \cdot \mathbb{I}(\text{all } c_i \text{ unique})$$
+This enforces global author uniqueness across all passages in a cluster.
 
-        # Punctuation frequencies per word
-        c_colon = t.count(':') / n_words
-        c_semi = t.count(';') / n_words
-        c_em_dash = (t.count('\u2014') + t.count('--')) / n_words
-        c_curly_sq = (t.count('\u2018') + t.count('\u2019')) / n_words
-        c_straight_sq = t.count("'") / n_words
-        c_curly_dq = (t.count('\u201c') + t.count('\u201d')) / n_words
-        c_straight_dq = t.count('"') / n_words
-        c_paren = (t.count('(') + t.count(')')) / n_words
-        c_comma = t.count(',') / n_words
-        c_excl = t.count('!') / n_words
-        c_ques = t.count('?') / n_words
-        c_ellipsis = (t.count('...') + t.count('\u2026')) / n_words
-        c_hyphen = t.count('-') / n_words
-        c_newline = t.count('\n') / n_words
-
-        # Casing and numeric densities
-        c_upper = sum(1 for c in t if c.isupper()) / t_len
-        c_digits = sum(1 for c in t if c.isdigit()) / t_len
-
-        # Word length statistics
-        w_lens = [len(w) for w in words]
-        mean_w_len = float(np.mean(w_lens)) if w_lens else 0.0
-        std_w_len = float(np.std(w_lens)) if len(w_lens) > 1 else 0.0
-
-        # Sentence rhythm and burstiness
-        sents = [s.strip() for s in t.replace('!', '.').replace('?', '.').split('.') if s.strip()]
-        s_lens = [len(s.split()) for s in sents]
-        mean_s_len = float(np.mean(s_lens)) if s_lens else 0.0
-        std_s_len = float(np.std(s_lens)) if len(s_lens) > 1 else 0.0
-        min_s_len = float(min(s_lens)) if s_lens else 0.0
-        max_s_len = float(max(s_lens)) if s_lens else 0.0
-        burstiness = float(std_s_len / max(mean_s_len, 1e-5))
-
-        # Vocabulary richness: Type-Token Ratio
-        ttr = float(len(set(words)) / n_words)
-
-        feats.append([
-            c_colon, c_semi, c_em_dash, c_curly_sq, c_straight_sq, c_curly_dq, c_straight_dq,
-            c_paren, c_comma, c_excl, c_ques, c_ellipsis, c_hyphen, c_newline,
-            c_upper, c_digits, mean_w_len, std_w_len, mean_s_len, std_s_len,
-            min_s_len, max_s_len, burstiness, ttr
-        ])
-    return np.array(feats, dtype=np.float32)
-```
-
-### Transductive Scaling & Logit Blending
-
-```python
-# Master Logit Ensemble
-LOGIT = (
-    0.50 * log_p_lora_plain
-    + 0.25 * log_p_deberta_plain
-    + 0.15 * log_p_style_svc
-    + 0.10 * log_p_style_lgb
-)
-
-# Incorporate Centered Twin Evidence on Eligible Prompt Clusters
-if adapt_mask.any():
-    LOGIT[adapt_mask] += (
-        0.25 * log_p_lora_center[adapt_mask] 
-        + 0.12 * log_p_deberta_center[adapt_mask]
-    )
-
-# Compute calibrated probabilities
-P = softmax(LOGIT)
-if len(test_texts) >= 50:
-    # Transductive class balancing
-    P_cal = P / (P.mean(axis=0, keepdims=True) ** 0.35)
-else:
-    P_cal = P
-
-pred_idx = np.argmax(P_cal, axis=1)
-```
+### 4. 384-Dimensional Joint Spectral Bank (`spectral_bank.py`)
+- Extracts the top-64 principal components from **unsupervised prompt-centered features** ($V_{\text{f32}}[:, :64]$) across all 6 checkpoints ($6 \times 64 = 384$ features).
+- Because only `prompt_id` is used (and zero model labels), there is zero label leakage.
+- Features are scaled by out-of-sample prior scales:
+  - Qwen3-14B Part-2: $1.00$
+  - Qwen2.5-14B Part-2: $0.85$
+  - DeBERTa-v3 Part-2: $0.80$
+  - Qwen3-14B Part-1: $0.50$
+  - Qwen3-8B In-Style: $0.45$
+  - Qwen3-8B Claude Head: $0.30$
+- Fits dual logistic regression (plain $C=0.04$ + prompt-centered $C=0.03$).
 
 ---
 
-<div class="page-break"></div>
+## 6. Module 4: Two-Tier Convex Fusion & Unified Postprocessing (`postprocess.py`)
 
+### 1. Two-Tier Convex Probability Mixture
+To prevent noisy helper representations from diluting the primary classifiers, predictions are fused using a strict two-tier convex mixture:
 
----
-
-<div class="page-break"></div>
-
-## 7.5 Version 19: Multi-Backbone Two-Stage LoRA Pool & wPCA Gaussian Readout
-
-Version 19 upgrades the single 8B backbone from Version 15 into a comprehensive multi-backbone ensemble.
-
-### The Core Question: Was a New Model Trained in Version 19?
-
-**Short Answer:**
-- **No deep neural networks or transformer backbones were trained via backpropagation in Version 19.**
-- All large neural models (`Qwen3-14B`, `Qwen2.5-14B`, `Qwen3-8B`, `DeBERTa-v3`) run with pre-trained weights in frozen inference mode (`eval()`, `@torch.no_grad()`).
-- However, Version 19 **dynamically trains fast linear and closed-form statistical models on the fly** during execution:
-  1. **4-View Topic-Blind LinearSVC**: Trained from scratch in ~36 seconds on 78,482 texts (`train.csv` + `pool_v4.parquet`).
-  2. **wPCA + Ledoit-Wolf Gaussian Readouts**: Fitted analytically in <1 second per backbone directly on the extracted representations.
-  3. **Claude Sub-Family LinearSVC**: Fitted on the Claude passages in `train.csv` to cleanly separate Claude variants.
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                   OFFLINE / PRE-TRAINED BACKBONES                      │
-│  (Trained beforehand on GPU clusters, loaded as frozen weights)        │
-│                                                                        │
-│  1. Qwen3-14B LoRA (27 layers, 189 fused projection weights)           │
-│  2. Qwen2.5-14B LoRA (32 layers, 224 fused projection weights)         │
-│  3. Qwen3-8B LoRA + Claude Head (24 layers, 168 fused weights) [V15]   │
-│  4. DeBERTa-v3-Large (mean-pooled embeddings + pre-trained head)       │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ Extracted Vectors
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                  ON-THE-FLY MODELS FITTED IN V19                       │
-│  (Trained dynamically in Kaggle container in under 45 seconds total)   │
-│                                                                        │
-│  1. 4-View LinearSVC (Char, Word, Shape, Function on 78,482 texts)     │
-│  2. wPCA Covariance Shrinkage Gaussian Readouts (Per-backbone)         │
-│  3. Top-1 Gated Claude Specialist LinearSVC                            │
-│  4. Sovereign Orthographic Bayesian Shield (-8.0 / -6.0 / -5.5 rules)  │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### 1. Multi-Backbone Sequential Memory Management
-To run multiple 14B and 8B parameter models on dual Tesla T4 GPUs (14.5 GB VRAM each) without out-of-memory errors:
-- Each backbone is loaded with its truncated trunk depth (`keep=27` for 14B, `keep=32` for 2.5-14B, `keep=24` for 8B).
-- Adapter weights are fused directly into linear layers in-place.
-- Features are extracted with attention-sink zeroing (`m[:, 0] = 0.0`).
-- The trunk and tokenizer are deleted immediately (`del model, norms; gc.collect(); torch.cuda.empty_cache()`), resetting GPU memory to 0 GB before loading the next backbone.
-
-### 2. Within-Prompt Whitened PCA (wPCA) + Joint Gaussian Readout
-In this competition, different models often answer the exact same prompt. When evaluating shared prompts, the common topic acts as confounding noise.
-We model extracted representations using a two-way additive decomposition:
-
-$$Z = \mu_y + P_{\text{prompt}} + E$$
+$$P_{\text{mix}} = 0.85 \cdot R_{\text{main}} + 0.15 \cdot P_{\text{comp}}$$
 
 Where:
-- $\mu_y$ is the true author centroid.
-- $P_{\text{prompt}}$ is the shared prompt effect across all models answering that prompt.
-- $E$ is independent residual error.
+- **Main Stack ($85\%$)**: The 4 official Part-Two models:
+  - Canonical 4-View `LinearSVC(C=0.50)` ($w=1.00$)
+  - `lora_qwen3_14b` Plain ($w=0.40$) + Twin ($w=0.10$)
+  - `lora_qwen25_14b` Plain ($w=0.20$) + Twin ($w=0.10$)
+  - `deberta_v3_large` Plain ($w=0.25$)
+- **Complementary Stack ($15\%$)**: Secondary LoRAs ($w=0.35$), 5-view BPE lexical ($w=0.20$), regularized wPCA DP posteriors ($w=0.30$), and the 384-dim Joint Spectral Bank ($w=0.15$).
 
-Using within-prompt whitened PCA and Ledoit-Wolf covariance shrinkage, we simultaneously diagonalize the error covariance $S_e$ and prompt covariance $S_p$:
+### 2. Vectorized Claude Specialist Gate
+The 5 Anthropic Claude models share close stylometric signatures. A dedicated Claude specialist head refines predictions exclusively when the primary model predicts Claude:
 
-$$A S_e A^T = I, \quad A S_p A^T = \text{diag}(\lambda)$$
+$$P_{\text{claude}} = (1 - w_{\text{gate}}) \cdot P_{\text{prior}} + w_{\text{gate}} \cdot (\text{mass} \cdot P_{\text{specialist}})$$
 
-For multi-passage prompt clusters, marginal probabilities are calculated using coordinate-ascent message passing with injectivity repulsion:
+Where $\text{mass} = \sum_{c \in \text{Claude}} P_{\text{prior}}(c)$. This guarantees **exact marginal mass preservation**: the total probability assigned to the Claude family remains identical, avoiding distortion of non-Claude classes.
 
-$$q_i(c) \propto \exp \left( \frac{a_{i,c}}{T_g} + \sum_{j \ne i} \frac{B_{ij} q_j}{T_g} - \log(1 - q_j(c)) \right)$$
+### 3. Unified Handwriting & Orthographic Shield
+Applies all discrete orthographic rules and continuous handwriting densities in a single vectorized step right before Sinkhorn balancing:
 
-### 3. Sovereign Orthographic Bayesian Shield
-Analysis of `train.csv` revealed absolute empirical orthographic invariants across model families:
+$$\log P_{\text{out}} = \text{softmax}\left(\log P_{\text{mix}} + B_{\text{disc}} \cdot W_{\text{pen}} + w_{\text{hw}} \cdot \log P_{\text{hw}}\right)$$
 
-| Orthographic Feature | Affected Model Family | Frequency in train.csv | Bayesian Log-Odds Penalty |
-| :--- | :--- | :---: | :---: |
-| **Curly Quotes** (`‘`, `’`, `“`, `”`) | Claude (all 5 variants) | **0 / 1,049 (0.00%)** | **-8.0** |
-| **Curly Quotes** (`‘`, `’`, `“`, `”`) | GLM (5.3 & Flash) | **0 / 300 (0.00%)** | **-8.0** |
-| **Em-Dash** (`—`) | Gemini (all 4 variants) | **1 / 600 (0.17%)** | **-5.5** |
-| **Straight Apostrophe** (`'`) | `gpt-5.6-sol` | **0 / 150 (0.00%)** | **-6.0** |
+#### The 4 Discrete Orthographic Rules ($W_{\text{pen}}$, shape $4 \times 18$):
+1. **Rule 1 (Typographic Curly Quotes)**: `‘, ’, “, ”` appearing anywhere in the passage.
+   - Claude (5 models) and GLM (2 models) strictly output straight ASCII quotes (`'`) in standard prose.
+   - Applies $-1.00$ log-penalty to all 5 Claude and 2 GLM classes ($\approx 0.368$ probability multiplier).
+2. **Rule 2 (Multi Em-Dashes)**: $\ge 2$ em-dashes (`—`) in non-code prose.
+   - Google Gemini rarely outputs multiple em-dashes in prose.
+   - Applies $-0.45$ log-penalty to all 4 Gemini models.
+3. **Rule 3 (Pure Straight Prose Contractions)**: $\ge 2$ straight contractions (`It's`, `don't`) and 0 curly apostrophes in non-code prose.
+   - `gpt-5.6-sol` consistently uses curly apostrophes in contractions.
+   - Applies $-0.60$ log-penalty to `gpt-5.6-sol`.
+4. **Rule 4 (Curly Prose Contractions)**: $\ge 1$ curly contraction in non-code prose.
+   - Reinforces $-0.40$ log-penalty on Claude and GLM classes.
 
-Whenever a mystery text exhibits these characters, the corresponding model logits are severely penalized, preventing catastrophic misattributions.
+#### Continuous Handwriting Density Integration:
+- Blends the 26-feature continuous handwriting classifier output: $+ 0.04 \cdot \log P_{\text{hw}}$.
+- Re-normalizes rows to the probability simplex.
 
+### 4. Official 300-Step Multiplicative Sinkhorn-Knopp Mass Balancing
+The competition test set has equal marginal distributions across the 18 classes ($N/18$ passages per model).
 
----
-
-<div class="page-break"></div>
-
-## 7.6 Version 20: 6-Checkpoint In-Place Trunk Reuse, Dedicated DeBERTa Loader, Exact 2^18 Subset DP & Joint Spectral Bank
-
-Version 20 eliminates the remaining structural bottlenecks identified in the audit of Version 19, pushing the ensemble toward the 0.650+ ceiling.
-
-### 1. In-Place Trunk Reuse via Reversible LoRA Merging
-Rather than reloading massive 14B and 8B parameter models from disk for each adapter, Version 20 loads each base model trunk into GPU VRAM exactly **once**:
-- **Qwen3-14B Trunk**: Loads `qwen-3/14b-base/1` once with `keep=27`.
-  1. `merge_lora(model, lora_qwen3_14b, sign=+1.0)`: In-place addition of delta weights ($W_{\text{eff}} = W_0 + \frac{\alpha}{r} BA$).
-  2. Extracts representations, computes plain/twin readouts and exact DP Gaussian probabilities.
-  3. `merge_lora(model, lora_qwen3_14b, sign=-1.0)`: In-place subtraction of delta weights, restoring base trunk $W_0$ to exact floating-point identity.
-  4. `merge_lora(model, lora14b_v1, sign=+1.0)`: Merges Part 1 adapter, extracts, scores, and unmerges.
-  5. Frees GPU VRAM completely.
-- **Qwen3-8B Trunk**: Loads `qwen-3/8b-base/1` once with `keep=24`.
-  1. In-place merges `ntl-qwen3-8b-lora-claude-head`, extracts and evaluates plain, twin, and Claude specialist readouts.
-  2. In-place unmerges (`sign=-1.0`).
-  3. In-place merges `lora8b_v1` (Part 1), extracts and scores.
-  4. Frees GPU VRAM.
-
-### 2. Dedicated Full-Encoder Loader for Fine-Tuned DeBERTa-v3
-In Version 19, DeBERTa was evaluated on base weights with an external linear head. Inside `ntl-handwriting-blend/deberta_v3_large`, the checkpoint contains a **fully fine-tuned DeBERTa encoder** (`encoder/model.safetensors`, 868 MB) that achieved 0.546 solo CV.
-Version 20:
-- Loads the fine-tuned encoder directly via `AutoModel.from_pretrained('.../deberta_v3_large/encoder')`.
-- Performs a live diagnostic on `train.csv[:36]` comparing full attention mask (`m[:, 0] = 1`) against drop-first mask (`m[:, 0] = 0`) to automatically select the optimal pooling strategy.
-- Evaluates the pre-trained neural classification head (`head.safetensors`).
-
-### 3. Exact 2^18 Bitmask Subset Dynamic Programming (`ExactAuthorPosterior`)
-Hard Hungarian assignment and approximate mean-field decoding destroy log-probability calibration.
-Version 20 implements an exact solver for shared-prompt Gaussian posteriors under author uniqueness ($c_i \neq c_j$) via forward-backward dynamic programming over all $2^{18} = 262,144$ author subsets:
-- Precomputes bitmask level partitions `_bitmask_levels(k=18)` using hardware-accelerated `.bit_count()`.
-- Forward pass accumulates partial likelihoods over subset author assignments.
-- Backward pass integrates out the shared prompt effect with prompt variance $\lambda$.
-- Computes exact marginal posteriors for prompt clusters of size $2 \le n \le 18$ in under 0.015 seconds per group!
-
-### 4. Joint Cross-Backbone Spectral Style Readout Bank (Zero Extra GPU Cost)
-Extracted representations across all 6 backbones are L2-normalized and concatenated into:
-- $X_{\text{joint, train}} = [Z^{(1)}_{\text{norm}}, Z^{(2)}_{\text{norm}}, \dots, Z^{(6)}_{\text{norm}}]$
-- $X_{\text{joint, test}} = [Z^{(1)}_{\text{norm}}, Z^{(2)}_{\text{norm}}, \dots, Z^{(6)}_{\text{norm}}]$
-
-We compute a within-prompt whitened projection matrix $V_{\text{joint}}$ ($d = 512$) on $X_{\text{joint, train}}$ and fit:
-1. **Plain Joint Spectral Ridge**: `LogisticRegression(C=0.15, max_iter=2000)` (weight 0.20).
-2. **Centered Joint Spectral Ridge**: `LogisticRegression(C=0.10, max_iter=2000)` on prompt-centered representations (weight 0.10 on twin-eligible rows).
-
-### 5. 50-Step Log-Domain Sinkhorn-Knopp & Calibrated Bayesian Shield
-- When evaluating the test set ($N_{\text{test}} \ge 50$), 50 iterations of dampened log-domain Sinkhorn-Knopp ($\\alpha = 0.50$) balance class marginals toward the uniform prior ($1/18$).
-- Post-Sinkhorn calibrated log-penalties (`-2.0`) are applied strictly on curly quotes (Claude/GLM), em-dashes (Gemini), and straight apostrophes (`gpt-5.6-sol`), followed by the Top-1 gated Claude specialist head.
+Module 4 applies 300 iterations of exact multiplicative Sinkhorn-Knopp balancing:
+$$P^{(t+1)} = \text{diag}(u^{(t)}) \cdot P^{(t)} \cdot \text{diag}(v^{(t)})$$
+Alternately normalizes row sums to $1.0$ and column sums to $N / 18$. This equalizes marginal class predictions without distorting sample-level probability rankings.
 
 ---
 
-<div class="page-break"></div>
+## 7. Declarative Configuration Architecture
 
-## 7.7 Version 44: Zero-RAM Reversible Unmerging, Exact 2^18 Bitmask DP, Prompt-Centered wPCA & Two-Tier 85/15 Production Architecture
+All ensemble weights, regularizers, prior scales, and thresholds are defined declaratively in [`configs/production_ensemble.json`](file:///c:/Projects/NameThatLLM-Anitgravity/configs/production_ensemble.json):
 
-Version 44 establishes the modular, single-source-of-truth production architecture in `src/namethatllm/`. It eliminates the 15GB CPU memory clone leak that threatened large-model inference, implements mathematically exact forward-backward subset dynamic programming under author uniqueness, and delivers honest out-of-fold generalization.
-
-### 1. Zero-RAM In-Place Reversible LoRA Unmerging
-In earlier attempts (e.g. V43), caching base model trunk weights into CPU host RAM via `snapshot_weights` duplicated 15 GB of unquantized float32 tensors in host memory, exceeding Kaggle's 30 GB cgroup memory limit (`DeadKernelError: exit code 137`).
-Version 44 resolves this permanently through exact in-place reversible weight arithmetic directly on GPU:
-1. Base trunks (`Qwen3-14B`, `Qwen2.5-14B`, `Qwen3-8B`, `DeBERTa-v3`) are loaded into GPU memory once with `low_cpu_mem_usage=True`.
-2. For each LoRA adapter, weights are merged directly into the base weights in-place:
-   $$W_{\text{eff}} = W_0 + \frac{\alpha}{r} (B A)$$
-3. Hidden states are extracted and pooled in float32 with dynamic `bfloat16` row overflow rescue.
-4. The adapter is unmerged by inverting the delta arithmetic directly on the parameter tensor:
-   $$W_0 = W_{\text{eff}} - \frac{\alpha}{r} (B A)$$
-   using `merge_lora(trunk.model, ckpt_dir, sign=-1.0)`.
-5. Explicit garbage collection (`gc.collect()`) and CUDA cache emptying (`torch.cuda.empty_cache()`) occur between checkpoints, ensuring peak system RAM stays well below container limits across all 4 trunks.
-
-### 2. Exact 18-Step Forward-Backward 2^18 Subset Dynamic Programming
-Approximate mean-field decoding or cluster-average approximations flatten probability peaks and degrade calibration.
-In `ExactAuthorPosterior`, Version 44 implements an exact forward-backward bitmask dynamic programming solver over all $2^{18} = 262,144$ author subset configurations:
-- Partitions bitmasks by Hamming weight $\sum_j b_j = m$ using fast bitwise operations.
-- The forward pass recursively accumulates log-likelihoods over valid partial assignments.
-- The backward pass propagates marginal evidence under the shared prompt effect with prompt variance $\lambda$, enforcing the author uniqueness constraint ($c_i \neq c_j$) for all clusters with $2 \le s \le 14 \le 18$.
-- Clusters exceeding 14 items are recursively split via average linkage cosine distance clustering (`split_oversized_clusters_dist`).
-
-### 3. Prompt-Centered Within-Class Covariance (`wPCA`)
-In `fit_shared_gaussian_lowram()`, training features from 90 balanced prompts ($1,620$ rows) are explicitly centered by prompt mean prior to computing the within-class covariance matrix $S_e$ and its SVD projection $V_{\text{top64}}$:
-$$Z_{\text{centered}} = Z - \bar{Z}_{\text{prompt}}$$
-This mathematically purges prompt topic semantics from the projection space, allowing the 64-dimensional principal components to capture pure stylometric and lexical authorship variance. Ledoit-Wolf shrinkage floors (`se_floor = 0.10` for Part-Two models, `0.35` for auxiliary models) prevent singular inverted variances.
-
-### 4. Two-Tier 85/15 Convex Fusion & Prior-Scaled 384D Spectral Bank
-To protect the high-scoring Part-Two core while integrating orthogonal signal:
-- **Main Stack ($85\%$ mass)**: The canonical 4-view `LinearSVC(C=0.5)` with uniform weights, `lora_qwen3_14b`, `lora_qwen25_14b`, and `deberta_v3_large`.
-- **Complementary Stack ($15\%$ mass)**: Secondary LoRA adapters, 5-view BPE lexical models, regularized wPCA DP posteriors, and the 384-dimensional Joint Spectral Bank.
-- **Unsupervised Spectral Bank**: Top-64 components per checkpoint are extracted without label leakage and weighted by out-of-sample prior scales (`q3_14b`: 1.00, `q25_14b`: 0.85, `deberta`: 0.80, `part1_14b`: 0.50, `instyle`: 0.45, `claude_head`: 0.30), achieving an honest **0.6398 OOF Balanced Accuracy**.
-- **Convex Blend**:
-  $$P_{\text{mix}} = 0.85 \cdot R_{\text{main}} + 0.15 \cdot P_{\text{comp}}$$
-
-### 5. Multi-Trunk LayerNorm, Vectorized Claude Gate & 300-Step Sinkhorn
-- Native `LayerNorm` projection heads are applied to pooled transformer embeddings before dot product evaluation, matching pre-trained head geometry.
-- The Claude Specialist Gate reallocates probability mass strictly within the Claude sub-family ($P_{\text{claude}} = 0.85 \cdot P_{\text{prior}} + 0.15 \cdot (\text{mass} \cdot P_{\text{specialist}})$) in a vectorized step, leaving non-Claude classes completely unaltered.
-- 300-step multiplicative Sinkhorn balancing equalizes class marginal distributions to $N / 18$ across all 18 classes.
-
----
-
-## 8. Live Verification Benchmarks & Leaderboard Proof
-
-Every component was validated through automated verification checks in the Kaggle GPU container prior to submission.
-
-### Check 1: Anchor Parity Check (`anchor_features.npz`)
-We verify that our live feature extraction produces vectors mathematically identical to the offline pre-trained reference vectors.
-
-```
-Anchor 0 (ID: 0018b3765972): Cosine Sim = 0.914336 | Max Abs Diff = 44.48
-Anchor 1 (ID: 0041ac86ee93): Cosine Sim = 0.911423 | Max Abs Diff = 45.54
-Anchor 2 (ID: 005a19083eae): Cosine Sim = 0.909299 | Max Abs Diff = 46.09
->>> Anchor Parity Mean Cosine Similarity: 0.911686 (PASSED > 0.85)
-```
-
-### Check 2: Fold 0 Live Extraction Validation Test (50 Samples)
-We take 50 unseen validation samples, extract features in real time on the GPU, and compute balanced accuracy:
-
-```
->>> Live Extracted Balanced Accuracy on 50 samples: 0.9688 (96.88%)
->>> 48 out of 50 samples correctly attributed across 18 classes! (PASSED)
-```
-
-### Check 3: Interactive Self-Test (54 Samples: 3 Prompts $\times$ 18 Classes)
-We test the progressive accuracy lift across each stage of the inference pipeline:
-
-```
-Stage 1: Plain Qwen LoRA Balanced Accuracy:    0.8889 (88.89%)
-Stage 2: + Soft Centered Twin Blending:        0.9630 (96.30%)  <-- +0.0741 Lift!
-Stage 3: + Top-1 Gated Claude Specialist:      0.9444 (94.44%)
->>> Self-test verified offline attribution fidelity! (PASSED)
-```
-
-### Check 4: Version 19 Live Multi-Backbone Execution (2x Tesla T4 GPUs)
-Version 19 was deployed and executed completely on dual Tesla T4 GPUs on Kaggle:
-
-```
-[System] CUDA Available: True | Device Count: 2 (Tesla T4, 14.56 GB each)
-[Module 1] Loaded public pool: 78,482 rows across 18 classes.
-[Module 1] 4-View LinearSVC fitted on 265,575 features in 36.80s.
-[Backbone: qwen3_14b] Merged 189 LoRA weights into truncated trunk (keep=27).
-[Backbone: qwen3_14b] Extracted 183 samples in 26.88s (6.8 samples/s).
-[Backbone: qwen25_14b] Merged 224 LoRA weights into truncated trunk (keep=32).
-[Backbone: qwen25_14b] Extracted 183 samples in 26.38s (6.9 samples/s).
-[Backbone: qwen3_8b] Merged 168 LoRA weights into truncated trunk (keep=24).
-[Backbone: qwen3_8b] Extracted 183 samples in 14.61s (12.5 samples/s).
-[Backbone: DeBERTa-v3] Evaluated pre-trained neural head in 15.35s.
-[Module 4] Sovereign Orthographic Shield applied: 1 curly-quote penalty.
-[Module 5] Claude specialist completed. Invariant verified: Non-Claude untouched.
-[SUCCESS] Generated valid submission.parquet (1,749 bytes)!
-Total Execution Time: 8 minutes 46 seconds (KernelWorkerStatus.COMPLETE)
-```
-
-### Kaggle Public Leaderboard Proof (Version 15 & Version 19)
-
-```
-Submission Reference: 57595711
-Notebook Version:     Version 15 (anilmittal/name-that-llm-v2-submission)
-Public Score:         0.491 Balanced Accuracy
-Total Execution Time: 3 minutes 58 seconds on 2x Tesla T4 GPUs
-
-Submission Reference: 57628730
-Notebook Version:     Version 19 (anilmittal/name-that-llm-v2-submission)
-Architecture:         Multi-Backbone Two-Stage LoRAs + wPCA + 4-View SVC + Shield
-Execution Status:     KernelWorkerStatus.COMPLETE (8 minutes 46 seconds)
-Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
+```json
+{
+  "main_stack": {
+    "linear_svc_weight": 1.00,
+    "members": {
+      "lora_qwen3_14b": { "plain_weight": 0.40, "twin_weight": 0.10, "twin_clustering": "groups_085" },
+      "lora_qwen25_14b": { "plain_weight": 0.20, "twin_weight": 0.10, "twin_clustering": "groups_085" },
+      "deberta_v3_large": { "plain_weight": 0.25, "twin_weight": 0.00 }
+    }
+  },
+  "complementary_stack": {
+    "stream_weights": {
+      "lora_and_twins": 0.35, "lexical": 0.20, "dp_posteriors": 0.30, "spectral_bank": 0.15
+    },
+    "dp_weights": {
+      "q3_14b": 0.38, "q25_14b": 0.24, "deberta": 0.20, "instyle": 0.10, "part1_14b": 0.08, "claude_8b": 0.04
+    },
+    "prior_scales": {
+      "qwen3_14b_p2": 1.00, "qwen25_14b_p2": 0.85, "deberta_p2": 0.80,
+      "qwen3_14b_p1": 0.50, "instyle": 0.45, "qwen3_8b_claude": 0.30
+    }
+  },
+  "fusion": { "main_ratio": 0.85, "comp_ratio": 0.15 },
+  "postprocess": {
+    "claude_specialist_weight": 0.15,
+    "curly_quote_multiplier": 0.36787944117144233,
+    "multi_em_dash_log_penalty": -0.45,
+    "straight_contr_log_penalty": -0.60,
+    "curly_contr_log_penalty": -0.40,
+    "continuous_hw_weight": 0.04,
+    "sinkhorn_iterations": 300,
+    "max_cluster_size": 14
+  }
+}
 ```
 
 ---
 
-## 9. Version Evolution & Debugging History
+## 8. Single-Source-of-Truth Compilation & Verification
 
-| Version | Training BAcc | Validation CV | Public LB | Key Changes & Diagnostics | Lesson Learned & Overfitting Diagnostics |
-| :---: | :---: | :---: | :---: | :--- | :--- |
-| **V1** | 1.000 | 0.335 | 0.321 | Basic TF-IDF word n-grams + Logistic Regression. | Severe overfitting: 100% train vs 32.1% LB demonstrates bag-of-words memorization. |
-| **V9** | 0.892 | 0.362 | 0.336 | DeBERTa-v3 60/40 blend + ANOVA specialists + Hungarian. | Hungarian matching inflated dense validation folds but hurt sparse test prompts. |
-| **V12** | 0.993 | 0.497 | 0.347 | Initial Qwen3-8B LoRA notebook. Token 0 left in pooling mask. | Attention sink corrupted all live vectors, causing huge gap between 99.3% train and 34.7% LB. |
-| **V13** | 0.993 | 0.512 | Error | Added parity assertion: `assert mean_sim > 0.99`. | Parity assertion was too strict; container float16 math gave 0.9117. |
-| **V14** | 0.993 | 0.512 | Error | Multi-view TF-IDF regex string escaping bug. | Raw regex string syntax errors halted execution before extraction. |
-| **V15** | 0.993 | 0.542 | **0.491** | Softened assertion, persistent extractor, attention-sink zeroed, soft adaptive centering. | **Breakthrough achieved! Generalization gap narrowed to 0.051.** |
-| **V16** | 0.995 | 0.610 | Error | Initial multi-backbone refactor with Qwen3-14B & Qwen2.5-14B. | Identified 2D weight slice mismatch in label alignment. |
-| **V17** | 0.995 | 0.610 | Error | Fixed align_cols 2D weight matrix indexing. | DeBERTa PyTorch tensor requires_grad blocked numpy export. |
-| **V18** | 1.000 | 0.615 | Error | Fixed extract_deb_last with @torch.no_grad() and .detach(). | Notebook code validated end-to-end on dual T4 GPUs. |
-| **V19** | 0.994 | 0.628 | **0.551** | Two-Stage Multi-LoRA (14B/8B/DeBERTa) + wPCA Gaussian + 4-View SVC + Shield. | Executed in 8m 46s on 2xT4 GPUs; Ref 57628730; +0.060 jump over V15. |
-| **V24** | 0.995 | 0.648 | **0.603** | 64-dim spectral bank + streamed CSR LinearSVC + float32 wPCA. | Low-RAM milestone: eliminated 30GB OOM, breaking 0.60 barrier. |
-| **V26** | 0.996 | 0.656 | **0.605** | Subprocess memory isolation + 78k lexical engine + 88/12 mixture. | Stable foundation: 88/12 probability mixture protects 78k heads. |
-| **V28** | 0.996 | 0.654 | **Crash** | Pure log-space fusion + transductive TTCA. | IndexError crash on hidden test set due to n > 18 cluster in bitmask DP. |
-| **V29** | 0.996 | 0.612 | **0.549** | Pure log-space + TTCA + / 1.85 logit division + double DP. | TTCA confirmation bias collapsed sister-class centroids; logit divisor flattened predictions. |
-| **V30 / v36** | 0.996 | 0.658 | **0.604** | Restored 88/12 mixture + crash-proof cluster splitting (s <= 14) + pre-Sinkhorn shield + in-style adapter. | Full recovery (+0.055 lift over V29); 0 crashes on 4k hidden test set. |
-| **V37** | **0.997** | **0.672** | **0.602** | Elimination of 180-row wPCA bug + 78k BPE & within-family refined core. | SOTA high-signal architecture; peak RAM < 2.09 GB. |
-| **V40** | 0.998 | 0.914 | **0.612** | 14B BF16 dynamic row rescue + full-rank wPCA (1,620 rows) + 384-dim spectral bank. | Breakthrough to 0.612 LB; audit exposed 8B in-sample memorization trap. |
-| **V42** | **0.998** | **0.665** | **0.613** | Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + unsupervised spectral bank (zero leakage). | Pure two-tier separation isolates Part-Two baseline (0.620) while adding orthogonal complementary signal; scored 0.613 Public LB. |
-| **V44** | **0.998** | **0.640** | **0.622** | Zero-RAM in-place unmerge (`sign=-1.0`) + exact 18-step $2^{18}$ bitmask DP + prompt-centered wPCA covariance + LayerNorm heads. | Eliminates 15GB CPU host clone leak (fixing V43 host OOM); honest 0.6398 OOF BAcc; executed cleanly in 2,122s (~35 min) on Kaggle GPU worker; scored 0.622 Public LB (+0.009 lift); 24 unit/integration tests passing. |
-| **V45 (Current)** | **0.998** | **0.640** | **0.621–0.622** | Single-pass non-code prose extractor + dedicated 26-feature continuous classifier + centralized postprocess penalty matrix + snapshot trunk weight isolation. | Eliminates cumulative FP16 subtraction drift via bit-exact weight caches on Trunk 1/3; removes dense contamination from 595k n-gram matrices (30% faster SVM/SGD); vectorized discrete rule application ($B_{\text{disc}} @ W_{\text{pen}}$); 27 unit tests passing. |
+The repository enforces a **Single Source of Truth** architecture:
+- All model logic lives in `src/namethatllm/`.
+- All hyperparameter values live in `configs/production_ensemble.json`.
+- `scripts/compile_notebook.py` parses module ASTs, strips package imports, and bundles everything into the executable single-file submission notebook [`kaggle_submission.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/submission/kaggle_submission.ipynb).
+
+### Running the 27 Unit Tests:
+```powershell
+python -m pytest tests -v
+```
+
+All 27 tests cover every component:
+1. `test_compiler_and_integration.py`: AST parity, single-source bundling, end-to-end smoke pipeline, full mock-neural pipeline, LayerNorm specifications.
+2. `test_lexical.py`: Shape patterns, function word preservation, punctuation retention, dual lexical outputs, continuous handwriting feature extraction.
+3. `test_neural_extractor`: Reversible LoRA unmerging, bfloat16 rescue, LayerNorm projection.
+4. `test_wpca_dp.py`: Covariance shrinkage floors, two-way prompt decomposition, safe cluster splitting ($s \le 14$), exact $2^{18}$ forward-backward bitmask DP.
+5. `test_spectral_bank.py`: Unsupervised $V_{\text{top64}}$ extraction (0 label leakage), prior scaling normalization, joint spectral bank execution.
+6. `test_postprocess.py`: Two-tier convex blend, mass-preserving Claude specialist gate, discrete orthographic rules, continuous handwriting integration, 300-step Sinkhorn mass equalization, submission schema.
 
 ---
 
-<div class="page-break"></div>
-
-## 10. Printable Quick Reference Cheatsheet
-
-### Core Mathematical Equations
+## 9. Mathematical Reference Cheatsheet
 
 ```
-1. LoRA Weight Fusion:
+1. LoRA Weight Fusion (GPU Device):
    W_effective = W_0 + (alpha / r) * (B @ A)
 
 2. Attention-Sink Zeroed Mean Pooling:
    z_pooled = sum_{i=1}^{L-1} (h_i * m_i) / sum_{i=1}^{L-1} m_i    (m_0 = 0)
 
-3. Soft Adaptive Centering:
+3. Prompt-Centered Feature Normalization:
    z_{i, centered} = z_i - (1 / |C|) * sum_{j in C} z_j            (for 2 <= |C| <= 18)
 
-4. Reversible LoRA In-Place Weight Addition & Subtraction:
-   W_effective = W_0 + (alpha / r) * (B @ A)
-   W_0 = W_effective - (alpha / r) * (B @ A)    (Zero-RAM rollback on device)
+4. Snapshot-Isolated Reversible Trunk Weight Restoration:
+   backup = trunk.snapshot_weights(adapter_path)
+   merge_lora(trunk.model, adapter_path, sign=+1.0)
+   trunk.restore_weights(backup)                                    (Bit-exact zero drift)
 
 5. Two-Tier Convex Mixture (85/15):
    P_mix = 0.85 * R_main + 0.15 * P_comp
 
 6. Vectorized Claude Specialist Gate (Mass-Preserving):
-   P_claude = 0.85 * P_prior + 0.15 * (mass * P_specialist)
+   P_claude = (1 - w_gate) * P_prior + w_gate * (mass * P_specialist)
 
-7. Exact Multiplicative Sinkhorn Equalization (300 Steps):
-   P^{(t+1)} = diag(u^{(t)}) @ P^{(t)} @ diag(v^{(t)})   (equalizing column sums to N / 18)
-
-8. Unified Handwriting & Orthographic Shield:
+7. Unified Handwriting & Orthographic Shield:
    log P_out = softmax(log P_mix + B_disc @ W_pen + w_hw * log P_hw)
+
+8. Exact Multiplicative Sinkhorn-Knopp Equalization (300 Steps):
+   P^{(t+1)} = diag(u^{(t)}) @ P^{(t)} @ diag(v^{(t)})             (column sums = N / 18)
 ```
-
-### Hyperparameter Reference Table
-
-| Hyperparameter | Value | Description |
-| :--- | :---: | :--- |
-| `keep_layers` | `24` | Truncated Qwen3-8B trunk layer depth |
-| `max_len` | `384` | Maximum token sequence length for transformer inputs |
-| `batch_size` | `8` | Extraction batch size on dual 14.5 GB T4 GPUs |
-| `lora_alpha / r` | `32 / 16 = 2.0` | LoRA adapter scaling factor |
-| `clustering_t` | `0.60` | Agglomerative average-linkage distance threshold |
-| `min_cluster_size` | `2` | Minimum passages required for prompt centering |
-| `max_cluster_size` | `18` | Maximum passages eligible for prompt centering |
-| `svc_C` | `0.5` | Regularization parameter for LinearSVC classifiers |
-| `lgb_num_leaves` | `31` | Tree leaf count for stylometric LightGBM |
-| `transductive_tau` | `0.35` | Exponent for transductive class marginal calibration |
-
-### Common Pitfalls & How to Avoid Them
-
-- [x] **Never snapshot large model weights into CPU host RAM:** Snapshotting 14B float32 weights on CPU exhausts Kaggle's 30 GB host memory limit (exit code 137). Use in-place mathematical subtraction `merge_lora(..., sign=-1.0)` with `low_cpu_mem_usage=True`.
-- [x] **Never leak training labels into stacking features:** Fitting PCA or classifiers across full training sets without prompt-group isolation creates severe in-sample memorization (e.g. V40's 0.9142 OOF trap). Extract unsupervised prompt-centered components ($V_{\text{f32}}[:, :64]$) and apply out-of-sample prior scaling.
-- [x] **Never load PEFT wrappers blindly on truncated causal models:** They introduce nested `.model` references that skip key adapter weights. Use direct in-place matrix addition.
-- [x] **Never include token 0 in causal model pooling:** Causal attention sinks store activations up to 1,000x larger than normal tokens. Always zero position 0: `m[:, 0, :] = 0.0`.
-- [x] **Never use hard Hungarian assignment when test prompt distributions are sparse:** In sparse settings, hard 1-to-1 matching forces catastrophic false assignments. Use soft adaptive centering instead.
-- [x] **Free GPU VRAM between models:** Delete models and run `gc.collect()` and `torch.cuda.empty_cache()` before loading the next transformer to avoid OOM crashes on dual T4 GPUs.
-- [x] **Keep specialist heads strictly gated:** Never allow a specialist sub-network to alter out-of-family predictions. Always verify that non-specialist predictions remain unchanged.
