@@ -24,6 +24,13 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from .config import LABELS, K, LAB2I, resolve_dataset_paths, resolve_all_pool_files, find_base_model
 from .wpca_gaussian import fit_shared_gaussian_lowram
 
+# Disable incompatible torchao version check in Kaggle environments
+try:
+    import peft.import_utils
+    peft.import_utils.is_torchao_available = lambda: False
+except Exception:
+    pass
+
 class MultiLayerLoRAClassifier(nn.Module):
     """
     Universal Multi-Layer LoRA sequence classifier with dedicated per-layer
@@ -331,6 +338,12 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True
     )
+
+    try:
+        import peft.import_utils
+        peft.import_utils.is_torchao_available = lambda: False
+    except Exception:
+        pass
 
     lora_cfg = LoraConfig(
         r=int(train_cfg.get("lora_r", 16)),
