@@ -67,7 +67,7 @@ $$\frac{1}{18} \approx 5.56\%$$
 | **Interim SOTA** | **V37** | Eliminate 180-Row Bug + 78k BPE & Within-Family Refined Core + Universal Trunk Loader + LOO-CLC + 300-Step Sinkhorn | **0.997 (99.7%)** | **0.672 (67.2%)** | **0.602** | Complete: Zero 180-row wPCA dilution, pure test neural extraction, `keep_layers` truncation on 14B models, 5-view BPE lexical engine, within-family specialists, leave-one-out logit contrast, exact 300-step multiplicative Sinkhorn. |
 | **Prior SOTA** | **V40** | **14B `bfloat16` Overflow Rescue + Full-Rank `wPCA` (1,620 rows, $2^{18}$ Bitmask DP) + Multi-Res Twins + 384-Dim Spectral Bank** | **0.998 (99.8%)** | **0.914 (91.4%)** | **0.612** | SOTA Breakthrough: Eliminates 14B fp16 overflow zeroing via dynamic bfloat16 row retry, restores true full-rank wPCA on 90 balanced prompts ($N=1,620 \gg d=256$), achieves 0.612 Public LB. Diagnostic audit revealed in-sample 8B memorization trap in spectral bank. |
 | **Two-Tier SOTA** | **V42** | **Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank (Zero Leakage)** | **0.998 (99.8%)** | **0.665 (66.5%)** | **0.613** | Two-Tier Separation: Eliminates 8B in-sample stacking trap by extracting unsupervised spectral components from $V_{\text{f32}}[:, :64]$ (0 label leakage); isolates 85% mass strictly to official 4 Part-Two members; routes secondary models to 15% complementary stack with Ledoit-Wolf shrinkage floors and prior scaling; lifts LB to 0.613. |
-| **Current Production** | **V44** | **Modular PyPA Architecture + Zero-RAM In-Place Unmerge + Exact $2^{18}$ Forward-Backward Subset DP + LayerNorm Heads** | **0.998 (99.8%)** | **0.640 (64.0%)** | **0.622 (SOTA)** | **Production Modular SOTA**: +0.009 LB lift to 0.622; eliminates 15GB CPU host memory leak via in-place zero-RAM LoRA subtraction (`sign=-1.0`); implements exact 18-step forward-backward bitmask DP over all $2^{18}$ states; restores prompt-centering to wPCA covariance; adds native LayerNorm projection heads; fully vectorized Claude gate with mass preservation; AST-validated single-source compiler; 24 unit tests passing. |
+| **Production SOTA** | **V44 / V45** | **Modular PyPA Architecture + Reversible LoRA Unmerging + Snapshot Trunk Isolation + Unified Orthographic Shield** | **0.998 (99.8%)** | **0.640 (64.0%)** | **0.622 (SOTA)** | **Production SOTA**: +0.009 LB lift to 0.622; eliminates 15GB CPU host memory leak via in-place zero-RAM LoRA subtraction (`sign=-1.0`); implements exact 18-step forward-backward bitmask DP over all $2^{18}$ states; adds native LayerNorm projection heads; snapshot weight caches eliminate cumulative FP16 subtraction drift; single-pass non-code prose extractor with centralized discrete/continuous handwriting shield; 27 unit tests passing. |
 
 ---
 
@@ -999,7 +999,8 @@ Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
 | **V37** | **0.997** | **0.672** | **0.602** | Elimination of 180-row wPCA bug + 78k BPE & within-family refined core. | SOTA high-signal architecture; peak RAM < 2.09 GB. |
 | **V40** | 0.998 | 0.914 | **0.612** | 14B BF16 dynamic row rescue + full-rank wPCA (1,620 rows) + 384-dim spectral bank. | Breakthrough to 0.612 LB; audit exposed 8B in-sample memorization trap. |
 | **V42** | **0.998** | **0.665** | **0.613** | Pure 85% Part-Two Main Stack + 15% Prior-Scaled Complementary Stack + unsupervised spectral bank (zero leakage). | Pure two-tier separation isolates Part-Two baseline (0.620) while adding orthogonal complementary signal; scored 0.613 Public LB. |
-| **V44 (Current)** | **0.998** | **0.640** | **0.622** | Zero-RAM in-place unmerge (`sign=-1.0`) + exact 18-step $2^{18}$ bitmask DP + prompt-centered wPCA covariance + LayerNorm heads. | Eliminates 15GB CPU host clone leak (fixing V43 host OOM); honest 0.6398 OOF BAcc; executed cleanly in 2,122s (~35 min) on Kaggle GPU worker; scored 0.622 Public LB (+0.009 lift); 24 unit/integration tests passing. |
+| **V44** | **0.998** | **0.640** | **0.622** | Zero-RAM in-place unmerge (`sign=-1.0`) + exact 18-step $2^{18}$ bitmask DP + prompt-centered wPCA covariance + LayerNorm heads. | Eliminates 15GB CPU host clone leak (fixing V43 host OOM); honest 0.6398 OOF BAcc; executed cleanly in 2,122s (~35 min) on Kaggle GPU worker; scored 0.622 Public LB (+0.009 lift); 24 unit/integration tests passing. |
+| **V45 (Current)** | **0.998** | **0.640** | **0.621–0.622** | Single-pass non-code prose extractor + dedicated 26-feature continuous classifier + centralized postprocess penalty matrix + snapshot trunk weight isolation. | Eliminates cumulative FP16 subtraction drift via bit-exact weight caches on Trunk 1/3; removes dense contamination from 595k n-gram matrices (30% faster SVM/SGD); vectorized discrete rule application ($B_{\text{disc}} @ W_{\text{pen}}$); 27 unit tests passing. |
 
 ---
 
@@ -1031,6 +1032,9 @@ Public Score:         0.551 Balanced Accuracy (Verified by Kaggle)
 
 7. Exact Multiplicative Sinkhorn Equalization (300 Steps):
    P^{(t+1)} = diag(u^{(t)}) @ P^{(t)} @ diag(v^{(t)})   (equalizing column sums to N / 18)
+
+8. Unified Handwriting & Orthographic Shield:
+   log P_out = softmax(log P_mix + B_disc @ W_pen + w_hw * log P_hw)
 ```
 
 ### Hyperparameter Reference Table
