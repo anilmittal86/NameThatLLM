@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Sampler
 
-from .config import LABELS, K, LAB2I, resolve_dataset_paths, resolve_all_pool_files
+from .config import LABELS, K, LAB2I, resolve_dataset_paths, resolve_all_pool_files, find_base_model
 from .wpca_gaussian import fit_shared_gaussian_lowram
 
 class MultiLayerLoRAClassifier(nn.Module):
@@ -302,21 +302,30 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     end_id = int(train_cfg.get("end_id", 151643))
     out_dir = Path(train_cfg.get("output_dir", "export_lora24"))
 
+    input_dir = Path(train_cfg.get("input_dir", "/kaggle/input"))
+    local_base = None
+    if input_dir.exists():
+        if "8b" in backbone_name.lower():
+            local_base = find_base_model(input_dir, "qwen3", 4096, 36)
+        elif "14b" in backbone_name.lower():
+            local_base = find_base_model(input_dir, "qwen3", 5120, 40)
+    model_source = str(local_base) if local_base else backbone_name
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Trainer] Device: {device}, Backbone: {backbone_name}, Keep: {keep_layers}")
+    print(f"[Trainer] Device: {device}, Model Source: {model_source}, Keep: {keep_layers}")
 
-    train_path, test_path, pool_file = resolve_dataset_paths()
-    all_pools = resolve_all_pool_files()
+    train_path, test_path, pool_file = resolve_dataset_paths(input_dir if input_dir.exists() else Path("."))
+    all_pools = resolve_all_pool_files(input_dir if input_dir.exists() else Path("."))
 
-    tok = AutoTokenizer.from_pretrained(backbone_name, trust_remote_code=True, use_fast=True)
+    tok = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    base_cfg = AutoConfig.from_pretrained(backbone_name, trust_remote_code=True)
+    base_cfg = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
     base_cfg.num_hidden_layers = keep_layers
 
     base_model = AutoModel.from_pretrained(
-        backbone_name,
+        model_source,
         config=base_cfg,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
