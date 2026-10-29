@@ -72,9 +72,9 @@ def apply_claude_specialist_gate(
 
 def build_orthographic_penalty_matrix(
     curly_quote_log_penalty: float = -1.00,      # Rule 1: 0/1049 Claude, 0/300 GLM
-    multi_em_dash_log_penalty: float = -0.45,    # Rule 2: >=2 em-dashes in Gemini (0/600)
-    straight_contr_log_penalty: float = -0.60,   # Rule 3: >=2 straight prose contractions in gpt-5.6-sol (0/150)
-    curly_contr_log_penalty: float = -0.40,      # Rule 4: extra penalty on Claude/GLM when curly contractions appear
+    multi_em_dash_log_penalty: float = 0.0,      # Rule 2: >=2 em-dashes (v44 default: 0.0)
+    straight_contr_log_penalty: float = 0.0,     # Rule 3: >=2 straight prose contractions (v44 default: 0.0)
+    curly_contr_log_penalty: float = 0.0,        # Rule 4: extra curly contraction penalty (v44 default: 0.0)
 ) -> np.ndarray:
     """
     Returns the (4, 18) log-penalty matrix W_pen mapping the 4 discrete orthographic
@@ -117,10 +117,10 @@ def apply_unified_handwriting_shield(
     log_p_handwriting: Optional[np.ndarray] = None,
     rule_flags: Optional[np.ndarray] = None,
     curly_quote_multiplier: float = 0.36787944117144233,  # exp(-1.0)
-    multi_em_dash_log_penalty: float = -0.45,
-    straight_contr_log_penalty: float = -0.60,
-    curly_contr_log_penalty: float = -0.40,
-    continuous_hw_weight: float = 0.04,
+    multi_em_dash_log_penalty: float = 0.0,
+    straight_contr_log_penalty: float = 0.0,
+    curly_contr_log_penalty: float = 0.0,
+    continuous_hw_weight: float = 0.0,
 ) -> np.ndarray:
     """
     Single unified point of application for ALL handwriting and orthographic rules:

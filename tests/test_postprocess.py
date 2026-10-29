@@ -95,12 +95,15 @@ class TestPostprocess(unittest.TestCase):
         N = len(test_texts)
         P_mix = np.ones((N, 18)) / 18.0
 
-        # Run with default discrete penalties
+        # Run with explicit discrete penalties to test all rules
         P_out = apply_unified_handwriting_shield(
             P_mix,
             test_texts,
             log_p_handwriting=None,
             rule_flags=None,
+            multi_em_dash_log_penalty=-0.45,
+            straight_contr_log_penalty=-0.60,
+            curly_contr_log_penalty=-0.40,
             continuous_hw_weight=0.0
         )
         self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0))

@@ -338,6 +338,61 @@ class TestCompilerAndIntegration(unittest.TestCase):
             finally:
                 os.environ.pop("NTL_SMOKE", None)
 
+    def test_load_head_file_formats_and_pool_discovery(self):
+        """Tests unified loading of heads.safetensors and heads.pt, and multi-pool discovery."""
+        import torch
+        from safetensors.torch import save_file
+        from namethatllm.neural_extractor import load_head_file, resolve_head_tensors
+        from namethatllm.config import resolve_all_pool_files, find_checkpoints
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+
+            # 1. Test heads.safetensors
+            d1 = tmp / "ckpt_safetensors"
+            d1.mkdir()
+            t_w = torch.randn(18, 128)
+            t_b = torch.randn(18)
+            save_file({"plain.weight": t_w, "plain.bias": t_b}, str(d1 / "heads.safetensors"))
+            loaded_1 = load_head_file(d1)
+            W_p1, b_p1, _, _ = resolve_head_tensors(loaded_1)
+            self.assertEqual(W_p1.shape, (18, 128))
+            self.assertEqual(b_p1.shape, (18,))
+
+            # 2. Test heads.pt (flat)
+            d2 = tmp / "l24x_q3b8"
+            d2.mkdir()
+            torch.save({"plain.weight": t_w, "plain.bias": t_b, "norms.0.weight": torch.randn(128)}, str(d2 / "heads.pt"))
+            loaded_2 = load_head_file(d2)
+            W_p2, b_p2, _, _ = resolve_head_tensors(loaded_2)
+            self.assertEqual(W_p2.shape, (18, 128))
+            self.assertEqual(b_p2.shape, (18,))
+            self.assertIn("norms.0.weight", loaded_2)
+
+            # 3. Test heads.pt (nested)
+            d3 = tmp / "nested_pt"
+            d3.mkdir()
+            torch.save({"plain": {"weight": t_w, "bias": t_b}}, str(d3 / "heads.pt"))
+            loaded_3 = load_head_file(d3)
+            W_p3, b_p3, _, _ = resolve_head_tensors(loaded_3)
+            self.assertEqual(W_p3.shape, (18, 128))
+            self.assertEqual(b_p3.shape, (18,))
+
+            # 4. Test find_checkpoints discovers heads.pt
+            ckpts = find_checkpoints(tmp)
+            self.assertIn("qwen3_8b_ts", ckpts)
+            self.assertEqual(ckpts["qwen3_8b_ts"], d2)
+
+            # 5. Test multi-pool resolution
+            p_v5 = tmp / "nlm_pool_v5.parquet"
+            p_v4 = tmp / "pool_v4.parquet"
+            pd.DataFrame({"text": ["a"], "model": ["gpt-5.5"]}).to_parquet(p_v5)
+            pd.DataFrame({"text": ["b"], "model": ["gpt-5.5"]}).to_parquet(p_v4)
+            pools = resolve_all_pool_files(tmp)
+            self.assertEqual(len(pools), 2)
+            self.assertEqual(pools[0].name, "nlm_pool_v5.parquet")
+            self.assertEqual(pools[1].name, "pool_v4.parquet")
+
 if __name__ == "__main__":
     unittest.main()
 

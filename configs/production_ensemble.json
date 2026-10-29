@@ -43,8 +43,10 @@
     "lora_members": {
       "lora_qwen3_14b": { "plain_weight": 0.30, "twin_weight": 0.10 },
       "lora14b_v1": { "plain_weight": 0.14, "twin_weight": 0.05 },
+      "qwen3_14b_ts": { "plain_weight": 0.20, "twin_weight": 0.08 },
       "lora_qwen25_14b": { "plain_weight": 0.20, "twin_weight": 0.08 },
       "instyle": { "plain_weight": 0.22, "twin_weight": 0.08 },
+      "qwen3_8b_ts": { "plain_weight": 0.20, "twin_weight": 0.08 },
       "ntl_claude_head": { "plain_weight": 0.14, "twin_weight": 0.05 },
       "deberta_v3_large": { "plain_weight": 0.18, "twin_weight": 0.06 }
     },
@@ -59,6 +61,8 @@
       "deberta": 0.20,
       "instyle": 0.10,
       "part1_14b": 0.08,
+      "q3_14b_ts": 0.10,
+      "q3_8b_ts": 0.10,
       "claude_8b": 0.04
     },
     "se_floors": {
@@ -66,7 +70,9 @@
       "qwen25_14b_p2": 0.10,
       "deberta_p2": 0.10,
       "qwen3_14b_p1": 0.35,
+      "qwen3_14b_ts": 0.25,
       "instyle": 0.35,
+      "qwen3_8b_ts": 0.35,
       "qwen3_8b_claude": 0.35
     },
     "prior_scales": {
@@ -74,7 +80,9 @@
       "qwen25_14b_p2": 0.85,
       "deberta_p2": 0.80,
       "qwen3_14b_p1": 0.50,
+      "qwen3_14b_ts": 0.50,
       "instyle": 0.45,
+      "qwen3_8b_ts": 0.40,
       "qwen3_8b_claude": 0.30
     },
     "spectral_bank": {
@@ -90,10 +98,10 @@
   "postprocess": {
     "claude_specialist_weight": 0.15,
     "curly_quote_multiplier": 0.36787944117144233,
-    "multi_em_dash_log_penalty": -0.45,
-    "straight_contr_log_penalty": -0.60,
-    "curly_contr_log_penalty": -0.40,
-    "continuous_hw_weight": 0.04,
+    "multi_em_dash_log_penalty": 0.0,
+    "straight_contr_log_penalty": 0.0,
+    "curly_contr_log_penalty": 0.0,
+    "continuous_hw_weight": 0.0,
     "sinkhorn_iterations": 300,
     "max_cluster_size": 14
   }

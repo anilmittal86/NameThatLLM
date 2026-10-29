@@ -86,10 +86,22 @@ def resolve_dataset_paths(input_dir: Optional[Path] = None) -> Tuple[Path, Path,
     if test_path is None:
         test_path = Path('local_data') / 'test.csv'
 
-    pool_paths = list(input_dir.rglob('pool_v4.parquet'))
-    pool_file = pool_paths[0] if pool_paths else None
+    pool_files = resolve_all_pool_files(input_dir)
+    pool_file = pool_files[0] if pool_files else None
 
     return train_path, test_path, pool_file
+
+def resolve_all_pool_files(input_dir: Optional[Path] = None) -> List[Path]:
+    """Discovers all pretraining/unlabeled pool parquet files in priority order."""
+    if input_dir is None:
+        input_dir = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
+    pool_files: List[Path] = []
+    pool_patterns = ['nlm_pool_v5.parquet', 'pool_v4.parquet', 'nlm_matched_clean.parquet', 'nlm_pool_v2.parquet']
+    for pat in pool_patterns:
+        for p in input_dir.rglob(pat):
+            if p not in pool_files:
+                pool_files.append(p)
+    return pool_files
 
 def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_layers: int) -> Optional[Path]:
     """Discovers base model directories from Hugging Face config.json inspection."""
@@ -106,21 +118,31 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
     return None
 
 def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
-    """Finds all fine-tuned LoRA and head checkpoints."""
+    """Finds all fine-tuned LoRA and head checkpoints across safetensors and PyTorch formats."""
     ckpts = {}
-    for p in input_dir.rglob('heads.safetensors'):
+
+    # 1. Check for heads.safetensors and heads.pt files
+    head_candidates = list(input_dir.rglob('heads.safetensors')) + list(input_dir.rglob('heads.pt'))
+    for p in head_candidates:
         p_str = str(p).lower().replace('\\', '/')
         if 'lora_qwen3_14b' in p_str or 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
             ckpts['qwen3_14b_p2'] = p.parent
         elif 'lora_qwen25_14b' in p_str or 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
             ckpts['qwen25_14b_p2'] = p.parent
+        elif 'q14v5' in p_str or 'ts_q3b14' in p_str:
+            ckpts['qwen3_14b_ts'] = p.parent
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
+        elif 'l24x_q3b8' in p_str or 'ts8_s7' in p_str or 'ts_q3b8' in p_str or 'll8v5' in p_str:
+            ckpts['qwen3_8b_ts'] = p.parent
         elif 'lora8b_v1' in p_str:
             ckpts['qwen3_8b_p1'] = p.parent
+        elif 'l24x_q25_7b' in p_str or 'ts_q25_7b' in p_str:
+            ckpts['qwen25_7b_ts'] = p.parent
         elif 'instyle' in p_str:
             ckpts['instyle'] = p.parent
 
+    # 2. Check for Claude specialist head
     for p in input_dir.rglob('claude_head.safetensors'):
         ckpts['qwen3_8b_claude'] = p.parent
         break
@@ -130,15 +152,26 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
                 ckpts['qwen3_8b_claude'] = p.parent
                 break
 
-    for p in input_dir.rglob('head.safetensors'):
+    # 3. Check for DeBERTa sequence classification head
+    for p in list(input_dir.rglob('head.safetensors')) + list(input_dir.rglob('heads.safetensors')):
         if 'deberta' in str(p).lower():
             ckpts['deberta_p2'] = p.parent
             break
 
+    # 4. Fallback search for instyle
     if 'instyle' not in ckpts:
         for p in input_dir.rglob('*'):
             p_s = str(p).lower().replace('\\', '/')
-            if 'instyle' in p_s and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists() or (p / 'heads.safetensors').exists()):
+            if 'instyle' in p_s and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists() or (p / 'heads.safetensors').exists() or (p / 'heads.pt').exists()):
                 ckpts['instyle'] = p
                 break
+
+    # 5. Fallback search for q14v5 / ts_q3b14 adapter
+    if 'qwen3_14b_ts' not in ckpts:
+        for p in input_dir.rglob('adapter_model.safetensors'):
+            p_s = str(p).lower().replace('\\', '/')
+            if 'q14v5' in p_s or 'ts_q3b14' in p_s:
+                ckpts['qwen3_14b_ts'] = p.parent
+                break
+
     return ckpts

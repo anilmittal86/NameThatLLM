@@ -18,7 +18,9 @@
     "nishantdahal/ntl-handwriting-blend",
     "zbigniewkirchner/ntl-qwen3-8b-lora-instyle",
     "kirilltym/ntl-spectral-style-heads-paired-4404",
-    "dhruvtibarewal/nlm-l24-adapters"
+    "dhruvtibarewal/nlm-l24-adapters",
+    "dhruvtibarewal/nlm-l24-adapters-v5",
+    "dhruvtibarewal/nlm-matched-clean"
   ],
   "competition_sources": [
     "name-that-llm"

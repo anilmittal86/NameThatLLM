@@ -224,13 +224,23 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     sz_085 = np.bincount(groups_085)[groups_085]
     twin_rows_085 = (sz_085 >= 2) & (sz_085 <= 18)
 
-    # 2. Load pool_v4.parquet if present
-    if pool_file and os.path.exists(pool_file):
-        df_pool = pd.read_parquet(pool_file, columns=['text', 'model'])
-        df_pool = df_pool[df_pool['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
+    # 2. Load pool parquet files if present (supports single path or list)
+    pool_candidates = [pool_file] if isinstance(pool_file, (str, Path)) else (pool_file if isinstance(pool_file, list) else [])
+    pool_dfs = []
+    for pf in pool_candidates:
+        if pf and os.path.exists(pf):
+            try:
+                p_df = pd.read_parquet(pf, columns=['text', 'model'])
+                p_df = p_df[p_df['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
+                pool_dfs.append(p_df)
+            except Exception as e:
+                print(f"[Lexical] Note: Could not read pool {pf}: {e}")
+    if pool_dfs:
+        df_pool = pd.concat(pool_dfs, ignore_index=True).drop_duplicates(subset=['text'])
+        print(f"[Lexical] Merged {len(pool_dfs)} pool file(s): {len(df_pool)} unique rows.")
         fit_texts += df_pool['text'].fillna('').astype(str).tolist()
         fit_y = np.r_[fit_y, df_pool['model'].map(LAB2I).values]
-        del df_pool
+        del df_pool, pool_dfs
         gc.collect()
 
     # 3. Canonical 4 Views (from NTL two-stage LoRA part two)

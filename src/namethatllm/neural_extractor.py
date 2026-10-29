@@ -130,6 +130,46 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
     out = torch.cat([nm(pooled_layers[idx_l]) for idx_l, nm in enumerate(norms)], dim=-1)
     return out.cpu().numpy(), n_bad
 
+def load_head_file(path_or_dir: Path) -> dict:
+    """
+    Unified loader for classification head state dictionaries.
+    Supports heads.safetensors, head.safetensors, and heads.pt (PyTorch OrderedDict).
+    Flattens any nested dictionaries to standard dot-separated keys.
+    """
+    p = Path(path_or_dir)
+    if p.is_file():
+        if p.suffix in (".safetensors",):
+            return load_file(str(p))
+        elif p.suffix in (".pt", ".bin"):
+            raw = torch.load(str(p), map_location="cpu", weights_only=False)
+            if isinstance(raw, dict):
+                flat = {}
+                for k, v in raw.items():
+                    if isinstance(v, dict):
+                        for sub_k, sub_v in v.items():
+                            flat[f"{k}.{sub_k}"] = sub_v
+                    else:
+                        flat[k] = v
+                return flat
+        return {}
+    for fname in ("heads.safetensors", "head.safetensors"):
+        cand = p / fname
+        if cand.exists():
+            return load_file(str(cand))
+    pt_cand = p / "heads.pt"
+    if pt_cand.exists():
+        raw = torch.load(str(pt_cand), map_location="cpu", weights_only=False)
+        if isinstance(raw, dict):
+            flat = {}
+            for k, v in raw.items():
+                if isinstance(v, dict):
+                    for sub_k, sub_v in v.items():
+                        flat[f"{k}.{sub_k}"] = sub_v
+                else:
+                    flat[k] = v
+            return flat
+    return {}
+
 def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Resolves plain and centered head weights and biases matching American and British naming."""
     W_p, b_p, W_c, b_c = None, None, None, None
@@ -358,10 +398,7 @@ def extract_deberta_checkpoint(
     tok_dir = str(base_deb_dir if base_deb_dir else ckpt_dir)
     tok = AutoTokenizer.from_pretrained(tok_dir, use_fast=True)
 
-    head_p = ckpt_dir / "heads.safetensors"
-    if not head_p.exists():
-        head_p = ckpt_dir / "head.safetensors"
-    heads_sd = load_file(str(head_p))
+    heads_sd = load_head_file(ckpt_dir)
     W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
 
     meta = read_checkpoint_meta(ckpt_dir, default_keep=24, default_layers=[3, 6, 9, 12, 15, 18, 21, 24], default_max_len=max_len)

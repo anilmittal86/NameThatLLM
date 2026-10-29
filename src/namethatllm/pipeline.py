@@ -26,11 +26,12 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from .config import (
     LABELS, K, LAB2I, FAMILIES, PRIOR_SCALES,
     softmax, log_softmax, align_cols,
-    resolve_dataset_paths, find_base_model, find_checkpoints
+    resolve_dataset_paths, resolve_all_pool_files, find_base_model, find_checkpoints
 )
 from .lexical_engine import run_lexical_engine
 from .neural_extractor import (
     UniversalLoRATrunkLoader,
+    load_head_file,
     resolve_head_tensors,
     compute_centered_logits,
     merge_lora,
@@ -81,11 +82,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         train_path = Path(cfg["train_path"])
         test_path = Path(cfg["test_path"])
         pool_file = Path(cfg["pool_file"]) if "pool_file" in cfg else None
+        all_pool_files = [pool_file] if pool_file else []
     else:
         train_path, test_path, pool_file = resolve_dataset_paths(input_dir)
+        all_pool_files = resolve_all_pool_files(input_dir)
 
     print(f"[Pipeline] Startup: is_smoke={is_smoke}")
-    print(f"[Pipeline] Paths: train={train_path}, test={test_path}, pool={pool_file}")
+    print(f"[Pipeline] Paths: train={train_path}, test={test_path}, pool={pool_file}, all_pools={len(all_pool_files)}")
 
     df_test = pd.read_csv(test_path)
     test_ids = df_test["id"]
@@ -108,7 +111,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         print("[Pipeline] Module 1: Executing run_lexical_engine directly...")
         tok_paths = list(input_dir.rglob("vocab.json"))
         qwen_tok_dir = str(tok_paths[0].parent) if tok_paths else ""
-        lex_out = run_lexical_engine(train_path, test_path, pool_file, qwen_tok_dir, working_dir)
+        lex_out = run_lexical_engine(train_path, test_path, all_pool_files or pool_file, qwen_tok_dir, working_dir)
         log_p_svc_main = lex_out["log_p_svc_main"]
         p_lex_comp = lex_out["p_lex_comp"]
         D_tfidf = lex_out["D_tfidf"]
@@ -190,7 +193,6 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     if has_neural:
         import torch
-        from safetensors.torch import load_file
 
         df_tr = pd.read_csv(train_path)
         rng = np.random.RandomState(42)
@@ -213,7 +215,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 1: Qwen3-14B (40 layers, hidden=5120)
         # ==============================================================================
         base_q3_14b = find_base_model(input_dir, "qwen3", 5120, 40)
-        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_p1" in ckpts):
+        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_p1" in ckpts or "qwen3_14b_ts" in ckpts):
             print(f"[Pipeline] Loading Trunk 1: Qwen3-14B from {base_q3_14b}...")
             trunk1 = UniversalLoRATrunkLoader(base_q3_14b, keep_layers=27, layers=[2, 4, 6, 9, 13, 17, 22, 27], max_len=447)
 
@@ -224,7 +226,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 trunk1.set_active_layers(meta_p2["layers"], meta_p2["max_len"])
                 backup_t1 = trunk1.snapshot_weights(p2_dir)
                 merge_lora(trunk1.model, p2_dir, sign=+1.0)
-                heads_sd = load_file(str(p2_dir / "heads.safetensors")) if (p2_dir / "heads.safetensors").exists() else {}
+                heads_sd = load_head_file(p2_dir)
                 trunk1.load_norm_weights(heads_sd)
                 W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
                 p2_labels = meta_p2["labels"]
@@ -272,8 +274,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 p1_dir = ckpts["qwen3_14b_p1"]
                 meta_p1 = read_checkpoint_meta(p1_dir, default_keep=24, default_layers=[2, 4, 6, 9, 13, 17, 21, 24], default_max_len=447)
                 trunk1.set_active_layers(meta_p1["layers"], meta_p1["max_len"])
+                backup_t1_p1 = trunk1.snapshot_weights(p1_dir)
                 merge_lora(trunk1.model, p1_dir, sign=+1.0)
-                heads_sd = load_file(str(p1_dir / "heads.safetensors")) if (p1_dir / "heads.safetensors").exists() else {}
+                heads_sd = load_head_file(p1_dir)
                 trunk1.load_norm_weights(heads_sd)
                 W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
                 p1_labels = meta_p1["labels"]
@@ -303,8 +306,51 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
 
-                merge_lora(trunk1.model, p1_dir, sign=-1.0)
-                del Z_all, Z_tr, Z_te, heads_sd, res_p1, U_te
+                trunk1.restore_weights(backup_t1_p1)
+                del backup_t1_p1, Z_all, Z_tr, Z_te, heads_sd, res_p1, U_te
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # Checkpoint 1C: Two-Stage LoRA24 (qwen3_14b_ts / q14v5)
+            if "qwen3_14b_ts" in ckpts:
+                ts14_dir = ckpts["qwen3_14b_ts"]
+                meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
+                trunk1.set_active_layers(meta_ts14["layers"], meta_ts14["max_len"])
+                backup_t1_ts = trunk1.snapshot_weights(ts14_dir)
+                merge_lora(trunk1.model, ts14_dir, sign=+1.0)
+                heads_sd = load_head_file(ts14_dir)
+                trunk1.load_norm_weights(heads_sd)
+                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+                ts14_labels = meta_ts14["labels"]
+
+                Z_all = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
+                update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_ts", 0.50))
+
+                w_comp_p = comp_members.get("qwen3_14b_ts", {}).get("plain_weight", 0.20)
+                w_comp_c = comp_members.get("qwen3_14b_ts", {}).get("twin_weight", 0.08)
+                if W_p is not None:
+                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels))
+                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                if W_c is not None:
+                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
+                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
+                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
+                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+
+                res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_ts", 0.25))
+                U_te = transform_lowram(Z_te, res_ts14)
+                lp_dp = scores_exact_dp(U_te, groups_065, res_ts14, D_hybrid)
+                dp_posteriors.append((dp_weights.get("q3_14b_ts", 0.10), softmax(lp_dp, axis=1)))
+
+                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, prior_scales.get("qwen3_14b_ts", 0.50))
+                spectral_blocks_tr.append(S_tr)
+                spectral_blocks_te.append(S_te)
+
+                trunk1.restore_weights(backup_t1_ts)
+                del backup_t1_ts, Z_all, Z_tr, Z_te, heads_sd, res_ts14, U_te
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -325,7 +371,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             meta_q25 = read_checkpoint_meta(p2_dir, default_keep=32, default_layers=[3, 5, 8, 11, 16, 21, 27, 32], default_max_len=447)
             trunk2 = UniversalLoRATrunkLoader(base_q25_14b, keep_layers=meta_q25["keep"], layers=meta_q25["layers"], max_len=meta_q25["max_len"])
             merge_lora(trunk2.model, p2_dir, sign=+1.0)
-            heads_sd = load_file(str(p2_dir / "heads.safetensors")) if (p2_dir / "heads.safetensors").exists() else {}
+            heads_sd = load_head_file(p2_dir)
             trunk2.load_norm_weights(heads_sd)
             W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
             p2_labels = meta_q25["labels"]
@@ -370,7 +416,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 3: Qwen3-8B (36 layers, hidden=4096)
         # ==============================================================================
         base_q3_8b = find_base_model(input_dir, "qwen3", 4096, 36)
-        if base_q3_8b and ("instyle" in ckpts or "qwen3_8b_claude" in ckpts):
+        if base_q3_8b and ("instyle" in ckpts or "qwen3_8b_claude" in ckpts or "qwen3_8b_ts" in ckpts):
             print(f"[Pipeline] Loading Trunk 3: Qwen3-8B from {base_q3_8b}...")
             trunk3 = UniversalLoRATrunkLoader(base_q3_8b, keep_layers=24, layers=[2, 4, 6, 8, 12, 16, 20, 24], max_len=447)
 
@@ -381,7 +427,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 trunk3.set_active_layers(meta_ins["layers"], meta_ins["max_len"])
                 backup_t3 = trunk3.snapshot_weights(instyle_dir)
                 merge_lora(trunk3.model, instyle_dir, sign=+1.0)
-                heads_sd = load_file(str(instyle_dir / "heads.safetensors")) if (instyle_dir / "heads.safetensors").exists() else {}
+                heads_sd = load_head_file(instyle_dir)
                 trunk3.load_norm_weights(heads_sd)
                 W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
 
@@ -417,6 +463,49 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+            # Two-Stage LoRA24 (qwen3_8b_ts / l24x_q3b8 / ts8_s7)
+            if "qwen3_8b_ts" in ckpts:
+                ts8_dir = ckpts["qwen3_8b_ts"]
+                meta_ts8 = read_checkpoint_meta(ts8_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
+                trunk3.set_active_layers(meta_ts8["layers"], meta_ts8["max_len"])
+                backup_t3_ts = trunk3.snapshot_weights(ts8_dir)
+                merge_lora(trunk3.model, ts8_dir, sign=+1.0)
+                heads_sd = load_head_file(ts8_dir)
+                trunk3.load_norm_weights(heads_sd)
+                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+                ts8_labels = meta_ts8["labels"]
+
+                Z_all = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
+                update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_ts", 0.40))
+
+                w_comp_p = comp_members.get("qwen3_8b_ts", {}).get("plain_weight", 0.20)
+                w_comp_c = comp_members.get("qwen3_8b_ts", {}).get("twin_weight", 0.08)
+                if W_p is not None:
+                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels))
+                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                if W_c is not None:
+                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
+                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
+                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
+                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+
+                res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_ts", 0.35))
+                U_te = transform_lowram(Z_te, res_ts8)
+                lp_dp = scores_exact_dp(U_te, groups_065, res_ts8, D_hybrid)
+                dp_posteriors.append((dp_weights.get("q3_8b_ts", 0.10), softmax(lp_dp, axis=1)))
+
+                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, prior_scales.get("qwen3_8b_ts", 0.40))
+                spectral_blocks_tr.append(S_tr)
+                spectral_blocks_te.append(S_te)
+
+                trunk3.restore_weights(backup_t3_ts)
+                del backup_t3_ts, Z_all, Z_tr, Z_te, heads_sd, res_ts8, U_te
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             # Claude Head LoRA
             if "qwen3_8b_claude" in ckpts:
                 claude_dir = ckpts["qwen3_8b_claude"]
@@ -424,9 +513,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 trunk3.set_active_layers(meta_cl["layers"], meta_cl["max_len"])
                 merge_lora(trunk3.model, claude_dir, sign=+1.0)
 
-                heads_file = claude_dir / "heads.safetensors"
-                if heads_file.exists():
-                    trunk3.load_norm_weights(load_file(str(heads_file)))
+                heads_sd_cl = load_head_file(claude_dir)
+                if heads_sd_cl:
+                    trunk3.load_norm_weights(heads_sd_cl)
 
                 W_p, b_p, W_c, b_c = None, None, None, None
                 readouts_file = claude_dir / "readouts.npz"
@@ -440,8 +529,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         if wk in rnpz and bk in rnpz and rnpz[wk].shape[0] == 18:
                             W_c, b_c = rnpz[wk], rnpz[bk]
                             break
-                if W_p is None and heads_file.exists():
-                    cand_W, cand_b, cand_Wc, cand_bc = resolve_head_tensors(load_file(str(heads_file)))
+                if W_p is None and heads_sd_cl:
+                    cand_W, cand_b, cand_Wc, cand_bc = resolve_head_tensors(heads_sd_cl)
                     if cand_W is not None and cand_W.shape[0] == 18:
                         W_p, b_p = cand_W, cand_b
                         if cand_Wc is not None and cand_Wc.shape[0] == 18:
@@ -458,7 +547,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if W_spec is None:
                     spec_file = claude_dir / "claude_head.safetensors"
                     if spec_file.exists():
-                        ch_sd = load_file(str(spec_file))
+                        ch_sd = load_head_file(spec_file)
                         for wk, bk in [("weight", "bias"), ("plain.weight", "plain.bias")]:
                             if wk in ch_sd and ch_sd[wk].shape[0] == 5:
                                 W_spec = ch_sd[wk].cpu().numpy()
