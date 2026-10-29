@@ -15,6 +15,8 @@ import importlib.util
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any, Iterator
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # Neutralize Kaggle's incompatible pre-installed torchao (<0.16.0) across all libraries
 _orig_find_spec = importlib.util.find_spec
 def _safe_find_spec(name, *args, **kwargs):
@@ -90,13 +92,21 @@ class MultiLayerLoRAClassifier(nn.Module):
             m[:, 0] = 0.0
         den = m.sum(dim=1, keepdim=True).clamp(min=1e-5)
 
+        first_device = input_ids.device
         pooled_list = []
         for idx, l in enumerate(self.layers):
             h = hidden_states[l].float()
+            layer_dev = h.device
+            m_l = m.to(layer_dev)
+            den_l = den.to(layer_dev)
             h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
-            pooled = (h * m.unsqueeze(-1)).sum(dim=1) / den
-            normed = self.norms[idx](pooled)
-            pooled_list.append(normed)
+            pooled = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
+            norm = self.norms[idx]
+            if next(norm.parameters()).device != layer_dev:
+                norm = norm.to(layer_dev)
+                self.norms[idx] = norm
+            normed = norm(pooled)
+            pooled_list.append(normed.to(first_device))
 
         return torch.cat(pooled_list, dim=-1)
 
@@ -107,6 +117,11 @@ class MultiLayerLoRAClassifier(nn.Module):
         drop_first_token: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         Z = self.forward_features(input_ids, attention_mask, drop_first_token=drop_first_token)
+        first_dev = Z.device
+        if next(self.plain_head.parameters()).device != first_dev:
+            self.plain_head = self.plain_head.to(first_dev)
+        if next(self.centered_head.parameters()).device != first_dev:
+            self.centered_head = self.centered_head.to(first_dev)
         logits_plain = self.plain_head(Z)
         logits_centered = self.centered_head(Z)
         return Z, logits_plain, logits_centered
@@ -122,8 +137,14 @@ def compute_two_stage_loss(
     Computes joint plain cross-entropy and within-prompt contrastive centered loss:
     L = L_plain + centered_weight * L_centered
     """
+    dev = Z.device
+    if next(model.plain_head.parameters()).device != dev:
+        model.plain_head = model.plain_head.to(dev)
+    if next(model.centered_head.parameters()).device != dev:
+        model.centered_head = model.centered_head.to(dev)
+
     logits_plain = model.plain_head(Z)
-    loss_plain = F.cross_entropy(logits_plain, labels)
+    loss_plain = F.cross_entropy(logits_plain, labels.to(dev))
 
     if prompt_ids is None or centered_weight <= 0.0:
         return loss_plain, loss_plain, None
@@ -133,14 +154,14 @@ def compute_two_stage_loss(
     prompt_arr = np.array(prompt_ids)
     unique_prompts = list(dict.fromkeys(prompt_ids))
     for p in unique_prompts:
-        mask = torch.tensor(prompt_arr == p, device=Z.device, dtype=torch.bool)
+        mask = torch.tensor(prompt_arr == p, device=dev, dtype=torch.bool)
         if mask.sum() > 1:
             Z_c[mask] = Z[mask] - Z[mask].mean(dim=0, keepdim=True)
         else:
             Z_c[mask] = Z[mask] - Z[mask]
 
     logits_centered = model.centered_head(Z_c)
-    loss_centered = F.cross_entropy(logits_centered, labels)
+    loss_centered = F.cross_entropy(logits_centered, labels.to(dev))
     total_loss = loss_plain + float(centered_weight) * loss_centered
     return total_loss, loss_plain, loss_centered
 
@@ -327,8 +348,9 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
             local_base = find_base_model(input_dir, "qwen3", 5120, 40)
     model_source = str(local_base) if local_base else backbone_name
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Trainer] Device: {device}, Model Source: {model_source}, Keep: {keep_layers}")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    n_gpus = torch.cuda.device_count()
+    print(f"[Trainer] Device: {device}, Available GPUs: {n_gpus}, Model Source: {model_source}, Keep: {keep_layers}")
 
     train_path, test_path, pool_file = resolve_dataset_paths(input_dir if input_dir.exists() else Path("."))
     all_pools = resolve_all_pool_files(input_dir if input_dir.exists() else Path("."))
@@ -340,13 +362,32 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     base_cfg = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
     base_cfg.num_hidden_layers = keep_layers
 
-    base_model = AutoModel.from_pretrained(
-        model_source,
-        config=base_cfg,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True
-    )
+    # Multi-GPU 2xT4 memory balancing: balance across both GPUs so GPU 0 has plenty of headroom
+    if n_gpus >= 2:
+        max_memory = {i: "9.0GiB" for i in range(n_gpus)}
+        base_model = AutoModel.from_pretrained(
+            model_source,
+            config=base_cfg,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            max_memory=max_memory,
+            trust_remote_code=True
+        )
+    elif n_gpus == 1:
+        base_model = AutoModel.from_pretrained(
+            model_source,
+            config=base_cfg,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+    else:
+        base_model = AutoModel.from_pretrained(
+            model_source,
+            config=base_cfg,
+            torch_dtype=torch.float32,
+            trust_remote_code=True
+        )
 
     try:
         import peft.import_utils
@@ -355,6 +396,9 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         peft.tuners.lora.torchao.is_torchao_available = lambda: False
     except Exception:
         pass
+
+    if hasattr(base_model, "enable_input_require_grads"):
+        base_model.enable_input_require_grads()
 
     lora_cfg = LoraConfig(
         r=int(train_cfg.get("lora_r", 16)),
@@ -365,7 +409,19 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         task_type="FEATURE_EXTRACTION"
     )
     base_model = get_peft_model(base_model, lora_cfg)
-    model = MultiLayerLoRAClassifier(base_model, hidden_size=base_cfg.hidden_size, layers=layers, num_classes=K).to(device)
+
+    if hasattr(base_model, "gradient_checkpointing_enable"):
+        base_model.gradient_checkpointing_enable()
+
+    model = MultiLayerLoRAClassifier(base_model, hidden_size=base_cfg.hidden_size, layers=layers, num_classes=K)
+    # If device_map was used, do NOT call model.to() as it overrides device_map onto a single GPU
+    if hasattr(base_model, "hf_device_map") and len(getattr(base_model, "hf_device_map", {})) > 1:
+        model.plain_head = model.plain_head.to(device)
+        model.centered_head = model.centered_head.to(device)
+        for idx in range(len(model.norms)):
+            model.norms[idx] = model.norms[idx].to(device)
+    else:
+        model = model.to(device)
 
     # Stage 1: Pool Pretraining
     stage1_cfg = train_cfg.get("stage1", {})
@@ -378,31 +434,42 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         if len(df_p) > max_s:
             df_p = df_p.iloc[:max_s]
 
+        bs1 = int(stage1_cfg.get("batch_size", 4))
+        accum1 = int(stage1_cfg.get("gradient_accumulation_steps", 2))
         ds1 = TextSequenceDataset(df_p["text"].tolist(), [LAB2I[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id)
-        loader1 = DataLoader(ds1, batch_size=int(stage1_cfg.get("batch_size", 8)), shuffle=True, collate_fn=collate_text_batch)
+        loader1 = DataLoader(ds1, batch_size=bs1, shuffle=True, collate_fn=collate_text_batch)
 
         opt1 = torch.optim.AdamW([
             {"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": float(stage1_cfg.get("lr_lora", 2e-4))},
             {"params": list(model.norms.parameters()) + list(model.plain_head.parameters()), "lr": float(stage1_cfg.get("lr_head", 1e-3))}
         ], weight_decay=float(train_cfg.get("weight_decay", 0.01)))
-        sched1 = get_cosine_schedule_with_warmup(opt1, num_warmup_steps=int(stage1_cfg.get("warmup_steps", 100)), num_training_steps=len(loader1))
+        sched1 = get_cosine_schedule_with_warmup(opt1, num_warmup_steps=int(stage1_cfg.get("warmup_steps", 100)), num_training_steps=math.ceil(len(loader1) / accum1))
 
         model.train()
-        for batch in loader1:
-            opt1.zero_grad()
+        opt1.zero_grad()
+        for step_idx, batch in enumerate(loader1):
             _, logits_p, _ = model(batch["input_ids"].to(device), batch["attention_mask"].to(device))
-            loss = F.cross_entropy(logits_p, batch["labels"].to(device))
+            loss = F.cross_entropy(logits_p, batch["labels"].to(device)) / accum1
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt1.step()
-            sched1.step()
+            if (step_idx + 1) % accum1 == 0 or (step_idx + 1) == len(loader1):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt1.step()
+                sched1.step()
+                opt1.zero_grad()
+
+        del ds1, loader1, opt1, sched1, df_p
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Stage 2: Prompt-Grouped Fine-Tuning on train.csv
     stage2_cfg = train_cfg.get("stage2", {})
     df_tr = pd.read_csv(train_path)
     print(f"[Trainer] Stage 2 Fine-Tuning on {train_path} ({len(df_tr)} samples)...")
+    bs2 = int(stage2_cfg.get("batch_size", 2))
+    accum2 = int(stage2_cfg.get("gradient_accumulation_steps", 2))
     ds2 = TextSequenceDataset(df_tr["text"].tolist(), [LAB2I[m] for m in df_tr["model"]], df_tr["prompt_id"].tolist(), tok, max_len=max_len, end_id=end_id)
-    sampler2 = PromptGroupBatchSampler(df_tr["prompt_id"].tolist(), batch_size=int(stage2_cfg.get("batch_size", 4)), shuffle=True)
+    sampler2 = PromptGroupBatchSampler(df_tr["prompt_id"].tolist(), batch_size=bs2, shuffle=True)
     loader2 = DataLoader(ds2, batch_sampler=sampler2, collate_fn=collate_text_batch)
 
     opt2 = torch.optim.AdamW([
@@ -410,27 +477,36 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         {"params": list(model.norms.parameters()) + list(model.plain_head.parameters()) + list(model.centered_head.parameters()), "lr": float(stage2_cfg.get("lr_head", 3e-4))}
     ], weight_decay=float(train_cfg.get("weight_decay", 0.01)))
     epochs2 = int(stage2_cfg.get("epochs", 2))
-    sched2 = get_cosine_schedule_with_warmup(opt2, num_warmup_steps=int(stage2_cfg.get("warmup_steps", 50)), num_training_steps=len(loader2) * epochs2)
+    total_steps2 = math.ceil(len(loader2) / accum2) * epochs2
+    sched2 = get_cosine_schedule_with_warmup(opt2, num_warmup_steps=int(stage2_cfg.get("warmup_steps", 50)), num_training_steps=total_steps2)
 
     model.train()
     for ep in range(epochs2):
         sampler2.set_epoch(ep)
-        for batch in loader2:
-            opt2.zero_grad()
+        opt2.zero_grad()
+        for step_idx, batch in enumerate(loader2):
             Z = model.forward_features(batch["input_ids"].to(device), batch["attention_mask"].to(device))
             tot_loss, _, _ = compute_two_stage_loss(
                 model, Z, batch["labels"].to(device),
                 prompt_ids=batch.get("prompt_ids"),
                 centered_weight=float(stage2_cfg.get("centered_weight", 0.5))
             )
-            tot_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt2.step()
-            sched2.step()
+            loss = tot_loss / accum2
+            loss.backward()
+            if (step_idx + 1) % accum2 == 0 or (step_idx + 1) == len(loader2):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt2.step()
+                sched2.step()
+                opt2.zero_grad()
 
     # Feature extraction for wPCA bank
+    del loader2, opt2, sched2, sampler2
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     model.eval()
-    loader_eval = DataLoader(ds2, batch_size=8, shuffle=False, collate_fn=collate_text_batch)
+    loader_eval = DataLoader(ds2, batch_size=4, shuffle=False, collate_fn=collate_text_batch)
     Z_list = []
     with torch.no_grad():
         for batch in loader_eval:

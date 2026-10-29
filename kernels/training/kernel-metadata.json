@@ -9,7 +9,9 @@
   "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "willrice/name-that-llm-openrouter-harvest"
+    "willrice/name-that-llm-openrouter-harvest",
+    "nishantdahal/ntl-two-stage-lora",
+    "dhruvtibarewal/nlm-matched-clean"
   ],
   "competition_sources": [
     "name-that-llm"

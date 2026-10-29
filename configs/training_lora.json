@@ -5,7 +5,7 @@
   "backbone": "Qwen/Qwen3-8B-Base",
   "keep_layers": 24,
   "layers": [2, 4, 6, 8, 12, 16, 20, 24],
-  "max_len": 447,
+  "max_len": 384,
   "end_id": 151643,
   "lora_r": 16,
   "lora_alpha": 32,
@@ -18,7 +18,8 @@
     "enabled": true,
     "lr_lora": 2e-4,
     "lr_head": 1e-3,
-    "batch_size": 8,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 2,
     "epochs": 1,
     "max_samples": 20000,
     "warmup_steps": 100
@@ -27,7 +28,8 @@
     "enabled": true,
     "lr_lora": 5e-5,
     "lr_head": 3e-4,
-    "batch_size": 4,
+    "batch_size": 2,
+    "gradient_accumulation_steps": 2,
     "epochs": 2,
     "centered_weight": 0.5,
     "warmup_steps": 50
@@ -35,4 +37,3 @@
   "weight_decay": 0.01,
   "output_dir": "export_lora24"
 }
-

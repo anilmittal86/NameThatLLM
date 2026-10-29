@@ -48,11 +48,12 @@ def _build_notebook(cells_code: List[str], output_path: Path) -> Path:
             {
                 "cell_type": "code",
                 "execution_count": None,
+                "id": f"cell_{idx}",
                 "metadata": {},
                 "outputs": [],
                 "source": [line + "\n" for line in code.splitlines()]
             }
-            for code in cells_code
+            for idx, code in enumerate(cells_code)
         ],
         "metadata": {
             "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
