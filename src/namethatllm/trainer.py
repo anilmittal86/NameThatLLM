@@ -11,8 +11,17 @@ import gc
 import json
 import math
 import time
+import importlib.util
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any, Iterator
+
+# Neutralize Kaggle's incompatible pre-installed torchao (<0.16.0) across all libraries
+_orig_find_spec = importlib.util.find_spec
+def _safe_find_spec(name, *args, **kwargs):
+    if name == "torchao":
+        return None
+    return _orig_find_spec(name, *args, **kwargs)
+importlib.util.find_spec = _safe_find_spec
 
 import numpy as np
 import pandas as pd
@@ -341,7 +350,9 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
 
     try:
         import peft.import_utils
+        import peft.tuners.lora.torchao
         peft.import_utils.is_torchao_available = lambda: False
+        peft.tuners.lora.torchao.is_torchao_available = lambda: False
     except Exception:
         pass
 
