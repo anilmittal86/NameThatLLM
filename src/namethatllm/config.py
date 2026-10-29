@@ -180,3 +180,81 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
                 break
 
     return ckpts
+
+def validate_production_assets(
+    input_dir: Path,
+    train_path: Path,
+    test_path: Path,
+    pool_files: List[Path],
+    ckpts: Dict[str, Path],
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Path]:
+    """
+    Fail-closed pre-flight validation for production inference runs (when NTL_SMOKE != '1').
+    Raises FileNotFoundError immediately at startup if any required dataset, pool parquet,
+    base model trunk, or checkpoint is missing.
+    Returns a dict of verified base_model paths keyed by name.
+    """
+    if cfg is None:
+        cfg = {}
+    req = cfg.get("required_assets", {})
+    missing: List[str] = []
+
+    # 1. Verify competition CSVs
+    if not train_path or not Path(train_path).exists():
+        missing.append(f"Competition train.csv not found at: {train_path}")
+    if not test_path or not Path(test_path).exists():
+        missing.append(f"Competition test.csv not found at: {test_path}")
+
+    # 2. Verify public pool parquet(s)
+    require_pool = req.get("require_pool_parquet", True)
+    valid_pools = [p for p in pool_files if p is not None and Path(p).exists()]
+    if require_pool and len(valid_pools) == 0:
+        missing.append(f"No public pool parquet (pool_v4.parquet / nlm_pool_v5.parquet) found under {input_dir}")
+
+    # 3. Verify all required base model trunks
+    default_bases = [
+        {"name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40},
+        {"name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48},
+        {"name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36},
+        {"name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24},
+    ]
+    base_specs = req.get("required_base_models", default_bases)
+    verified_bases: Dict[str, Path] = {}
+    for b_spec in base_specs:
+        b_path = find_base_model(
+            input_dir,
+            b_spec["family"],
+            int(b_spec["hidden_size"]),
+            int(b_spec["num_layers"]),
+        )
+        if b_path is None or not Path(b_path).exists():
+            missing.append(
+                f"Required base model '{b_spec['name']}' (family={b_spec['family']}, "
+                f"hidden={b_spec['hidden_size']}, layers={b_spec['num_layers']}) not found under {input_dir}"
+            )
+        else:
+            verified_bases[b_spec["name"]] = b_path
+
+    # 4. Verify all required fine-tuned checkpoints
+    default_req_ckpts = [
+        "qwen3_14b_p2", "qwen3_14b_p1", "qwen25_14b_p2",
+        "deberta_p2", "instyle", "qwen3_8b_claude"
+    ]
+    req_ckpts = req.get("required_checkpoints", default_req_ckpts)
+    for ck_name in req_ckpts:
+        if ck_name not in ckpts or not Path(ckpts[ck_name]).exists():
+            missing.append(f"Required checkpoint '{ck_name}' not found under {input_dir} (discovered: {list(ckpts.keys())})")
+
+    if missing:
+        error_msg = (
+            "[PRE-FLIGHT ASSET AUDIT FAILED] Missing required inference assets:\n  - "
+            + "\n  - ".join(missing)
+        )
+        raise FileNotFoundError(error_msg)
+
+    print(
+        f"[Pre-Flight Audit PASSED] Verified {len(valid_pools)} pool file(s), "
+        f"{len(verified_bases)} base trunks, and {len(ckpts)} checkpoints: {list(ckpts.keys())}"
+    )
+    return verified_bases

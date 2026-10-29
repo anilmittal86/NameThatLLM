@@ -198,6 +198,9 @@ class TestCompilerAndIntegration(unittest.TestCase):
             test_csv = tmp_path / "test.csv"
             df_test.to_csv(test_csv, index=False)
 
+            # 2B. Synthesize public pool parquet
+            pd.DataFrame({"text": ["Pool text sample"] * 10}).to_parquet(input_dir / "pool_v4.parquet")
+
             # 3. Create mock base model directories with config.json
             base_q3_14b = input_dir / "base_qwen3_14b"
             base_q3_14b.mkdir(parents=True, exist_ok=True)
@@ -392,6 +395,100 @@ class TestCompilerAndIntegration(unittest.TestCase):
             self.assertEqual(len(pools), 2)
             self.assertEqual(pools[0].name, "nlm_pool_v5.parquet")
             self.assertEqual(pools[1].name, "pool_v4.parquet")
+
+    def test_preflight_validation_raises_on_missing_assets_when_not_smoke(self):
+        """Pre-flight asset validation fails closed immediately when NTL_SMOKE=0 and assets are missing."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            train_p = tmp / "train.csv"
+            test_p = tmp / "test.csv"
+            pd.DataFrame({"id": [1], "prompt_id": [1], "model": [LABELS[0]], "text": ["hello"]}).to_csv(train_p, index=False)
+            pd.DataFrame({"id": [2], "prompt_id": [2], "text": ["world"]}).to_csv(test_p, index=False)
+
+            cfg = {
+                "train_path": str(train_p),
+                "test_path": str(test_p),
+                "working_dir": str(tmp / "working"),
+                "input_dir": str(tmp / "input"),
+            }
+            (tmp / "input").mkdir(parents=True, exist_ok=True)
+            (tmp / "working").mkdir(parents=True, exist_ok=True)
+
+            os.environ["NTL_SMOKE"] = "0"
+            try:
+                with self.assertRaises(FileNotFoundError) as ctx:
+                    run_submission_pipeline(cfg)
+                err_str = str(ctx.exception)
+                self.assertIn("PRE-FLIGHT ASSET AUDIT FAILED", err_str)
+                self.assertIn("No public pool parquet", err_str)
+                self.assertIn("Required base model 'qwen3_14b'", err_str)
+                self.assertIn("Required checkpoint 'qwen3_14b_p2'", err_str)
+            finally:
+                os.environ.pop("NTL_SMOKE", None)
+
+    def test_preflight_validation_passes_when_all_required_assets_present(self):
+        """Pre-flight asset validation succeeds when all required base trunks, checkpoints, and pools exist."""
+        from namethatllm.config import validate_production_assets
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            train_p = tmp / "train.csv"
+            test_p = tmp / "test.csv"
+            pool_p = tmp / "pool_v4.parquet"
+            pd.DataFrame({"id": [1], "prompt_id": [1], "model": [LABELS[0]], "text": ["hello"]}).to_csv(train_p, index=False)
+            pd.DataFrame({"id": [2], "prompt_id": [2], "text": ["world"]}).to_csv(test_p, index=False)
+            pd.DataFrame({"text": ["dummy"]}).to_parquet(pool_p)
+
+            # Create 4 base models
+            b_q3_14 = tmp / "q3_14"
+            b_q3_14.mkdir()
+            (b_q3_14 / "config.json").write_text(json.dumps({"model_type": "qwen3", "hidden_size": 5120, "num_hidden_layers": 40}))
+
+            b_q25_14 = tmp / "q25_14"
+            b_q25_14.mkdir()
+            (b_q25_14 / "config.json").write_text(json.dumps({"model_type": "qwen2", "hidden_size": 5120, "num_hidden_layers": 48}))
+
+            b_q3_8 = tmp / "q3_8"
+            b_q3_8.mkdir()
+            (b_q3_8 / "config.json").write_text(json.dumps({"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36}))
+
+            b_deb = tmp / "deb"
+            b_deb.mkdir()
+            (b_deb / "config.json").write_text(json.dumps({"model_type": "deberta", "hidden_size": 1024, "num_hidden_layers": 24}))
+
+            # Mock checkpoints dict
+            ckpts = {
+                "qwen3_14b_p2": tmp / "p2_14",
+                "qwen3_14b_p1": tmp / "p1_14",
+                "qwen25_14b_p2": tmp / "p2_q25",
+                "deberta_p2": tmp / "deb_p2",
+                "instyle": tmp / "instyle",
+                "qwen3_8b_claude": tmp / "cl_8b",
+            }
+            for p in ckpts.values():
+                p.mkdir()
+
+            verified_bases = validate_production_assets(
+                input_dir=tmp,
+                train_path=train_p,
+                test_path=test_p,
+                pool_files=[pool_p],
+                ckpts=ckpts,
+                cfg={"required_assets": {
+                    "require_pool_parquet": True,
+                    "required_base_models": [
+                        {"name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40},
+                        {"name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48},
+                        {"name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36},
+                        {"name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24},
+                    ],
+                    "required_checkpoints": list(ckpts.keys()),
+                }}
+            )
+            self.assertEqual(len(verified_bases), 4)
+            self.assertIn("qwen3_14b", verified_bases)
+            self.assertIn("qwen25_14b", verified_bases)
+            self.assertIn("qwen3_8b", verified_bases)
+            self.assertIn("deberta_v3_large", verified_bases)
 
 if __name__ == "__main__":
     unittest.main()
