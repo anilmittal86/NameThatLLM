@@ -20,12 +20,15 @@
     "kirilltym/ntl-spectral-style-heads-paired-4404",
     "dhruvtibarewal/nlm-l24-adapters",
     "dhruvtibarewal/nlm-l24-adapters-v5",
-    "dhruvtibarewal/nlm-matched-clean"
+    "dhruvtibarewal/nlm-matched-clean",
+    "anilmittal/ntl-inhouse-two-stage-lora24"
   ],
   "competition_sources": [
     "name-that-llm"
   ],
-  "kernel_sources": [],
+  "kernel_sources": [
+    "anilmittal/name-that-llm-lora-peft-training"
+  ],
   "model_sources": [
     "angelndevil2/deberta-v3-large/Transformers/default/1",
     "qwen-lm/qwen-3/Transformers/8b-base/1",

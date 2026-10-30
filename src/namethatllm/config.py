@@ -136,8 +136,10 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
                 ckpts['qwen3_14b_ts'] = p.parent
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
+        elif 'inhouse' in p_str or 'ntl-inhouse' in p_str or 'export_lora24' in p_str or 'lora-peft-training' in p_str or 'peft_training' in p_str:
+            ckpts['qwen3_8b_ts'] = p.parent
         elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'q8v5' in p_str or 'l24x_q3b8' in p_str or 'll8v5' in p_str:
-            if 'qwen3_8b_ts' not in ckpts or (not is_fold):
+            if 'qwen3_8b_ts' not in ckpts or ('inhouse' not in str(ckpts['qwen3_8b_ts']).lower() and 'export_lora24' not in str(ckpts['qwen3_8b_ts']).lower()):
                 ckpts['qwen3_8b_ts'] = p.parent
         elif 'lora8b_v1' in p_str:
             ckpts['qwen3_8b_p1'] = p.parent
