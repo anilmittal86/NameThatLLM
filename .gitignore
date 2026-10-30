@@ -15,6 +15,7 @@ venv/
 local_data/
 artifacts/
 output/
+output_*/
 cache/
 checkpoints/
 scratch/

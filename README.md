@@ -4,7 +4,7 @@
 [![Codebase Architecture](https://img.shields.io/badge/Architecture-Modular%20PyPA%20Package-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
 [![In-House Checkpoint](https://img.shields.io/badge/In--House%20LoRA24-73.19%25%20Validation%20BAcc-brightgreen)](https://www.kaggle.com/datasets/anilmittal/ntl-inhouse-two-stage-lora24)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-37%20Passed-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-41%20Passed-brightgreen)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
 A competition-grade, memory-isolated machine learning solution for the **Kaggle "Name That LLM"** competition. The objective is to identify which of 18 specific Large Language Models authored an unattributed response passage.
@@ -56,7 +56,26 @@ The production system operates as a **two-tier, memory-isolated ensemble** combi
 
 ---
 
-## 2. The 18 Target Models Across Families
+## 2. Step-by-Step Cumulative Accuracy Lift (Building to 0.622 SOTA)
+
+The production pipeline achieves **0.622 Balanced Accuracy** on the public leaderboard through the cumulative synthesis of 9 distinct algorithmic and structural layers:
+
+| Step | Component / Layer Added | Exact Function & Mathematical Role | Marginal Lift ($\Delta \text{BAcc}$) | Cumulative Score |
+| :---: | :--- | :--- | :---: | :---: |
+| **—** | **Random Guess Baseline** | Uniform random selection across 18 classes ($1/18$) | — | **0.0556** (5.56%) |
+| **1** | **Primary Causal Trunk**<br>`Qwen3-14B Part-2` | 8-layer multi-layer pooled causal hidden states ($D = 40,960$) with LayerNorm linear classification head. Anchor deep representation. | **+0.4638**<br>*(Solo Baseline)* | **0.5194** (51.94%) |
+| **2** | **Surface Stylometric Baseline**<br>`4-View LinearSVC` | 4-view word, char, shape, and function word n-grams ($C=0.50$). Captures exact punctuation habits and uppercase frequency. | **+0.0445** | **0.5639** (56.39%) |
+| **3** | **Subword Lexical Ensemble**<br>`5-View Lexical Comp` | Complementary SGDClassifier with Byte-Pair Encoding (BPE) subword and character n-grams. Provides complementary surface view. | **+0.0028** | **0.5667** (56.67%) |
+| **4** | **Secondary Causal & Bidirectional Trunks**<br>`Qwen2.5-14B` & `DeBERTa-v3` | Injects distinct Qwen2.5 pretraining representation and DeBERTa-v3 bidirectional masked context using Ledoit-Wolf covariance floors. | **+0.0090** | **0.5757** (57.57%) |
+| **5** | **Multi-Resolution Centered Twins**<br>`W_c, b_c` ($t = 0.85, 0.72, 0.60$) | Subtracts prompt topic centroids ($z_i - \mu_{\text{prompt}}$) across hierarchical cluster resolutions. Strips away topic semantics, leaving pure author style. | **+0.0120** | **0.5877** (58.77%) |
+| **6** | **384D Joint Spectral Bank**<br>`fit_joint_spectral_bank` | Combines top-64 unsupervised PCA eigenvectors across all 3 neural trunks into a low-noise manifold with Ridge meta-classifier (CV OOF = 0.6441). | **+0.0150** | **0.6027** (60.27%) |
+| **7** | **wPCA Exact $2^{18}$ Bitmask DP Solver**<br>`scores_exact_dp` | Exact forward-backward dynamic programming enforcing the competition constraint: **exactly 1 author per prompt**. Deduplicates prompt clusters. | **+0.0125** | **0.6152** (61.52%) |
+| **8** | **Unified Orthographic & Handwriting Shield**<br>`apply_unified_handwriting_shield` | Bayesian log-penalties on typographic curly quotes (rules out Claude/GLM), multiple em-dashes (rules out Gemini), and contraction patterns. | **+0.0035** | **0.6187** (61.87%) |
+| **9** | **300-Step Sinkhorn-Knopp Mass Balancing**<br>`sinkhorn_balancing` | Multiplicative dual-diagonal scaling ($P \to D_1 P D_2$) equalizing all 18 class marginal distributions to exactly $N/18$ across submission rows. | **+0.0030** | **0.6217 (~0.622)** |
+
+---
+
+## 3. The 18 Target Models Across Families
 
 ```
 1. Anthropic Claude (5):  claude-fable-5, claude-opus-4-6, claude-opus-4-8,
@@ -71,7 +90,7 @@ The production system operates as a **two-tier, memory-isolated ensemble** combi
 
 ---
 
-## 3. Current Codebase Architecture
+## 4. Current Codebase Architecture
 
 The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5 decoupled execution modules:
 
@@ -136,7 +155,7 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5
 
 ---
 
-## 4. Benchmark & Submission History
+## 5. Benchmark & Submission History
 
 | Version | Ref | Public Score | Key Architectural Advancements |
 | :---: | :---: | :---: | :--- |
@@ -153,7 +172,7 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5
 
 ---
 
-## 5. Repository Layout (PyPA `src` Layout)
+## 6. Repository Layout (PyPA `src` Layout)
 
 ```
 NameThatLLM/
@@ -182,8 +201,10 @@ NameThatLLM/
 │   ├── spectral_bank.py                 # Unsupervised 384-dim Joint Spectral Bank (0 label leakage)
 │   ├── postprocess.py                   # Two-tier blend, Claude gate, unified handwriting shield, Sinkhorn
 │   ├── trainer.py                       # Two-stage LoRA training engine, micro-batching, Ridge heads
+│   ├── ablation.py                      # Zero-leakage unseen holdout benchmark, greedy selection, LOO attribution
 │   └── pipeline.py                      # Top-level orchestrator connecting Modules 1 through 4
-└── tests/                               # Comprehensive unit and integration test suite (37 tests)
+└── tests/                               # Comprehensive unit and integration test suite (41 tests)
+    ├── test_ablation.py                 # Zero-leakage holdout benchmark, greedy selection, LOO attribution
     ├── test_compiler_and_integration.py # AST validation, compiler checks, mock-neural integration
     ├── test_lexical.py                  # Tokenizers, shape patterns, stopwords, dual lexical outputs
     ├── test_wpca_dp.py                  # Covariance shrinkage, two-way decomposition, ExactAuthorPosterior
@@ -194,7 +215,7 @@ NameThatLLM/
 
 ---
 
-## 6. Developer Quickstart
+## 7. Developer Quickstart
 
 ### 1. Installation
 Install the package locally in editable mode:
@@ -203,7 +224,7 @@ pip install -e . --no-deps
 ```
 
 ### 2. Running Unit & Integration Tests
-Run the complete 37-test suite:
+Run the complete 41-test suite:
 ```powershell
 python -m pytest tests -v
 ```
