@@ -127,8 +127,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     N_test = len(test_texts)
     print(f"[Pipeline] Loaded test set: {N_test} rows")
 
-    # Build Zero-Leakage Unseen Holdout Benchmark
-    df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=80)
+    # Build Zero-Leakage Unseen Holdout Benchmark (N_unseen = 360 rows, 4x faster on GPU)
+    df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=20)
     unseen_parquet_path = working_dir / "unseen_holdout.parquet"
     df_unseen.to_parquet(unseen_parquet_path, index=False)
     unseen_texts = df_unseen["text"].fillna("").astype(str).tolist() if len(df_unseen) > 0 else []
@@ -342,9 +342,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
 
                 if N_unseen > 0 and W_p is not None:
-                    lp_model_u = w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)
-                    lp_model_te = w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)
-                    auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=1.0, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
+                    w_tot_14b = w_main_p + (w_main_c if W_c is not None else 0.0)
+                    lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_14b)
+                    lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_14b)
+                    auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
                 # wPCA + DP Posterior + Spectral Bank
                 res_p2 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_p2", 0.10))
@@ -435,63 +436,84 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         trunk1.load_norm_weights(heads_sd)
                         W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
                         ts14_labels = meta_ts14["labels"]
+                        w_comp_p = comp_members.get(opt_14b_key, {}).get("plain_weight", 0.20)
+                        w_comp_c = comp_members.get(opt_14b_key, {}).get("twin_weight", 0.08)
 
-                        Z_all = trunk1.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
-                        Z_te = Z_all[:N_test]
-                        Z_unseen = Z_all[N_test : N_test + N_unseen]
-                        Z_tr = Z_all[N_test + N_unseen :]
+                        # Stage A: Fast 360-row probe on df_unseen
+                        if N_unseen >= 36 and W_p is not None:
+                            Z_unseen = trunk1.extract_exact(unseen_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
+                            solo_bacc = float(balanced_accuracy_score(y_unseen, lp_u_p.argmax(axis=1)))
+                            print(f"[Fast Probe] {opt_14b_key}: solo unseen BAcc = {solo_bacc:.4f}")
+
+                            if solo_bacc < 0.45:
+                                print(f"[Fast Probe Pruning] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < 0.45 -> SKIPPING 5,620-row test/train extraction!")
+                                trunk1.restore_weights(backup_t1_ts)
+                                del backup_t1_ts, heads_sd, Z_unseen
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                            if len(auditor.models) > 0:
+                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
+                                if lift < -0.001:
+                                    print(f"[Fast Probe Pruning] {opt_14b_key}: marginal lift {lift:+.4f} < -0.001 -> SKIPPING 5,620-row test/train extraction!")
+                                    trunk1.restore_weights(backup_t1_ts)
+                                    del backup_t1_ts, heads_sd, Z_unseen
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    continue
+                                print(f"[Fast Probe] {opt_14b_key}: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
+
+                            # Stage B: Extract test and train
+                            Z_te_tr = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                            Z_te = Z_te_tr[:N_test]
+                            Z_tr = Z_te_tr[N_test:]
+                            del Z_te_tr
+                        else:
+                            Z_all = trunk1.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                            Z_te = Z_all[:N_test]
+                            Z_unseen = Z_all[N_test : N_test + N_unseen]
+                            Z_tr = Z_all[N_test + N_unseen :]
+                            del Z_all
+                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels)) if (N_unseen > 0 and W_p is not None) else None
 
                         gate_passed = True
                         if not is_smoke and len(y_sub) >= 180:
                             gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts14_labels, y_sub, name=opt_14b_key, min_bacc=0.50)
 
                         if gate_passed:
-                            w_comp_p = comp_members.get(opt_14b_key, {}).get("plain_weight", 0.20)
-                            w_comp_c = comp_members.get(opt_14b_key, {}).get("twin_weight", 0.08)
                             lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
-                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels)) if (N_unseen > 0 and W_p is not None) else None
+                            pr_sc = prior_scales.get(opt_14b_key, 0.50)
+                            update_hybrid_groups(Z_te, pr_sc)
+                            if W_p is not None:
+                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                            if W_c is not None:
+                                lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
+                                lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
+                                lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
+                                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-                            # Check dead-weight pruning on strictly unseen holdout
-                            pruned = False
-                            if N_unseen > 0 and len(auditor.models) > 0 and lp_u_p is not None:
-                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
-                                if lift < -0.001:
-                                    print(f"[Ablation Pruning] {opt_14b_key}: Marginal lift on unseen holdout is {lift:+.4f} (< -0.001) -> PRUNED from ensemble.")
-                                    pruned = True
-                                else:
-                                    print(f"[Ablation Pruning] {opt_14b_key}: Marginal lift on unseen holdout is {lift:+.4f} (>= -0.001) -> KEPT in ensemble.")
+                            res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_14b_key, 0.25))
+                            U_te = transform_lowram(Z_te, res_ts14)
+                            lp_dp = scores_exact_dp(U_te, groups_065, res_ts14, D_hybrid)
+                            dp_posteriors.append((dp_weights.get(opt_14b_key, dp_weights.get("q3_14b_ts", 0.10)), softmax(lp_dp, axis=1)))
 
-                            if not pruned:
-                                pr_sc = prior_scales.get(opt_14b_key, 0.50)
-                                update_hybrid_groups(Z_te, pr_sc)
-                                if W_p is not None:
-                                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                                if W_c is not None:
-                                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
-                                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
-                                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
-                                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                            S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, pr_sc)
+                            spectral_blocks_tr.append(S_tr)
+                            spectral_blocks_te.append(S_te)
+                            del res_ts14, U_te
 
-                                res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_14b_key, 0.25))
-                                U_te = transform_lowram(Z_te, res_ts14)
-                                lp_dp = scores_exact_dp(U_te, groups_065, res_ts14, D_hybrid)
-                                dp_posteriors.append((dp_weights.get(opt_14b_key, dp_weights.get("q3_14b_ts", 0.10)), softmax(lp_dp, axis=1)))
-
-                                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, pr_sc)
-                                spectral_blocks_tr.append(S_tr)
-                                spectral_blocks_te.append(S_te)
-                                del res_ts14, U_te
-
-                                if N_unseen > 0 and lp_u_p is not None and lp_p is not None:
-                                    auditor.add_model(name=opt_14b_key, tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
-                            else:
-                                print(f"[Pipeline] Checkpoint {opt_14b_key} pruned by ablation auditor; excluded from logits and spectral bank.")
+                            if N_unseen > 0 and lp_u_p is not None and lp_p is not None:
+                                auditor.add_model(name=opt_14b_key, tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
 
                         trunk1.restore_weights(backup_t1_ts)
-                        del backup_t1_ts, Z_all, Z_tr, Z_te, heads_sd
+                        del backup_t1_ts, Z_tr, Z_te, heads_sd
                         if "Z_unseen" in locals():
                             del Z_unseen
                         gc.collect()
@@ -553,9 +575,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
 
             if N_unseen > 0 and W_p is not None:
-                lp_model_u = w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)
-                lp_model_te = w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)
-                auditor.add_model("Qwen2.5-14B Part-2", tier="Main", weight=1.0, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
+                w_tot_q25 = w_main_p + (w_main_c if W_c is not None else 0.0)
+                lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_q25)
+                lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_q25)
+                auditor.add_model("Qwen2.5-14B Part-2", tier="Main", weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
             res_q25 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen25_14b_p2", 0.10))
             U_te = transform_lowram(Z_te, res_q25)
@@ -599,39 +622,77 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     if W_p is None:
                         print(f"[Pipeline] In-Style checkpoint has no plain classification head W_p; computing density and spectral features.")
 
-                    Z_all = trunk3.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ins["end_id"])
-                    Z_te = Z_all[:N_test]
-                    Z_unseen = Z_all[N_test : N_test + N_unseen]
-                    Z_tr = Z_all[N_test + N_unseen :]
-                    update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45))
+                    w_comp_p = comp_members.get("instyle", {}).get("plain_weight", 0.22)
+                    w_comp_c = comp_members.get("instyle", {}).get("twin_weight", 0.08)
+                    instyle_pruned = False
 
-                    if W_p is not None:
-                        w_comp_p = comp_members.get("instyle", {}).get("plain_weight", 0.22)
-                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, meta_ins["labels"]))
-                        comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                        if N_unseen > 0:
-                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"]))
-                            auditor.add_model("Qwen3-8B In-Style", tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
+                    # Stage A: Fast 360-row probe on df_unseen
+                    if N_unseen >= 36 and W_p is not None:
+                        Z_unseen = trunk3.extract_exact(unseen_texts, batch_size=8, end_id=meta_ins["end_id"])
+                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"]))
+                        solo_bacc = float(balanced_accuracy_score(y_unseen, lp_u_p.argmax(axis=1)))
+                        print(f"[Fast Probe] instyle: solo unseen BAcc = {solo_bacc:.4f}")
 
-                    if W_c is not None:
-                        lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, meta_ins["labels"])
-                        lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, meta_ins["labels"])
-                        lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, meta_ins["labels"])
-                        lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                        w_comp_c = comp_members.get("instyle", {}).get("twin_weight", 0.08)
-                        comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                        if solo_bacc < 0.45:
+                            print(f"[Fast Probe Pruning] instyle: solo BAcc {solo_bacc:.4f} < 0.45 -> SKIPPING full extraction!")
+                            instyle_pruned = True
+                        elif len(auditor.models) > 0:
+                            lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
+                            if lift < -0.001:
+                                print(f"[Fast Probe Pruning] instyle: marginal lift {lift:+.4f} < -0.001 -> SKIPPING full extraction!")
+                                instyle_pruned = True
+                            else:
+                                print(f"[Fast Probe] instyle: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
 
-                    res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
-                    U_te = transform_lowram(Z_te, res_ins)
-                    lp_dp = scores_exact_dp(U_te, groups_065, res_ins, D_hybrid)
-                    dp_posteriors.append((dp_weights.get("instyle", 0.10), softmax(lp_dp, axis=1)))
+                        if not instyle_pruned:
+                            # Stage B: Extract test and train
+                            Z_te_tr = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ins["end_id"])
+                            Z_te = Z_te_tr[:N_test]
+                            Z_tr = Z_te_tr[N_test:]
+                            del Z_te_tr
+                    else:
+                        Z_all = trunk3.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ins["end_id"])
+                        Z_te = Z_all[:N_test]
+                        Z_unseen = Z_all[N_test : N_test + N_unseen]
+                        Z_tr = Z_all[N_test + N_unseen :]
+                        del Z_all
+                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"])) if (N_unseen > 0 and W_p is not None) else None
 
-                    S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ins, prior_scales.get("instyle", 0.45))
-                    spectral_blocks_tr.append(S_tr)
-                    spectral_blocks_te.append(S_te)
+                    if not instyle_pruned:
+                        update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45))
+
+                        if W_p is not None:
+                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, meta_ins["labels"]))
+                            comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                            if N_unseen > 0 and lp_u_p is not None:
+                                auditor.add_model("Qwen3-8B In-Style", tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
+
+                        if W_c is not None:
+                            lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, meta_ins["labels"])
+                            lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, meta_ins["labels"])
+                            lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, meta_ins["labels"])
+                            lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                            w_comp_c = comp_members.get("instyle", {}).get("twin_weight", 0.08)
+                            comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+
+                        res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
+                        U_te = transform_lowram(Z_te, res_ins)
+                        lp_dp = scores_exact_dp(U_te, groups_065, res_ins, D_hybrid)
+                        dp_posteriors.append((dp_weights.get("instyle", 0.10), softmax(lp_dp, axis=1)))
+
+                        S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ins, prior_scales.get("instyle", 0.45))
+                        spectral_blocks_tr.append(S_tr)
+                        spectral_blocks_te.append(S_te)
+                        del res_ins, U_te
 
                     trunk3.restore_weights(backup_t3)
-                    del backup_t3, Z_all, Z_tr, Z_te, heads_sd, res_ins, U_te
+                    del backup_t3, heads_sd
+                    if "Z_tr" in locals():
+                        del Z_tr
+                    if "Z_te" in locals():
+                        del Z_te
+                    if "Z_unseen" in locals():
+                        del Z_unseen
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -652,67 +713,93 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         trunk3.load_norm_weights(heads_sd)
                         W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
                         ts8_labels = meta_ts8["labels"]
+                        w_comp_p = comp_members.get(opt_8b_key, {}).get("plain_weight", 0.20)
+                        w_comp_c = comp_members.get(opt_8b_key, {}).get("twin_weight", 0.08)
 
-                        Z_all = trunk3.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
-                        Z_te = Z_all[:N_test]
-                        Z_unseen = Z_all[N_test : N_test + N_unseen]
-                        Z_tr = Z_all[N_test + N_unseen :]
+                        # Stage A: Fast 360-row probe on df_unseen
+                        if N_unseen >= 36 and W_p is not None:
+                            Z_unseen = trunk3.extract_exact(unseen_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
+                            solo_bacc = float(balanced_accuracy_score(y_unseen, lp_u_p.argmax(axis=1)))
+                            print(f"[Fast Probe] {opt_8b_key}: solo unseen BAcc = {solo_bacc:.4f}")
+
+                            if solo_bacc < 0.45:
+                                print(f"[Fast Probe Pruning] {opt_8b_key}: solo BAcc {solo_bacc:.4f} < 0.45 -> SKIPPING full extraction!")
+                                trunk3.restore_weights(backup_t3_ts)
+                                del backup_t3_ts, heads_sd, Z_unseen
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+
+                            if len(auditor.models) > 0:
+                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
+                                if lift < -0.001:
+                                    print(f"[Fast Probe Pruning] {opt_8b_key}: marginal lift {lift:+.4f} < -0.001 -> SKIPPING full extraction!")
+                                    trunk3.restore_weights(backup_t3_ts)
+                                    del backup_t3_ts, heads_sd, Z_unseen
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    continue
+                                print(f"[Fast Probe] {opt_8b_key}: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
+
+                            # Stage B: Extract test and train
+                            Z_te_tr = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                            Z_te = Z_te_tr[:N_test]
+                            Z_tr = Z_te_tr[N_test:]
+                            del Z_te_tr
+                        else:
+                            Z_all = trunk3.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                            Z_te = Z_all[:N_test]
+                            Z_unseen = Z_all[N_test : N_test + N_unseen]
+                            Z_tr = Z_all[N_test + N_unseen :]
+                            del Z_all
+                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels)) if (N_unseen > 0 and W_p is not None) else None
 
                         gate_passed = True
                         if not is_smoke and len(y_sub) >= 180:
                             gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts8_labels, y_sub, name=opt_8b_key, min_bacc=0.50)
 
                         if gate_passed:
-                            w_comp_p = comp_members.get(opt_8b_key, {}).get("plain_weight", 0.20)
-                            w_comp_c = comp_members.get(opt_8b_key, {}).get("twin_weight", 0.08)
                             lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
-                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels)) if (N_unseen > 0 and W_p is not None) else None
+                            def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
+                            def_se = 0.40 if opt_8b_key == "qwen3_8b_inhouse" else 0.35
+                            pr_sc = prior_scales.get(opt_8b_key, def_pr)
+                            se_fl = se_floors.get(opt_8b_key, def_se)
 
-                            # Check dead-weight pruning on strictly unseen holdout
-                            pruned = False
-                            if N_unseen > 0 and len(auditor.models) > 0 and lp_u_p is not None:
-                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
-                                if lift < -0.001:
-                                    print(f"[Ablation Pruning] {opt_8b_key}: Marginal lift on unseen holdout is {lift:+.4f} (< -0.001) -> PRUNED from ensemble.")
-                                    pruned = True
-                                else:
-                                    print(f"[Ablation Pruning] {opt_8b_key}: Marginal lift on unseen holdout is {lift:+.4f} (>= -0.001) -> KEPT in ensemble.")
+                            update_hybrid_groups(Z_te, pr_sc)
+                            if W_p is not None:
+                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                            if W_c is not None:
+                                lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
+                                lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
+                                lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
+                                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-                            if not pruned:
-                                def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
-                                def_se = 0.40 if opt_8b_key == "qwen3_8b_inhouse" else 0.35
-                                pr_sc = prior_scales.get(opt_8b_key, def_pr)
-                                se_fl = se_floors.get(opt_8b_key, def_se)
+                            res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
+                            U_te = transform_lowram(Z_te, res_ts8)
+                            lp_dp = scores_exact_dp(U_te, groups_065, res_ts8, D_hybrid)
+                            dp_posteriors.append((dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10)), softmax(lp_dp, axis=1)))
 
-                                update_hybrid_groups(Z_te, pr_sc)
-                                if W_p is not None:
-                                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                                if W_c is not None:
-                                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
-                                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
-                                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
-                                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                            S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, pr_sc)
+                            spectral_blocks_tr.append(S_tr)
+                            spectral_blocks_te.append(S_te)
+                            del res_ts8, U_te
 
-                                res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
-                                U_te = transform_lowram(Z_te, res_ts8)
-                                lp_dp = scores_exact_dp(U_te, groups_065, res_ts8, D_hybrid)
-                                dp_posteriors.append((dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10)), softmax(lp_dp, axis=1)))
-
-                                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, pr_sc)
-                                spectral_blocks_tr.append(S_tr)
-                                spectral_blocks_te.append(S_te)
-                                del res_ts8, U_te
-
-                                if N_unseen > 0 and lp_u_p is not None and lp_p is not None:
-                                    auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
-                            else:
-                                print(f"[Pipeline] Checkpoint {opt_8b_key} pruned by ablation auditor; excluded from logits and spectral bank.")
+                            if N_unseen > 0 and lp_u_p is not None and lp_p is not None:
+                                auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_8b_key} rejected by gate; excluded from logits and spectral bank.")
 
                         trunk3.restore_weights(backup_t3_ts)
-                        del backup_t3_ts, Z_all, Z_tr, Z_te, heads_sd
+                        del backup_t3_ts, Z_tr, Z_te, heads_sd
+                        if "Z_unseen" in locals():
+                            del Z_unseen
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         if "Z_unseen" in locals():
                             del Z_unseen
                         gc.collect()

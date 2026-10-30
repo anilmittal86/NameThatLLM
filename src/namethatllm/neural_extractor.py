@@ -214,13 +214,15 @@ def compute_centered_logits(Z_test: np.ndarray, groups: np.ndarray, W_c: np.ndar
     out_lp = np.zeros((N, K), dtype=np.float64)
     if N < 2 or W_c is None:
         return out_lp, np.zeros(N, dtype=bool)
-    sz = np.bincount(groups)[groups]
+    _, inv_g = np.unique(np.asarray(groups, dtype=str), return_inverse=True)
+    safe_g = inv_g + 1
+    sz = np.bincount(safe_g)[safe_g]
     valid = (sz >= 2) & (sz <= 18)
     if not valid.any():
         return out_lp, valid
     Zc = Z_test.copy()
-    for g in np.unique(groups[valid]):
-        mask = (groups == g)
+    for g in np.unique(safe_g[valid]):
+        mask = (safe_g == g)
         Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
     raw_c = Zc[valid] @ W_c.T + b_c
     out_lp[valid] = log_softmax(align_cols(raw_c, src_labels))
