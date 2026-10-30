@@ -10,6 +10,7 @@ import gc
 import re
 import sys
 import time
+import hashlib
 import subprocess
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
@@ -50,6 +51,11 @@ def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     """Numerically stable log-softmax."""
     c = np.max(x, axis=axis, keepdims=True)
     return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
+
+def _text_hash(text: str) -> str:
+    """Normalized SHA1 hash of whitespace-collapsed text to guarantee zero exact/near-exact leakage."""
+    norm = " ".join(str(text).strip().split())
+    return hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
 
 FUNCTION_WORDS = set(
     "a an the and or but if while although because as so than that which who whom whose "
@@ -224,6 +230,24 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     sz_085 = np.bincount(groups_085)[groups_085]
     twin_rows_085 = (sz_085 >= 2) & (sz_085 <= 18)
 
+    # 1.5. Check for quarantined unseen holdout dataset
+    working_dir = Path(working_dir)
+    unseen_parquet = working_dir / "unseen_holdout.parquet"
+    unseen_texts: List[str] = []
+    unseen_hashes = set()
+    if unseen_parquet.exists():
+        try:
+            df_unseen_holdout = pd.read_parquet(unseen_parquet)
+            if len(df_unseen_holdout) > 0 and "text" in df_unseen_holdout.columns:
+                unseen_texts = df_unseen_holdout["text"].fillna("").astype(str).tolist()
+                if "_hash" in df_unseen_holdout.columns:
+                    unseen_hashes = set(df_unseen_holdout["_hash"].tolist())
+                else:
+                    unseen_hashes = set(_text_hash(t) for t in unseen_texts)
+                print(f"[Lexical] Found unseen holdout set: {len(unseen_texts)} rows quarantined from training.")
+        except Exception as e:
+            print(f"[Lexical] Note: Could not read {unseen_parquet}: {e}")
+
     # 2. Load pool parquet files if present (supports single path or list)
     pool_candidates = [pool_file] if isinstance(pool_file, (str, Path)) else (pool_file if isinstance(pool_file, list) else [])
     pool_dfs = []
@@ -237,6 +261,13 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 print(f"[Lexical] Note: Could not read pool {pf}: {e}")
     if pool_dfs:
         df_pool = pd.concat(pool_dfs, ignore_index=True).drop_duplicates(subset=['text'])
+        if unseen_hashes:
+            pool_hashes = [_text_hash(t) for t in df_pool['text']]
+            mask_clean = [h not in unseen_hashes for h in pool_hashes]
+            n_dropped = len(df_pool) - sum(mask_clean)
+            if n_dropped > 0:
+                print(f"[Lexical] Quarantined {n_dropped} pool rows that overlapped with unseen holdout.")
+            df_pool = df_pool[mask_clean].reset_index(drop=True)
         print(f"[Lexical] Merged {len(pool_dfs)} pool file(s): {len(df_pool)} unique rows.")
         fit_texts += df_pool['text'].fillna('').astype(str).tolist()
         fit_y = np.r_[fit_y, df_pool['model'].map(LAB2I).values]
@@ -253,11 +284,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
     fit_sh = [shape_text(t) for t in fit_texts]
     test_sh = [shape_text(t) for t in test_texts]
+    unseen_sh = [shape_text(t) for t in unseen_texts] if unseen_texts else []
     fit_fn = [function_text(t) for t in fit_texts]
     test_fn = [function_text(t) for t in test_texts]
+    unseen_fn = [function_text(t) for t in unseen_texts] if unseen_texts else []
 
     tr_mats_4v = []
     te_mats_4v = []
+    unseen_mats_4v = []
     for mode, mn, mx, mf, sc in VIEWS_4V:
         analyzer = "char" if mode == "shape" else ("word" if mode == "function" else mode)
         opts = dict(
@@ -276,23 +310,34 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         if mode == "shape":
             tr_m = v.fit_transform(fit_sh) * np.float32(sc)
             te_m = v.transform(test_sh) * np.float32(sc)
+            u_m = v.transform(unseen_sh) * np.float32(sc) if unseen_texts else None
         elif mode == "function":
             tr_m = v.fit_transform(fit_fn) * np.float32(sc)
             te_m = v.transform(test_fn) * np.float32(sc)
+            u_m = v.transform(unseen_fn) * np.float32(sc) if unseen_texts else None
         else:
             tr_m = v.fit_transform(fit_texts) * np.float32(sc)
             te_m = v.transform(test_texts) * np.float32(sc)
+            u_m = v.transform(unseen_texts) * np.float32(sc) if unseen_texts else None
         tr_mats_4v.append(tr_m)
         te_mats_4v.append(te_m)
+        if u_m is not None:
+            unseen_mats_4v.append(u_m)
 
     X_tr_4v = sparse.hstack(tr_mats_4v, format="csr")
     X_te_4v = sparse.hstack(te_mats_4v, format="csr")
+    X_unseen_4v = sparse.hstack(unseen_mats_4v, format="csr") if unseen_mats_4v else None
 
     # OUTPUT 1: Pure 4-View LinearSVC (C=0.5, uniform 1.0 sample weights)
     svc_main = LinearSVC(C=0.5, random_state=42, max_iter=3000, tol=1e-3)
     svc_main.fit(X_tr_4v, fit_y)
     logits_svc_main = svc_main.decision_function(X_te_4v)
     log_p_svc_main = log_softmax(logits_svc_main)
+
+    if X_unseen_4v is not None and X_unseen_4v.shape[0] > 0:
+        unseen_log_p_svc_main = log_softmax(svc_main.decision_function(X_unseen_4v))
+    else:
+        unseen_log_p_svc_main = np.zeros((0, K), dtype=np.float32)
 
     # OUTPUT 2: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
     # Continuous Handwriting & Punctuation Density Features + Dedicated Classifier
@@ -327,22 +372,27 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
         fit_bpe_strs = batch_bpe_strings(fit_texts)
         test_bpe_strs = batch_bpe_strings(test_texts)
+        unseen_bpe_strs = batch_bpe_strings(unseen_texts) if unseen_texts else []
         v_bpe = TfidfVectorizer(
             analyzer="word", token_pattern=r"\S+", lowercase=False,
             ngram_range=(1, 3), max_features=75000, sublinear_tf=True, dtype=np.float32
         )
         tr_bpe = v_bpe.fit_transform(fit_bpe_strs) * 0.8
         te_bpe = v_bpe.transform(test_bpe_strs) * 0.8
-        del fit_bpe_strs, test_bpe_strs, v_bpe
+        unseen_bpe = v_bpe.transform(unseen_bpe_strs) * 0.8 if unseen_texts else None
+        del fit_bpe_strs, test_bpe_strs, unseen_bpe_strs, v_bpe
         gc.collect()
         X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe], format="csr")
         X_te_5v = sparse.hstack([X_te_4v, te_bpe], format="csr")
+        X_unseen_5v = sparse.hstack([X_unseen_4v, unseen_bpe], format="csr") if unseen_bpe is not None else None
     else:
         v_cw = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=75000, sublinear_tf=True, dtype=np.float32)
         tr_cw = v_cw.fit_transform(fit_texts) * 0.8
         te_cw = v_cw.transform(test_texts) * 0.8
+        unseen_cw = v_cw.transform(unseen_texts) * 0.8 if unseen_texts else None
         X_tr_5v = sparse.hstack([X_tr_4v, tr_cw], format="csr")
         X_te_5v = sparse.hstack([X_te_4v, te_cw], format="csr")
+        X_unseen_5v = sparse.hstack([X_unseen_4v, unseen_cw], format="csr") if unseen_cw is not None else None
 
     svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3)
     svc_comp.fit(X_tr_5v, fit_y)
@@ -351,6 +401,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     sgd_comp = SGDClassifier(loss='log_loss', alpha=1e-4, max_iter=1500, random_state=42)
     sgd_comp.fit(X_tr_5v, fit_y)
     P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
+
+    if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
+        P_unseen_svc = softmax(svc_comp.decision_function(X_unseen_5v), axis=1)
+        P_unseen_sgd = sgd_comp.predict_proba(X_unseen_5v)
+        P_unseen_comp = 0.55 * P_unseen_svc + 0.45 * P_unseen_sgd
+        log_p_unseen_comp = np.log(np.clip(P_unseen_comp, 1e-9, 1.0))
+    else:
+        log_p_unseen_comp = None
 
     # Style Twin on groups_085
     P_twin_comp = P_svc_comp.copy()
@@ -402,7 +460,18 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
             log_ratio = np.log(np.clip(P_refined, 1e-9, 1.0)) - np.log(np.clip(P_prior_norm, 1e-9, 1.0))
             log_p_lex_comp[:, fam_cols] += log_ratio
 
+            if log_p_unseen_comp is not None:
+                df_spec_u = spec_svc.decision_function(X_unseen_5v)
+                logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
+                P_spec_u = softmax(logits_spec_u, axis=1)
+                P_prior_u = P_unseen_comp[:, fam_cols]
+                P_prior_u_norm = P_prior_u / (P_prior_u.sum(axis=1, keepdims=True) + 1e-12)
+                P_refined_u = (1.0 - beta) * P_prior_u_norm + beta * P_spec_u
+                log_ratio_u = np.log(np.clip(P_refined_u, 1e-9, 1.0)) - np.log(np.clip(P_prior_u_norm, 1e-9, 1.0))
+                log_p_unseen_comp[:, fam_cols] += log_ratio_u
+
     P_lex_comp_final = softmax(log_p_lex_comp, axis=1)
+    unseen_p_lex_comp_final = softmax(log_p_unseen_comp, axis=1) if log_p_unseen_comp is not None else np.zeros((0, K), dtype=np.float32)
 
     # Save to disk
     os.makedirs(working_dir, exist_ok=True)
@@ -412,6 +481,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     np.save(working_dir / 'groups_085.npy', groups_085)
     np.save(working_dir / 'log_p_handwriting.npy', lp_hw)
     np.save(working_dir / 'rule_flags_test.npy', rule_flags_te)
+    np.save(working_dir / 'unseen_log_p_svc_main.npy', unseen_log_p_svc_main)
+    np.save(working_dir / 'unseen_p_lex_comp.npy', unseen_p_lex_comp_final)
 
     return {
         "log_p_svc_main": log_p_svc_main,
@@ -419,7 +490,9 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         "D_tfidf": D,
         "groups_085": groups_085,
         "log_p_handwriting": lp_hw,
-        "rule_flags_test": rule_flags_te
+        "rule_flags_test": rule_flags_te,
+        "unseen_log_p_svc_main": unseen_log_p_svc_main,
+        "unseen_p_lex_comp": unseen_p_lex_comp_final,
     }
 
 if __name__ == "__main__":

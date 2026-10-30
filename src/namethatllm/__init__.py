@@ -55,6 +55,11 @@ from .postprocess import (
     sinkhorn_balancing,
     generate_submission
 )
+from .ablation import (
+    _text_hash,
+    build_unseen_holdout_dataset,
+    UnseenStepwiseAuditor
+)
 from .pipeline import run_submission_pipeline
 
 __all__ = [
@@ -73,5 +78,6 @@ __all__ = [
     "blend_main_and_complementary", "apply_claude_specialist_gate",
     "build_orthographic_penalty_matrix", "apply_unified_handwriting_shield",
     "apply_curly_quote_shield", "sinkhorn_balancing", "generate_submission",
+    "_text_hash", "build_unseen_holdout_dataset", "UnseenStepwiseAuditor",
     "run_submission_pipeline"
 ]

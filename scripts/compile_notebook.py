@@ -17,6 +17,7 @@ SUBMISSION_MODULES = [
     "spectral_bank.py",
     "neural_extractor.py",
     "postprocess.py",
+    "ablation.py",
     "pipeline.py",
 ]
 
@@ -24,6 +25,7 @@ TRAINING_MODULES = [
     "config.py",
     "wpca_gaussian.py",
     "neural_extractor.py",
+    "ablation.py",
     "trainer.py",
 ]
 

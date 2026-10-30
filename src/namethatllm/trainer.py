@@ -34,6 +34,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 
 from .config import LABELS, K, LAB2I, resolve_dataset_paths, resolve_all_pool_files, find_base_model
 from .wpca_gaussian import fit_shared_gaussian_lowram
+from .ablation import _text_hash, build_unseen_holdout_dataset
 
 # Disable incompatible torchao version check in Kaggle environments
 try:
@@ -561,6 +562,20 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         print(f"[Trainer] Stage 1 Pretraining on pool {pool_p}...")
         df_p = pd.read_parquet(pool_p, columns=["text", "model"])
         df_p = df_p[df_p["model"].isin(LABELS)].dropna().sample(frac=1.0, random_state=42).reset_index(drop=True)
+
+        # Build unseen holdout to quarantine holdout passages from Stage 1 pretraining
+        try:
+            _, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path)
+            if holdout_hashes:
+                p_hashes = [_text_hash(t) for t in df_p["text"]]
+                mask_clean = [h not in holdout_hashes for h in p_hashes]
+                n_dropped = len(df_p) - sum(mask_clean)
+                if n_dropped > 0:
+                    print(f"[Trainer] Quarantined {n_dropped} pool rows that overlapped with unseen holdout.")
+                df_p = df_p[mask_clean].reset_index(drop=True)
+        except Exception as e:
+            print(f"[Trainer] Note on holdout quarantine: {e}")
+
         max_s = int(stage1_cfg.get("max_samples", 75000))
         if len(df_p) > max_s:
             df_p = df_p.iloc[:max_s]

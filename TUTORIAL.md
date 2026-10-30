@@ -365,7 +365,35 @@ All ensemble weights, regularizers, prior scales, and thresholds are defined dec
 
 ---
 
-## 8. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `lora_training.ipynb`)
+## 8. Component Attribution & Forward Stepwise Ablation Analysis
+
+To prevent in-sample memorization and leakage from corrupting model selection, each model is evaluated on a strictly unseen holdout dataset (`df_unseen`) constructed by removing all passages present in `train.csv` and `pool_v4.parquet`.
+
+The table below breaks down the effective vote share, selection purpose, empirical strength, and architectural verdict for every candidate model and component in the system:
+
+| Model or Component | Effective Vote | Selection Purpose | Key Strength | Verdict |
+| :--- | :---: | :--- | :--- | :--- |
+| **4-View LinearSVC** | 32.1% | Surface stylometric baseline | Exact n-gram punctuation habits | **Keep (Essential)** |
+| **lora_qwen3_14b (Part 2)** | 26.8% | Primary deep causal trunk | Highest unseen CV (0.611) | **Keep (Essential)** |
+| **lora_qwen25_14b (Part 2)** | 15.0% | Secondary 14B causal family | Distinct pretraining representation | **Keep (Essential)** |
+| **deberta_v3_large (Part 2)** | 11.8% | Bidirectional encoder | Masked attention context | **Keep (Essential)** |
+| **wPCA Bitmask DP** | 4.5% | Prompt-cluster deduplication | Enforces 1-author-per-prompt | **Keep (On Core 3)** |
+| **qwen3_14b_ts (External)** | 0.8% | Independent 14B seed | Fold-averaged 78k training | **Keep Only If Promoted** |
+| **lora14b_v1 (Part 1)** | 0.9% | Legacy 14B checkpoint | Extra 24-layer projection | **Avoid (Superseded)** |
+| **instyle_8b** | 0.9% | Contrastive style adapter | High train fit (0.9401) | **Avoid (Overfit)** |
+| **qwen3_8b_claude** | 0.7% | Within-Claude tie-breaker | 5-way sibling head | **Avoid (Low LB 0.491)** |
+| **qwen3_8b_inhouse** | 0.8% | Custom 8B LoRA24 | Local training pipeline test | **Avoid (Redundant)** |
+| **5-View BPE Lexical** | 3.0% | Subword linear ensemble | Adds SGD and BPE n-grams | **Avoid (90% Overlap)** |
+| **384D Spectral Bank** | 2.3% | Cross-trunk meta-stacker | Combines top-64 PCA dims | **Avoid (Train Leakage)** |
+
+### Architectural Insights & Quarantine Protocol:
+1. **The Core Quartet (85.7% Vote)**: 4-View LinearSVC, Qwen3-14B Part 2, Qwen2.5-14B Part 2, and DeBERTa-v3 Part 2 contribute **85.7%** of the total effective vote and drive virtually all competitive accuracy.
+2. **Dynamic Programming Guardrail (4.5% Vote)**: Exact $2^{18}$ Bitmask DP enforces the strict rule that no model can author two responses to the same prompt.
+3. **Automatic Dead-Weight Pruning**: The ablation engine (`src/namethatllm/ablation.py`) computes the marginal lift ($\Delta \text{BAcc}$) of each secondary component on `df_unseen`. Any component with $\Delta \text{BAcc} < -0.001$ is automatically pruned from the ensemble blend.
+
+---
+
+## 9. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `lora_training.ipynb`)
 
 Module 5 provides the end-to-end training and artifact generation pipeline used to build our in-house multi-layer LoRA checkpoints (such as `anilmittal/ntl-inhouse-two-stage-lora24`).
 
@@ -396,7 +424,7 @@ In Stage 2, samples are grouped into 18-row prompt batches via `PromptGroupBatch
 
 ---
 
-## 9. Single-Source-of-Truth Compilation & Verification
+## 10. Single-Source-of-Truth Compilation & Verification
 
 The repository enforces a **Single Source of Truth** architecture:
 - All model logic lives in `src/namethatllm/`.
@@ -421,7 +449,7 @@ All 37 tests cover every component across 7 test suites:
 
 ---
 
-## 10. Mathematical Reference Cheatsheet
+## 11. Mathematical Reference Cheatsheet
 
 ```
 1. LoRA Weight Fusion (GPU Device):
