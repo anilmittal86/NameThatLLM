@@ -260,7 +260,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 1: Qwen3-14B (40 layers, hidden=5120)
         # ==============================================================================
         base_q3_14b = verified_bases.get("qwen3_14b") or find_base_model(input_dir, "qwen3", 5120, 40)
-        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_p1" in ckpts or "qwen3_14b_ts" in ckpts):
+        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_p1" in ckpts or "qwen3_14b_ts" in ckpts or "qwen3_14b_v5" in ckpts):
             print(f"[Pipeline] Loading Trunk 1: Qwen3-14B from {base_q3_14b}...")
             trunk1 = UniversalLoRATrunkLoader(base_q3_14b, keep_layers=27, layers=[2, 4, 6, 9, 13, 17, 22, 27], max_len=447)
 
@@ -365,60 +365,62 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            # Checkpoint 1C: Two-Stage LoRA24 (qwen3_14b_ts / q14v5)
-            if "qwen3_14b_ts" in ckpts:
-                ts14_dir = ckpts["qwen3_14b_ts"]
-                meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
-                trunk1.set_active_layers(meta_ts14["layers"], meta_ts14["max_len"])
-                backup_t1_ts = trunk1.snapshot_weights(ts14_dir)
-                merged = merge_lora(trunk1.model, ts14_dir, sign=+1.0)
-                if not merged:
-                    print(f"[Pipeline] Optional checkpoint qwen3_14b_ts failed to merge LoRA; skipping.")
-                    trunk1.restore_weights(backup_t1_ts)
-                else:
-                    heads_sd = load_head_file(ts14_dir)
-                    trunk1.load_norm_weights(heads_sd)
-                    W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                    ts14_labels = meta_ts14["labels"]
-
-                    Z_all = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
-                    Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
-
-                    gate_passed = True
-                    if not is_smoke and len(y_sub) >= 180:
-                        gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts14_labels, y_sub, name="qwen3_14b_ts", min_bacc=0.50)
-
-                    if gate_passed:
-                        update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_ts", 0.50))
-                        w_comp_p = comp_members.get("qwen3_14b_ts", {}).get("plain_weight", 0.20)
-                        w_comp_c = comp_members.get("qwen3_14b_ts", {}).get("twin_weight", 0.08)
-                        if W_p is not None:
-                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels))
-                            comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                        if W_c is not None:
-                            lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
-                            lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
-                            lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
-                            lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                            comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-
-                        res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_ts", 0.25))
-                        U_te = transform_lowram(Z_te, res_ts14)
-                        lp_dp = scores_exact_dp(U_te, groups_065, res_ts14, D_hybrid)
-                        dp_posteriors.append((dp_weights.get("q3_14b_ts", 0.10), softmax(lp_dp, axis=1)))
-
-                        S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, prior_scales.get("qwen3_14b_ts", 0.50))
-                        spectral_blocks_tr.append(S_tr)
-                        spectral_blocks_te.append(S_te)
-                        del res_ts14, U_te
+            # Checkpoint 1C: Optional Two-Stage LoRA24 (qwen3_14b_ts, qwen3_14b_v5)
+            for opt_14b_key in ("qwen3_14b_ts", "qwen3_14b_v5"):
+                if opt_14b_key in ckpts:
+                    ts14_dir = ckpts[opt_14b_key]
+                    meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
+                    trunk1.set_active_layers(meta_ts14["layers"], meta_ts14["max_len"])
+                    backup_t1_ts = trunk1.snapshot_weights(ts14_dir)
+                    merged = merge_lora(trunk1.model, ts14_dir, sign=+1.0)
+                    if not merged:
+                        print(f"[Pipeline] Optional checkpoint {opt_14b_key} failed to merge LoRA; skipping.")
+                        trunk1.restore_weights(backup_t1_ts)
                     else:
-                        print("[Pipeline] Optional checkpoint qwen3_14b_ts rejected by gate; excluded from logits and spectral bank.")
+                        heads_sd = load_head_file(ts14_dir)
+                        trunk1.load_norm_weights(heads_sd)
+                        W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+                        ts14_labels = meta_ts14["labels"]
 
-                    trunk1.restore_weights(backup_t1_ts)
-                    del backup_t1_ts, Z_all, Z_tr, Z_te, heads_sd
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        Z_all = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                        Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
+
+                        gate_passed = True
+                        if not is_smoke and len(y_sub) >= 180:
+                            gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts14_labels, y_sub, name=opt_14b_key, min_bacc=0.50)
+
+                        if gate_passed:
+                            pr_sc = prior_scales.get(opt_14b_key, 0.50)
+                            update_hybrid_groups(Z_te, pr_sc)
+                            w_comp_p = comp_members.get(opt_14b_key, {}).get("plain_weight", 0.20)
+                            w_comp_c = comp_members.get(opt_14b_key, {}).get("twin_weight", 0.08)
+                            if W_p is not None:
+                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels))
+                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                            if W_c is not None:
+                                lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
+                                lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
+                                lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
+                                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+
+                            res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_14b_key, 0.25))
+                            U_te = transform_lowram(Z_te, res_ts14)
+                            lp_dp = scores_exact_dp(U_te, groups_065, res_ts14, D_hybrid)
+                            dp_posteriors.append((dp_weights.get(opt_14b_key, dp_weights.get("q3_14b_ts", 0.10)), softmax(lp_dp, axis=1)))
+
+                            S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, pr_sc)
+                            spectral_blocks_tr.append(S_tr)
+                            spectral_blocks_te.append(S_te)
+                            del res_ts14, U_te
+                        else:
+                            print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
+
+                        trunk1.restore_weights(backup_t1_ts)
+                        del backup_t1_ts, Z_all, Z_tr, Z_te, heads_sd
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
             trunk1.free_memory()
             del trunk1
@@ -485,7 +487,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 3: Qwen3-8B (36 layers, hidden=4096)
         # ==============================================================================
         base_q3_8b = verified_bases.get("qwen3_8b") or find_base_model(input_dir, "qwen3", 4096, 36)
-        if base_q3_8b and ("instyle" in ckpts or "qwen3_8b_claude" in ckpts or "qwen3_8b_ts" in ckpts):
+        if base_q3_8b and ("instyle" in ckpts or "qwen3_8b_claude" in ckpts or "qwen3_8b_ts" in ckpts or "qwen3_8b_v5" in ckpts or "qwen3_8b_inhouse" in ckpts):
             print(f"[Pipeline] Loading Trunk 3: Qwen3-8B from {base_q3_8b}...")
             trunk3 = UniversalLoRATrunkLoader(base_q3_8b, keep_layers=24, layers=[2, 4, 6, 8, 12, 16, 20, 24], max_len=447)
 
@@ -538,60 +540,66 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-            # Two-Stage LoRA24 (qwen3_8b_ts / l24x_q3b8 / ts8_s7)
-            if "qwen3_8b_ts" in ckpts:
-                ts8_dir = ckpts["qwen3_8b_ts"]
-                meta_ts8 = read_checkpoint_meta(ts8_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
-                trunk3.set_active_layers(meta_ts8["layers"], meta_ts8["max_len"])
-                backup_t3_ts = trunk3.snapshot_weights(ts8_dir)
-                merged = merge_lora(trunk3.model, ts8_dir, sign=+1.0)
-                if not merged:
-                    print(f"[Pipeline] Optional checkpoint qwen3_8b_ts failed to merge LoRA; skipping.")
-                    trunk3.restore_weights(backup_t3_ts)
-                else:
-                    heads_sd = load_head_file(ts8_dir)
-                    trunk3.load_norm_weights(heads_sd)
-                    W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                    ts8_labels = meta_ts8["labels"]
-
-                    Z_all = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
-                    Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
-
-                    gate_passed = True
-                    if not is_smoke and len(y_sub) >= 180:
-                        gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts8_labels, y_sub, name="qwen3_8b_ts", min_bacc=0.50)
-
-                    if gate_passed:
-                        update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_ts", 0.40))
-                        w_comp_p = comp_members.get("qwen3_8b_ts", {}).get("plain_weight", 0.20)
-                        w_comp_c = comp_members.get("qwen3_8b_ts", {}).get("twin_weight", 0.08)
-                        if W_p is not None:
-                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels))
-                            comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                        if W_c is not None:
-                            lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
-                            lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
-                            lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
-                            lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                            comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-
-                        res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_ts", 0.35))
-                        U_te = transform_lowram(Z_te, res_ts8)
-                        lp_dp = scores_exact_dp(U_te, groups_065, res_ts8, D_hybrid)
-                        dp_posteriors.append((dp_weights.get("q3_8b_ts", 0.10), softmax(lp_dp, axis=1)))
-
-                        S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, prior_scales.get("qwen3_8b_ts", 0.40))
-                        spectral_blocks_tr.append(S_tr)
-                        spectral_blocks_te.append(S_te)
-                        del res_ts8, U_te
+            # Optional Checkpoints on Trunk 3: Two-Stage LoRA24 (qwen3_8b_ts, qwen3_8b_v5, qwen3_8b_inhouse)
+            for opt_8b_key in ("qwen3_8b_ts", "qwen3_8b_v5", "qwen3_8b_inhouse"):
+                if opt_8b_key in ckpts:
+                    ts8_dir = ckpts[opt_8b_key]
+                    meta_ts8 = read_checkpoint_meta(ts8_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
+                    trunk3.set_active_layers(meta_ts8["layers"], meta_ts8["max_len"])
+                    backup_t3_ts = trunk3.snapshot_weights(ts8_dir)
+                    merged = merge_lora(trunk3.model, ts8_dir, sign=+1.0)
+                    if not merged:
+                        print(f"[Pipeline] Optional checkpoint {opt_8b_key} failed to merge LoRA; skipping.")
+                        trunk3.restore_weights(backup_t3_ts)
                     else:
-                        print("[Pipeline] Optional checkpoint qwen3_8b_ts rejected by gate; excluded from logits and spectral bank.")
+                        heads_sd = load_head_file(ts8_dir)
+                        trunk3.load_norm_weights(heads_sd)
+                        W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+                        ts8_labels = meta_ts8["labels"]
 
-                    trunk3.restore_weights(backup_t3_ts)
-                    del backup_t3_ts, Z_all, Z_tr, Z_te, heads_sd
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        Z_all = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                        Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
+
+                        gate_passed = True
+                        if not is_smoke and len(y_sub) >= 180:
+                            gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts8_labels, y_sub, name=opt_8b_key, min_bacc=0.50)
+
+                        if gate_passed:
+                            def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
+                            def_se = 0.40 if opt_8b_key == "qwen3_8b_inhouse" else 0.35
+                            pr_sc = prior_scales.get(opt_8b_key, def_pr)
+                            se_fl = se_floors.get(opt_8b_key, def_se)
+
+                            update_hybrid_groups(Z_te, pr_sc)
+                            w_comp_p = comp_members.get(opt_8b_key, {}).get("plain_weight", 0.20)
+                            w_comp_c = comp_members.get(opt_8b_key, {}).get("twin_weight", 0.08)
+                            if W_p is not None:
+                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels))
+                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                            if W_c is not None:
+                                lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
+                                lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
+                                lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
+                                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+
+                            res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
+                            U_te = transform_lowram(Z_te, res_ts8)
+                            lp_dp = scores_exact_dp(U_te, groups_065, res_ts8, D_hybrid)
+                            dp_posteriors.append((dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10)), softmax(lp_dp, axis=1)))
+
+                            S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, pr_sc)
+                            spectral_blocks_tr.append(S_tr)
+                            spectral_blocks_te.append(S_te)
+                            del res_ts8, U_te
+                        else:
+                            print(f"[Pipeline] Optional checkpoint {opt_8b_key} rejected by gate; excluded from logits and spectral bank.")
+
+                        trunk3.restore_weights(backup_t3_ts)
+                        del backup_t3_ts, Z_all, Z_tr, Z_te, heads_sd
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
             # Claude Head LoRA
             if "qwen3_8b_claude" in ckpts:

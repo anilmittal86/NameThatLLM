@@ -450,12 +450,15 @@ if __name__ == "__main__":
     if test_path is None:
         test_path = Path('local_data') / 'test.csv'
 
-    pool_paths = list(input_dir.rglob('pool_v4.parquet'))
-    pool_file = pool_paths[0] if pool_paths else None
+    pool_files: List[Path] = []
+    for pat in ['nlm_pool_v5.parquet', 'pool_v4.parquet', 'nlm_matched_clean.parquet', 'nlm_pool_v2.parquet']:
+        for p in input_dir.rglob(pat):
+            if p not in pool_files:
+                pool_files.append(p)
 
     tok_paths = list(input_dir.rglob("vocab.json"))
     qwen_tok_dir = str(tok_paths[0].parent) if tok_paths else ""
 
-    print(f"[Module 1 CLI] Running lexical engine: train={train_path}, test={test_path}")
-    run_lexical_engine(train_path, test_path, pool_file, qwen_tok_dir, working_dir)
+    print(f"[Module 1 CLI] Running lexical engine: train={train_path}, test={test_path}, pools={[p.name for p in pool_files]}")
+    run_lexical_engine(train_path, test_path, pool_files, qwen_tok_dir, working_dir)
     print("[Module 1 CLI] Lexical engine finished successfully.")

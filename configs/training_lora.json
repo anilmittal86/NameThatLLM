@@ -19,9 +19,9 @@
     "lr_lora": 2e-4,
     "lr_head": 1e-3,
     "batch_size": 4,
-    "gradient_accumulation_steps": 2,
+    "gradient_accumulation_steps": 4,
     "epochs": 1,
-    "max_samples": 20000,
+    "max_samples": 75000,
     "warmup_steps": 100
   },
   "stage2": {

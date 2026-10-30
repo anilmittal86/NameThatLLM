@@ -42,6 +42,17 @@ try:
 except Exception:
     pass
 
+def _disable_final_norm(mod: nn.Module) -> None:
+    for path in ["norm", "model.norm", "base_model.norm", "base_model.model.norm", "base_model.model.model.norm"]:
+        curr = mod
+        parts = path.split(".")
+        for p in parts[:-1]:
+            curr = getattr(curr, p, None)
+            if curr is None:
+                break
+        if curr is not None and hasattr(curr, parts[-1]) and getattr(curr, parts[-1]) is not None:
+            setattr(curr, parts[-1], nn.Identity())
+
 class MultiLayerLoRAClassifier(nn.Module):
     """
     Universal Multi-Layer LoRA sequence classifier with dedicated per-layer
@@ -57,8 +68,7 @@ class MultiLayerLoRAClassifier(nn.Module):
     ):
         super().__init__()
         self.backbone = backbone
-        if hasattr(self.backbone, "norm") and self.backbone.norm is not None:
-            self.backbone.norm = nn.Identity()
+        _disable_final_norm(self.backbone)
         self.layers = list(layers)
         self.num_classes = num_classes
         self.hidden_size = hidden_size
@@ -167,8 +177,8 @@ def compute_two_stage_loss(
 
 class PromptGroupBatchSampler(Sampler):
     """
-    Groups samples sharing the same prompt_id into complete batches to ensure exact
-    within-prompt contrastive centering during Stage 2 training.
+    Groups samples sharing the same prompt_id into complete batches (one prompt group per step)
+    to enable two-pass micro-batched within-prompt contrastive centering during Stage 2 training.
     """
     def __init__(self, prompt_ids: List[Any], batch_size: int = 18, shuffle: bool = True, seed: int = 42):
         self.prompt_to_indices: Dict[Any, List[int]] = {}
@@ -185,25 +195,14 @@ class PromptGroupBatchSampler(Sampler):
         prompts = list(self.prompts)
         if self.shuffle:
             rng.shuffle(prompts)
-
-        current_batch: List[int] = []
         for p in prompts:
             idxs = list(self.prompt_to_indices[p])
             if self.shuffle:
                 rng.shuffle(idxs)
-            if len(current_batch) + len(idxs) > self.batch_size and len(current_batch) > 0:
-                yield current_batch
-                current_batch = []
-            current_batch.extend(idxs)
-            if len(current_batch) >= self.batch_size:
-                yield current_batch
-                current_batch = []
-        if len(current_batch) > 0:
-            yield current_batch
+            yield idxs
 
     def __len__(self) -> int:
-        total = sum(len(v) for v in self.prompt_to_indices.values())
-        return math.ceil(total / max(1, self.batch_size))
+        return len(self.prompts)
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
@@ -231,23 +230,147 @@ class TextSequenceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         raw_ids = self.tok(str(self.texts[idx]), add_special_tokens=False, truncation=True, max_length=self.max_len)["input_ids"]
         input_ids = raw_ids + [self.end_id]
-        item: Dict[str, Any] = {"input_ids": torch.tensor(input_ids, dtype=torch.long)}
+        item: Dict[str, Any] = {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+        }
         if self.labels is not None:
             item["label"] = torch.tensor(self.labels[idx], dtype=torch.long)
         if self.prompt_ids is not None:
             item["prompt_id"] = self.prompt_ids[idx]
         return item
 
-def collate_text_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def collate_text_batch(batch: List[Dict[str, Any]], pad_token_id: int = 151643) -> Dict[str, Any]:
     input_ids = [item["input_ids"] for item in batch]
-    padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask = (padded != 0).long()
-    res: Dict[str, Any] = {"input_ids": padded, "attention_mask": attention_mask}
+    masks = [item.get("attention_mask", torch.ones_like(item["input_ids"])) for item in batch]
+    padded_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
+    padded_mask = torch.nn.utils.rnn.pad_sequence(masks, batch_first=True, padding_value=0)
+    res: Dict[str, Any] = {"input_ids": padded_ids, "attention_mask": padded_mask}
     if "label" in batch[0]:
         res["labels"] = torch.stack([item["label"] for item in batch])
     if "prompt_id" in batch[0]:
         res["prompt_ids"] = [item["prompt_id"] for item in batch]
     return res
+
+def train_prompt_group_step(
+    model: MultiLayerLoRAClassifier,
+    opt: torch.optim.Optimizer,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    micro_batch_size: int = 2,
+    centered_weight: float = 0.5,
+    label_smoothing: float = 0.10
+) -> Tuple[float, float, float]:
+    """
+    Two-pass micro-batched training step for a single prompt group.
+    Pass 1: Computes exact within-prompt mean vector mu_prompt without gradients in chunks of 4.
+    Pass 2: Computes plain and centered cross-entropy losses over micro-batches of micro_batch_size,
+            accumulating gradients directly with dynamic sequence length slicing.
+    """
+    N = input_ids.shape[0]
+    dev = input_ids.device
+    labels_dev = labels.to(dev)
+
+    # Pass 1: Compute mu_prompt with no_grad in chunks of 4
+    z_chunks = []
+    with torch.no_grad():
+        for s in range(0, N, 4):
+            e = min(s + 4, N)
+            mb_mask = attention_mask[s:e]
+            max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+            z_c = model.forward_features(input_ids[s:e, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+            z_chunks.append(z_c)
+    Z_all_no_grad = torch.cat(z_chunks, dim=0)
+    mu_prompt = Z_all_no_grad.mean(dim=0, keepdim=True)
+    del z_chunks, Z_all_no_grad
+
+    # Pass 2: Autograd micro-batches
+    total_loss_val = 0.0
+    plain_loss_val = 0.0
+    centered_loss_val = 0.0
+
+    model.train()
+    for s in range(0, N, micro_batch_size):
+        e = min(s + micro_batch_size, N)
+        mb_mask = attention_mask[s:e]
+        max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+        mb_ids = input_ids[s:e, :max_l]
+        mb_mask_slice = mb_mask[:, :max_l]
+
+        Z_mb = model.forward_features(mb_ids, mb_mask_slice, drop_first_token=True)
+        mb_dev = Z_mb.device
+
+        if next(model.plain_head.parameters()).device != mb_dev:
+            model.plain_head = model.plain_head.to(mb_dev)
+        if next(model.centered_head.parameters()).device != mb_dev:
+            model.centered_head = model.centered_head.to(mb_dev)
+
+        logits_p = model.plain_head(Z_mb)
+        loss_p = F.cross_entropy(logits_p, labels_dev[s:e].to(mb_dev), label_smoothing=label_smoothing)
+
+        logits_c = model.centered_head(Z_mb - mu_prompt.to(mb_dev))
+        loss_c = F.cross_entropy(logits_c, labels_dev[s:e].to(mb_dev), label_smoothing=label_smoothing)
+
+        loss_mb = loss_p + float(centered_weight) * loss_c
+        weight_frac = (e - s) / float(N)
+        scaled_loss = loss_mb * weight_frac
+        scaled_loss.backward()
+
+        total_loss_val += loss_mb.item() * weight_frac
+        plain_loss_val += loss_p.item() * weight_frac
+        centered_loss_val += loss_c.item() * weight_frac
+
+    return total_loss_val, plain_loss_val, centered_loss_val
+
+def fit_ridge_heads(
+    Z: np.ndarray,
+    y: np.ndarray,
+    prompts: Optional[np.ndarray] = None,
+    alpha: float = 10.0,
+    label_smoothing: float = 0.10,
+    num_classes: int = K
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Fits closed-form dual Ridge regression heads for plain and centered representations
+    with label smoothing. Uses dual formulation (N x N) for ultra-fast, numerically stable solution.
+    """
+    N, D = Z.shape
+    Y = np.zeros((N, num_classes), dtype=np.float32)
+    for i, lab in enumerate(y):
+        Y[i, lab] = 1.0
+    if label_smoothing > 0.0:
+        Y = (1.0 - label_smoothing) * Y + (label_smoothing / num_classes)
+
+    # Plain head: Z_tilde = [Z, 1]
+    Z_tilde = np.hstack([Z, np.ones((N, 1), dtype=np.float32)])
+    K_mat = Z_tilde @ Z_tilde.T
+    K_mat.flat[::N + 1] += alpha
+    A = np.linalg.solve(K_mat, Y)
+    W_tilde = (A.T @ Z_tilde).astype(np.float32)
+    W_p = W_tilde[:, :-1]
+    b_p = W_tilde[:, -1]
+
+    # Centered head: Z_c
+    Z_c = Z.copy()
+    if prompts is not None:
+        u_p = np.unique(prompts)
+        for p in u_p:
+            mask = (prompts == p)
+            if mask.sum() > 1:
+                Z_c[mask] = Z[mask] - Z[mask].mean(axis=0, keepdims=True)
+            else:
+                Z_c[mask] = 0.0
+
+    Z_c_tilde = np.hstack([Z_c, np.ones((N, 1), dtype=np.float32)])
+    K_mat_c = Z_c_tilde @ Z_c_tilde.T
+    K_mat_c.flat[::N + 1] += alpha
+    A_c = np.linalg.solve(K_mat_c, Y)
+    W_c_tilde = (A_c.T @ Z_c_tilde).astype(np.float32)
+    W_c = W_c_tilde[:, :-1]
+    b_c = W_c_tilde[:, -1]
+
+    return W_p, b_p, W_c, b_c
 
 def export_compatible_checkpoint(
     model: MultiLayerLoRAClassifier,
@@ -397,6 +520,8 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     except Exception:
         pass
 
+    _disable_final_norm(base_model)
+
     if hasattr(base_model, "enable_input_require_grads"):
         base_model.enable_input_require_grads()
 
@@ -411,7 +536,13 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     base_model = get_peft_model(base_model, lora_cfg)
 
     if hasattr(base_model, "gradient_checkpointing_enable"):
-        base_model.gradient_checkpointing_enable()
+        try:
+            base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            base_model.gradient_checkpointing_enable()
+    for mod in base_model.modules():
+        if hasattr(mod, "gradient_checkpointing"):
+            setattr(mod, "gradient_checkpointing", True)
 
     model = MultiLayerLoRAClassifier(base_model, hidden_size=base_cfg.hidden_size, layers=layers, num_classes=K)
     # If device_map was used, do NOT call model.to() as it overrides device_map onto a single GPU
@@ -430,12 +561,12 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         print(f"[Trainer] Stage 1 Pretraining on pool {pool_p}...")
         df_p = pd.read_parquet(pool_p, columns=["text", "model"])
         df_p = df_p[df_p["model"].isin(LABELS)].dropna().sample(frac=1.0, random_state=42).reset_index(drop=True)
-        max_s = int(stage1_cfg.get("max_samples", 20000))
+        max_s = int(stage1_cfg.get("max_samples", 75000))
         if len(df_p) > max_s:
             df_p = df_p.iloc[:max_s]
 
         bs1 = int(stage1_cfg.get("batch_size", 4))
-        accum1 = int(stage1_cfg.get("gradient_accumulation_steps", 2))
+        accum1 = int(stage1_cfg.get("gradient_accumulation_steps", 4))
         ds1 = TextSequenceDataset(df_p["text"].tolist(), [LAB2I[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id)
         loader1 = DataLoader(ds1, batch_size=bs1, shuffle=True, collate_fn=collate_text_batch)
 
@@ -467,17 +598,39 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     df_tr = pd.read_csv(train_path)
     print(f"[Trainer] Stage 2 Fine-Tuning on {train_path} ({len(df_tr)} samples)...")
     bs2 = int(stage2_cfg.get("batch_size", 2))
-    accum2 = int(stage2_cfg.get("gradient_accumulation_steps", 2))
     ds2 = TextSequenceDataset(df_tr["text"].tolist(), [LAB2I[m] for m in df_tr["model"]], df_tr["prompt_id"].tolist(), tok, max_len=max_len, end_id=end_id)
     sampler2 = PromptGroupBatchSampler(df_tr["prompt_id"].tolist(), batch_size=bs2, shuffle=True)
     loader2 = DataLoader(ds2, batch_sampler=sampler2, collate_fn=collate_text_batch)
+
+    # Pre-calibrate heads with closed-form Ridge weights on extracted features before Stage 2
+    print("[Trainer] Pre-calibrating classification heads with closed-form Ridge weights...")
+    model.eval()
+    loader_init = DataLoader(ds2, batch_size=4, shuffle=False, collate_fn=collate_text_batch)
+    Z_init_list = []
+    with torch.no_grad():
+        for batch in loader_init:
+            z_b = model.forward_features(batch["input_ids"].to(device), batch["attention_mask"].to(device))
+            Z_init_list.append(z_b.cpu().numpy())
+    Z_init = np.vstack(Z_init_list)
+    y_init = np.array([LAB2I[m] for m in df_tr["model"]])
+    prompts_init = df_tr["prompt_id"].values
+    W_p_init, b_p_init, W_c_init, b_c_init = fit_ridge_heads(Z_init, y_init, prompts_init, alpha=10.0, label_smoothing=0.10, num_classes=K)
+    with torch.no_grad():
+        model.plain_head.weight.copy_(torch.from_numpy(W_p_init).to(model.plain_head.weight.device, model.plain_head.weight.dtype))
+        model.plain_head.bias.copy_(torch.from_numpy(b_p_init).to(model.plain_head.bias.device, model.plain_head.bias.dtype))
+        model.centered_head.weight.copy_(torch.from_numpy(W_c_init).to(model.centered_head.weight.device, model.centered_head.weight.dtype))
+        model.centered_head.bias.copy_(torch.from_numpy(b_c_init).to(model.centered_head.bias.device, model.centered_head.bias.dtype))
+    del Z_init_list, Z_init, loader_init
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     opt2 = torch.optim.AdamW([
         {"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": float(stage2_cfg.get("lr_lora", 5e-5))},
         {"params": list(model.norms.parameters()) + list(model.plain_head.parameters()) + list(model.centered_head.parameters()), "lr": float(stage2_cfg.get("lr_head", 3e-4))}
     ], weight_decay=float(train_cfg.get("weight_decay", 0.01)))
     epochs2 = int(stage2_cfg.get("epochs", 2))
-    total_steps2 = math.ceil(len(loader2) / accum2) * epochs2
+    total_steps2 = len(loader2) * epochs2
     sched2 = get_cosine_schedule_with_warmup(opt2, num_warmup_steps=int(stage2_cfg.get("warmup_steps", 50)), num_training_steps=total_steps2)
 
     model.train()
@@ -485,21 +638,22 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         sampler2.set_epoch(ep)
         opt2.zero_grad()
         for step_idx, batch in enumerate(loader2):
-            Z = model.forward_features(batch["input_ids"].to(device), batch["attention_mask"].to(device))
-            tot_loss, _, _ = compute_two_stage_loss(
-                model, Z, batch["labels"].to(device),
-                prompt_ids=batch.get("prompt_ids"),
-                centered_weight=float(stage2_cfg.get("centered_weight", 0.5))
+            train_prompt_group_step(
+                model=model,
+                opt=opt2,
+                input_ids=batch["input_ids"].to(device),
+                attention_mask=batch["attention_mask"].to(device),
+                labels=batch["labels"].to(device),
+                micro_batch_size=bs2,
+                centered_weight=float(stage2_cfg.get("centered_weight", 0.5)),
+                label_smoothing=0.10
             )
-            loss = tot_loss / accum2
-            loss.backward()
-            if (step_idx + 1) % accum2 == 0 or (step_idx + 1) == len(loader2):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt2.step()
-                sched2.step()
-                opt2.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt2.step()
+            sched2.step()
+            opt2.zero_grad()
 
-    # Feature extraction for wPCA bank
+    # Feature extraction for wPCA bank & final Ridge calibration
     del loader2, opt2, sched2, sampler2
     gc.collect()
     if torch.cuda.is_available():
@@ -515,6 +669,14 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     Z_train = np.vstack(Z_list)
     y_train = np.array([LAB2I[m] for m in df_tr["model"]])
     prompts_train = df_tr["prompt_id"].values
+
+    # Calibrate final heads with closed-form Ridge weights on fine-tuned features
+    W_p_fin, b_p_fin, W_c_fin, b_c_fin = fit_ridge_heads(Z_train, y_train, prompts_train, alpha=10.0, label_smoothing=0.10, num_classes=K)
+    with torch.no_grad():
+        model.plain_head.weight.copy_(torch.from_numpy(W_p_fin).to(model.plain_head.weight.device, model.plain_head.weight.dtype))
+        model.plain_head.bias.copy_(torch.from_numpy(b_p_fin).to(model.plain_head.bias.device, model.plain_head.bias.dtype))
+        model.centered_head.weight.copy_(torch.from_numpy(W_c_fin).to(model.centered_head.weight.device, model.centered_head.weight.dtype))
+        model.centered_head.bias.copy_(torch.from_numpy(b_c_fin).to(model.centered_head.bias.device, model.centered_head.bias.dtype))
 
     export_compatible_checkpoint(
         model=model,

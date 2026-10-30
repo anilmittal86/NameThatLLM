@@ -32,7 +32,10 @@
     "optional_checkpoints": [
       "instyle",
       "qwen3_14b_ts",
+      "qwen3_14b_v5",
       "qwen3_8b_ts",
+      "qwen3_8b_v5",
+      "qwen3_8b_inhouse",
       "qwen25_7b_ts"
     ]
   },

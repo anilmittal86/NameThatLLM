@@ -381,10 +381,34 @@ class TestCompilerAndIntegration(unittest.TestCase):
             self.assertEqual(W_p3.shape, (18, 128))
             self.assertEqual(b_p3.shape, (18,))
 
-            # 4. Test find_checkpoints discovers heads.pt
+            # 4. Test find_checkpoints discovers heads.pt and distinct keys without collision
+            d_q14v5 = tmp / "q14v5"
+            d_q14v5.mkdir()
+            save_file({"plain.weight": t_w, "plain.bias": t_b}, str(d_q14v5 / "heads.safetensors"))
+
+            d_ts14 = tmp / "ts_q3b14"
+            d_ts14.mkdir()
+            save_file({"plain.weight": t_w, "plain.bias": t_b}, str(d_ts14 / "heads.safetensors"))
+
+            d_q8v5 = tmp / "q8v5"
+            d_q8v5.mkdir()
+            save_file({"plain.weight": t_w, "plain.bias": t_b}, str(d_q8v5 / "heads.safetensors"))
+
+            d_inhouse = tmp / "ntl-inhouse-two-stage-lora24"
+            d_inhouse.mkdir()
+            save_file({"plain.weight": t_w, "plain.bias": t_b}, str(d_inhouse / "heads.safetensors"))
+
             ckpts = find_checkpoints(tmp)
             self.assertIn("qwen3_8b_ts", ckpts)
             self.assertEqual(ckpts["qwen3_8b_ts"], d2)
+            self.assertIn("qwen3_14b_v5", ckpts)
+            self.assertEqual(ckpts["qwen3_14b_v5"], d_q14v5)
+            self.assertIn("qwen3_14b_ts", ckpts)
+            self.assertEqual(ckpts["qwen3_14b_ts"], d_ts14)
+            self.assertIn("qwen3_8b_v5", ckpts)
+            self.assertEqual(ckpts["qwen3_8b_v5"], d_q8v5)
+            self.assertIn("qwen3_8b_inhouse", ckpts)
+            self.assertEqual(ckpts["qwen3_8b_inhouse"], d_inhouse)
 
             # 5. Test multi-pool resolution
             p_v5 = tmp / "nlm_pool_v5.parquet"

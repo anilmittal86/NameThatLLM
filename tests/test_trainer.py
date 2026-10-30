@@ -4,6 +4,7 @@ Unit and Integration Tests for namethatllm.trainer
 """
 
 import unittest
+import math
 from pathlib import Path
 import tempfile
 import numpy as np
@@ -147,6 +148,98 @@ class TestTrainer(unittest.TestCase):
             self.assertTrue(np.allclose(b_p, expected_b_p, atol=1e-7))
             self.assertTrue(np.allclose(W_c, expected_W_c, atol=1e-7))
             self.assertTrue(np.allclose(b_c, expected_b_c, atol=1e-7))
+
+    def test_collate_text_batch_preserves_token_zero(self):
+        from namethatllm.trainer import collate_text_batch
+        b1 = {
+            "input_ids": torch.tensor([0, 42, 99], dtype=torch.long),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "label": torch.tensor(1, dtype=torch.long),
+            "prompt_id": 101,
+        }
+        b2 = {
+            "input_ids": torch.tensor([15, 20, 25, 30], dtype=torch.long),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "label": torch.tensor(2, dtype=torch.long),
+            "prompt_id": 102,
+        }
+        res = collate_text_batch([b1, b2], pad_token_id=151643)
+        # Token ID 0 must NOT be treated as padding
+        self.assertEqual(res["input_ids"][0, 0].item(), 0)
+        self.assertEqual(res["attention_mask"][0, 0].item(), 1)
+        # Padding value must be 151643 and attention_mask must be 0
+        self.assertEqual(res["input_ids"][0, 3].item(), 151643)
+        self.assertEqual(res["attention_mask"][0, 3].item(), 0)
+        # Second sequence should have mask 1 on all positions
+        self.assertTrue((res["attention_mask"][1] == 1).all())
+
+    def test_peft_wrapped_model_disables_final_norm(self):
+        from namethatllm.trainer import _disable_final_norm
+        class MockNorm(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(16))
+            def forward(self, x):
+                return x * self.weight
+
+        class MockBaseInner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm = MockNorm()
+
+        class MockBase(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = MockBaseInner()
+
+        class MockPeftWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.base_model = MockBase()
+
+        wrapped = MockPeftWrapper()
+        self.assertIsInstance(wrapped.base_model.model.norm, MockNorm)
+        _disable_final_norm(wrapped)
+        self.assertIsInstance(wrapped.base_model.model.norm, nn.Identity)
+
+    def test_train_prompt_group_step_microbatched(self):
+        from namethatllm.trainer import train_prompt_group_step
+        torch.manual_seed(42)
+        hidden_size = 32
+        layers = [1, 2, 3]
+        mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=4)
+        model = MultiLayerLoRAClassifier(
+            backbone=mock_backbone,
+            hidden_size=hidden_size,
+            layers=layers,
+            num_classes=K
+        )
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        input_ids = torch.randint(0, 100, (6, 12))
+        attention_mask = torch.ones(6, 12, dtype=torch.long)
+        attention_mask[0, 8:] = 0
+        labels = torch.randint(0, K, (6,))
+
+        opt.zero_grad()
+        tot_loss, l_plain, l_centered = train_prompt_group_step(
+            model=model,
+            opt=opt,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            micro_batch_size=2,
+            centered_weight=0.5,
+            label_smoothing=0.10
+        )
+        self.assertTrue(math.isfinite(tot_loss))
+        self.assertTrue(math.isfinite(l_plain))
+        self.assertTrue(math.isfinite(l_centered))
+
+        # Check gradients are populated on heads
+        self.assertIsNotNone(model.plain_head.weight.grad)
+        self.assertIsNotNone(model.centered_head.weight.grad)
+        self.assertGreater(model.plain_head.weight.grad.abs().sum().item(), 0.0)
+        self.assertGreater(model.centered_head.weight.grad.abs().sum().item(), 0.0)
 
     def test_both_notebooks_compile_with_ast_parity(self):
         repo_root = Path(__file__).resolve().parents[1]

@@ -131,15 +131,21 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
             ckpts['qwen3_14b_p2'] = p.parent
         elif 'lora_qwen25_14b' in p_str or 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
             ckpts['qwen25_14b_p2'] = p.parent
-        elif 'ts_q3b14' in p_str or 'q14v5' in p_str:
+        elif 'q14v5' in p_str:
+            if 'qwen3_14b_v5' not in ckpts or (not is_fold):
+                ckpts['qwen3_14b_v5'] = p.parent
+        elif 'ts_q3b14' in p_str:
             if 'qwen3_14b_ts' not in ckpts or (not is_fold):
                 ckpts['qwen3_14b_ts'] = p.parent
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
         elif 'inhouse' in p_str or 'ntl-inhouse' in p_str or 'export_lora24' in p_str or 'lora-peft-training' in p_str or 'peft_training' in p_str:
-            ckpts['qwen3_8b_ts'] = p.parent
-        elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'q8v5' in p_str or 'l24x_q3b8' in p_str or 'll8v5' in p_str:
-            if 'qwen3_8b_ts' not in ckpts or ('inhouse' not in str(ckpts['qwen3_8b_ts']).lower() and 'export_lora24' not in str(ckpts['qwen3_8b_ts']).lower()):
+            ckpts['qwen3_8b_inhouse'] = p.parent
+        elif 'q8v5' in p_str:
+            if 'qwen3_8b_v5' not in ckpts or (not is_fold):
+                ckpts['qwen3_8b_v5'] = p.parent
+        elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'l24x_q3b8' in p_str or 'll8v5' in p_str:
+            if 'qwen3_8b_ts' not in ckpts or (not is_fold):
                 ckpts['qwen3_8b_ts'] = p.parent
         elif 'lora8b_v1' in p_str:
             ckpts['qwen3_8b_p1'] = p.parent
