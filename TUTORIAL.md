@@ -48,7 +48,7 @@ Where $K = 18$. A completely random guess yields:
 
 $$\frac{1}{18} \approx 5.56\%$$
 
-The production ensemble achieves **0.622 Balanced Accuracy** on the public test set.
+The production ensemble achieves **0.622 Balanced Accuracy** on the public test set, with our in-house Two-Stage LoRA24 model (`anilmittal/ntl-inhouse-two-stage-lora24`) achieving **73.19% validation accuracy** and the Joint Spectral Bank achieving **0.6441 Out-of-Fold Balanced Accuracy**.
 
 ### The Fundamental Machine Learning Challenge
 
@@ -57,13 +57,13 @@ The primary challenge in LLM authorship attribution is **Prompt Semantic Entangl
 2. A standard bag-of-words or un-centered classifier will memorize the prompt topic rather than learning the subtle **stylometric signature** ("handwriting") of the author.
 3. On unseen test prompts, a model that learned topics collapses.
 
-The production codebase solves this through **Within-Prompt Covariance Analysis (`wPCA`)**, **Adaptive Prompt-Mean Centering**, **Exact $2^{18}$ Subset Dynamic Programming**, and **Unified Orthographic Rule Postprocessing**.
+The production codebase solves this through **Within-Prompt Covariance Analysis (`wPCA`)**, **Adaptive Prompt-Mean Centering**, **Exact $2^{18}$ Subset Dynamic Programming**, **Two-Stage Multi-Layer LoRA Fine-Tuning**, and **Unified Orthographic Rule Postprocessing**.
 
 ---
 
 ## 2. End-to-End System Architecture
 
-The production pipeline is organized into 4 decoupled, memory-isolated modules executing sequentially within Kaggle's 30 GB RAM and 2-hour GPU limits:
+The production pipeline is organized into 5 decoupled, memory-isolated modules executing sequentially within Kaggle's 30 GB RAM and 2-hour GPU limits:
 
 ```
                           [ 4,000 Mystery Passages (test.csv) ]
@@ -71,13 +71,13 @@ The production pipeline is organized into 4 decoupled, memory-isolated modules e
         ┌───────────────────────────────────┴───────────────────────────────────┐
         ▼                                                                       ▼
 ┌──────────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
-│  MODULE 1: SUBPROCESS 78k LEXICAL ENGINE     │        │  MODULE 2: 4-TRUNK NEURAL EXTRACTORS         │
-│  - 78,482 Passages (train.csv + pool_v4)     │        │  - Base Trunks: Q3-14B, Q2.5-14B, Q3-8B, Deb │
+│  MODULE 1: SUBPROCESS MULTI-POOL LEXICAL     │        │  MODULE 2: 4-TRUNK NEURAL EXTRACTORS         │
+│  - Multi-Pool Discovery (78k+ unique texts)  │        │  - Base Trunks: Q3-14B, Q2.5-14B, Q3-8B, Deb │
 │  - Output 1: 4-View LinearSVC (C=0.50)       │        │  - Dynamic bfloat16 Overflow Rescue          │
-│  - Output 2: 5-View BPE + SGD + Style Twins  │        │  - Reversible In-Place LoRA Arithmetic       │
-│  - Dedicated 26-Feature Handwriting Model    │        │  - Snapshot Weight Isolation (Trunks 1 & 3)  │
-│  - Pure Sparse Matrices (100% Non-Zero Fast) │        │  - Native LayerNorm Readout Projections      │
-│  - Discrete Structural Rule Flags (N, 4)     │        │  - DeBERTa Token-0 Probing & NaN Guard       │
+│  - Output 2: 5-View BPE + SGD + Style Twins  │        │  - Reversible LoRA & Snapshot Isolation      │
+│  - Dedicated 26-Feature Handwriting Model    │        │  - Non-Colliding Checkpoint Multi-LoRA Loops │
+│  - Pure Sparse Matrices (100% Non-Zero Fast) │        │  - Live Checkpoint Accuracy Gate (>= 0.50)   │
+│  - Discrete Structural Rule Flags (N, 4)     │        │  - In-House LoRA24 Passed Gate (73.19% BAcc) │
 └──────────────────────┬───────────────────────┘        └──────────────────────┬───────────────────────┘
                        │                                                       │
                        └───────────────────────┬───────────────────────────────┘
@@ -89,6 +89,7 @@ The production pipeline is organized into 4 decoupled, memory-isolated modules e
 │  - ExactAuthorPosterior: Exact forward-backward dynamic programming over 2^18 author subsets         │
 │  - Crash-Proof Cluster Splitting: Guaranteed cluster size 2 <= s <= 14 <= 18                         │
 │  - Unsupervised 384-Dim Joint Spectral Bank: Top-64 components per checkpoint with Prior Scaling     │
+│  - Validated Out-of-Fold Balanced Accuracy: 0.6441                                                   │
 └──────────────────────────────────────────────┬───────────────────────────────────────────────────────┘
                                                ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -156,17 +157,37 @@ The extractor outputs `rule_flags_test` with shape $(N, 4)$ for Module 4.
 
 ## 4. Module 2: Multi-Trunk Neural Extractors (`neural_extractor.py`)
 
-### 1. Trunk Reuse Across 6 Checkpoints
-Loading 6 distinct large language models into GPU memory simultaneously would require $> 80$ GB VRAM. Module 2 achieves zero-memory duplication by sequentially reusing 4 base model trunks:
+### 1. Trunk Reuse Across Multi-Checkpoint Ensembles
+Loading multiple large language models into GPU memory simultaneously would require $> 80$ GB VRAM. Module 2 achieves zero-memory duplication by sequentially reusing 4 base model trunks across primary, secondary, and optional checkpoints:
 
 | Trunk | Base Model | Truncated Depth | Active Layers | Checkpoints Served |
 | :--- | :--- | :---: | :--- | :--- |
-| **Trunk 1** | `Qwen3-14B` | 27 Layers | `[2, 4, 6, 9, 13, 17, 22, 27]` | **1A**: Part-2 LoRA (`lora_qwen3_14b`)<br>**1B**: Part-1 LoRA (`lora14b_v1`) |
+| **Trunk 1** | `Qwen3-14B` | 27 Layers | `[2, 4, 6, 9, 13, 17, 22, 27]` | **1A**: Part-2 LoRA (`lora_qwen3_14b`)<br>**1B**: Part-1 LoRA (`lora14b_v1`)<br>**1C**: Optional `ts_q3b14` (`qwen3_14b_ts`)<br>**1D**: Optional `q14v5` (`qwen3_14b_v5`) |
 | **Trunk 2** | `Qwen2.5-14B` | 32 Layers | `[3, 5, 8, 11, 16, 21, 27, 32]` | **2**: Part-2 LoRA (`lora_qwen25_14b`) |
-| **Trunk 3** | `Qwen3-8B` | 24 Layers | `[2, 4, 6, 8, 12, 16, 20, 24]` | **3A**: In-Style LoRA (`instyle`)<br>**3B**: Claude Head LoRA (`qwen3_8b_claude`) |
+| **Trunk 3** | `Qwen3-8B` | 24 Layers | `[2, 4, 6, 8, 12, 16, 20, 24]` | **3A**: In-Style LoRA (`instyle`)<br>**3B**: Claude Head LoRA (`qwen3_8b_claude`)<br>**3C**: Optional `ts_q3b8` (`qwen3_8b_ts`)<br>**3D**: Optional `q8v5` (`qwen3_8b_v5`)<br>**3E**: In-House Two-Stage LoRA24 (`qwen3_8b_inhouse`) |
 | **Trunk 4** | `DeBERTa-v3` | 24 Layers | `[3, 6, 9, 12, 15, 18, 21, 24]` | Dedicated Sequence Classification Encoder |
 
-### 2. Attention-Sink Zeroing (`m[:, 0, :] = 0.0`)
+### 2. Live Checkpoint Accuracy Gating (`verify_checkpoint_gate`)
+To prevent corrupt, misaligned, or underperforming LoRAs from degrading test predictions, every optional checkpoint is subjected to an empirical live validation gate before inclusion:
+1. The model predicts on the 1,622-sample `train_sub` validation set.
+2. If balanced accuracy $< 0.50$, the checkpoint is discarded:
+   ```
+   [Gate] Rejecting underperforming checkpoint (acc < 0.50 threshold)
+   ```
+3. In production, our in-house model passed with flying colors:
+   ```
+   [Gate] qwen3_8b_ts: train_sub accuracy = 0.7319 (threshold=0.50) -> PASSED
+   ```
+
+### 3. Non-Colliding Checkpoint Discovery (`config.py`)
+Checkpoints from external datasets (`nlm-l24-adapters`, `nlm-l24-adapters-v5`) and our in-house training (`ntl-inhouse-two-stage-lora24`) are mapped to isolated dictionary keys:
+- `qwen3_14b_ts`: `ts_q3b14`
+- `qwen3_14b_v5`: `q14v5`
+- `qwen3_8b_ts`: `ts_q3b8` / `ts8_s7` / `l24x_q3b8`
+- `qwen3_8b_v5`: `q8v5`
+- `qwen3_8b_inhouse`: `inhouse` / `export_lora24` / `lora-peft-training`
+
+### 4. Attention-Sink Zeroing (`m[:, 0, :] = 0.0`)
 Causal transformers (such as Qwen) allocate massive attention weights to the first token ($position = 0$), creating an "attention sink" whose activation values can be 1,000x larger than normal tokens.
 
 If included in average pooling, this single token crushes the semantic representation. Module 2 zeroes out position 0 before mean-pooling:
@@ -344,29 +365,63 @@ All ensemble weights, regularizers, prior scales, and thresholds are defined dec
 
 ---
 
-## 8. Single-Source-of-Truth Compilation & Verification
+## 8. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `lora_training.ipynb`)
+
+Module 5 provides the end-to-end training and artifact generation pipeline used to build our in-house multi-layer LoRA checkpoints (such as `anilmittal/ntl-inhouse-two-stage-lora24`).
+
+### 1. 2x T4 Multi-GPU Memory Balancing & Non-Reentrant Gradient Checkpointing
+To train Qwen3-8B across Kaggle's dual T4 GPUs (15 GB VRAM each) without OOM or CUDA context crashes:
+- Device placement is constrained explicitly: `max_memory={"0": "9.0GiB", "1": "9.0GiB"}` via HuggingFace `accelerate`.
+- PyTorch gradient checkpointing is activated with `use_reentrant=False` on the causal transformer backbone, eliminating peak autograd cache spikes.
+
+### 2. Stage 1: Sequence Classification Pre-Training
+- Trained across 75,000 augmented passages (`configs/training_lora.json`).
+- Optimizes Cross-Entropy Loss with AdamW ($lr = 10^{-4}, \text{weight\_decay} = 0.01$).
+- Accumulates gradients over micro-batches (`batch_size = 4, gradient_accumulation_steps = 4`).
+
+### 3. Stage 2: Prompt-Group Multi-Task Contrastive Fine-Tuning
+In Stage 2, samples are grouped into 18-row prompt batches via `PromptGroupBatchSampler`. Each prompt group contains responses to the same topic across all 18 models:
+- **Two-Pass Micro-Batched Execution (`train_prompt_group_step`)**:
+  - **Pass 1 (`torch.no_grad()`)**: Iterates through the 18 rows in chunks of 4 to compute the exact prompt mean embedding $\mu_{\text{prompt}} = \frac{1}{18} \sum_{i=1}^{18} z_i$.
+  - **Pass 2 (Autograd Micro-Batches)**: Evaluates loss over micro-batches of size 2 with dynamic sequence length slicing (`:max_l` across the micro-batch), dynamically centering features:
+    $$z_{\text{centered}, i} = z_i - \mu_{\text{prompt}}$$
+    Loss is a dual objective with label smoothing ($\epsilon = 0.10$):
+    $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}}(\text{plain}) + 0.5 \cdot \mathcal{L}_{\text{CE}}(\text{centered})$$
+  - Accumulates gradients directly into parameters with peak VRAM bounded to only 2 sequences.
+
+### 4. Critical Training Bug Fixes & Protections
+1. **Token-0 Padding Bug**: Qwen token ID `0` is `"!"` (exclamation mark), while `pad_token_id = 151643`. In `collate_text_batch`, `attention_mask` is initialized to 1 for all valid tokens, padded with 0, and `input_ids` padded with 151643. Token `0` (`"!"`) is never masked out.
+2. **Recursive Final Norm Removal (`_disable_final_norm`)**: When wrapping models with PEFT, `norm` is nested under `base_model.model.norm`. `_disable_final_norm` recursively replaces all final RMSNorm modules with `nn.Identity()`, ensuring hidden states extracted at layer 24 during training match the un-normalized representations extracted during inference.
+3. **Closed-Form Dual Ridge Regression Head Calibration (`fit_ridge_heads`)**: Before Stage 2 and immediately prior to exporting artifacts, closed-form $N \times N$ dual Ridge regression ($L_2$-regularized, $\lambda = 1.0$) with label smoothing $0.10$ solves optimal classification weights $W_p$ and $W_c$ directly on extracted training features, preventing overfitting to prompt topics.
+
+---
+
+## 9. Single-Source-of-Truth Compilation & Verification
 
 The repository enforces a **Single Source of Truth** architecture:
 - All model logic lives in `src/namethatllm/`.
-- All hyperparameter values live in `configs/production_ensemble.json`.
-- `scripts/compile_notebook.py` parses module ASTs, strips package imports, and bundles everything into the executable single-file submission notebook [`kaggle_submission.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/submission/kaggle_submission.ipynb).
+- All hyperparameter values live in `configs/production_ensemble.json` and `configs/training_lora.json`.
+- `scripts/compile_notebook.py` parses module ASTs, strips package imports, and bundles everything into two standalone notebooks:
+  1. [`kaggle_submission.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/submission/kaggle_submission.ipynb) (Inference pipeline)
+  2. [`lora_training.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/training/lora_training.ipynb) (Training pipeline)
 
-### Running the 27 Unit Tests:
+### Running the 37 Unit Tests:
 ```powershell
 python -m pytest tests -v
 ```
 
-All 27 tests cover every component:
-1. `test_compiler_and_integration.py`: AST parity, single-source bundling, end-to-end smoke pipeline, full mock-neural pipeline, LayerNorm specifications.
-2. `test_lexical.py`: Shape patterns, function word preservation, punctuation retention, dual lexical outputs, continuous handwriting feature extraction.
-3. `test_neural_extractor`: Reversible LoRA unmerging, bfloat16 rescue, LayerNorm projection.
-4. `test_wpca_dp.py`: Covariance shrinkage floors, two-way prompt decomposition, safe cluster splitting ($s \le 14$), exact $2^{18}$ forward-backward bitmask DP.
-5. `test_spectral_bank.py`: Unsupervised $V_{\text{top64}}$ extraction (0 label leakage), prior scaling normalization, joint spectral bank execution.
-6. `test_postprocess.py`: Two-tier convex blend, mass-preserving Claude specialist gate, discrete orthographic rules, continuous handwriting integration, 300-step Sinkhorn mass equalization, submission schema.
+All 37 tests cover every component across 7 test suites:
+1. `test_compiler_and_integration.py` (8 tests): AST parity, single-source bundling, multi-key checkpoint discovery, end-to-end smoke pipeline, full mock-neural pipeline, LayerNorm specifications.
+2. `test_lexical.py` (5 tests): Shape patterns, function word preservation, punctuation retention, dual lexical outputs, continuous handwriting feature extraction.
+3. `test_neural_extractor.py` (4 tests): Reversible LoRA unmerging, bfloat16 rescue, LayerNorm projection.
+4. `test_wpca_dp.py` (4 tests): Covariance shrinkage floors, two-way prompt decomposition, safe cluster splitting ($s \le 14$), exact $2^{18}$ forward-backward bitmask DP.
+5. `test_spectral_bank.py` (4 tests): Unsupervised $V_{\text{top64}}$ extraction (0 label leakage), prior scaling normalization, joint spectral bank execution.
+6. `test_postprocess.py` (6 tests): Two-tier convex blend, mass-preserving Claude specialist gate, discrete orthographic rules, continuous handwriting integration, 300-step Sinkhorn mass equalization, submission schema.
+7. `test_trainer.py` (6 tests): Prompt group batch sampler, loss formulation, dataset tokenization, token-0 attention mask preservation, PEFT final norm deactivation, two-pass micro-batched prompt group step.
 
 ---
 
-## 9. Mathematical Reference Cheatsheet
+## 10. Mathematical Reference Cheatsheet
 
 ```
 1. LoRA Weight Fusion (GPU Device):
@@ -383,15 +438,23 @@ All 27 tests cover every component:
    merge_lora(trunk.model, adapter_path, sign=+1.0)
    trunk.restore_weights(backup)                                    (Bit-exact zero drift)
 
-5. Two-Tier Convex Mixture (85/15):
+5. Two-Pass Micro-Batched Prompt Group Step:
+   Pass 1 (no_grad):  mu_prompt = (1 / 18) * sum_{j=1}^{18} z_j
+   Pass 2 (autograd): z_{c, i} = z_i - mu_prompt;  L = L_plain + 0.5 * L_centered
+
+6. Closed-Form Dual Ridge Regression (N x N Gram Solver):
+   W = (Z^T @ Z + lambda * I)^{-1} @ Z^T @ Y_smoothed
+     = Z^T @ (Z @ Z^T + lambda * I)^{-1} @ Y_smoothed
+
+7. Two-Tier Convex Mixture (85/15):
    P_mix = 0.85 * R_main + 0.15 * P_comp
 
-6. Vectorized Claude Specialist Gate (Mass-Preserving):
+8. Vectorized Claude Specialist Gate (Mass-Preserving):
    P_claude = (1 - w_gate) * P_prior + w_gate * (mass * P_specialist)
 
-7. Unified Handwriting & Orthographic Shield:
+9. Unified Handwriting & Orthographic Shield:
    log P_out = softmax(log P_mix + B_disc @ W_pen + w_hw * log P_hw)
 
-8. Exact Multiplicative Sinkhorn-Knopp Equalization (300 Steps):
-   P^{(t+1)} = diag(u^{(t)}) @ P^{(t)} @ diag(v^{(t)})             (column sums = N / 18)
+10. Exact Multiplicative Sinkhorn-Knopp Equalization (300 Steps):
+    P^{(t+1)} = diag(u^{(t)}) @ P^{(t)} @ diag(v^{(t)})             (column sums = N / 18)
 ```

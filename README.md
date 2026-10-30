@@ -3,7 +3,8 @@
 [![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.622%20(SOTA)-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
 [![Codebase Architecture](https://img.shields.io/badge/Architecture-Modular%20PyPA%20Package-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-27%20Passed-brightgreen)](#)
+[![In-House Checkpoint](https://img.shields.io/badge/In--House%20LoRA24-73.19%25%20Validation%20BAcc-brightgreen)](https://www.kaggle.com/datasets/anilmittal/ntl-inhouse-two-stage-lora24)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-37%20Passed-brightgreen)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
 A competition-grade, memory-isolated machine learning solution for the **Kaggle "Name That LLM"** competition. The objective is to identify which of 18 specific Large Language Models authored an unattributed response passage.
@@ -12,7 +13,7 @@ A competition-grade, memory-isolated machine learning solution for the **Kaggle 
 
 ## 1. System Overview
 
-The production system operates as a **two-tier, memory-isolated ensemble** combining 4 foundation model trunks, 6 fine-tuned LoRA/encoder checkpoints, dual lexical engines, within-prompt stylometric covariance analysis, exact subset dynamic programming, and unified Bayesian orthographic postprocessing.
+The production system operates as a **two-tier, memory-isolated ensemble** combining 4 foundation model trunks, 10 fine-tuned LoRA/encoder checkpoints (including our in-house Two-Stage LoRA24 model, achieving **73.19% live validation accuracy**), multi-pool lexical engines, within-prompt stylometric covariance analysis, exact subset dynamic programming, an unsupervised **0.6441 OOF Joint Spectral Bank**, and unified Bayesian orthographic postprocessing.
 
 ```
                           [ 4,000 Mystery Passages (test.csv) ]
@@ -20,13 +21,13 @@ The production system operates as a **two-tier, memory-isolated ensemble** combi
         ┌───────────────────────────────────┴───────────────────────────────────┐
         ▼                                                                       ▼
 ┌──────────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
-│  MODULE 1: SUBPROCESS 78k LEXICAL ENGINE     │        │  MODULE 2: 4-TRUNK NEURAL EXTRACTORS         │
-│  - 78,482 Passages (train.csv + pool_v4)     │        │  - Base Trunks: Q3-14B, Q2.5-14B, Q3-8B, Deb │
+│  MODULE 1: SUBPROCESS MULTI-POOL LEXICAL     │        │  MODULE 2: 4-TRUNK NEURAL EXTRACTORS         │
+│  - Multi-Pool Discovery (78k+ unique texts)  │        │  - Base Trunks: Q3-14B, Q2.5-14B, Q3-8B, Deb │
 │  - Output 1: 4-View LinearSVC (C=0.50)       │        │  - Dynamic bfloat16 Overflow Rescue          │
-│  - Output 2: 5-View BPE + SGD + Style Twins  │        │  - Reversible In-Place LoRA Arithmetic       │
-│  - Dedicated 26-Feature Handwriting Model    │        │  - Snapshot Weight Isolation (Trunks 1 & 3)  │
-│  - Pure Sparse Matrices (100% Non-Zero Fast) │        │  - Native LayerNorm Readout Projections      │
-│  - Discrete Structural Rule Flags (N, 4)     │        │  - DeBERTa Token-0 Probing & NaN Guard       │
+│  - Output 2: 5-View BPE + SGD + Style Twins  │        │  - Reversible LoRA & Snapshot Isolation      │
+│  - Dedicated 26-Feature Handwriting Model    │        │  - Non-Colliding Checkpoint Multi-LoRA Loops │
+│  - Pure Sparse Matrices (100% Non-Zero Fast) │        │  - Live Checkpoint Accuracy Gate (>= 0.50)   │
+│  - Discrete Structural Rule Flags (N, 4)     │        │  - In-House LoRA24 Passed Gate (73.19% BAcc) │
 └──────────────────────┬───────────────────────┘        └──────────────────────┬───────────────────────┘
                        │                                                       │
                        └───────────────────────┬───────────────────────────────┘
@@ -38,6 +39,7 @@ The production system operates as a **two-tier, memory-isolated ensemble** combi
 │  - ExactAuthorPosterior: Exact forward-backward dynamic programming over 2^18 author subsets         │
 │  - Crash-Proof Cluster Splitting: Guaranteed cluster size 2 <= s <= 14 <= 18                         │
 │  - Unsupervised 384-Dim Joint Spectral Bank: Top-64 components per checkpoint with Prior Scaling     │
+│  - Validated Out-of-Fold Balanced Accuracy: 0.6441                                                   │
 └──────────────────────────────────────────────┬───────────────────────────────────────────────────────┘
                                                ▼
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -71,11 +73,12 @@ The production system operates as a **two-tier, memory-isolated ensemble** combi
 
 ## 3. Current Codebase Architecture
 
-The codebase is organized in `src/namethatllm/` as a modular PyPA package with 4 decoupled execution modules:
+The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5 decoupled execution modules:
 
-### Module 1: Subprocess Dual-Output Lexical Engine (`lexical_engine.py`)
+### Module 1: Subprocess Multi-Pool Lexical Engine (`lexical_engine.py`)
 - **Memory Isolation**: Executes in a subprocess prior to GPU neural loading, freeing all host RAM before PyTorch initializes CUDA.
-- **Output 1 (`log_p_svc_main`, Main Stack)**: Pure 4-view `LinearSVC(C=0.50)` fitted on 78,482 passages (`train.csv` + `pool_v4.parquet`):
+- **Multi-Pool Discovery**: Scans and aggregates all available pool parquets (`nlm_pool_v5.parquet`, `pool_v4.parquet`, `nlm_matched_clean.parquet`, `nlm_pool_v2.parquet`) alongside `train.csv`, producing over 78,000 unique training passages.
+- **Output 1 (`log_p_svc_main`, Main Stack)**: Pure 4-view `LinearSVC(C=0.50)`:
   - Char n-grams: (3, 5), 250,000 features, scale 1.0
   - Word n-grams: (1, 3), 180,000 features, scale 0.7
   - Shape character patterns: (2, 6), 60,000 features, scale 0.5 (preserves uppercase/lowercase character blocks)
@@ -85,11 +88,12 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 4
 - **Discrete Rule Extraction**: Strips fenced code blocks (`_RE_CODE_BLOCK`) and returns `rule_flags_test` `(N, 4)`. Keeps n-gram matrices 100% sparse for ~30% faster SVM/SGD training.
 
 ### Module 2: Multi-Trunk Neural Extractors (`neural_extractor.py`)
-- **Trunk Reuse Across 6 Checkpoints**:
-  - `Trunk 1 (Qwen3-14B)`: Checkpoint 1A (Part-2, 27 layers) + Checkpoint 1B (Part-1, 24 layers)
-  - `Trunk 2 (Qwen2.5-14B)`: Checkpoint 2 (Part-2, 32 layers)
-  - `Trunk 3 (Qwen3-8B)`: Checkpoint 3A (In-Style, 24 layers) + Checkpoint 3B (Claude Head, 24 layers)
+- **Trunk Reuse Across 10 Checkpoints**:
+  - `Trunk 1 (Qwen3-14B)`: Part-2 LoRA (`lora_qwen3_14b`), Part-1 LoRA (`lora14b_v1`), Two-Stage LoRA (`qwen3_14b_ts`), v5 LoRA (`qwen3_14b_v5`)
+  - `Trunk 2 (Qwen2.5-14B)`: Part-2 LoRA (`lora_qwen25_14b`)
+  - `Trunk 3 (Qwen3-8B)`: In-Style LoRA (`instyle`), Claude Head LoRA (`qwen3_8b_claude`), Two-Stage LoRA (`qwen3_8b_ts`), v5 LoRA (`qwen3_8b_v5`), and In-House LoRA24 (`qwen3_8b_inhouse`)
   - `Trunk 4 (DeBERTa-v3-large)`: Fine-tuned sequence classification encoder (24 layers)
+- **Live Checkpoint Accuracy Gating**: Validates each optional checkpoint on `train_sub` (`min_bacc=0.50`) before allowing its posteriors or spectral representations into the ensemble. Our in-house LoRA24 achieved **73.19% balanced accuracy**.
 - **Dynamic `bfloat16` Overflow Rescue**: Detects residual activation blowup ($> 65,504$) in deep layers and recomputes only affected rows in `bfloat16`, eliminating NaN propagation.
 - **Reversible LoRA In-Place Arithmetic**: Merges LoRA adapters directly on GPU memory ($W_{\text{eff}} = W_0 + \frac{\alpha}{r} BA$).
 - **Bit-Exact Snapshot Weight Isolation**: Caches affected trunk weights on CPU prior to merging and restores them via `restore_weights` on Trunks 1 and 3, eliminating cumulative FP16 subtraction drift.
@@ -101,7 +105,7 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 4
 - **Shrinkage Regularization**: Ledoit-Wolf style covariance shrinkage with per-checkpoint floors (`se_floor`).
 - **Crash-Proof Cluster Splitting (`split_oversized_clusters_dist`)**: Splits oversized test clusters via average-linkage distance clustering, mathematically guaranteeing cluster sizes $2 \le s \le 14 \le 18$.
 - **`ExactAuthorPosterior`**: Evaluates exact 18-step forward-backward bitmask dynamic programming over all $2^{18} = 262,144$ author configurations on safe clusters, enforcing the hard author uniqueness constraint ($c_i \neq c_j$).
-- **384-Dim Joint Spectral Bank**: Extracts top-64 principal components from unsupervised prompt-centered features ($V_{\text{f32}}[:, :64]$) with out-of-sample prior scaling (zero label leakage). Fits dual logistic regression (plain $C=0.04$ + prompt-centered $C=0.03$).
+- **384-Dim Joint Spectral Bank**: Extracts top-64 principal components from unsupervised prompt-centered features ($V_{\text{f32}}[:, :64]$) with out-of-sample prior scaling (zero label leakage). Fits dual logistic regression (plain $C=0.04$ + prompt-centered $C=0.03$), reaching **0.6441 Out-of-Fold Balanced Accuracy**.
 
 ### Module 4: Two-Tier Convex Fusion & Unified Postprocessing (`postprocess.py`)
 - **Two-Tier Convex Blend**:
@@ -119,6 +123,17 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 4
   - Re-normalizes rows to the probability simplex.
 - **300-Step Multiplicative Sinkhorn-Knopp Mass Balancing**: Iteratively rescales row and column marginals, equalizing predicted class mass to $N/18$.
 
+### Module 5: Two-Stage LoRA Training Engine (`trainer.py`)
+- **Memory-Balancing Across 2x T4 GPUs**: Distributes weights with `max_memory={i: "9.0GiB"}` and non-reentrant gradient checkpointing (`use_reentrant=False`), eliminating CUDA out-of-memory crashes.
+- **Stage 1 (Pool Pre-training)**: Trains adapter on 75,000 multi-pool passages (`batch_size=4`, `accum=4`, `lr=2e-4`).
+- **Stage 2 (Prompt-Grouped Fine-Tuning)**: Two-pass micro-batched training via `train_prompt_group_step`:
+  - Pass 1 (`torch.no_grad()`): Computes exact within-prompt mean vector `mu_prompt` in chunks of 4.
+  - Pass 2 (Autograd micro-batches of 2): Dynamically slices sequences to `max_l` and accumulates gradients with `label_smoothing=0.10`, ensuring peak memory never exceeds 2 sequences.
+- **Token-0 Padding Preservation**: Properly preserves token ID 0 (`"!"`) with `attention_mask = 1` while padding with `151643` (`attention_mask = 0`).
+- **Full Norm Deactivation (`_disable_final_norm`)**: Recursively neutralizes `.norm` across all PEFT nesting levels to guarantee inference parity with `UniversalLoRATrunkLoader`.
+- **Closed-Form Dual Ridge Head Calibration (`fit_ridge_heads`)**: Ultra-fast dual formulation $(N \times N)$ Ridge regression with label smoothing (0.10) to pre-calibrate and post-calibrate classification heads.
+- **Inference-Compliant Export**: Produces exact `adapter/`, `heads.safetensors`, `meta.json`, and `wPCA_bank.npz` files for instant plug-and-play mounting.
+
 ---
 
 ## 4. Repository Layout (PyPA `src` Layout)
@@ -129,32 +144,35 @@ NameThatLLM/
 ├── README.md                            # High-level architecture guide based on current codebase
 ├── TUTORIAL.md                          # Comprehensive technical masterclass & mathematical guide
 ├── configs/
-│   └── production_ensemble.json         # Declarative weights, floors, prior scales, and thresholds
+│   ├── production_ensemble.json         # Declarative weights, floors, prior scales, and thresholds
+│   └── training_lora.json               # Two-stage LoRA training hyperparameters and layer schedules
 ├── kernels/
 │   ├── submission/
 │   │   ├── kernel-metadata.json         # Kaggle GPU/dataset mounts configuration
 │   │   └── kaggle_submission.ipynb      # Compiled single-file production notebook
 │   └── training/
-│       ├── kernel-metadata.json
-│       └── lora_training.ipynb
+│       ├── kernel-metadata.json         # Kaggle 2xT4 training GPU configuration
+│       └── lora_training.ipynb          # Compiled two-stage LoRA training notebook
 ├── scripts/
-│   ├── compile_notebook.py              # Single-source-of-truth AST compiler from src/ + configs/
+│   ├── compile_notebook.py              # Single-source-of-truth AST compiler for submission & training
 │   └── push_submission.py               # Automated test, compile, and push CLI runner
 ├── src/namethatllm/                     # Decoupled production Python package
 │   ├── __init__.py                      # Package exports and version
 │   ├── config.py                        # 18 labels, families, simplex helpers, path resolvers
-│   ├── lexical_engine.py                # 78k 4-view Main SVC + 5-view BPE + Handwriting classifier
+│   ├── lexical_engine.py                # Multi-pool 4-view Main SVC + 5-view BPE + Handwriting classifier
 │   ├── neural_extractor.py              # 4-trunk loader, reversible LoRA, snapshot isolation, LayerNorm
 │   ├── wpca_gaussian.py                 # Full-rank wPCA, safe cluster splitting, 2^18 Bitmask DP
 │   ├── spectral_bank.py                 # Unsupervised 384-dim Joint Spectral Bank (0 label leakage)
 │   ├── postprocess.py                   # Two-tier blend, Claude gate, unified handwriting shield, Sinkhorn
+│   ├── trainer.py                       # Two-stage LoRA training engine, micro-batching, Ridge heads
 │   └── pipeline.py                      # Top-level orchestrator connecting Modules 1 through 4
-└── tests/                               # Comprehensive unit and integration test suite
+└── tests/                               # Comprehensive unit and integration test suite (37 tests)
     ├── test_compiler_and_integration.py # AST validation, compiler checks, mock-neural integration
     ├── test_lexical.py                  # Tokenizers, shape patterns, stopwords, dual lexical outputs
     ├── test_wpca_dp.py                  # Covariance shrinkage, two-way decomposition, ExactAuthorPosterior
     ├── test_spectral_bank.py            # Prior scaling, unsupervised V_f32 projection, OOF validation
-    └── test_postprocess.py              # Two-tier blend, Claude gate, unified shield, Sinkhorn balancing
+    ├── test_postprocess.py              # Two-tier blend, Claude gate, unified shield, Sinkhorn balancing
+    └── test_trainer.py                  # Collate padding, norm deactivation, micro-batching, export parity
 ```
 
 ---
@@ -168,19 +186,28 @@ pip install -e . --no-deps
 ```
 
 ### 2. Running Unit & Integration Tests
-Run the complete 27-test suite:
+Run the complete 37-test suite:
 ```powershell
 python -m pytest tests -v
 ```
 
-### 3. Compiling & Pushing to Kaggle
-Compile the notebook directly from `src/namethatllm/` and push to Kaggle:
+### 3. Compiling Notebooks from Single Source of Truth
+Compile notebooks directly from `src/namethatllm/` and `configs/`:
 ```powershell
-# Automated single-command execution (tests -> compile -> push)
-python scripts/push_submission.py
+# Compile all notebooks (submission + training)
+python scripts/compile_notebook.py --target all
 
-# Or step-by-step
-python scripts/compile_notebook.py --config configs/production_ensemble.json
+# Or compile individually
+python scripts/compile_notebook.py --target submission
+python scripts/compile_notebook.py --target training
+```
+
+### 4. Pushing to Kaggle
+Push compiled notebooks to Kaggle:
+```powershell
+# Push submission notebook
 python -m kaggle kernels push -p kernels/submission
-python -m kaggle kernels status anilmittal/name-that-llm-v2-submission
+
+# Push training notebook
+python -m kaggle kernels push -p kernels/training
 ```
