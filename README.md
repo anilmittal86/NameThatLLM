@@ -136,7 +136,24 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5
 
 ---
 
-## 4. Repository Layout (PyPA `src` Layout)
+## 4. Benchmark & Submission History
+
+| Version | Ref | Public Score | Key Architectural Advancements |
+| :---: | :---: | :---: | :--- |
+| **v48** | `57795094` | **0.621** | **In-House Two-Stage LoRA24 Activated**: Passed live gate with **73.19% validation accuracy**, 0.6441 Joint Spectral Bank OOF, non-colliding multi-checkpoint ensemble across 4 trunks. |
+| **v46** | `57774506` | **0.620** | Live accuracy gate (`verify_checkpoint_gate`), `heads.pt` auto-discovery, roll back discrete penalty. |
+| **v45** | `57740226` | **0.621** | Unified Handwriting & Orthographic Rules, Shared Trunk CPU snapshot weight isolation. |
+| **v44** | `57725771` | **0.622** | Zero-RAM in-place unmerge, multi-resolution twins, 384-dim Joint Spectral Bank. |
+| **v42** | `57722364` | **0.613** | Two-tier convex fusion (85% Main Stack / 15% Complementary Stack). |
+| **v40** | `57707605` | **0.612** | Dynamic `bfloat16` overflow rescue on 14B trunks, 1,620-row full-rank wPCA covariance. |
+| **v30** | `57696915` | **0.604** | Crash-proof average-linkage cluster splitting ($2 \le s \le 14 \le 18$), pre-Sinkhorn orthographic shield. |
+| **v26** | `57664232` | **0.605** | Memory-isolated subprocess lexical engine (`run_lexical.py`), head-tail subword pooling. |
+| **v19** | `57628730` | **0.551** | Multi-trunk neural feature extraction with within-prompt Gaussian covariance. |
+| **v15** | `57595711` | **0.491** | Attention-sink zeroed pooling (`m[:, 0, :] = 0.0`), soft adaptive prompt centering. |
+
+---
+
+## 5. Repository Layout (PyPA `src` Layout)
 
 ```
 NameThatLLM/
@@ -177,7 +194,7 @@ NameThatLLM/
 
 ---
 
-## 5. Developer Quickstart
+## 6. Developer Quickstart
 
 ### 1. Installation
 Install the package locally in editable mode:
