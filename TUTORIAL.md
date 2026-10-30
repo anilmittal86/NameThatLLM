@@ -393,7 +393,94 @@ The table below breaks down the effective vote share, selection purpose, empiric
 
 ---
 
-## 9. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `lora_training.ipynb`)
+## 9. Empirical Live Ablation Results from Kaggle GPU (Version 49)
+
+In submission run **Version 49** (5,003 seconds, dual T4 GPUs), the full **Zero-Leakage Unseen Holdout Benchmark** (`N_unseen = 360`, 20 samples per class, zero overlap with `train.csv` and `pool_v4.parquet`) was executed live.
+
+### 1. Stage A: Live "Probe-First" Fast GPU Pruning Results
+Optional checkpoints underwent an automatic ~60-second probe on the 360 holdout rows before full feature extraction. Checkpoints failing the gate ($< 0.45$ solo BAcc) were instantly pruned, saving over 35,000 redundant forward passes (>1 hour of GPU quota):
+
+| Checkpoint Key | Model Name / Source | Solo Unseen BAcc | Gate Verdict | Action Taken |
+| :--- | :--- | :---: | :---: | :--- |
+| `qwen3_14b_ts` | Qwen3-14B TS (External) | **0.1361** | `< 0.45` | **Pruned (Skipped full extraction)** |
+| `qwen3_14b_v5` | Qwen3-14B v5 (External) | **0.1528** | `< 0.45` | **Pruned (Skipped full extraction)** |
+| `qwen3_8b_ts` | Qwen3-8B TS (External) | **0.1167** | `< 0.45` | **Pruned (Skipped full extraction)** |
+| `qwen3_8b_v5` | Qwen3-8B v5 (External) | **0.1472** | `< 0.45` | **Pruned (Skipped full extraction)** |
+| `qwen3_8b_inhouse` | **NTL In-House Two-Stage LoRA24** | **0.4306** | `< 0.45` | **Pruned (Protected Ensemble Balance)** |
+
+> [!NOTE]
+> **In-House Model Performance**: Our in-house model scored **`0.4306` (43.06%)**, which is nearly **3x to 4x higher** than the external 8B and 14B adapter checkpoints (`ts8` at 0.1167 and `v5` at 0.1472), while random guessing is only `5.56%`.
+
+---
+
+### 2. Table 1: Standalone (Solo) Accuracy on Unseen Holdout
+Evaluates each individual component in complete isolation on strictly unseen data:
+
+| Model / Checkpoint | Tier | Unseen Raw BAcc | Unseen + Sinkhorn BAcc | Agrees w/ Final Test | Key Architectural Role |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Qwen3-14B Part-2** | Main | **0.5278** | **0.5194** | 66.7% | Primary deep causal backbone |
+| **LinearSVC (4-View)** | Main | **0.4833** | **0.4889** | 33.3% | Surface stylometric punctuation baseline |
+| **Lexical Comp (5-View)** | Comp | **0.4028** | **0.4778** | 33.3% | Subword BPE + character n-gram ensemble |
+| **Qwen3-14B Part-1** | Comp | **0.4278** | **0.4500** | 66.7% | Legacy 14B causal projection |
+| **Qwen2.5-14B Part-2** | Main | **0.4333** | **0.4333** | 66.7% | Secondary 14B causal family |
+| **Qwen3-8B Claude-Head** | Comp | **0.1083** | **0.1111** | 33.3% | Within-Claude sibling head (in-sample overfit) |
+| **DeBERTa-v3-Large** | Main | **0.0472** | **0.0861** | 33.3% | Bidirectional masked encoder (head shifted) |
+
+---
+
+### 3. Table 2: Greedy Forward Stepwise Selection
+Starting from the single highest-scoring solo model (`Qwen3-14B Part-2`), candidate models were added iteratively based on maximal cumulative lift:
+
+| Step | Added Model | Weight | Cumul Raw BAcc | Cumul + Sinkhorn BAcc | Marginal Lift | Test Rows Flipped |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **1** | `+ Qwen3-14B Part-2` | 0.50 | 0.5278 | **0.5194** | *BASELINE* | 3 (Init) |
+| **2** | `+ LinearSVC (4-View)` | 1.00 | 0.5694 | **0.5639** | **+0.0444** | 0 (0.0%) |
+| **3** | `+ Lexical Comp (5-View)` | 0.20 | 0.5722 | **0.5667** | **+0.0028** | 0 (0.0%) |
+| *Terminated* | *DeBERTa-v3-Large* | 0.25 | — | — | *-0.0056* | *Pruned by Stopping Rule* |
+
+- Blending `LinearSVC (4-View)` with `Qwen3-14B Part-2` provided an immediate **+4.44% boost** in out-of-sample balanced accuracy!
+- The forward search terminated automatically when adding remaining models resulted in negative marginal lift.
+
+---
+
+### 4. Table 3: Globally Optimal Subset & Leave-One-Out (LOO) Attribution
+Exhaustive evaluation of all $2^7 - 1 = 127$ non-empty combinations identified the globally optimal combination:
+
+$$\text{Globally Optimal Subset BAcc} = \mathbf{0.5667} \quad (\text{Uses 3 of 7 Models})$$
+$$\text{Optimal Set} = \{\text{LinearSVC (4-View)}, \; \text{Lexical Comp (5-View)}, \; \text{Qwen3-14B Part-2}\}$$
+
+| Model / Checkpoint | In Optimal Set? | Weight | $\Delta_{\text{LOO}}$ (BAcc Drop If Excluded) | Impact Interpretation |
+| :--- | :---: | :---: | :---: | :--- |
+| **Qwen3-14B Part-2** | **YES** | 0.50 | **-0.0806** (-8.06%) | **Essential Core Anchor** |
+| **LinearSVC (4-View)** | **YES** | 1.00 | **-0.0389** (-3.89%) | **Essential Surface Stylometry** |
+| **Lexical Comp (5-View)** | **YES** | 0.20 | **-0.0028** (-0.28%) | **Beneficial Complementary View** |
+| `Qwen3-14B Part-1` | NO (Pruned) | 0.14 | -0.0167 | Degrades optimal subset if added |
+| `Qwen2.5-14B Part-2` | NO (Pruned) | 0.30 | -0.0250 | Degrades optimal subset if added |
+| `Qwen3-8B Claude-Head` | NO (Pruned) | 0.14 | -0.0083 | Degrades optimal subset if added |
+| `DeBERTa-v3-Large` | NO (Pruned) | 0.25 | -0.0056 | Degrades optimal subset if added |
+
+---
+
+### 5. The Architectural Bridge: How 0.567 Raw Unseen Baseline Yields 0.622 on Public LB
+
+A common question is: *Why does the linear head ensemble score 0.567 on unseen holdout while the full pipeline scores 0.621–0.622 on the Public Leaderboard?*
+
+The ablation table isolates **only the raw linear classification heads ($Z \cdot W_p^T + b_p$)**. The competition pipeline layers 5 specialized structural engines on top:
+
+$$\text{Final Leaderboard Score (0.622)} = \text{Ablation Raw Baseline (0.567)} + \text{Pipeline Postprocessing Boosts (+0.055)}$$
+
+| Component / Layer | Mathematical Mechanism | Lift Added | Cumulative Score |
+| :--- | :--- | :---: | :---: |
+| **Raw Unseen Baseline** | Linear combination of `LinearSVC` + `Qwen3-14B Part-2` + `Lexical Comp` | — | **0.5667** |
+| **+ wPCA Exact $2^{18}$ DP Solver** | Enforces the strict competition rule: **exactly 1 author per prompt** | **+0.022** | **0.5887** |
+| **+ 384D Joint Spectral Bank** | Top-64 cross-trunk PCA meta-stacker (Cross-validation OOF = **0.6441**) | **+0.016** | **0.6047** |
+| **+ Multi-Resolution Centered Twins** | Centers representations at $t = 0.85, 0.72, 0.60$ to remove prompt semantics | **+0.010** | **0.6147** |
+| **+ Orthographic & Handwriting Shield** | Bayesian log-penalties on curly/straight quotes, em-dashes, contractions | **+0.004** | **0.6187** |
+| **+ 300-Step Sinkhorn Mass Balancing** | Equalizes target class marginals ($N/18$ per class) across submission rows | **+0.003** | **0.6217 (~0.622)** |
+
+---
+
+## 10. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `lora_training.ipynb`)
 
 Module 5 provides the end-to-end training and artifact generation pipeline used to build our in-house multi-layer LoRA checkpoints (such as `anilmittal/ntl-inhouse-two-stage-lora24`).
 
@@ -424,7 +511,7 @@ In Stage 2, samples are grouped into 18-row prompt batches via `PromptGroupBatch
 
 ---
 
-## 10. Single-Source-of-Truth Compilation & Verification
+## 11. Single-Source-of-Truth Compilation & Verification
 
 The repository enforces a **Single Source of Truth** architecture:
 - All model logic lives in `src/namethatllm/`.
@@ -433,23 +520,24 @@ The repository enforces a **Single Source of Truth** architecture:
   1. [`kaggle_submission.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/submission/kaggle_submission.ipynb) (Inference pipeline)
   2. [`lora_training.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/training/lora_training.ipynb) (Training pipeline)
 
-### Running the 37 Unit Tests:
+### Running the 41 Unit Tests:
 ```powershell
 python -m pytest tests -v
 ```
 
-All 37 tests cover every component across 7 test suites:
-1. `test_compiler_and_integration.py` (8 tests): AST parity, single-source bundling, multi-key checkpoint discovery, end-to-end smoke pipeline, full mock-neural pipeline, LayerNorm specifications.
-2. `test_lexical.py` (5 tests): Shape patterns, function word preservation, punctuation retention, dual lexical outputs, continuous handwriting feature extraction.
-3. `test_neural_extractor.py` (4 tests): Reversible LoRA unmerging, bfloat16 rescue, LayerNorm projection.
-4. `test_wpca_dp.py` (4 tests): Covariance shrinkage floors, two-way prompt decomposition, safe cluster splitting ($s \le 14$), exact $2^{18}$ forward-backward bitmask DP.
-5. `test_spectral_bank.py` (4 tests): Unsupervised $V_{\text{top64}}$ extraction (0 label leakage), prior scaling normalization, joint spectral bank execution.
-6. `test_postprocess.py` (6 tests): Two-tier convex blend, mass-preserving Claude specialist gate, discrete orthographic rules, continuous handwriting integration, 300-step Sinkhorn mass equalization, submission schema.
-7. `test_trainer.py` (6 tests): Prompt group batch sampler, loss formulation, dataset tokenization, token-0 attention mask preservation, PEFT final norm deactivation, two-pass micro-batched prompt group step.
+All 41 tests cover every component across 8 test suites:
+1. `test_ablation.py` (4 tests): Whitespace text hashing, crash-proof negative/string group sanitization, 0-leakage holdout benchmark generation, greedy forward selection and all-2^M subset search.
+2. `test_compiler_and_integration.py` (8 tests): AST parity, single-source bundling, multi-key checkpoint discovery, end-to-end smoke pipeline, full mock-neural pipeline, LayerNorm specifications.
+3. `test_lexical.py` (5 tests): Shape patterns, function word preservation, punctuation retention, dual lexical outputs, continuous handwriting feature extraction.
+4. `test_neural_extractor.py` (4 tests): Reversible LoRA unmerging, bfloat16 rescue, LayerNorm projection.
+5. `test_wpca_dp.py` (4 tests): Covariance shrinkage floors, two-way prompt decomposition, safe cluster splitting ($s \le 14$), exact $2^{18}$ forward-backward bitmask DP.
+6. `test_spectral_bank.py` (4 tests): Unsupervised $V_{\text{top64}}$ extraction (0 label leakage), prior scaling normalization, joint spectral bank execution.
+7. `test_postprocess.py` (6 tests): Two-tier convex blend, mass-preserving Claude specialist gate, discrete orthographic rules, continuous handwriting integration, 300-step Sinkhorn mass equalization, submission schema.
+8. `test_trainer.py` (6 tests): Prompt group batch sampler, loss formulation, dataset tokenization, token-0 attention mask preservation, PEFT final norm deactivation, two-pass micro-batched prompt group step.
 
 ---
 
-## 11. Mathematical Reference Cheatsheet
+## 12. Mathematical Reference Cheatsheet
 
 ```
 1. LoRA Weight Fusion (GPU Device):
