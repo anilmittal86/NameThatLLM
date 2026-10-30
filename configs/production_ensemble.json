@@ -27,10 +27,10 @@
       "qwen3_14b_p1",
       "qwen25_14b_p2",
       "deberta_p2",
-      "instyle",
       "qwen3_8b_claude"
     ],
     "optional_checkpoints": [
+      "instyle",
       "qwen3_14b_ts",
       "qwen3_8b_ts",
       "qwen25_7b_ts"

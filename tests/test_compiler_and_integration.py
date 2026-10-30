@@ -251,11 +251,11 @@ class TestCompilerAndIntegration(unittest.TestCase):
             (q25_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [3, 5, 8, 11, 16, 21, 27, 32], "keep": 32, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
             save_file(make_18class_head(), str(q25_dir / "heads.safetensors"))
 
-            # 4D. instyle
+            # 4D. instyle (adapter only, no classification head)
             ins_dir = input_dir / "instyle"
             ins_dir.mkdir(parents=True, exist_ok=True)
             (ins_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [2, 4, 6, 8, 12, 16, 20, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
-            save_file(make_18class_head(), str(ins_dir / "heads.safetensors"))
+            save_file({}, str(ins_dir / "heads.safetensors"))
 
             # 4E. qwen3_8b_claude (5-class specialist + 18-class readouts.npz)
             claude_dir = input_dir / "qwen3_8b_claude"

@@ -496,45 +496,47 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 trunk3.set_active_layers(meta_ins["layers"], meta_ins["max_len"])
                 backup_t3 = trunk3.snapshot_weights(instyle_dir)
                 merged = merge_lora(trunk3.model, instyle_dir, sign=+1.0)
-                if not merged and not is_smoke:
-                    raise RuntimeError(f"Failed to merge required LoRA adapter at {instyle_dir}")
-                heads_sd = load_head_file(instyle_dir)
-                trunk3.load_norm_weights(heads_sd)
-                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                if W_p is None and not is_smoke:
-                    raise RuntimeError(f"Required classification head W_p is None for {instyle_dir}")
+                if not merged:
+                    print(f"[Pipeline] Optional checkpoint instyle failed to merge LoRA; skipping.")
+                    trunk3.restore_weights(backup_t3)
+                else:
+                    heads_sd = load_head_file(instyle_dir)
+                    trunk3.load_norm_weights(heads_sd)
+                    W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+                    if W_p is None:
+                        print(f"[Pipeline] In-Style checkpoint has no plain classification head W_p; computing density and spectral features.")
 
-                Z_all = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ins["end_id"])
-                Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
-                update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45))
+                    Z_all = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ins["end_id"])
+                    Z_te, Z_tr = Z_all[:N_test], Z_all[N_test:]
+                    update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45))
 
-                if W_p is not None:
-                    w_comp_p = comp_members.get("instyle", {}).get("plain_weight", 0.22)
-                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, meta_ins["labels"]))
-                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                    if W_p is not None:
+                        w_comp_p = comp_members.get("instyle", {}).get("plain_weight", 0.22)
+                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, meta_ins["labels"]))
+                        comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
 
-                if W_c is not None:
-                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, meta_ins["labels"])
-                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, meta_ins["labels"])
-                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, meta_ins["labels"])
-                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                    w_comp_c = comp_members.get("instyle", {}).get("twin_weight", 0.08)
-                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                    if W_c is not None:
+                        lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, meta_ins["labels"])
+                        lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, meta_ins["labels"])
+                        lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, meta_ins["labels"])
+                        lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                        w_comp_c = comp_members.get("instyle", {}).get("twin_weight", 0.08)
+                        comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-                res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
-                U_te = transform_lowram(Z_te, res_ins)
-                lp_dp = scores_exact_dp(U_te, groups_065, res_ins, D_hybrid)
-                dp_posteriors.append((dp_weights.get("instyle", 0.10), softmax(lp_dp, axis=1)))
+                    res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
+                    U_te = transform_lowram(Z_te, res_ins)
+                    lp_dp = scores_exact_dp(U_te, groups_065, res_ins, D_hybrid)
+                    dp_posteriors.append((dp_weights.get("instyle", 0.10), softmax(lp_dp, axis=1)))
 
-                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ins, prior_scales.get("instyle", 0.45))
-                spectral_blocks_tr.append(S_tr)
-                spectral_blocks_te.append(S_te)
+                    S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ins, prior_scales.get("instyle", 0.45))
+                    spectral_blocks_tr.append(S_tr)
+                    spectral_blocks_te.append(S_te)
 
-                trunk3.restore_weights(backup_t3)
-                del backup_t3, Z_all, Z_tr, Z_te, heads_sd, res_ins, U_te
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    trunk3.restore_weights(backup_t3)
+                    del backup_t3, Z_all, Z_tr, Z_te, heads_sd, res_ins, U_te
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Two-Stage LoRA24 (qwen3_8b_ts / l24x_q3b8 / ts8_s7)
             if "qwen3_8b_ts" in ckpts:
