@@ -121,16 +121,18 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
             continue
     return None
 
-def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
-    """Returns (head_feature_dim, keep_layers) for checkpoint directory without full model loading."""
+def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int, str]:
+    """Returns (head_feature_dim, keep_layers, backbone_name) for checkpoint directory without full model loading."""
     dim = 0
     keep = 0
+    backbone = ""
     meta_p = ckpt_dir / "meta.json"
     if meta_p.exists():
         try:
             m = json.load(open(meta_p))
             cfg = m.get("cfg", m)
             keep = int(cfg.get("keep", 0))
+            backbone = str(m.get("backbone", cfg.get("backbone", ""))).lower()
         except Exception:
             pass
 
@@ -156,7 +158,7 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
                     break
         except Exception:
             pass
-    return dim, keep
+    return dim, keep, backbone
 
 def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
     """Finds all fine-tuned LoRA and head checkpoints across safetensors and PyTorch formats."""
@@ -181,13 +183,12 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
         elif any(token in p_str for token in ('inhouse', 'ntl-inhouse', 'export_lora24', 'export_champion', 'lora-peft-training', 'peft_training')):
-            dim, keep = _inspect_checkpoint_dim_and_keep(p.parent)
-            if dim == 40960 or '14b' in p_str:
-                if keep >= 30 or '25' in p_str or 'qwen25' in p_str:
-                    ckpts['qwen25_14b_inhouse'] = p.parent
-                else:
-                    ckpts['qwen3_14b_inhouse'] = p.parent
-            elif dim == 8192 or 'deberta' in p_str:
+            dim, keep, backbone = _inspect_checkpoint_dim_and_keep(p.parent)
+            if '2.5' in backbone or 'qwen25' in backbone or (dim == 40960 and (keep >= 30 or '25' in p_str or 'qwen25' in p_str)):
+                ckpts['qwen25_14b_inhouse'] = p.parent
+            elif ('qwen3' in backbone and '14b' in backbone) or (dim == 40960 or '14b' in p_str):
+                ckpts['qwen3_14b_inhouse'] = p.parent
+            elif 'deberta' in backbone or (dim == 8192 or 'deberta' in p_str):
                 ckpts['deberta_inhouse'] = p.parent
             else:
                 ckpts['qwen3_8b_inhouse'] = p.parent

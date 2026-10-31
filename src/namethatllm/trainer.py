@@ -257,34 +257,30 @@ def family_margin_cross_entropy(
         logits = logits + boost
     return F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
 
-def compute_supcon_loss(z: torch.Tensor, labels: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+def compute_supcon_loss(
+    Z_c_mb: torch.Tensor,
+    labels_mb: torch.Tensor,
+    centered_head_weight: torch.Tensor,
+    Z_group_centered: Optional[torch.Tensor] = None,
+    temperature: float = 0.10,
+) -> torch.Tensor:
     """
-    Supervised Contrastive Cosine Loss on normalized representations.
-    When duplicate classes exist, attracts same-class pairs while repelling different classes.
-    When all classes in batch are distinct, penalizes positive cosine similarity among different models.
+    Prototype-anchored supervised contrastive loss on prompt-centered embeddings Z_c_mb:
+    - Positive anchor for sample i is its L2-normalized class prototype w_{y_i} from centered_head.
+    - Negatives are the other 17 class prototypes + all other passages in the current prompt group.
+    Guarantees well-defined, non-NaN gradients even when micro_batch_size=2 and all prompt labels are unique!
     """
-    if z.shape[0] < 2:
-        return torch.tensor(0.0, device=z.device)
-    z_norm = F.normalize(z, p=2, dim=-1)
-    sim = torch.matmul(z_norm, z_norm.T) / max(temperature, 1e-4)
-    diag_mask = torch.eye(z.shape[0], device=z.device, dtype=torch.bool)
-    sim_max, _ = torch.max(sim, dim=1, keepdim=True)
-    sim = sim - sim_max.detach()
+    z_norm = F.normalize(Z_c_mb.float(), p=2, dim=-1, eps=1e-6)
+    w_norm = F.normalize(centered_head_weight.float().to(z_norm.device), p=2, dim=-1, eps=1e-6)
+    sim_proto = (z_norm @ w_norm.T) / max(float(temperature), 1e-3)
+    loss = F.cross_entropy(sim_proto, labels_mb.to(z_norm.device))
 
-    label_mat = labels.unsqueeze(0) == labels.unsqueeze(1)
-    pos_mask = label_mat & ~diag_mask
-    if pos_mask.sum() == 0:
-        off_diag = ~diag_mask
-        if off_diag.sum() > 0:
-            return torch.clamp(sim[off_diag], min=0.0).mean()
-        return torch.tensor(0.0, device=z.device)
-
-    exp_sim = torch.exp(sim) * (~diag_mask).float()
-    denom = exp_sim.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    log_prob = sim - torch.log(denom)
-    mean_log_prob_pos = (pos_mask.float() * log_prob).sum(dim=1) / pos_mask.sum(dim=1).clamp(min=1)
-    valid_anchors = pos_mask.sum(dim=1) > 0
-    return -mean_log_prob_pos[valid_anchors].mean()
+    if Z_group_centered is not None and Z_group_centered.shape[0] > Z_c_mb.shape[0]:
+        g_norm = F.normalize(Z_group_centered.detach().float().to(z_norm.device), p=2, dim=-1, eps=1e-6)
+        # Repel distinct passages within the same prompt group (orthogonality / uniformity regularization)
+        sim_group = z_norm @ g_norm.T
+        loss = loss + 0.10 * (sim_group.pow(2).mean())
+    return loss
 
 def compute_two_stage_loss(
     model: MultiLayerLoRAClassifier,
@@ -338,7 +334,7 @@ def compute_two_stage_loss(
 
     total_loss = loss_plain + float(centered_weight) * loss_centered
     if supcon_weight > 0.0:
-        loss_sup = compute_supcon_loss(Z_c, labels_dev)
+        loss_sup = compute_supcon_loss(Z_c, labels_dev, model.centered_head.weight, Z_group_centered=None)
         total_loss = total_loss + float(supcon_weight) * loss_sup
 
     return total_loss, loss_plain, loss_centered
@@ -492,7 +488,8 @@ def train_prompt_group_step(
                 z_chunks.append(z_c)
     Z_all_no_grad = torch.cat(z_chunks, dim=0)
     mu_prompt = Z_all_no_grad.mean(dim=0, keepdim=True)
-    del z_chunks, Z_all_no_grad
+    Z_group_centered = (Z_all_no_grad - mu_prompt).detach()
+    del z_chunks
 
     # Pass 2: Autograd micro-batches with AMP
     total_loss_val = 0.0
@@ -519,8 +516,14 @@ def train_prompt_group_step(
             loss_c = family_margin_cross_entropy(logits_c, labels_dev[s:e].to(mb_dev), family_margin=family_margin, label_smoothing=label_smoothing)
 
             loss_mb = loss_p + float(centered_weight) * loss_c
-            if supcon_weight > 0.0 and (e - s) > 1:
-                loss_sup = compute_supcon_loss(Z_c_mb, labels_dev[s:e].to(mb_dev))
+            if supcon_weight > 0.0:
+                loss_sup = compute_supcon_loss(
+                    Z_c_mb,
+                    labels_dev[s:e],
+                    model.centered_head.weight,
+                    Z_group_centered=Z_group_centered,
+                    temperature=0.10
+                )
                 loss_mb = loss_mb + float(supcon_weight) * loss_sup
 
             weight_frac = (e - s) / float(N)
@@ -590,6 +593,7 @@ def export_compatible_checkpoint(
     keep: int,
     max_len: int = 447,
     end_id: int = 151643,
+    backbone_name: Optional[str] = None,
     Z_train: Optional[np.ndarray] = None,
     y_train: Optional[np.ndarray] = None,
     prompts_train: Optional[np.ndarray] = None
@@ -598,7 +602,7 @@ def export_compatible_checkpoint(
     Exports standard checkpoint artifacts strictly compatible with inference loaders:
     1. adapter/ (LoRA adapter weights and config)
     2. heads.safetensors (norms.{i}.weight, norms.{i}.bias, plain.weight, plain.bias, centered.weight, centered.bias)
-    3. meta.json (keep, layers, max_len, end_id, labels)
+    3. meta.json (keep, layers, max_len, end_id, labels, backbone)
     4. wPCA_bank.npz (shared Gaussian covariance / whitening basis)
     """
     from safetensors.torch import save_file
@@ -631,11 +635,13 @@ def export_compatible_checkpoint(
     # 3. Meta JSON
     meta = {
         "labels": list(LABELS),
+        "backbone": str(backbone_name) if backbone_name else "",
         "cfg": {
             "keep": int(keep),
             "layers": [int(x) for x in layers],
             "max_len": int(max_len),
-            "end_token_id": int(end_id)
+            "end_token_id": int(end_id),
+            "backbone": str(backbone_name) if backbone_name else ""
         }
     }
     (out_p / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -706,13 +712,19 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     tok = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    vocab_sz = len(tok)
+    if end_id >= vocab_sz:
+        safe_end_id = int(tok.eos_token_id or tok.sep_token_id or 2)
+        print(f"[Trainer] Config end_id ({end_id}) >= vocab size ({vocab_sz}); adjusting to {safe_end_id}")
+        end_id = safe_end_id
 
     base_cfg = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
     base_cfg.num_hidden_layers = keep_layers
 
     # Multi-GPU 2xT4 memory balancing: balance across both GPUs so GPU 0 has plenty of headroom
+    head_dev = torch.device("cuda:1" if n_gpus >= 2 else ("cuda:0" if n_gpus == 1 else "cpu"))
     if n_gpus >= 2:
-        max_memory = {i: "9.0GiB" for i in range(n_gpus)}
+        max_memory = {0: "13.0GiB", 1: "13.5GiB"}
         base_model = AutoModel.from_pretrained(
             model_source,
             config=base_cfg,
@@ -750,16 +762,31 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     if hasattr(base_model, "enable_input_require_grads"):
         base_model.enable_input_require_grads()
 
-    default_targets = (
-        ["query_proj", "key_proj", "value_proj", "dense"]
-        if is_deberta
-        else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    )
+    linear_mod_names = set()
+    for name, module in base_model.named_modules():
+        if isinstance(module, nn.Linear):
+            linear_mod_names.add(name.split(".")[-1])
+
+    configured_targets = list(train_cfg.get("lora_target_modules", []))
+    if not configured_targets:
+        configured_targets = (
+            ["query_proj", "key_proj", "value_proj", "dense"]
+            if is_deberta
+            else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        )
+
+    active_targets = [m for m in configured_targets if m in linear_mod_names]
+    if not active_targets:
+        active_targets = list(linear_mod_names)[:7] if linear_mod_names else configured_targets
+        print(f"[Trainer] Configured LoRA targets not found; falling back to: {active_targets}")
+    else:
+        print(f"[Trainer] Active LoRA target modules: {active_targets}")
+
     lora_cfg = LoraConfig(
         r=int(train_cfg.get("lora_r", 32)),
         lora_alpha=int(train_cfg.get("lora_alpha", 64)),
         lora_dropout=float(train_cfg.get("lora_dropout", 0.05)),
-        target_modules=list(train_cfg.get("lora_target_modules", default_targets)),
+        target_modules=active_targets,
         bias="none",
         task_type="FEATURE_EXTRACTION"
     )
@@ -777,16 +804,18 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     model = MultiLayerLoRAClassifier(base_model, hidden_size=base_cfg.hidden_size, layers=layers, num_classes=K)
     # If device_map was used, do NOT call model.to() as it overrides device_map onto a single GPU
     if hasattr(base_model, "hf_device_map") and len(getattr(base_model, "hf_device_map", {})) > 1:
-        model.plain_head = model.plain_head.to(device)
-        model.centered_head = model.centered_head.to(device)
+        model.plain_head = model.plain_head.to(head_dev)
+        model.centered_head = model.centered_head.to(head_dev)
         for idx in range(len(model.norms)):
-            model.norms[idx] = model.norms[idx].to(device)
+            model.norms[idx] = model.norms[idx].to(head_dev)
     else:
         model = model.to(device)
 
     # Stage 1: Pool Pretraining
     stage1_cfg = train_cfg.get("stage1", {})
     if stage1_cfg.get("enabled", True) and (all_pools or pool_file):
+        max_stage1_hours = float(stage1_cfg.get("max_hours", 5.5))
+        stage1_start = time.time()
         pool_list = all_pools if all_pools else ([pool_file] if pool_file else [])
         print(f"[Trainer] Stage 1 Pretraining on {len(pool_list)} pool file(s)...")
         dfs = []
@@ -863,6 +892,12 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         model.train()
         opt1.zero_grad()
         for step_idx, batch in enumerate(loader1):
+            if (step_idx + 1) % 50 == 0:
+                elapsed_hours = (time.time() - stage1_start) / 3600.0
+                if elapsed_hours >= max_stage1_hours:
+                    print(f"[Trainer] Stage 1 reached time budget ({max_stage1_hours}h at step {step_idx + 1}); advancing to Stage 2...")
+                    break
+
             mb_ids = batch["input_ids"].to(device)
             mb_mask = batch["attention_mask"].to(device)
             max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
@@ -885,6 +920,21 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # Intermediate checkpoint export after Stage 1
+        try:
+            export_compatible_checkpoint(
+                model=model,
+                output_dir=out_dir,
+                layers=layers,
+                keep=keep_layers,
+                max_len=max_len,
+                end_id=end_id,
+                backbone_name=backbone_name
+            )
+            print(f"[Trainer] Safe intermediate Stage 1 checkpoint exported to {out_dir}")
+        except Exception as e:
+            print(f"[Trainer] Warning: could not export Stage 1 intermediate checkpoint: {e}")
 
     # Stage 2: Prompt-Grouped Fine-Tuning on train.csv
     stage2_cfg = train_cfg.get("stage2", {})
@@ -949,6 +999,7 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         keep=keep_layers,
         max_len=max_len,
         end_id=end_id,
+        backbone_name=backbone_name,
         Z_train=Z_train,
         y_train=y_train,
         prompts_train=prompts_train

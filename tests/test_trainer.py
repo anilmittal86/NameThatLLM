@@ -303,6 +303,83 @@ class TestTrainer(unittest.TestCase):
             self.assertAlmostEqual(float(W_p[0, 0]), 0.42, places=4)
             self.assertAlmostEqual(float(b_p[0]), 0.15, places=4)
 
+    def test_compute_supcon_loss_unique_labels_no_nan(self):
+        from namethatllm.trainer import compute_supcon_loss
+        torch.manual_seed(42)
+        Z_c_mb = torch.randn(2, 64, requires_grad=True)
+        labels_mb = torch.tensor([0, 1])
+        centered_head_weight = torch.randn(K, 64, requires_grad=True)
+        Z_group_centered = torch.randn(18, 64)
+
+        loss = compute_supcon_loss(
+            Z_c_mb,
+            labels_mb,
+            centered_head_weight,
+            Z_group_centered=Z_group_centered,
+            temperature=0.10
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(loss.item(), 0.0)
+
+        loss.backward()
+        self.assertIsNotNone(Z_c_mb.grad)
+        self.assertIsNotNone(centered_head_weight.grad)
+        self.assertGreater(Z_c_mb.grad.abs().sum().item(), 0.0)
+        self.assertGreater(centered_head_weight.grad.abs().sum().item(), 0.0)
+
+    def test_stage1_time_budget_guard_and_metadata_backbone(self):
+        from namethatllm.config import _inspect_checkpoint_dim_and_keep, find_checkpoints
+        torch.manual_seed(42)
+        hidden_size = 16
+        layers = [1, 2]
+        mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=3)
+        model = MultiLayerLoRAClassifier(
+            backbone=mock_backbone,
+            hidden_size=hidden_size,
+            layers=layers,
+            num_classes=K
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # Export Qwen3-14B inhouse
+            q3_p = tmp_path / "export_champion_qwen3_14b"
+            export_compatible_checkpoint(
+                model=model,
+                output_dir=q3_p,
+                layers=layers,
+                keep=27,
+                max_len=128,
+                end_id=151643,
+                backbone_name="Qwen/Qwen3-14B-Base"
+            )
+            dim3, keep3, bb3 = _inspect_checkpoint_dim_and_keep(q3_p)
+            self.assertIn("qwen3", bb3)
+            self.assertEqual(keep3, 27)
+
+            # Export Qwen2.5-14B inhouse
+            q25_p = tmp_path / "export_champion_qwen25_14b"
+            export_compatible_checkpoint(
+                model=model,
+                output_dir=q25_p,
+                layers=layers,
+                keep=32,
+                max_len=128,
+                end_id=151643,
+                backbone_name="Qwen/Qwen2.5-14B"
+            )
+            dim25, keep25, bb25 = _inspect_checkpoint_dim_and_keep(q25_p)
+            self.assertIn("qwen2.5", bb25)
+            self.assertEqual(keep25, 32)
+
+            # Checkpoint routing
+            ckpts = find_checkpoints(tmp_path)
+            self.assertIn("qwen3_14b_inhouse", ckpts)
+            self.assertIn("qwen25_14b_inhouse", ckpts)
+            self.assertEqual(ckpts["qwen3_14b_inhouse"], q3_p)
+            self.assertEqual(ckpts["qwen25_14b_inhouse"], q25_p)
+
     def test_both_notebooks_compile_with_ast_parity(self):
         repo_root = Path(__file__).resolve().parents[1]
         build_script = repo_root / "scripts" / "build_training_notebook.py"
