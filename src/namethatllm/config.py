@@ -122,7 +122,7 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
     return None
 
 def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int, str]:
-    """Returns (head_feature_dim, keep_layers, backbone_name) for checkpoint directory without full model loading."""
+    """Returns (head_feature_dim, keep_layers, backbone_name) without full model loading."""
     dim = 0
     keep = 0
     backbone = ""
@@ -142,20 +142,22 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int, str]:
             from safetensors import safe_open
             with safe_open(str(heads_p), framework="pt", device="cpu") as f:
                 for k in f.keys():
-                    if "plain.weight" in k or "weight" in k:
+                    if "plain.weight" in k or "centered.weight" in k or k in ("weight", "head.weight"):
                         shape = f.get_tensor(k).shape
-                        dim = shape[1] if len(shape) == 2 and shape[0] == 18 else shape[0]
-                        break
+                        if len(shape) == 2:
+                            dim = int(shape[1] if shape[0] == 18 else shape[0])
+                            break
         except Exception:
             pass
     elif (ckpt_dir / "heads.pt").exists():
         try:
             import torch
-            sd = torch.load(ckpt_dir / "heads.pt", map_location="cpu")
-            for k, v in sd.items():
-                if hasattr(v, "shape") and len(v.shape) == 2:
-                    dim = v.shape[1] if v.shape[0] == 18 else v.shape[0]
-                    break
+            sd = torch.load(ckpt_dir / "heads.pt", map_location="cpu", weights_only=False)
+            if isinstance(sd, dict):
+                for k, v in sd.items():
+                    if hasattr(v, "shape") and len(v.shape) == 2 and (v.shape[0] == 18 or v.shape[1] == 18):
+                        dim = int(v.shape[1] if v.shape[0] == 18 else v.shape[0])
+                        break
         except Exception:
             pass
     return dim, keep, backbone
@@ -186,9 +188,9 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
             dim, keep, backbone = _inspect_checkpoint_dim_and_keep(p.parent)
             if '2.5' in backbone or 'qwen25' in backbone or (dim == 40960 and (keep >= 30 or '25' in p_str or 'qwen25' in p_str)):
                 ckpts['qwen25_14b_inhouse'] = p.parent
-            elif ('qwen3' in backbone and '14b' in backbone) or (dim == 40960 or '14b' in p_str):
+            elif dim == 40960 or '14b' in p_str or '14b' in backbone:
                 ckpts['qwen3_14b_inhouse'] = p.parent
-            elif 'deberta' in backbone or (dim == 8192 or 'deberta' in p_str):
+            elif dim == 8192 or 'deberta' in p_str or 'deberta' in backbone:
                 ckpts['deberta_inhouse'] = p.parent
             else:
                 ckpts['qwen3_8b_inhouse'] = p.parent

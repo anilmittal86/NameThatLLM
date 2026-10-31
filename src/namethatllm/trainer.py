@@ -258,28 +258,70 @@ def family_margin_cross_entropy(
     return F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
 
 def compute_supcon_loss(
-    Z_c_mb: torch.Tensor,
-    labels_mb: torch.Tensor,
-    centered_head_weight: torch.Tensor,
-    Z_group_centered: Optional[torch.Tensor] = None,
+    z: torch.Tensor,
+    labels: torch.Tensor,
     temperature: float = 0.10,
+    **kwargs
 ) -> torch.Tensor:
     """
-    Prototype-anchored supervised contrastive loss on prompt-centered embeddings Z_c_mb:
-    - Positive anchor for sample i is its L2-normalized class prototype w_{y_i} from centered_head.
-    - Negatives are the other 17 class prototypes + all other passages in the current prompt group.
-    Guarantees well-defined, non-NaN gradients even when micro_batch_size=2 and all prompt labels are unique!
+    Supervised contrastive loss with support for unique-class prompt groups.
+    When multiple samples share the same class, performs standard supervised contrastive alignment.
+    When all samples in the batch have distinct classes (pos_mask.sum() == 0, e.g. Stage 2 prompt groups),
+    repels distinct authors using unshifted pairwise cosine penalty: clamp(cos + 0.05, min=0.0)^2.
+    Also aligns against class prototypes if provided via prototypes/centered_head_weight.
     """
-    z_norm = F.normalize(Z_c_mb.float(), p=2, dim=-1, eps=1e-6)
-    w_norm = F.normalize(centered_head_weight.float().to(z_norm.device), p=2, dim=-1, eps=1e-6)
-    sim_proto = (z_norm @ w_norm.T) / max(float(temperature), 1e-3)
-    loss = F.cross_entropy(sim_proto, labels_mb.to(z_norm.device))
+    if z.shape[0] < 2:
+        return (z * 0.0).sum()
 
-    if Z_group_centered is not None and Z_group_centered.shape[0] > Z_c_mb.shape[0]:
-        g_norm = F.normalize(Z_group_centered.detach().float().to(z_norm.device), p=2, dim=-1, eps=1e-6)
-        # Repel distinct passages within the same prompt group (orthogonality / uniformity regularization)
-        sim_group = z_norm @ g_norm.T
-        loss = loss + 0.10 * (sim_group.pow(2).mean())
+    dev = z.device
+    z_norm = F.normalize(z.float(), p=2, dim=-1, eps=1e-6)
+    raw_cos = torch.matmul(z_norm, z_norm.T)
+    diag_mask = torch.eye(z.shape[0], device=dev, dtype=torch.bool)
+
+    labels_dev = labels.to(dev)
+    label_mat = labels_dev.unsqueeze(0) == labels_dev.unsqueeze(1)
+    pos_mask = label_mat & ~diag_mask
+
+    prototypes = kwargs.get("prototypes")
+    if prototypes is None:
+        prototypes = kwargs.get("centered_head_weight")
+
+    if pos_mask.sum() == 0:
+        off_diag = ~diag_mask
+        if off_diag.sum() > 0:
+            loss = torch.clamp(raw_cos[off_diag] + 0.05, min=0.0).pow(2).mean()
+        else:
+            loss = (z * 0.0).sum()
+
+        if prototypes is not None:
+            w_norm = F.normalize(prototypes.float().to(dev), p=2, dim=-1, eps=1e-6)
+            sim_proto = (z_norm @ w_norm.T) / max(float(temperature), 1e-3)
+            loss = loss + 0.5 * F.cross_entropy(sim_proto, labels_dev)
+
+        Z_group = kwargs.get("Z_group_centered")
+        if Z_group is not None and Z_group.shape[0] > z.shape[0]:
+            g_norm = F.normalize(Z_group.detach().float().to(dev), p=2, dim=-1, eps=1e-6)
+            sim_group = z_norm @ g_norm.T
+            loss = loss + 0.10 * (sim_group.pow(2).mean())
+        return loss
+
+    sim = raw_cos / max(float(temperature), 1e-4)
+    sim = sim.masked_fill(diag_mask, -1e4)
+    sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+    sim = sim - sim_max.detach()
+
+    exp_sim = torch.exp(sim) * (~diag_mask).float()
+    denom = exp_sim.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    log_prob = sim - torch.log(denom)
+    mean_log_prob_pos = (pos_mask.float() * log_prob).sum(dim=1) / pos_mask.sum(dim=1).clamp(min=1)
+    valid_anchors = pos_mask.sum(dim=1) > 0
+    loss = -mean_log_prob_pos[valid_anchors].mean()
+
+    if prototypes is not None:
+        w_norm = F.normalize(prototypes.float().to(dev), p=2, dim=-1, eps=1e-6)
+        sim_proto = (z_norm @ w_norm.T) / max(float(temperature), 1e-3)
+        loss = loss + 0.5 * F.cross_entropy(sim_proto, labels_dev)
+
     return loss
 
 def compute_two_stage_loss(
@@ -334,7 +376,7 @@ def compute_two_stage_loss(
 
     total_loss = loss_plain + float(centered_weight) * loss_centered
     if supcon_weight > 0.0:
-        loss_sup = compute_supcon_loss(Z_c, labels_dev, model.centered_head.weight, Z_group_centered=None)
+        loss_sup = compute_supcon_loss(Z_c, labels_dev, prototypes=model.centered_head.weight)
         total_loss = total_loss + float(supcon_weight) * loss_sup
 
     return total_loss, loss_plain, loss_centered
@@ -520,9 +562,9 @@ def train_prompt_group_step(
                 loss_sup = compute_supcon_loss(
                     Z_c_mb,
                     labels_dev[s:e],
-                    model.centered_head.weight,
-                    Z_group_centered=Z_group_centered,
-                    temperature=0.10
+                    temperature=0.10,
+                    prototypes=model.centered_head.weight,
+                    Z_group_centered=Z_group_centered
                 )
                 loss_mb = loss_mb + float(supcon_weight) * loss_sup
 
@@ -652,9 +694,14 @@ def export_compatible_checkpoint(
         res = fit_shared_gaussian_lowram(Z_train, y_train, prompts_train, d_target=d_target)
         np.savez_compressed(
             str(out_p / "wPCA_bank.npz"),
+            mx=res["mx"].astype(np.float32),
+            sx=res["sx"].astype(np.float32),
             mu=res["mx"].astype(np.float32),
             sd=res["sx"].astype(np.float32),
             W=res["W"].astype(np.float32),
+            m=res["m"].astype(np.float32),
+            lam=res["lam"].astype(np.float32),
+            V_top64=res["V_top64"].astype(np.float32),
             layers=np.array(layers, dtype=np.int32)
         )
 
@@ -720,17 +767,21 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
 
     base_cfg = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
     base_cfg.num_hidden_layers = keep_layers
+    base_cfg.use_cache = False
+    if getattr(base_cfg, "layer_types", None) is not None:
+        base_cfg.layer_types = base_cfg.layer_types[:keep_layers]
 
     # Multi-GPU 2xT4 memory balancing: balance across both GPUs so GPU 0 has plenty of headroom
     head_dev = torch.device("cuda:1" if n_gpus >= 2 else ("cuda:0" if n_gpus == 1 else "cpu"))
     if n_gpus >= 2:
-        max_memory = {0: "13.0GiB", 1: "13.5GiB"}
+        max_memory = {0: "12.5GiB", 1: "13.5GiB"}
         base_model = AutoModel.from_pretrained(
             model_source,
             config=base_cfg,
             torch_dtype=torch.float16,
             device_map="auto",
             max_memory=max_memory,
+            low_cpu_mem_usage=True,
             trust_remote_code=True
         )
     elif n_gpus == 1:
@@ -739,6 +790,7 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
             config=base_cfg,
             torch_dtype=torch.float16,
             device_map="auto",
+            low_cpu_mem_usage=True,
             trust_remote_code=True
         )
     else:
@@ -746,6 +798,7 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
             model_source,
             config=base_cfg,
             torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
             trust_remote_code=True
         )
 
@@ -814,8 +867,9 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     # Stage 1: Pool Pretraining
     stage1_cfg = train_cfg.get("stage1", {})
     if stage1_cfg.get("enabled", True) and (all_pools or pool_file):
-        max_stage1_hours = float(stage1_cfg.get("max_hours", 5.5))
-        stage1_start = time.time()
+        max_stage1_hours = float(stage1_cfg.get("max_hours", 4.5))
+        s1_start = time.time()
+        max_s1_sec = max_stage1_hours * 3600.0
         pool_list = all_pools if all_pools else ([pool_file] if pool_file else [])
         print(f"[Trainer] Stage 1 Pretraining on {len(pool_list)} pool file(s)...")
         dfs = []
@@ -876,7 +930,7 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         else:
             df_p = df_p.sample(frac=1.0, random_state=42).reset_index(drop=True)
 
-        lengths = [len(tok(t, add_special_tokens=False, truncation=True, max_length=max_len)["input_ids"]) for t in df_p["text"]]
+        lengths = [min(len(t) // 4 + 1, max_len) for t in df_p["text"]]
         bs1 = int(stage1_cfg.get("batch_size", 2))
         accum1 = int(stage1_cfg.get("gradient_accumulation_steps", 8))
         ds1 = TextSequenceDataset(df_p["text"].tolist(), [LAB2I[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id)
@@ -892,12 +946,6 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         model.train()
         opt1.zero_grad()
         for step_idx, batch in enumerate(loader1):
-            if (step_idx + 1) % 50 == 0:
-                elapsed_hours = (time.time() - stage1_start) / 3600.0
-                if elapsed_hours >= max_stage1_hours:
-                    print(f"[Trainer] Stage 1 reached time budget ({max_stage1_hours}h at step {step_idx + 1}); advancing to Stage 2...")
-                    break
-
             mb_ids = batch["input_ids"].to(device)
             mb_mask = batch["attention_mask"].to(device)
             max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
@@ -915,6 +963,13 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
                 opt1.step()
                 sched1.step()
                 opt1.zero_grad()
+
+            if (step_idx + 1) % 200 == 0:
+                elapsed_m = (time.time() - s1_start) / 60.0
+                print(f"[Trainer Stage 1] Step {step_idx + 1}/{len(loader1)} | Loss: {loss.item() * accum1:.4f} | Elapsed: {elapsed_m:.1f}m")
+            if (time.time() - s1_start) >= max_s1_sec:
+                print(f"[Trainer Stage 1] Reached {stage1_cfg.get('max_hours', 4.5)}h time budget at step {step_idx + 1}; advancing to Stage 2.")
+                break
 
         del ds1, loader1, opt1, sched1, df_p
         gc.collect()
@@ -985,9 +1040,13 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     loader_eval = DataLoader(ds2, batch_size=4, shuffle=False, collate_fn=collate_text_batch)
     Z_list = []
     with torch.no_grad():
-        for batch in loader_eval:
-            z_b = model.forward_features(batch["input_ids"].to(device), batch["attention_mask"].to(device), drop_first_token=not is_deberta)
-            Z_list.append(z_b.cpu().numpy())
+        with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=torch.float16):
+            for batch in loader_eval:
+                b_ids = batch["input_ids"].to(device)
+                b_mask = batch["attention_mask"].to(device)
+                max_l = max(int(b_mask.sum(dim=1).max().item()), 2)
+                z_b = model.forward_features(b_ids[:, :max_l], b_mask[:, :max_l], drop_first_token=not is_deberta)
+                Z_list.append(z_b.cpu().numpy())
     Z_train = np.vstack(Z_list)
     y_train = np.array([LAB2I[m] for m in df_tr["model"]])
     prompts_train = df_tr["prompt_id"].values

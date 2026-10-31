@@ -306,6 +306,19 @@ class TestTrainer(unittest.TestCase):
     def test_compute_supcon_loss_unique_labels_no_nan(self):
         from namethatllm.trainer import compute_supcon_loss
         torch.manual_seed(42)
+
+        # 1. Verification of 2-arg signature on distinct-class positive cosine vectors
+        z_pos = torch.tensor([[1.0, 0.0], [0.8, 0.6]], requires_grad=True)
+        labels_distinct = torch.tensor([0, 1])
+        loss_pos = compute_supcon_loss(z_pos, labels_distinct)
+        self.assertTrue(torch.isfinite(loss_pos))
+        self.assertGreater(loss_pos.item(), 0.0)
+
+        loss_pos.backward()
+        self.assertIsNotNone(z_pos.grad)
+        self.assertGreater(z_pos.grad.abs().sum().item(), 0.0)
+
+        # 2. Verification of multi-sample prompt group with prototypes
         Z_c_mb = torch.randn(2, 64, requires_grad=True)
         labels_mb = torch.tensor([0, 1])
         centered_head_weight = torch.randn(K, 64, requires_grad=True)
@@ -314,9 +327,9 @@ class TestTrainer(unittest.TestCase):
         loss = compute_supcon_loss(
             Z_c_mb,
             labels_mb,
-            centered_head_weight,
-            Z_group_centered=Z_group_centered,
-            temperature=0.10
+            temperature=0.10,
+            prototypes=centered_head_weight,
+            Z_group_centered=Z_group_centered
         )
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(loss.item(), 0.0)
@@ -329,6 +342,7 @@ class TestTrainer(unittest.TestCase):
 
     def test_stage1_time_budget_guard_and_metadata_backbone(self):
         from namethatllm.config import _inspect_checkpoint_dim_and_keep, find_checkpoints
+        from safetensors.torch import save_file
         torch.manual_seed(42)
         hidden_size = 16
         layers = [1, 2]
@@ -354,7 +368,18 @@ class TestTrainer(unittest.TestCase):
                 end_id=151643,
                 backbone_name="Qwen/Qwen3-14B-Base"
             )
+            # Create a 14B heads file containing 1D norms.0.weight (5120) and 2D plain.weight (18, 40960)
+            mock_14b_heads = {
+                "norms.0.weight": torch.ones(5120),
+                "plain.weight": torch.randn(18, 40960),
+                "plain.bias": torch.zeros(18),
+                "centered.weight": torch.randn(18, 40960),
+                "centered.bias": torch.zeros(18)
+            }
+            save_file(mock_14b_heads, str(q3_p / "heads.safetensors"))
+
             dim3, keep3, bb3 = _inspect_checkpoint_dim_and_keep(q3_p)
+            self.assertEqual(dim3, 40960, "Must inspect 2D tensor shape 40960, NOT 1D norm tensor 5120")
             self.assertIn("qwen3", bb3)
             self.assertEqual(keep3, 27)
 
