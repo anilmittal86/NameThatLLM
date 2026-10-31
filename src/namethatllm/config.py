@@ -29,11 +29,15 @@ FAMILIES = {
 
 PRIOR_SCALES = {
     "qwen3_14b_p2": 1.00,
+    "qwen3_14b_inhouse": 1.00,
     "qwen25_14b_p2": 0.85,
+    "qwen25_14b_inhouse": 0.85,
     "deberta_p2": 0.80,
+    "deberta_inhouse": 0.80,
     "qwen3_14b_p1": 0.50,
     "instyle": 0.45,
-    "qwen3_8b_claude": 0.30
+    "qwen3_8b_claude": 0.30,
+    "qwen3_8b_inhouse": 0.30,
 }
 
 def align_cols(arr: np.ndarray, src_labels: list) -> np.ndarray:
@@ -117,6 +121,43 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
             continue
     return None
 
+def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
+    """Returns (head_feature_dim, keep_layers) for checkpoint directory without full model loading."""
+    dim = 0
+    keep = 0
+    meta_p = ckpt_dir / "meta.json"
+    if meta_p.exists():
+        try:
+            m = json.load(open(meta_p))
+            cfg = m.get("cfg", m)
+            keep = int(cfg.get("keep", 0))
+        except Exception:
+            pass
+
+    heads_p = ckpt_dir / "heads.safetensors"
+    if heads_p.exists():
+        try:
+            from safetensors import safe_open
+            with safe_open(str(heads_p), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if "plain.weight" in k or "weight" in k:
+                        shape = f.get_tensor(k).shape
+                        dim = shape[1] if len(shape) == 2 and shape[0] == 18 else shape[0]
+                        break
+        except Exception:
+            pass
+    elif (ckpt_dir / "heads.pt").exists():
+        try:
+            import torch
+            sd = torch.load(ckpt_dir / "heads.pt", map_location="cpu")
+            for k, v in sd.items():
+                if hasattr(v, "shape") and len(v.shape) == 2:
+                    dim = v.shape[1] if v.shape[0] == 18 else v.shape[0]
+                    break
+        except Exception:
+            pass
+    return dim, keep
+
 def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
     """Finds all fine-tuned LoRA and head checkpoints across safetensors and PyTorch formats."""
     ckpts = {}
@@ -139,8 +180,17 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
                 ckpts['qwen3_14b_ts'] = p.parent
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
-        elif 'inhouse' in p_str or 'ntl-inhouse' in p_str or 'export_lora24' in p_str or 'lora-peft-training' in p_str or 'peft_training' in p_str:
-            ckpts['qwen3_8b_inhouse'] = p.parent
+        elif any(token in p_str for token in ('inhouse', 'ntl-inhouse', 'export_lora24', 'export_champion', 'lora-peft-training', 'peft_training')):
+            dim, keep = _inspect_checkpoint_dim_and_keep(p.parent)
+            if dim == 40960 or '14b' in p_str:
+                if keep >= 30 or '25' in p_str or 'qwen25' in p_str:
+                    ckpts['qwen25_14b_inhouse'] = p.parent
+                else:
+                    ckpts['qwen3_14b_inhouse'] = p.parent
+            elif dim == 8192 or 'deberta' in p_str:
+                ckpts['deberta_inhouse'] = p.parent
+            else:
+                ckpts['qwen3_8b_inhouse'] = p.parent
         elif 'q8v5' in p_str:
             if 'qwen3_8b_v5' not in ckpts or (not is_fold):
                 ckpts['qwen3_8b_v5'] = p.parent

@@ -241,6 +241,68 @@ class TestTrainer(unittest.TestCase):
         self.assertGreater(model.plain_head.weight.grad.abs().sum().item(), 0.0)
         self.assertGreater(model.centered_head.weight.grad.abs().sum().item(), 0.0)
 
+    def test_family_margin_cross_entropy_penalizes_sister_classes(self):
+        from namethatllm.trainer import family_margin_cross_entropy, _build_sister_mask
+        from namethatllm.config import FAMILIES
+        mask = _build_sister_mask(torch.device("cpu"))
+        self.assertEqual(mask.shape, (K, K))
+
+        # Check GPT family sister relationships
+        gpt_members = FAMILIES["gpt"]
+        for m1 in gpt_members:
+            for m2 in gpt_members:
+                if m1 != m2:
+                    self.assertEqual(mask[m1, m2].item(), 1.0)
+                else:
+                    self.assertEqual(mask[m1, m2].item(), 0.0)
+
+        # Sister margin penalty check
+        logits = torch.zeros(2, K)
+        labels = torch.tensor([0, 5])  # 0 is GPT, 5 is Gemini
+        loss_zero_margin = family_margin_cross_entropy(logits, labels, family_margin=0.0)
+        loss_with_margin = family_margin_cross_entropy(logits, labels, family_margin=0.35)
+        self.assertGreater(loss_with_margin.item(), loss_zero_margin.item())
+
+    def test_bucketed_length_batch_sampler(self):
+        from namethatllm.trainer import BucketedLengthBatchSampler
+        lengths = [10, 500, 15, 480, 20, 510, 12, 490]
+        sampler = BucketedLengthBatchSampler(lengths, batch_size=2, bucket_size_multiplier=2, shuffle=False)
+        batches = list(iter(sampler))
+        all_indices = [idx for b in batches for idx in b]
+        self.assertEqual(sorted(all_indices), list(range(len(lengths))))
+
+    def test_trainer_preserves_cross_entropy_heads_without_ridge_overwrite(self):
+        torch.manual_seed(42)
+        hidden_size = 16
+        layers = [1, 2]
+        mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=3)
+        model = MultiLayerLoRAClassifier(
+            backbone=mock_backbone,
+            hidden_size=hidden_size,
+            layers=layers,
+            num_classes=K
+        )
+        # Custom head values
+        model.plain_head.weight.data.fill_(0.42)
+        model.plain_head.bias.data.fill_(0.15)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_p = Path(tmp_dir) / "ckpt_export"
+            export_compatible_checkpoint(
+                model=model,
+                output_dir=out_p,
+                layers=layers,
+                keep=2,
+                max_len=128,
+                end_id=151643
+            )
+            heads_sd = load_head_file(out_p)
+            W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+            self.assertIsNotNone(W_p)
+            self.assertIsNotNone(b_p)
+            self.assertAlmostEqual(float(W_p[0, 0]), 0.42, places=4)
+            self.assertAlmostEqual(float(b_p[0]), 0.15, places=4)
+
     def test_both_notebooks_compile_with_ast_parity(self):
         repo_root = Path(__file__).resolve().parents[1]
         build_script = repo_root / "scripts" / "build_training_notebook.py"

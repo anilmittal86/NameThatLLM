@@ -378,7 +378,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 1: Qwen3-14B (40 layers, hidden=5120)
         # ==============================================================================
         base_q3_14b = verified_bases.get("qwen3_14b") or find_base_model(input_dir, "qwen3", 5120, 40)
-        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_p1" in ckpts or "qwen3_14b_ts" in ckpts or "qwen3_14b_v5" in ckpts):
+        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_p1" in ckpts or "qwen3_14b_ts" in ckpts or "qwen3_14b_v5" in ckpts or "qwen3_14b_inhouse" in ckpts):
             print(f"[Pipeline] Loading Trunk 1: Qwen3-14B from {base_q3_14b}...")
             trunk1 = UniversalLoRATrunkLoader(base_q3_14b, keep_layers=27, layers=[2, 4, 6, 9, 13, 17, 22, 27], max_len=447)
 
@@ -518,8 +518,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            # Checkpoint 1C: Optional Two-Stage LoRA24 (qwen3_14b_ts, qwen3_14b_v5)
-            for opt_14b_key in ("qwen3_14b_ts", "qwen3_14b_v5"):
+            # Checkpoint 1C: Optional Two-Stage LoRA24 (qwen3_14b_ts, qwen3_14b_v5, qwen3_14b_inhouse)
+            for opt_14b_key in ("qwen3_14b_ts", "qwen3_14b_v5", "qwen3_14b_inhouse"):
                 if opt_14b_key in ckpts:
                     ts14_dir = ckpts[opt_14b_key]
                     meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
@@ -678,9 +678,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 2: Qwen2.5-14B (48 layers, hidden=5120)
         # ==============================================================================
         base_q25_14b = verified_bases.get("qwen25_14b") or find_base_model(input_dir, "qwen2", 5120, 48)
-        if base_q25_14b and "qwen25_14b_p2" in ckpts:
-            print(f"[Pipeline] Loading Trunk 2: Qwen2.5-14B from {base_q25_14b}...")
-            p2_dir = ckpts["qwen25_14b_p2"]
+        if base_q25_14b and ("qwen25_14b_p2" in ckpts or "qwen25_14b_inhouse" in ckpts):
+            p2_key = "qwen25_14b_p2" if "qwen25_14b_p2" in ckpts else "qwen25_14b_inhouse"
+            print(f"[Pipeline] Loading Trunk 2: Qwen2.5-14B ({p2_key}) from {base_q25_14b}...")
+            p2_dir = ckpts[p2_key]
             meta_q25 = read_checkpoint_meta(p2_dir, default_keep=32, default_layers=[3, 5, 8, 11, 16, 21, 27, 32], default_max_len=447)
             trunk2 = UniversalLoRATrunkLoader(base_q25_14b, keep_layers=meta_q25["keep"], layers=meta_q25["layers"], max_len=meta_q25["max_len"])
             merged = merge_lora(trunk2.model, p2_dir, sign=+1.0)
@@ -1181,10 +1182,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # ==============================================================================
         # TRUNK 4: DeBERTa-v3-Large
         # ==============================================================================
-        if "deberta_p2" in ckpts:
-            deb_dir = ckpts["deberta_p2"]
+        if "deberta_p2" in ckpts or "deberta_inhouse" in ckpts:
+            deb_key = "deberta_p2" if "deberta_p2" in ckpts else "deberta_inhouse"
+            deb_dir = ckpts[deb_key]
             base_deb_dir = verified_bases.get("deberta_v3_large") or find_base_model(input_dir, "deberta", 1024, 24)
-            print(f"[Pipeline] Loading Trunk 4: DeBERTa-v3 from {deb_dir}...")
+            print(f"[Pipeline] Loading Trunk 4: DeBERTa-v3 ({deb_key}) from {deb_dir}...")
             Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
                 deb_dir, base_deb_dir, test_texts + unseen_texts, train_sub_texts, y_sub
             )

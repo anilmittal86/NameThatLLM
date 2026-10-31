@@ -7,17 +7,21 @@
   "is_private": true,
   "enable_gpu": true,
   "enable_tpu": false,
-  "enable_internet": true,
+  "enable_internet": false,
   "dataset_sources": [
-    "willrice/name-that-llm-openrouter-harvest",
+    "nishantdahal/ntl-handwriting-blend",
+    "dhruvtibarewal/nlm-matched-clean",
     "nishantdahal/ntl-two-stage-lora",
-    "dhruvtibarewal/nlm-matched-clean"
+    "willrice/name-that-llm-openrouter-harvest"
   ],
   "competition_sources": [
     "name-that-llm"
   ],
   "kernel_sources": [],
   "model_sources": [
-    "qwen-lm/qwen-3/Transformers/8b-base/1"
+    "qwen-lm/qwen-3/Transformers/14b-base/1",
+    "qwen-lm/qwen2.5/Transformers/14b/1",
+    "qwen-lm/qwen-3/Transformers/8b-base/1",
+    "angelndevil2/deberta-v3-large/Transformers/default/1"
   ]
 }
