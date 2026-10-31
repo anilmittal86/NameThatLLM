@@ -558,9 +558,19 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     # Stage 1: Pool Pretraining
     stage1_cfg = train_cfg.get("stage1", {})
     if stage1_cfg.get("enabled", True) and (all_pools or pool_file):
-        pool_p = all_pools[0] if all_pools else pool_file
-        print(f"[Trainer] Stage 1 Pretraining on pool {pool_p}...")
-        df_p = pd.read_parquet(pool_p, columns=["text", "model"])
+        pool_list = all_pools if all_pools else ([pool_file] if pool_file else [])
+        print(f"[Trainer] Stage 1 Pretraining on {len(pool_list)} pool file(s)...")
+        dfs = []
+        for p in pool_list:
+            try:
+                df_one = pd.read_parquet(p, columns=["text", "model"])
+                dfs.append(df_one)
+            except Exception as e:
+                print(f"[Trainer] Could not read pool {p}: {e}")
+        if dfs:
+            df_p = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["text"])
+        else:
+            df_p = pd.DataFrame(columns=["text", "model"])
         df_p = df_p[df_p["model"].isin(LABELS)].dropna().sample(frac=1.0, random_state=42).reset_index(drop=True)
 
         # Build unseen holdout to quarantine holdout passages from Stage 1 pretraining
@@ -617,29 +627,6 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     sampler2 = PromptGroupBatchSampler(df_tr["prompt_id"].tolist(), batch_size=bs2, shuffle=True)
     loader2 = DataLoader(ds2, batch_sampler=sampler2, collate_fn=collate_text_batch)
 
-    # Pre-calibrate heads with closed-form Ridge weights on extracted features before Stage 2
-    print("[Trainer] Pre-calibrating classification heads with closed-form Ridge weights...")
-    model.eval()
-    loader_init = DataLoader(ds2, batch_size=4, shuffle=False, collate_fn=collate_text_batch)
-    Z_init_list = []
-    with torch.no_grad():
-        for batch in loader_init:
-            z_b = model.forward_features(batch["input_ids"].to(device), batch["attention_mask"].to(device))
-            Z_init_list.append(z_b.cpu().numpy())
-    Z_init = np.vstack(Z_init_list)
-    y_init = np.array([LAB2I[m] for m in df_tr["model"]])
-    prompts_init = df_tr["prompt_id"].values
-    W_p_init, b_p_init, W_c_init, b_c_init = fit_ridge_heads(Z_init, y_init, prompts_init, alpha=10.0, label_smoothing=0.10, num_classes=K)
-    with torch.no_grad():
-        model.plain_head.weight.copy_(torch.from_numpy(W_p_init).to(model.plain_head.weight.device, model.plain_head.weight.dtype))
-        model.plain_head.bias.copy_(torch.from_numpy(b_p_init).to(model.plain_head.bias.device, model.plain_head.bias.dtype))
-        model.centered_head.weight.copy_(torch.from_numpy(W_c_init).to(model.centered_head.weight.device, model.centered_head.weight.dtype))
-        model.centered_head.bias.copy_(torch.from_numpy(b_c_init).to(model.centered_head.bias.device, model.centered_head.bias.dtype))
-    del Z_init_list, Z_init, loader_init
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     opt2 = torch.optim.AdamW([
         {"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": float(stage2_cfg.get("lr_lora", 5e-5))},
         {"params": list(model.norms.parameters()) + list(model.plain_head.parameters()) + list(model.centered_head.parameters()), "lr": float(stage2_cfg.get("lr_head", 3e-4))}
@@ -684,14 +671,6 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     Z_train = np.vstack(Z_list)
     y_train = np.array([LAB2I[m] for m in df_tr["model"]])
     prompts_train = df_tr["prompt_id"].values
-
-    # Calibrate final heads with closed-form Ridge weights on fine-tuned features
-    W_p_fin, b_p_fin, W_c_fin, b_c_fin = fit_ridge_heads(Z_train, y_train, prompts_train, alpha=10.0, label_smoothing=0.10, num_classes=K)
-    with torch.no_grad():
-        model.plain_head.weight.copy_(torch.from_numpy(W_p_fin).to(model.plain_head.weight.device, model.plain_head.weight.dtype))
-        model.plain_head.bias.copy_(torch.from_numpy(b_p_fin).to(model.plain_head.bias.device, model.plain_head.bias.dtype))
-        model.centered_head.weight.copy_(torch.from_numpy(W_c_fin).to(model.centered_head.weight.device, model.centered_head.weight.dtype))
-        model.centered_head.bias.copy_(torch.from_numpy(b_c_fin).to(model.centered_head.bias.device, model.centered_head.bias.dtype))
 
     export_compatible_checkpoint(
         model=model,

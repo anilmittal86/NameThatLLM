@@ -39,6 +39,23 @@
       "qwen25_7b_ts"
     ]
   },
+  "model_weights": {
+    "svc_4view": { "plain_weight": 0.85, "twin_weight": 0.00 },
+    "qwen3_14b_p2": { "plain_weight": 0.42, "twin_weight": 0.12 },
+    "qwen25_14b_p2": { "plain_weight": 0.24, "twin_weight": 0.10 },
+    "deberta_p2": { "plain_weight": 0.25, "twin_weight": 0.06 },
+    "qwen3_14b_v5": { "plain_weight": 0.24, "twin_weight": 0.08 },
+    "qwen3_14b_ts": { "plain_weight": 0.22, "twin_weight": 0.08 },
+    "qwen3_8b_v5": { "plain_weight": 0.18, "twin_weight": 0.06 },
+    "qwen3_8b_ts": { "plain_weight": 0.16, "twin_weight": 0.06 },
+    "qwen3_8b_inhouse": { "plain_weight": 0.16, "twin_weight": 0.06 },
+    "instyle": { "plain_weight": 0.16, "twin_weight": 0.06 },
+    "qwen3_14b_p1": { "plain_weight": 0.12, "twin_weight": 0.04 },
+    "qwen3_8b_claude": { "plain_weight": 0.10, "twin_weight": 0.04 },
+    "lexical_5v": { "plain_weight": 0.15, "twin_weight": 0.00 },
+    "wpca_dp": { "plain_weight": 0.22, "twin_weight": 0.00 },
+    "spectral_bank": { "plain_weight": 0.12, "twin_weight": 0.00 }
+  },
   "main_stack": {
     "linear_svc_weight": 1.00,
     "members": {

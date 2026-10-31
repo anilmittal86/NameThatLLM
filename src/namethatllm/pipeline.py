@@ -83,6 +83,74 @@ def verify_checkpoint_gate(
     print(f"[Gate] {name}: train_sub accuracy = {acc:.4f} (threshold={min_bacc:.2f}) -> {'PASSED' if passed else 'REJECTED'}")
     return passed
 
+def auto_align_and_verify_head(
+    Z_tr: np.ndarray,
+    W_p: Optional[np.ndarray],
+    b_p: Optional[np.ndarray],
+    W_c: Optional[np.ndarray],
+    b_c: Optional[np.ndarray],
+    ckpt_labels: list,
+    y_sub: np.ndarray,
+    prompts_sub: np.ndarray,
+    name: str,
+    min_bacc: float = 0.50,
+) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], list, float]:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GroupKFold
+    from sklearn.metrics import balanced_accuracy_score
+
+    if len(Z_tr) == 0:
+        return False, W_p, b_p, W_c, b_c, ckpt_labels, 0.0
+
+    if W_p is not None and b_p is not None and W_p.shape == (K, Z_tr.shape[1]):
+        best_order = ckpt_labels
+        best_acc = -1.0
+        for _, cand_order in [("canonical", ckpt_labels), ("alphabetical", sorted(LABELS))]:
+            try:
+                logits_tr = align_cols(Z_tr @ W_p.T + b_p, cand_order)
+                acc = float(balanced_accuracy_score(y_sub, logits_tr.argmax(axis=1)))
+                if acc > best_acc:
+                    best_acc = acc
+                    best_order = cand_order
+            except Exception:
+                continue
+        if best_acc >= min_bacc:
+            print(f"[Gate] {name}: Pre-trained head PASSED with BAcc = {best_acc:.4f} (threshold={min_bacc:.2f})")
+            return True, W_p, b_p, W_c, b_c, best_order, best_acc
+        print(f"[Gate] {name}: Pre-trained head BAcc = {best_acc:.4f} < {min_bacc:.2f}; probing 5-fold OOF LogReg readout...")
+
+    if len(y_sub) >= 90 and len(np.unique(prompts_sub)) >= 5:
+        scale = float(np.sqrt(Z_tr.shape[1]))
+        Z_scaled = Z_tr / scale
+        gkf = GroupKFold(n_splits=5)
+        oof_preds = np.zeros(len(y_sub), dtype=int)
+        for tr_i, val_i in gkf.split(Z_scaled, y_sub, groups=prompts_sub):
+            clf = LogisticRegression(C=0.20, max_iter=1000, random_state=42)
+            clf.fit(Z_scaled[tr_i], y_sub[tr_i])
+            oof_preds[val_i] = clf.predict(Z_scaled[val_i])
+        oof_bacc = float(balanced_accuracy_score(y_sub, oof_preds))
+        if oof_bacc >= min_bacc:
+            clf_full = LogisticRegression(C=0.20, max_iter=1000, random_state=42)
+            clf_full.fit(Z_scaled, y_sub)
+            W_p_new = (clf_full.coef_ / scale).astype(np.float32)
+            b_p_new = clf_full.intercept_.astype(np.float32)
+
+            Z_c = Z_scaled.copy()
+            for p in np.unique(prompts_sub):
+                m = (prompts_sub == p)
+                if m.sum() > 1:
+                    Z_c[m] -= Z_c[m].mean(axis=0, keepdims=True)
+            clf_c = LogisticRegression(C=0.12, max_iter=1000, random_state=42)
+            clf_c.fit(Z_c, y_sub)
+            W_c_new = (clf_c.coef_ / scale).astype(np.float32)
+            b_c_new = clf_c.intercept_.astype(np.float32)
+            fit_labels = [LABELS[c] for c in clf_full.classes_]
+            print(f"[Gate] {name}: 5-Fold OOF Readout PASSED with BAcc = {oof_bacc:.4f}!")
+            return True, W_p_new, b_p_new, W_c_new, b_c_new, fit_labels, oof_bacc
+
+    print(f"[Gate] {name}: REJECTED (failed both pre-trained and 5-fold OOF gates).")
+    return False, None, None, None, None, ckpt_labels, 0.0
+
 def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.DataFrame, Path]:
     """
     Executes the complete production or smoke-test submission pipeline.
@@ -187,11 +255,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     comp_cfg = cfg.get("complementary_stack", {})
     fusion_cfg = cfg.get("fusion", {})
     post_cfg = cfg.get("postprocess", {})
+    model_weights = cfg.get("model_weights", {})
 
-    svc_weight = main_cfg.get("linear_svc_weight", 1.00)
+    svc_weight = model_weights.get("svc_4view", {}).get("plain_weight", main_cfg.get("linear_svc_weight", 1.00))
     main_members = main_cfg.get("members", {})
     comp_streams = comp_cfg.get("stream_weights", {})
     comp_members = comp_cfg.get("lora_members", {})
+    lex_comp_weight = model_weights.get("lexical_5v", {}).get("plain_weight", comp_streams.get("lexical", 0.20))
     se_floors = comp_cfg.get("se_floors", {
         "qwen3_14b_p2": 0.10, "qwen25_14b_p2": 0.10, "deberta_p2": 0.10,
         "qwen3_14b_p1": 0.35, "instyle": 0.35, "qwen3_8b_claude": 0.35
@@ -210,24 +280,24 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     LOGIT_MAIN = log_p_svc_main * svc_weight
     COMP_LIST: List[Tuple[float, np.ndarray]] = [
-        (comp_streams.get("lexical", 0.20), p_lex_comp)
+        (lex_comp_weight, p_lex_comp)
     ]
-    if N_unseen > 0 and len(unseen_log_p_svc_main) == N_unseen:
-        auditor.add_model(
-            name="LinearSVC (4-View)",
-            tier="Main",
-            weight=svc_weight,
-            unseen_log_probs=unseen_log_p_svc_main,
-            test_log_probs=log_p_svc_main,
-        )
-    if N_unseen > 0 and len(unseen_p_lex_comp) == N_unseen:
-        auditor.add_model(
-            name="Lexical Comp (5-View)",
-            tier="Comp",
-            weight=comp_streams.get("lexical", 0.20),
-            unseen_log_probs=np.log(np.clip(unseen_p_lex_comp, 1e-9, 1.0)),
-            test_log_probs=np.log(np.clip(p_lex_comp, 1e-9, 1.0)),
-        )
+    u_lp_svc = unseen_log_p_svc_main if (N_unseen > 0 and len(unseen_log_p_svc_main) == N_unseen) else np.zeros((N_unseen, K), dtype=np.float32)
+    auditor.add_model(
+        name="LinearSVC (4-View)",
+        tier="Main",
+        weight=svc_weight,
+        unseen_log_probs=u_lp_svc,
+        test_log_probs=log_p_svc_main,
+    )
+    u_p_lex = unseen_p_lex_comp if (N_unseen > 0 and len(unseen_p_lex_comp) == N_unseen) else (np.ones((N_unseen, K), dtype=np.float32) / float(K))
+    auditor.add_model(
+        name="Lexical Comp (5-View)",
+        tier="Comp",
+        weight=lex_comp_weight,
+        unseen_log_probs=np.log(np.clip(u_p_lex, 1e-9, 1.0)),
+        test_log_probs=np.log(np.clip(p_lex_comp, 1e-9, 1.0)),
+    )
     claude_spec_logits = None
     claude_classes = None
 
@@ -266,6 +336,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             groups_060 = split_oversized_clusters_dist(D_hybrid, fcluster(Z_link, t=0.60, criterion="distance"), max_cluster_size=max_cl)
 
     has_neural = len(ckpts) > 0 and not is_smoke
+    spectral_blocks_tr: List[np.ndarray] = []
+    spectral_blocks_te: List[np.ndarray] = []
+    dp_posteriors: List[Tuple[float, np.ndarray]] = []
+    comp_lora_posteriors: List[Tuple[float, np.ndarray]] = []
+    P_spectral = None
 
     if has_neural:
         import torch
@@ -318,8 +393,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_p2", 1.00))
 
                 # Main Stack contributions
-                w_main_p = main_members.get("lora_qwen3_14b", {}).get("plain_weight", 0.40)
-                w_main_c = main_members.get("lora_qwen3_14b", {}).get("twin_weight", 0.10)
+                w_main_p = model_weights.get("qwen3_14b_p2", {}).get("plain_weight", main_members.get("lora_qwen3_14b", {}).get("plain_weight", 0.42))
+                w_main_c = model_weights.get("qwen3_14b_p2", {}).get("twin_weight", main_members.get("lora_qwen3_14b", {}).get("twin_weight", 0.12))
                 lp_u_p = np.zeros((0, K), dtype=np.float32)
                 lp_u_c = np.zeros((0, K), dtype=np.float32)
                 if W_p is not None:
@@ -341,9 +416,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     if N_unseen > 0:
                         lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
 
-                if N_unseen > 0 and W_p is not None:
+                if W_p is not None:
                     w_tot_14b = w_main_p + (w_main_c if W_c is not None else 0.0)
-                    lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_14b)
+                    lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_14b) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
                     lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_14b)
                     auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
@@ -387,14 +462,17 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_tr = Z_all[N_test + N_unseen :]
                 update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_p1", 0.50))
 
-                w_comp_p = comp_members.get("lora14b_v1", {}).get("plain_weight", 0.14)
-                w_comp_c = comp_members.get("lora14b_v1", {}).get("twin_weight", 0.05)
+                w_comp_p = model_weights.get("qwen3_14b_p1", {}).get("plain_weight", comp_members.get("lora14b_v1", {}).get("plain_weight", 0.12))
+                w_comp_c = model_weights.get("qwen3_14b_p1", {}).get("twin_weight", comp_members.get("lora14b_v1", {}).get("twin_weight", 0.04))
+                lp_p = None
+                lp_u_p = np.zeros((0, K), dtype=np.float32)
+                lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                lp_u_c = np.zeros((0, K), dtype=np.float32)
                 if W_p is not None:
                     lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p1_labels))
                     comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
                     if N_unseen > 0:
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p1_labels))
-                        auditor.add_model("Qwen3-14B Part-1", tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
 
                 if W_c is not None:
                     lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, p1_labels)
@@ -402,6 +480,14 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, p1_labels)
                     lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
                     comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                    if N_unseen > 0:
+                        lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p1_labels)
+
+                if W_p is not None:
+                    w_tot_p1 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
+                    lp_u_p1 = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_p1) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
+                    lp_te_p1 = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_p1)
+                    auditor.add_model("Qwen3-14B Part-1", tier="Comp", weight=w_tot_p1, unseen_log_probs=lp_u_p1, test_log_probs=lp_te_p1)
 
                 res_p1 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_p1", 0.35))
                 U_te = transform_lowram(Z_te, res_p1)
@@ -436,8 +522,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         trunk1.load_norm_weights(heads_sd)
                         W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
                         ts14_labels = meta_ts14["labels"]
-                        w_comp_p = comp_members.get(opt_14b_key, {}).get("plain_weight", 0.20)
-                        w_comp_c = comp_members.get(opt_14b_key, {}).get("twin_weight", 0.08)
+                        w_comp_p = model_weights.get(opt_14b_key, {}).get("plain_weight", comp_members.get(opt_14b_key, {}).get("plain_weight", 0.22))
+                        w_comp_c = model_weights.get(opt_14b_key, {}).get("twin_weight", comp_members.get(opt_14b_key, {}).get("twin_weight", 0.08))
+                        w_comp_tot = w_comp_p + w_comp_c
 
                         # Stage A: Fast 360-row probe on df_unseen
                         if N_unseen >= 36 and W_p is not None:
@@ -456,9 +543,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 continue
 
                             if len(auditor.models) > 0:
-                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
-                                if lift < -0.001:
-                                    print(f"[Fast Probe Pruning] {opt_14b_key}: marginal lift {lift:+.4f} < -0.001 -> SKIPPING 5,620-row test/train extraction!")
+                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_tot)
+                                if lift < -0.002:
+                                    print(f"[Fast Probe Pruning] {opt_14b_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING 5,620-row test/train extraction!")
                                     trunk1.restore_weights(backup_t1_ts)
                                     del backup_t1_ts, heads_sd, Z_unseen
                                     gc.collect()
@@ -482,10 +569,25 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                         gate_passed = True
                         if not is_smoke and len(y_sub) >= 180:
-                            gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts14_labels, y_sub, name=opt_14b_key, min_bacc=0.50)
+                            gate_passed, W_p, b_p, W_c, b_c, ts14_labels, _ = auto_align_and_verify_head(
+                                Z_tr=Z_tr,
+                                W_p=W_p,
+                                b_p=b_p,
+                                W_c=W_c,
+                                b_c=b_c,
+                                ckpt_labels=ts14_labels,
+                                y_sub=y_sub,
+                                prompts_sub=prompts_sub,
+                                name=opt_14b_key,
+                                min_bacc=0.50,
+                            )
 
                         if gate_passed:
                             lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
+                            if N_unseen > 0 and W_p is not None:
+                                lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
+                            else:
+                                lp_u_p = np.zeros((0, K), dtype=np.float32)
                             pr_sc = prior_scales.get(opt_14b_key, 0.50)
                             update_hybrid_groups(Z_te, pr_sc)
                             if W_p is not None:
@@ -496,6 +598,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
                                 lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
                                 comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                                if N_unseen > 0:
+                                    lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts14_labels)
+                                else:
+                                    lp_u_c = np.zeros((0, K), dtype=np.float32)
+                            else:
+                                lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                                lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                             res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_14b_key, 0.25))
                             U_te = transform_lowram(Z_te, res_ts14)
@@ -507,8 +616,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             spectral_blocks_te.append(S_te)
                             del res_ts14, U_te
 
-                            if N_unseen > 0 and lp_u_p is not None and lp_p is not None:
-                                auditor.add_model(name=opt_14b_key, tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
+                            if W_p is not None and lp_p is not None:
+                                w_tot_ts14 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
+                                lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_ts14) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
+                                lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_ts14)
+                                auditor.add_model(name=opt_14b_key, tier="Comp", weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
 
@@ -551,8 +663,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             Z_tr = Z_all[N_test + N_unseen :]
             update_hybrid_groups(Z_te, prior_scales.get("qwen25_14b_p2", 0.85))
 
-            w_main_p = main_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.20)
-            w_main_c = main_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.10)
+            w_main_p = model_weights.get("qwen25_14b_p2", {}).get("plain_weight", main_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.24))
+            w_main_c = model_weights.get("qwen25_14b_p2", {}).get("twin_weight", main_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.10))
             lp_u_p = np.zeros((0, K), dtype=np.float32)
             lp_u_c = np.zeros((0, K), dtype=np.float32)
             if W_p is not None:
@@ -574,9 +686,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if N_unseen > 0:
                     lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
 
-            if N_unseen > 0 and W_p is not None:
+            if W_p is not None:
                 w_tot_q25 = w_main_p + (w_main_c if W_c is not None else 0.0)
-                lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_q25)
+                lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_q25) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
                 lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_q25)
                 auditor.add_model("Qwen2.5-14B Part-2", tier="Main", weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
@@ -622,8 +734,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     if W_p is None:
                         print(f"[Pipeline] In-Style checkpoint has no plain classification head W_p; computing density and spectral features.")
 
-                    w_comp_p = comp_members.get("instyle", {}).get("plain_weight", 0.22)
-                    w_comp_c = comp_members.get("instyle", {}).get("twin_weight", 0.08)
+                    w_comp_p = model_weights.get("instyle", {}).get("plain_weight", comp_members.get("instyle", {}).get("plain_weight", 0.16))
+                    w_comp_c = model_weights.get("instyle", {}).get("twin_weight", comp_members.get("instyle", {}).get("twin_weight", 0.06))
+                    w_comp_tot = w_comp_p + w_comp_c
                     instyle_pruned = False
 
                     # Stage A: Fast 360-row probe on df_unseen
@@ -637,9 +750,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             print(f"[Fast Probe Pruning] instyle: solo BAcc {solo_bacc:.4f} < 0.45 -> SKIPPING full extraction!")
                             instyle_pruned = True
                         elif len(auditor.models) > 0:
-                            lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
-                            if lift < -0.001:
-                                print(f"[Fast Probe Pruning] instyle: marginal lift {lift:+.4f} < -0.001 -> SKIPPING full extraction!")
+                            lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_tot)
+                            if lift < -0.002:
+                                print(f"[Fast Probe Pruning] instyle: marginal lift {lift:+.4f} < -0.002 -> SKIPPING full extraction!")
                                 instyle_pruned = True
                             else:
                                 print(f"[Fast Probe] instyle: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
@@ -658,22 +771,49 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         del Z_all
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"])) if (N_unseen > 0 and W_p is not None) else None
 
+                    ins_labels = meta_ins["labels"]
+                    if not instyle_pruned:
+                        if not is_smoke and len(y_sub) >= 180:
+                            gate_passed, W_p, b_p, W_c, b_c, ins_labels, _ = auto_align_and_verify_head(
+                                Z_tr=Z_tr,
+                                W_p=W_p,
+                                b_p=b_p,
+                                W_c=W_c,
+                                b_c=b_c,
+                                ckpt_labels=meta_ins["labels"],
+                                y_sub=y_sub,
+                                prompts_sub=prompts_sub,
+                                name="instyle",
+                                min_bacc=0.50,
+                            )
+                            if not gate_passed:
+                                instyle_pruned = True
+
                     if not instyle_pruned:
                         update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45))
 
+                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ins_labels)) if W_p is not None else None
+                        if N_unseen > 0 and W_p is not None:
+                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ins_labels))
+                        else:
+                            lp_u_p = np.zeros((0, K), dtype=np.float32)
+
                         if W_p is not None:
-                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, meta_ins["labels"]))
                             comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                            if N_unseen > 0 and lp_u_p is not None:
-                                auditor.add_model("Qwen3-8B In-Style", tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
 
                         if W_c is not None:
-                            lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, meta_ins["labels"])
-                            lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, meta_ins["labels"])
-                            lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, meta_ins["labels"])
+                            lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ins_labels)
+                            lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ins_labels)
+                            lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ins_labels)
                             lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                            w_comp_c = comp_members.get("instyle", {}).get("twin_weight", 0.08)
                             comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                            if N_unseen > 0:
+                                lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ins_labels)
+                            else:
+                                lp_u_c = np.zeros((0, K), dtype=np.float32)
+                        else:
+                            lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                            lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                         res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
                         U_te = transform_lowram(Z_te, res_ins)
@@ -684,6 +824,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         spectral_blocks_tr.append(S_tr)
                         spectral_blocks_te.append(S_te)
                         del res_ins, U_te
+
+                        if W_p is not None and lp_p is not None:
+                            w_tot_ins = w_comp_p + (w_comp_c if W_c is not None else 0.0)
+                            lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_ins) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
+                            lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_ins)
+                            auditor.add_model("Qwen3-8B In-Style", tier="Comp", weight=w_tot_ins, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                     trunk3.restore_weights(backup_t3)
                     del backup_t3, heads_sd
@@ -713,8 +859,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         trunk3.load_norm_weights(heads_sd)
                         W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
                         ts8_labels = meta_ts8["labels"]
-                        w_comp_p = comp_members.get(opt_8b_key, {}).get("plain_weight", 0.20)
-                        w_comp_c = comp_members.get(opt_8b_key, {}).get("twin_weight", 0.08)
+                        w_comp_p = model_weights.get(opt_8b_key, {}).get("plain_weight", comp_members.get(opt_8b_key, {}).get("plain_weight", 0.16))
+                        w_comp_c = model_weights.get(opt_8b_key, {}).get("twin_weight", comp_members.get(opt_8b_key, {}).get("twin_weight", 0.06))
+                        w_comp_tot = w_comp_p + w_comp_c
 
                         # Stage A: Fast 360-row probe on df_unseen
                         if N_unseen >= 36 and W_p is not None:
@@ -733,9 +880,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 continue
 
                             if len(auditor.models) > 0:
-                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_p)
-                                if lift < -0.001:
-                                    print(f"[Fast Probe Pruning] {opt_8b_key}: marginal lift {lift:+.4f} < -0.001 -> SKIPPING full extraction!")
+                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_tot)
+                                if lift < -0.002:
+                                    print(f"[Fast Probe Pruning] {opt_8b_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING full extraction!")
                                     trunk3.restore_weights(backup_t3_ts)
                                     del backup_t3_ts, heads_sd, Z_unseen
                                     gc.collect()
@@ -759,10 +906,25 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                         gate_passed = True
                         if not is_smoke and len(y_sub) >= 180:
-                            gate_passed = verify_checkpoint_gate(Z_tr, W_p, b_p, ts8_labels, y_sub, name=opt_8b_key, min_bacc=0.50)
+                            gate_passed, W_p, b_p, W_c, b_c, ts8_labels, _ = auto_align_and_verify_head(
+                                Z_tr=Z_tr,
+                                W_p=W_p,
+                                b_p=b_p,
+                                W_c=W_c,
+                                b_c=b_c,
+                                ckpt_labels=ts8_labels,
+                                y_sub=y_sub,
+                                prompts_sub=prompts_sub,
+                                name=opt_8b_key,
+                                min_bacc=0.50,
+                            )
 
                         if gate_passed:
                             lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
+                            if N_unseen > 0 and W_p is not None:
+                                lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
+                            else:
+                                lp_u_p = np.zeros((0, K), dtype=np.float32)
                             def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
                             def_se = 0.40 if opt_8b_key == "qwen3_8b_inhouse" else 0.35
                             pr_sc = prior_scales.get(opt_8b_key, def_pr)
@@ -777,6 +939,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
                                 lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
                                 comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                                if N_unseen > 0:
+                                    lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts8_labels)
+                                else:
+                                    lp_u_c = np.zeros((0, K), dtype=np.float32)
+                            else:
+                                lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                                lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                             res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
                             U_te = transform_lowram(Z_te, res_ts8)
@@ -787,6 +956,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             spectral_blocks_tr.append(S_tr)
                             spectral_blocks_te.append(S_te)
                             del res_ts8, U_te
+
+                            if W_p is not None and lp_p is not None:
+                                w_tot_ts8 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
+                                lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_ts8) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
+                                lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_ts8)
+                                auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_tot_ts8, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                             if N_unseen > 0 and lp_u_p is not None and lp_p is not None:
                                 auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
@@ -870,19 +1045,33 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     claude_spec_logits = Z_te @ W_spec.T + b_spec
 
                 if W_p is not None and W_p.shape[0] == 18:
-                    w_comp_p = comp_members.get("ntl_claude_head", {}).get("plain_weight", 0.14)
+                    w_comp_p = model_weights.get("qwen3_8b_claude", {}).get("plain_weight", comp_members.get("ntl_claude_head", {}).get("plain_weight", 0.10))
+                    w_comp_c = model_weights.get("qwen3_8b_claude", {}).get("twin_weight", comp_members.get("ntl_claude_head", {}).get("twin_weight", 0.04))
                     lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, LABELS))
                     comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
                     if N_unseen > 0:
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, LABELS))
-                        auditor.add_model("Qwen3-8B Claude-Head", tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
+                    else:
+                        lp_u_p = np.zeros((0, K), dtype=np.float32)
+
                     if W_c is not None and W_c.shape[0] == 18:
-                        w_comp_c = comp_members.get("ntl_claude_head", {}).get("twin_weight", 0.05)
                         lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, LABELS)
                         lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, LABELS)
                         lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, LABELS)
                         lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
                         comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                        if N_unseen > 0:
+                            lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, LABELS)
+                        else:
+                            lp_u_c = np.zeros((0, K), dtype=np.float32)
+                    else:
+                        lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                        lp_u_c = np.zeros((0, K), dtype=np.float32)
+
+                    w_tot_cl = w_comp_p + (w_comp_c if (W_c is not None and W_c.shape[0] == 18) else 0.0)
+                    lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if (W_c is not None and W_c.shape[0] == 18) else 0.0)) / max(1e-8, w_tot_cl) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
+                    lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if (W_c is not None and W_c.shape[0] == 18) else 0.0)) / max(1e-8, w_tot_cl)
+                    auditor.add_model("Qwen3-8B Claude Head", tier="Comp", weight=w_tot_cl, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                 res_cl = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_claude", 0.35))
                 U_te = transform_lowram(Z_te, res_cl)
@@ -922,25 +1111,35 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 raise RuntimeError(f"Required classification head W_p is None for {deb_dir}")
             update_hybrid_groups(Z_te_deb, prior_scales.get("deberta_p2", 0.80))
 
+            w_main_deb = model_weights.get("deberta_p2", {}).get("plain_weight", main_members.get("deberta_v3_large", {}).get("plain_weight", 0.25))
+            w_comp_deb = comp_members.get("deberta_v3_large", {}).get("plain_weight", 0.18)
+            w_comp_c = model_weights.get("deberta_p2", {}).get("twin_weight", comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06))
+            lp_p_deb = None
+            lp_u_deb = np.zeros((0, K), dtype=np.float32)
+            lp_c85_deb = np.zeros((N_test, K), dtype=np.float32)
+            lp_u_c_deb = np.zeros((0, K), dtype=np.float32)
+
             if W_p_deb is not None:
-                w_main_deb = main_members.get("deberta_v3_large", {}).get("plain_weight", 0.25)
-                lp_deb = log_softmax(align_cols(Z_te_deb @ W_p_deb.T + b_p_deb, deb_labels))
-                LOGIT_MAIN += lp_deb * w_main_deb
-
-                w_comp_deb = comp_members.get("deberta_v3_large", {}).get("plain_weight", 0.18)
-                comp_lora_posteriors.append((w_comp_deb, softmax(lp_deb, axis=1)))
-
+                lp_p_deb = log_softmax(align_cols(Z_te_deb @ W_p_deb.T + b_p_deb, deb_labels))
+                LOGIT_MAIN += lp_p_deb * w_main_deb
+                comp_lora_posteriors.append((w_comp_deb, softmax(lp_p_deb, axis=1)))
                 if N_unseen > 0:
                     lp_u_deb = log_softmax(align_cols(Z_unseen_deb @ W_p_deb.T + b_p_deb, deb_labels))
-                    auditor.add_model("DeBERTa-v3-Large", tier="Main", weight=w_main_deb, unseen_log_probs=lp_u_deb, test_log_probs=lp_deb)
 
             if W_c_deb is not None:
-                lp_c85, _ = compute_centered_logits(Z_te_deb, groups_085, W_c_deb, b_c_deb, deb_labels)
+                lp_c85_deb, _ = compute_centered_logits(Z_te_deb, groups_085, W_c_deb, b_c_deb, deb_labels)
                 lp_c72, _ = compute_centered_logits(Z_te_deb, groups_072, W_c_deb, b_c_deb, deb_labels)
                 lp_c60, _ = compute_centered_logits(Z_te_deb, groups_060, W_c_deb, b_c_deb, deb_labels)
-                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                w_comp_c = comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06)
+                lp_c_blend = w85 * lp_c85_deb + w72 * lp_c72 + w60 * lp_c60
                 comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                if N_unseen > 0:
+                    lp_u_c_deb, _ = compute_centered_logits(Z_unseen_deb, groups_unseen, W_c_deb, b_c_deb, deb_labels)
+
+            if W_p_deb is not None and lp_p_deb is not None:
+                w_tot_deb = w_main_deb + (w_comp_c if W_c_deb is not None else 0.0)
+                lp_m_u = (w_main_deb * lp_u_deb + (w_comp_c * lp_u_c_deb if W_c_deb is not None else 0.0)) / max(1e-8, w_tot_deb) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
+                lp_m_te = (w_main_deb * lp_p_deb + (w_comp_c * lp_c85_deb if W_c_deb is not None else 0.0)) / max(1e-8, w_tot_deb)
+                auditor.add_model("DeBERTa-v3-Large", tier="Main", weight=w_tot_deb, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
             res_deb = fit_shared_gaussian_lowram(Z_tr_deb, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("deberta_p2", 0.10))
             U_te = transform_lowram(Z_te_deb, res_deb)
@@ -1003,12 +1202,39 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         COMP_LIST.append((comp_streams.get("lora_and_twins", 0.35), mock_p_lora))
         COMP_LIST.append((comp_streams.get("dp_posteriors", 0.30), mock_p_dp))
         COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), mock_p_spec))
+        dp_posteriors.append((comp_streams.get("dp_posteriors", 0.30), mock_p_dp))
+        P_spectral = mock_p_spec
 
-    # 4. MODULE 4: Convex Blend, Claude Specialist Gate, Curly Quote Guard & Sinkhorn
-    print("[Pipeline] Module 4: Fusing Main and Complementary stacks...")
-    main_ratio = fusion_cfg.get("main_ratio", 0.85)
-    comp_ratio = fusion_cfg.get("comp_ratio", 0.15)
-    P_mix, R_main = blend_main_and_complementary(LOGIT_MAIN, COMP_LIST, main_ratio=main_ratio, comp_ratio=comp_ratio)
+    # 4. MODULE 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration
+    print("[Pipeline] Module 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration...")
+    extra_streams: List[Tuple[str, float, np.ndarray]] = []
+    w_dp = model_weights.get("wpca_dp", {}).get("plain_weight", 0.22)
+    if dp_posteriors:
+        tot_dp_w = sum(w for w, _ in dp_posteriors)
+        P_dp_comb = sum(w * P_dp for w, P_dp in dp_posteriors) / max(1e-8, tot_dp_w)
+        extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_comb, 1e-9, 1.0))))
+    elif is_smoke:
+        extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(mock_p_dp, 1e-9, 1.0))))
+
+    w_sb = model_weights.get("spectral_bank", {}).get("plain_weight", 0.12)
+    if "P_spectral" in locals() and P_spectral is not None:
+        extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral, 1e-9, 1.0))))
+    elif is_smoke:
+        extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(mock_p_spec, 1e-9, 1.0))))
+
+    if len(auditor.models) > 0:
+        optimize_on_unseen = (N_unseen >= 36 and not is_smoke)
+        P_mix, active_weights_map, df_ablation = auditor.optimize_weights_and_blend(
+            working_dir=working_dir,
+            extra_test_log_probs=extra_streams,
+            optimize_on_unseen=optimize_on_unseen,
+        )
+        print(f"[Pipeline] Flat log-space ensemble active weights: {active_weights_map}")
+        R_main = P_mix
+    else:
+        main_ratio = fusion_cfg.get("main_ratio", 0.85)
+        comp_ratio = fusion_cfg.get("comp_ratio", 0.15)
+        P_mix, R_main = blend_main_and_complementary(LOGIT_MAIN, COMP_LIST, main_ratio=main_ratio, comp_ratio=comp_ratio)
 
     # Claude Specialist Gate (Vectorized)
     gate_weight = post_cfg.get("claude_specialist_weight", 0.15)

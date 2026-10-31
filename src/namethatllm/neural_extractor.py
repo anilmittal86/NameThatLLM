@@ -130,44 +130,43 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
     out = torch.cat([nm(pooled_layers[idx_l]) for idx_l, nm in enumerate(norms)], dim=-1)
     return out.cpu().numpy(), n_bad
 
+def _flatten_state_dict(obj: Any, prefix: str = "", out: Optional[dict] = None) -> dict:
+    if out is None:
+        out = {}
+    if hasattr(obj, "state_dict") and callable(obj.state_dict):
+        obj = obj.state_dict()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            new_k = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (dict, list, tuple)) or (hasattr(v, "state_dict") and callable(v.state_dict)):
+                _flatten_state_dict(v, new_k, out)
+            else:
+                out[new_k] = v
+                if prefix in ("state_dict", "model", "heads", "head") and str(k) not in out:
+                    out[str(k)] = v
+    elif isinstance(obj, (list, tuple)):
+        for idx, item in enumerate(obj):
+            new_k = f"{prefix}.{idx}" if prefix else str(idx)
+            _flatten_state_dict(item, new_k, out)
+    return out
+
 def load_head_file(path_or_dir: Path) -> dict:
-    """
-    Unified loader for classification head state dictionaries.
-    Supports heads.safetensors, head.safetensors, and heads.pt (PyTorch OrderedDict).
-    Flattens any nested dictionaries to standard dot-separated keys.
-    """
+    """Unified loader for classification head state dicts (.safetensors, .pt, .bin, .npz)."""
     p = Path(path_or_dir)
     if p.is_file():
-        if p.suffix in (".safetensors",):
+        if p.suffix == ".safetensors":
             return load_file(str(p))
         elif p.suffix in (".pt", ".bin"):
             raw = torch.load(str(p), map_location="cpu", weights_only=False)
-            if isinstance(raw, dict):
-                flat = {}
-                for k, v in raw.items():
-                    if isinstance(v, dict):
-                        for sub_k, sub_v in v.items():
-                            flat[f"{k}.{sub_k}"] = sub_v
-                    else:
-                        flat[k] = v
-                return flat
+            return _flatten_state_dict(raw)
+        elif p.suffix == ".npz":
+            npz = np.load(str(p), allow_pickle=True)
+            return {k: npz[k] for k in npz.files}
         return {}
-    for fname in ("heads.safetensors", "head.safetensors"):
+    for fname in ("heads.safetensors", "head.safetensors", "heads.pt", "head.pt", "readouts.npz"):
         cand = p / fname
         if cand.exists():
-            return load_file(str(cand))
-    pt_cand = p / "heads.pt"
-    if pt_cand.exists():
-        raw = torch.load(str(pt_cand), map_location="cpu", weights_only=False)
-        if isinstance(raw, dict):
-            flat = {}
-            for k, v in raw.items():
-                if isinstance(v, dict):
-                    for sub_k, sub_v in v.items():
-                        flat[f"{k}.{sub_k}"] = sub_v
-                else:
-                    flat[k] = v
-            return flat
+            return load_head_file(cand)
     return {}
 
 def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:

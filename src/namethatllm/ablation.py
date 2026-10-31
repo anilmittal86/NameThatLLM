@@ -185,12 +185,12 @@ class UnseenStepwiseAuditor:
         unseen_log_probs: np.ndarray,
         test_log_probs: np.ndarray,
     ):
-        if len(self.y_unseen) == 0 or len(unseen_log_probs) != len(self.y_unseen):
+        if len(self.y_unseen) > 0 and len(unseen_log_probs) != len(self.y_unseen):
             return
-        u_lp = log_softmax(np.asarray(unseen_log_probs, dtype=np.float64), axis=1)
+        u_lp = log_softmax(np.asarray(unseen_log_probs, dtype=np.float64), axis=1) if len(self.y_unseen) > 0 and len(unseen_log_probs) == len(self.y_unseen) else np.zeros((0, K), dtype=np.float64)
         t_lp = log_softmax(np.asarray(test_log_probs, dtype=np.float64), axis=1) if len(test_log_probs) == self.N_test else np.zeros((self.N_test, K), dtype=np.float64)
-        solo_raw = float(balanced_accuracy_score(self.y_unseen, u_lp.argmax(axis=1)))
-        solo_sink = _fast_sinkhorn_bacc(u_lp, self.y_unseen, iters=200)
+        solo_raw = float(balanced_accuracy_score(self.y_unseen, u_lp.argmax(axis=1))) if len(self.y_unseen) > 0 else 0.0
+        solo_sink = _fast_sinkhorn_bacc(u_lp, self.y_unseen, iters=200) if len(self.y_unseen) >= 18 else solo_raw
         self.models.append({
             "name": name,
             "tier": tier,
@@ -200,6 +200,91 @@ class UnseenStepwiseAuditor:
             "solo_unseen_bacc": solo_raw,
             "solo_unseen_sinkhorn_bacc": solo_sink,
         })
+
+    def optimize_weights_and_blend(
+        self,
+        working_dir: Path,
+        extra_test_log_probs: Optional[List[Tuple[str, float, np.ndarray]]] = None,
+        optimize_on_unseen: bool = True,
+    ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
+        """
+        1. Runs Greedy Forward Stepwise Selection + Coordinate Line Search on `df_unseen`
+           to determine each model's optimal individual weight `w_star` (>= 0.0).
+        2. Any model that fails to improve unseen balanced accuracy gets `w_star = 0.0` (PRUNED).
+        3. Combines all active models + extra_test_log_probs (wpca_dp, spectral_bank) directly
+           in flat log-probability space:
+               LOGIT_FLAT = sum_m (w_star[m] * test_lp[m])
+        """
+        if len(self.models) == 0:
+            return np.ones((self.N_test, K), dtype=np.float64) / float(K), {}, pd.DataFrame()
+
+        if not optimize_on_unseen or len(self.y_unseen) < 36:
+            weights_map = {m["name"]: m["weight"] for m in self.models}
+            logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
+            for m in self.models:
+                logit_flat += m["weight"] * m["test_lp"]
+            if extra_test_log_probs:
+                for ex_name, w_ex, lp_ex in extra_test_log_probs:
+                    if len(lp_ex) == self.N_test and w_ex > 0.0:
+                        logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
+                        weights_map[ex_name] = float(w_ex)
+            P_mix = softmax(logit_flat, axis=1)
+            df_rep = self.print_and_save_report(working_dir, final_test_preds=P_mix.argmax(axis=1))
+            return P_mix, weights_map, df_rep
+
+        M = len(self.models)
+        order = sorted(range(M), key=lambda i: self.models[i]["solo_unseen_sinkhorn_bacc"], reverse=True)
+
+        active_weights = np.zeros(M, dtype=np.float64)
+        first_idx = order[0]
+        active_weights[first_idx] = self.models[first_idx]["weight"]
+        cum_u_lp = active_weights[first_idx] * self.models[first_idx]["unseen_lp"]
+        best_bacc = float(
+            balanced_accuracy_score(
+                self.y_unseen,
+                sinkhorn_balancing(softmax(cum_u_lp, axis=1), iters=60).argmax(axis=1),
+            )
+        )
+
+        multipliers = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50]
+        for idx in order[1:]:
+            prior_w = self.models[idx]["weight"]
+            u_lp = self.models[idx]["unseen_lp"]
+            best_m_w = 0.0
+            best_m_bacc = best_bacc
+            for mult in multipliers:
+                cand_w = prior_w * mult
+                trial_lp = cum_u_lp + cand_w * u_lp
+                trial_P = sinkhorn_balancing(softmax(trial_lp, axis=1), iters=60)
+                score = float(balanced_accuracy_score(self.y_unseen, trial_P.argmax(axis=1)))
+                if score > best_m_bacc + 1e-6:
+                    best_m_bacc = score
+                    best_m_w = cand_w
+            if best_m_w > 0.0:
+                active_weights[idx] = best_m_w
+                cum_u_lp = cum_u_lp + best_m_w * u_lp
+                best_bacc = best_m_bacc
+            else:
+                active_weights[idx] = 0.0
+
+        weights_map: Dict[str, float] = {}
+        logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
+        for idx, m in enumerate(self.models):
+            m["prior_weight"] = m["weight"]
+            m["weight"] = float(active_weights[idx])
+            weights_map[m["name"]] = float(active_weights[idx])
+            if active_weights[idx] > 0.0:
+                logit_flat += active_weights[idx] * m["test_lp"]
+
+        if extra_test_log_probs:
+            for ex_name, w_ex, lp_ex in extra_test_log_probs:
+                if len(lp_ex) == self.N_test and w_ex > 0.0:
+                    logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
+                    weights_map[ex_name] = float(w_ex)
+
+        P_mix = softmax(logit_flat, axis=1)
+        df_rep = self.print_and_save_report(working_dir, final_test_preds=P_mix.argmax(axis=1))
+        return P_mix, weights_map, df_rep
 
     def evaluate_marginal_lift(
         self,

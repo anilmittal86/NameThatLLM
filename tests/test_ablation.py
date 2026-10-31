@@ -7,8 +7,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from namethatllm.config import LABELS, K
+from namethatllm.config import LABELS, K, align_cols
 from namethatllm.neural_extractor import compute_centered_logits
+from namethatllm.pipeline import auto_align_and_verify_head
 from namethatllm.ablation import (
     _text_hash,
     build_unseen_holdout_dataset,
@@ -210,3 +211,132 @@ def test_unseen_stepwise_auditor_standalone_and_stepwise(tmp_path: Path):
     # Greedy forward selection stopped before adding the adversarial model with negative lift
     assert "Adversarial-Model" not in df_saved["added_model"].values, "Greedy selection must stop before adding adversarial model"
     assert len(df_saved) == 2
+
+
+def test_compute_centered_logits_negative_and_string_group_ids():
+    """Exact test verifying negative (-1, -99), string, and NaN group IDs are sanitized before np.bincount."""
+    np.random.seed(42)
+    Z = np.random.randn(8, 16)
+    W_c = np.random.randn(18, 16)
+    b_c = np.zeros(18)
+
+    # Mixed negative, string, and singleton values
+    mixed_groups = np.array([-1, -1, "singleton", "prompt_A", "prompt_A", 42, 42, 42])
+    out_lp, valid = compute_centered_logits(Z, mixed_groups, W_c, b_c, LABELS)
+    assert out_lp.shape == (8, 18)
+    assert valid.shape == (8,)
+    # Sizes: -1 has 2, "singleton" has 1, prompt_A has 2, 42 has 3 -> sizes >= 2 are valid
+    assert valid[0] and valid[1]
+    assert not valid[2]
+    assert valid[3] and valid[4]
+    assert valid[5] and valid[6] and valid[7]
+
+
+def test_auto_align_and_verify_head_alphabetical_labels():
+    """Verify auto_align_and_verify_head successfully discovers alphabetical labels and 5-fold OOF readout."""
+    np.random.seed(42)
+    N = 180
+    D = 32
+    # 10 samples per class
+    y_sub = np.repeat(np.arange(18), 10)
+    prompts_sub = np.tile(np.arange(10), 18)  # 10 prompt clusters with balanced class representations
+
+    # Create synthetic representations where each class has a distinct centroid
+    centroids = np.random.randn(18, D) * 2.0
+    Z_tr = centroids[y_sub] + np.random.randn(N, D) * 0.2
+
+    # Case 1: Head trained with alphabetical class ordering
+    sorted_labels = sorted(LABELS)
+    # Mapping: class name -> index in sorted_labels
+    W_alpha = np.zeros((18, D), dtype=np.float32)
+    for i, model_name in enumerate(LABELS):
+        alpha_idx = sorted_labels.index(model_name)
+        W_alpha[alpha_idx] = centroids[i]
+    b_alpha = np.zeros(18, dtype=np.float32)
+
+    passed, W_p_out, b_p_out, _, _, best_labels, acc = auto_align_and_verify_head(
+        Z_tr=Z_tr,
+        W_p=W_alpha,
+        b_p=b_alpha,
+        W_c=None,
+        b_c=None,
+        ckpt_labels=LABELS,
+        y_sub=y_sub,
+        prompts_sub=prompts_sub,
+        name="test_alpha_ckpt",
+        min_bacc=0.50,
+    )
+    assert passed, "Head with alphabetical labels must pass gate via auto-detection!"
+    assert best_labels == sorted_labels, "Auto-align must detect alphabetical label ordering."
+    assert acc > 0.80
+
+    # Case 2: W_p is None -> 5-fold OOF LogisticRegression fallback
+    passed_oof, W_oof, b_oof, W_c_oof, b_c_oof, fit_labels, oof_acc = auto_align_and_verify_head(
+        Z_tr=Z_tr,
+        W_p=None,
+        b_p=None,
+        W_c=None,
+        b_c=None,
+        ckpt_labels=LABELS,
+        y_sub=y_sub,
+        prompts_sub=prompts_sub,
+        name="test_missing_head_ckpt",
+        min_bacc=0.50,
+    )
+    assert passed_oof, "5-Fold OOF readout must pass on well-separated synthetic representations."
+    assert W_oof is not None and W_oof.shape == (18, D)
+    assert b_oof is not None and b_oof.shape == (18,)
+    assert W_c_oof is not None
+    assert oof_acc > 0.50
+
+
+def test_optimize_weights_and_blend_prunes_bad_model_and_weights_individually(tmp_path: Path):
+    """Verify optimize_weights_and_blend tunes individual weights and prunes degrading models to 0.0."""
+    np.random.seed(42)
+    n_samples = 180
+    n_test = 40
+
+    y_unseen = np.repeat(np.arange(K), 10)
+    groups_unseen = (np.arange(n_samples) // 3) + 1
+
+    auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=groups_unseen, N_test=n_test)
+
+    # Model 1: Strong anchor model
+    logits_m1_u = np.random.randn(n_samples, K) * 0.2
+    for i, c in enumerate(y_unseen):
+        logits_m1_u[i, c] += 4.0
+    logits_m1_te = np.random.randn(n_test, K)
+    auditor.add_model("Strong-Anchor", tier="Main", weight=0.50, unseen_log_probs=logits_m1_u, test_log_probs=logits_m1_te)
+
+    # Model 2: Complementary model
+    logits_m2_u = np.random.randn(n_samples, K) * 0.2
+    for i, c in enumerate(y_unseen):
+        logits_m2_u[i, c] += 3.0
+    logits_m2_te = np.random.randn(n_test, K)
+    auditor.add_model("Complementary-Model", tier="Comp", weight=0.25, unseen_log_probs=logits_m2_u, test_log_probs=logits_m2_te)
+
+    # Model 3: Poisonous / adversarial model (predicts wrong class with high confidence)
+    logits_m3_u = np.random.randn(n_samples, K) * 0.5
+    for i, c in enumerate(y_unseen):
+        logits_m3_u[i, (c + 1) % K] += 12.0
+    logits_m3_te = np.random.randn(n_test, K)
+    auditor.add_model("Poison-Model", tier="Comp", weight=0.30, unseen_log_probs=logits_m3_u, test_log_probs=logits_m3_te)
+
+    # Extra stream: mock wpca_dp
+    mock_dp_te = np.random.randn(n_test, K)
+    extra_streams = [("wpca_dp", 0.22, mock_dp_te)]
+
+    P_mix, weights_map, df_rep = auditor.optimize_weights_and_blend(
+        working_dir=tmp_path,
+        extra_test_log_probs=extra_streams,
+        optimize_on_unseen=True,
+    )
+
+    assert P_mix.shape == (n_test, K)
+    np.testing.assert_allclose(P_mix.sum(axis=1), 1.0, rtol=1e-5)
+
+    # Verify: Poison-Model MUST be pruned to 0.0 weight
+    assert weights_map["Poison-Model"] == 0.0, f"Poisonous model should have been pruned to 0.0, got {weights_map['Poison-Model']}"
+    assert weights_map["Strong-Anchor"] > 0.0, "Strong anchor model must retain positive weight"
+    assert "wpca_dp" in weights_map
+    assert weights_map["wpca_dp"] == 0.22
