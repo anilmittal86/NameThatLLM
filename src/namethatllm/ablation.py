@@ -24,19 +24,24 @@ from sklearn.metrics import balanced_accuracy_score
 
 from .config import LABELS, K, LAB2I, softmax, log_softmax
 
-def sinkhorn_balancing(P: np.ndarray, iters: int = 200, eps: float = 1e-9) -> np.ndarray:
+def _ablation_sinkhorn(P: np.ndarray, iters: int = 200, eps: float = 1e-12) -> np.ndarray:
     """Fast vectorized Sinkhorn mass balancing for balanced multiclass prediction."""
-    P = np.clip(P, eps, 1.0)
+    if len(P) < 18:
+        return P
+    P = np.clip(P.astype(np.float64), eps, 1.0)
+    target_col = 1.0 / P.shape[1]
     for _ in range(iters):
-        P = P / P.sum(axis=1, keepdims=True).clip(min=eps)
-        P = P / P.sum(axis=0, keepdims=True).clip(min=eps)
+        P /= P.sum(axis=1, keepdims=True).clip(min=eps)
+        P /= (P.sum(axis=0, keepdims=True) / (target_col * P.shape[0])).clip(min=eps)
     return P / P.sum(axis=1, keepdims=True).clip(min=eps)
+
+sinkhorn_balancing = _ablation_sinkhorn
 
 def _fast_sinkhorn_bacc(lp_mat: np.ndarray, y_true: np.ndarray, iters: int = 40) -> float:
     """Computes balanced accuracy after fast Sinkhorn mass equalization."""
     P = softmax(lp_mat, axis=1)
     if len(P) >= 18:
-        P = sinkhorn_balancing(P, iters=iters)
+        P = _ablation_sinkhorn(P, iters=iters)
     return float(balanced_accuracy_score(y_true, P.argmax(axis=1)))
 
 def _text_hash(text: str) -> str:
@@ -229,8 +234,11 @@ class UnseenStepwiseAuditor:
                         logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
                         weights_map[ex_name] = float(w_ex)
             P_mix = softmax(logit_flat, axis=1)
-            df_rep = self.print_and_save_report(working_dir, final_test_preds=P_mix.argmax(axis=1))
-            return P_mix, weights_map, df_rep
+            df_summary = pd.DataFrame([
+                {"model": m["name"], "tier": m["tier"], "prior_weight": m.get("prior_weight", m["weight"]), "learned_weight": m["weight"]}
+                for m in self.models
+            ])
+            return P_mix, weights_map, df_summary
 
         M = len(self.models)
         order = sorted(range(M), key=lambda i: self.models[i]["solo_unseen_sinkhorn_bacc"], reverse=True)
@@ -242,7 +250,7 @@ class UnseenStepwiseAuditor:
         best_bacc = float(
             balanced_accuracy_score(
                 self.y_unseen,
-                sinkhorn_balancing(softmax(cum_u_lp, axis=1), iters=60).argmax(axis=1),
+                _ablation_sinkhorn(softmax(cum_u_lp, axis=1), iters=60).argmax(axis=1),
             )
         )
 
@@ -255,7 +263,7 @@ class UnseenStepwiseAuditor:
             for mult in multipliers:
                 cand_w = prior_w * mult
                 trial_lp = cum_u_lp + cand_w * u_lp
-                trial_P = sinkhorn_balancing(softmax(trial_lp, axis=1), iters=60)
+                trial_P = _ablation_sinkhorn(softmax(trial_lp, axis=1), iters=60)
                 score = float(balanced_accuracy_score(self.y_unseen, trial_P.argmax(axis=1)))
                 if score > best_m_bacc + 1e-6:
                     best_m_bacc = score
@@ -270,7 +278,8 @@ class UnseenStepwiseAuditor:
         weights_map: Dict[str, float] = {}
         logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
         for idx, m in enumerate(self.models):
-            m["prior_weight"] = m["weight"]
+            m["prior_weight"] = m.get("prior_weight", m["weight"])
+            m["learned_weight"] = float(active_weights[idx])
             m["weight"] = float(active_weights[idx])
             weights_map[m["name"]] = float(active_weights[idx])
             if active_weights[idx] > 0.0:
@@ -283,8 +292,11 @@ class UnseenStepwiseAuditor:
                     weights_map[ex_name] = float(w_ex)
 
         P_mix = softmax(logit_flat, axis=1)
-        df_rep = self.print_and_save_report(working_dir, final_test_preds=P_mix.argmax(axis=1))
-        return P_mix, weights_map, df_rep
+        df_summary = pd.DataFrame([
+            {"model": m["name"], "tier": m["tier"], "prior_weight": m.get("prior_weight", m["weight"]), "learned_weight": m["weight"]}
+            for m in self.models
+        ])
+        return P_mix, weights_map, df_summary
 
     def evaluate_marginal_lift(
         self,
@@ -358,7 +370,8 @@ class UnseenStepwiseAuditor:
                 # Pick model with highest solo unseen sinkhorn bacc
                 for idx in remaining:
                     cand = self.models[idx]
-                    cand_lp = cand["weight"] * cand["unseen_lp"]
+                    cand_w = cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15)
+                    cand_lp = cand_w * cand["unseen_lp"]
                     cand_bacc = _fast_sinkhorn_bacc(cand_lp, self.y_unseen, iters=40)
                     if cand_bacc > best_cand_bacc:
                         best_cand_bacc = cand_bacc
@@ -368,7 +381,8 @@ class UnseenStepwiseAuditor:
                 # Test all remaining candidate models
                 for idx in remaining:
                     cand = self.models[idx]
-                    cand_lp = cum_unseen_lp + cand["weight"] * cand["unseen_lp"]
+                    cand_w = cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15)
+                    cand_lp = cum_unseen_lp + cand_w * cand["unseen_lp"]
                     cand_bacc = _fast_sinkhorn_bacc(cand_lp, self.y_unseen, iters=40)
                     if cand_bacc > best_cand_bacc:
                         best_cand_bacc = cand_bacc
@@ -386,12 +400,12 @@ class UnseenStepwiseAuditor:
             m = self.models[best_cand_idx]
             remaining.remove(best_cand_idx)
 
-            w = m["weight"]
+            w = m["weight"] if m["weight"] > 0 else m.get("prior_weight", 0.15)
             cum_unseen_lp = cum_unseen_lp + w * m["unseen_lp"]
             cum_test_lp = cum_test_lp + w * m["test_lp"]
 
             lift_str = f"{lift:+.4f}" if step_idx > 1 else "BASELINE"
-            cur_test_preds = sinkhorn_balancing(softmax(cum_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
+            cur_test_preds = _ablation_sinkhorn(softmax(cum_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
             if prev_test_preds is None:
                 flips = self.N_test
                 flip_str = f"{flips} (Init)"
@@ -434,7 +448,7 @@ class UnseenStepwiseAuditor:
 
             for r in range(1, M + 1):
                 for sub in combinations(range(M), r):
-                    sub_unseen_lp = sum(self.models[i]["weight"] * self.models[i]["unseen_lp"] for i in sub)
+                    sub_unseen_lp = sum((self.models[i]["weight"] if self.models[i]["weight"] > 0 else self.models[i].get("prior_weight", 0.15)) * self.models[i]["unseen_lp"] for i in sub)
                     bacc = _fast_sinkhorn_bacc(sub_unseen_lp, self.y_unseen, iters=30)
                     if bacc > best_subset_bacc:
                         best_subset_bacc = bacc
@@ -456,13 +470,13 @@ class UnseenStepwiseAuditor:
                         delta_loo = best_subset_bacc
                     else:
                         loo_sub = [j for j in best_subset if j != i]
-                        loo_lp = sum(self.models[j]["weight"] * self.models[j]["unseen_lp"] for j in loo_sub)
+                        loo_lp = sum((self.models[j]["weight"] if self.models[j]["weight"] > 0 else self.models[j].get("prior_weight", 0.15)) * self.models[j]["unseen_lp"] for j in loo_sub)
                         loo_bacc = _fast_sinkhorn_bacc(loo_lp, self.y_unseen, iters=30)
                         delta_loo = best_subset_bacc - loo_bacc
                     loo_str = f"-{delta_loo:.4f}" if delta_loo >= 0 else f"+{abs(delta_loo):.4f}"
                 else:
                     with_m_sub = list(best_subset) + [i]
-                    with_m_lp = sum(self.models[j]["weight"] * self.models[j]["unseen_lp"] for j in with_m_sub)
+                    with_m_lp = sum((self.models[j]["weight"] if self.models[j]["weight"] > 0 else self.models[j].get("prior_weight", 0.15)) * self.models[j]["unseen_lp"] for j in with_m_sub)
                     with_m_bacc = _fast_sinkhorn_bacc(with_m_lp, self.y_unseen, iters=30)
                     delta_add = with_m_bacc - best_subset_bacc
                     loo_str = f"{delta_add:+.4f} (Degrades if added)"

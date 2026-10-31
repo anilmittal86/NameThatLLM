@@ -243,6 +243,35 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
             b_c = np.zeros(K, dtype=np.float32)
             break
 
+    # Suffix / Keyword Matching fallback if W_p or W_c still None
+    if W_p is None or W_c is None:
+        for k, v in heads_dict.items():
+            k_lower = str(k).lower()
+            shape = getattr(v, "shape", None)
+            if shape is not None and len(shape) == 2 and (shape[0] == K or shape[1] == K):
+                # Check for center / twin
+                if any(tag in k_lower for tag in ("center", "centred", "twin")):
+                    if W_c is None:
+                        W_c = v
+                        base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
+                        for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "centered.bias", "b"]:
+                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) == (K,):
+                                b_c = heads_dict[bk]
+                                break
+                        if b_c is None:
+                            b_c = np.zeros(K, dtype=np.float32)
+                # Check for plain / head / clf / classifier
+                elif any(tag in k_lower for tag in ("plain", "head", "clf", "classifier")):
+                    if W_p is None:
+                        W_p = v
+                        base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
+                        for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "plain.bias", "b"]:
+                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) == (K,):
+                                b_p = heads_dict[bk]
+                                break
+                        if b_p is None:
+                            b_p = np.zeros(K, dtype=np.float32)
+
     if W_p is not None and hasattr(W_p, "cpu"):
         W_p = W_p.cpu().numpy()
     if b_p is not None and hasattr(b_p, "cpu"):

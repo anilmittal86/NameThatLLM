@@ -434,3 +434,70 @@ def test_enable_ablation_probe_toggle(tmp_path: Path):
     np.testing.assert_allclose(P_mix.sum(axis=1), 1.0, rtol=1e-5)
     assert weights_map["Model-A"] == 0.60
     assert weights_map["Model-B"] == 0.40
+
+
+def test_resolve_head_tensors_suffix_matching():
+    """Verify resolve_head_tensors resolves non-standard suffix keys for plain and centered heads."""
+    import torch
+    from namethatllm.neural_extractor import resolve_head_tensors
+
+    # 1. Non-standard plain classifier key (e.g. module.classifier.weight)
+    heads_dict = {
+        "module.classifier.weight": torch.randn(18, 128),
+        "module.classifier.bias": torch.randn(18),
+        "encoder.center_proj.weight": torch.randn(18, 128),
+        "encoder.center_proj.bias": torch.randn(18),
+    }
+    W_p, b_p, W_c, b_c = resolve_head_tensors(heads_dict)
+    assert W_p is not None and W_p.shape == (18, 128)
+    assert b_p is not None and b_p.shape == (18,)
+    assert W_c is not None and W_c.shape == (18, 128)
+    assert b_c is not None and b_c.shape == (18,)
+
+    # 2. Transposed shape (128, 18) guard
+    heads_transposed = {
+        "custom_clf_head.weight": torch.randn(128, 18),
+        "custom_twin_head.weight": torch.randn(128, 18),
+    }
+    W_p2, b_p2, W_c2, b_c2 = resolve_head_tensors(heads_transposed)
+    assert W_p2 is not None and W_p2.shape == (18, 128)
+    assert W_c2 is not None and W_c2.shape == (18, 128)
+    assert b_p2 is not None and b_p2.shape == (18,)
+    assert b_c2 is not None and b_c2.shape == (18,)
+
+
+def test_ablation_sinkhorn_and_prior_weight_preservation(tmp_path: Path):
+    """Verify _ablation_sinkhorn normalizes mass and print_and_save_report preserves prior weights."""
+    from namethatllm.ablation import _ablation_sinkhorn, UnseenStepwiseAuditor
+
+    # Test _ablation_sinkhorn
+    P_rand = np.random.rand(36, 18)
+    P_sink = _ablation_sinkhorn(P_rand, iters=100)
+    assert P_sink.shape == (36, 18)
+    np.testing.assert_allclose(P_sink.sum(axis=1), 1.0, atol=1e-6)
+    np.testing.assert_allclose(P_sink.sum(axis=0), 36.0 / 18.0, atol=1e-3)
+
+    # Test prior weight preservation when model is pruned
+    y_unseen = np.tile(np.arange(18), 2)  # 36 samples
+    auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=np.arange(36), N_test=20)
+
+    # Model 1 is great (one-hot on true labels)
+    lp1_u = np.full((36, 18), -10.0)
+    for i, y in enumerate(y_unseen):
+        lp1_u[i, y] = 5.0
+    # Model 2 is terrible (one-hot on wrong labels)
+    lp2_u = np.full((36, 18), -10.0)
+    for i, y in enumerate(y_unseen):
+        lp2_u[i, (y + 1) % 18] = 5.0
+
+    auditor.add_model("Champion-1", tier="Main", weight=0.60, unseen_log_probs=lp1_u, test_log_probs=np.zeros((20, 18)))
+    auditor.add_model("Poison-2", tier="Comp", weight=0.40, unseen_log_probs=lp2_u, test_log_probs=np.zeros((20, 18)))
+
+    # Optimize: Poison-2 will receive learned weight 0.0 (pruned)
+    P_mix, weights_map, _ = auditor.optimize_weights_and_blend(working_dir=tmp_path)
+    assert weights_map["Poison-2"] == 0.0
+    assert auditor.models[1]["prior_weight"] == 0.40
+
+    # Report evaluates Poison-2 at prior weight (0.40) rather than 0.0
+    df_rep = auditor.print_and_save_report(working_dir=tmp_path, final_test_preds=np.zeros(20, dtype=int))
+    assert (tmp_path / "unseen_stepwise_ablation.csv").exists()

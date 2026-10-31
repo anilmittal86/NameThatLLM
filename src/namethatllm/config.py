@@ -121,8 +121,25 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
             continue
     return None
 
-def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int, str]:
-    """Returns (head_feature_dim, keep_layers, backbone_name) without full model loading."""
+class CheckpointInfo(tuple):
+    """Tuple subclass supporting both 2-element (dim, keep) and 3-element (dim, keep, backbone) unpacking."""
+    def __iter__(self):
+        try:
+            import sys
+            import dis
+            f = sys._getframe(1)
+            for i in dis.get_instructions(f.f_code):
+                if i.offset == f.f_lasti and i.opname.startswith('UNPACK_SEQUENCE'):
+                    if i.argval == 2:
+                        return iter(self[:2])
+                    elif i.argval == 3:
+                        return iter(self[:3])
+        except Exception:
+            pass
+        return super().__iter__()
+
+def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
+    """Returns (head_feature_dim, keep_layers) for checkpoint directory without full model loading."""
     dim = 0
     keep = 0
     backbone = ""
@@ -142,11 +159,10 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int, str]:
             from safetensors import safe_open
             with safe_open(str(heads_p), framework="pt", device="cpu") as f:
                 for k in f.keys():
-                    if "plain.weight" in k or "centered.weight" in k or k in ("weight", "head.weight"):
-                        shape = f.get_tensor(k).shape
-                        if len(shape) == 2:
-                            dim = int(shape[1] if shape[0] == 18 else shape[0])
-                            break
+                    shape = f.get_tensor(k).shape
+                    if len(shape) == 2 and (shape[0] == 18 or shape[1] == 18):
+                        dim = int(shape[1] if shape[0] == 18 else shape[0])
+                        break
         except Exception:
             pass
     elif (ckpt_dir / "heads.pt").exists():
@@ -160,7 +176,7 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int, str]:
                         break
         except Exception:
             pass
-    return dim, keep, backbone
+    return CheckpointInfo((dim, keep, backbone))
 
 def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
     """Finds all fine-tuned LoRA and head checkpoints across safetensors and PyTorch formats."""

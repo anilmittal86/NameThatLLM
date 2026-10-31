@@ -22,6 +22,7 @@ import pandas as pd
 from scipy import sparse
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
+from sklearn.metrics import balanced_accuracy_score
 
 from .config import (
     LABELS, K, LAB2I, FAMILIES, PRIOR_SCALES,
@@ -570,15 +571,19 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             print(f"[Fast Probe] {opt_14b_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
 
                             if solo_bacc < probe_gate_min_bacc:
-                                print(f"[Fast Probe Pruning] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING 5,620-row test/train extraction!")
-                                trunk1.restore_weights(backup_t1_ts)
-                                del backup_t1_ts, heads_sd, Z_unseen
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-
-                            if len(auditor.models) > 0:
+                                if opt_14b_key in ("qwen3_14b_ts", "qwen3_14b_v5"):
+                                    print(f"[Fast Probe] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> deferring to auto_align_and_verify_head on Z_tr...")
+                                    W_p = None
+                                    W_c = None
+                                else:
+                                    print(f"[Fast Probe Pruning] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING 5,620-row test/train extraction!")
+                                    trunk1.restore_weights(backup_t1_ts)
+                                    del backup_t1_ts, heads_sd, Z_unseen
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    continue
+                            elif len(auditor.models) > 0:
                                 lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_tot)
                                 if lift < -0.002:
                                     print(f"[Fast Probe Pruning] {opt_14b_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING 5,620-row test/train extraction!")
@@ -617,6 +622,21 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 name=opt_14b_key,
                                 min_bacc=probe_gate_min_bacc,
                             )
+
+                        if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
+                            lp_u_fitted = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
+                            fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
+                            print(f"[Post-Fit Probe] {opt_14b_key}: unseen BAcc = {fitted_bacc:.4f}")
+                            if fitted_bacc < probe_gate_min_bacc:
+                                print(f"[Post-Fit Pruning] {opt_14b_key}: fitted unseen BAcc {fitted_bacc:.4f} < {probe_gate_min_bacc:.2f} -> rejecting checkpoint!")
+                                gate_passed = False
+                            elif len(auditor.models) > 0:
+                                fitted_lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_fitted, weight=w_comp_tot)
+                                if fitted_lift < -0.002:
+                                    print(f"[Post-Fit Pruning] {opt_14b_key}: fitted marginal lift {fitted_lift:+.4f} < -0.002 -> rejecting checkpoint!")
+                                    gate_passed = False
+                                else:
+                                    lp_u_p = lp_u_fitted
 
                         if gate_passed:
                             lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
@@ -956,15 +976,19 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             print(f"[Fast Probe] {opt_8b_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
 
                             if solo_bacc < probe_gate_min_bacc:
-                                print(f"[Fast Probe Pruning] {opt_8b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING full extraction!")
-                                trunk3.restore_weights(backup_t3_ts)
-                                del backup_t3_ts, heads_sd, Z_unseen
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                continue
-
-                            if len(auditor.models) > 0:
+                                if opt_8b_key in ("qwen3_8b_ts", "qwen3_8b_v5"):
+                                    print(f"[Fast Probe] {opt_8b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> deferring to auto_align_and_verify_head on Z_tr...")
+                                    W_p = None
+                                    W_c = None
+                                else:
+                                    print(f"[Fast Probe Pruning] {opt_8b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING full extraction!")
+                                    trunk3.restore_weights(backup_t3_ts)
+                                    del backup_t3_ts, heads_sd, Z_unseen
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    continue
+                            elif len(auditor.models) > 0:
                                 lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_tot)
                                 if lift < -0.002:
                                     print(f"[Fast Probe Pruning] {opt_8b_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING full extraction!")
@@ -1003,6 +1027,21 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 name=opt_8b_key,
                                 min_bacc=probe_gate_min_bacc,
                             )
+
+                        if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
+                            lp_u_fitted = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
+                            fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
+                            print(f"[Post-Fit Probe] {opt_8b_key}: unseen BAcc = {fitted_bacc:.4f}")
+                            if fitted_bacc < probe_gate_min_bacc:
+                                print(f"[Post-Fit Pruning] {opt_8b_key}: fitted unseen BAcc {fitted_bacc:.4f} < {probe_gate_min_bacc:.2f} -> rejecting checkpoint!")
+                                gate_passed = False
+                            elif len(auditor.models) > 0:
+                                fitted_lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_fitted, weight=w_comp_tot)
+                                if fitted_lift < -0.002:
+                                    print(f"[Post-Fit Pruning] {opt_8b_key}: fitted marginal lift {fitted_lift:+.4f} < -0.002 -> rejecting checkpoint!")
+                                    gate_passed = False
+                                else:
+                                    lp_u_p = lp_u_fitted
 
                         if gate_passed:
                             lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
@@ -1047,19 +1086,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_ts8) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
                                 lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_ts8)
                                 auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_tot_ts8, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
-
-                            if N_unseen > 0 and lp_u_p is not None and lp_p is not None:
-                                auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_comp_p, unseen_log_probs=lp_u_p, test_log_probs=lp_p)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_8b_key} rejected by gate; excluded from logits and spectral bank.")
 
                         trunk3.restore_weights(backup_t3_ts)
                         del backup_t3_ts, Z_tr, Z_te, heads_sd
-                        if "Z_unseen" in locals():
-                            del Z_unseen
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                         if "Z_unseen" in locals():
                             del Z_unseen
                         gc.collect()
