@@ -29,6 +29,7 @@ from .neural_extractor import (
     compute_centered_logits,
     UniversalLoRATrunkLoader,
     read_checkpoint_meta,
+    infer_adapter_max_layer,
     extract_deberta_checkpoint
 )
 from .wpca_gaussian import (

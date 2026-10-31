@@ -8,6 +8,7 @@ and bit-exact CPU fp16 snapshot/restore for shared trunks.
 
 import gc
 import os
+import re
 import json
 import time
 import shutil
@@ -21,6 +22,37 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 from safetensors.torch import load_file
 
 from .config import LABELS, K, align_cols, log_softmax
+
+def infer_adapter_max_layer(ckpt_dir: Path) -> Optional[int]:
+    """Returns 1-indexed max transformer layer modified by the LoRA adapter (e.g. 24 or 27)."""
+    ckpt_dir = Path(ckpt_dir)
+    for rel in (
+        "adapter_model.safetensors",
+        "adapter/adapter_model.safetensors",
+        "adapter_model.bin",
+        "adapter/adapter_model.bin",
+        "adapter_model.pt",
+        "adapter/adapter_model.pt",
+    ):
+        p = ckpt_dir / rel
+        if p.exists():
+            try:
+                if p.suffix == ".safetensors":
+                    sd = load_file(str(p))
+                else:
+                    sd = torch.load(str(p), map_location="cpu", weights_only=False)
+                    if hasattr(sd, "state_dict") and callable(sd.state_dict):
+                        sd = sd.state_dict()
+                layer_nums = []
+                for k in sd.keys():
+                    m = re.search(r"layers\.(\d+)\.", str(k))
+                    if m:
+                        layer_nums.append(int(m.group(1)) + 1)
+                if layer_nums:
+                    return max(layer_nums)
+            except Exception:
+                continue
+    return None
 
 def in_place_copy(dst: torch.Tensor, src: torch.Tensor):
     """In-place weight copy."""
@@ -153,16 +185,19 @@ def _flatten_state_dict(obj: Any, prefix: str = "", out: Optional[dict] = None) 
 def load_head_file(path_or_dir: Path) -> dict:
     """Unified loader for classification head state dicts (.safetensors, .pt, .bin, .npz)."""
     p = Path(path_or_dir)
+    res = {}
     if p.is_file():
         if p.suffix == ".safetensors":
-            return load_file(str(p))
+            res = load_file(str(p))
         elif p.suffix in (".pt", ".bin"):
             raw = torch.load(str(p), map_location="cpu", weights_only=False)
-            return _flatten_state_dict(raw)
+            res = _flatten_state_dict(raw)
         elif p.suffix == ".npz":
             npz = np.load(str(p), allow_pickle=True)
-            return {k: npz[k] for k in npz.files}
-        return {}
+            res = {k: npz[k] for k in npz.files}
+        if res:
+            print(f"[Head File] {p.name} loaded ({len(res)} keys): {list(res.keys())[:15]}")
+        return res
     for fname in ("heads.safetensors", "head.safetensors", "heads.pt", "head.pt", "readouts.npz"):
         cand = p / fname
         if cand.exists():
@@ -170,12 +205,14 @@ def load_head_file(path_or_dir: Path) -> dict:
     return {}
 
 def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-    """Resolves plain and centered head weights and biases matching American and British naming."""
+    """Resolves plain and centered head weights and biases matching American/British naming and handles transposed weights."""
     W_p, b_p, W_c, b_c = None, None, None, None
     for wk, bk in [
         ("plain.weight", "plain.bias"),
         ("plain_coef", "plain_intercept"),
         ("head.weight", "head.bias"),
+        ("classifier.weight", "classifier.bias"),
+        ("fc.weight", "fc.bias"),
         ("W_plain", "b_plain"),
         ("weight", "bias"),
         ("W", "b"),
@@ -183,6 +220,11 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
         if wk in heads_dict and bk in heads_dict:
             W_p, b_p = heads_dict[wk], heads_dict[bk]
             break
+        elif wk in heads_dict and bk not in heads_dict:
+            W_p = heads_dict[wk]
+            b_p = np.zeros(K, dtype=np.float32)
+            break
+
     for wk, bk in [
         ("centered.weight", "centered.bias"),
         ("centred.weight", "centred.bias"),
@@ -191,9 +233,14 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
         ("center_coef", "center_intercept"),
         ("centred_coef", "centred_intercept"),
         ("W_center", "b_center"),
+        ("W_twin", "b_twin"),
     ]:
         if wk in heads_dict and bk in heads_dict:
             W_c, b_c = heads_dict[wk], heads_dict[bk]
+            break
+        elif wk in heads_dict and bk not in heads_dict:
+            W_c = heads_dict[wk]
+            b_c = np.zeros(K, dtype=np.float32)
             break
 
     if W_p is not None and hasattr(W_p, "cpu"):
@@ -204,6 +251,14 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
         W_c = W_c.cpu().numpy()
     if b_c is not None and hasattr(b_c, "cpu"):
         b_c = b_c.cpu().numpy()
+
+    # Transpose Guard: if shape is (D, K) where K == 18, transpose to canonical (18, D)
+    if W_p is not None and W_p.ndim == 2:
+        if W_p.shape[1] == K and W_p.shape[0] != K:
+            W_p = W_p.T
+    if W_c is not None and W_c.ndim == 2:
+        if W_c.shape[1] == K and W_c.shape[0] != K:
+            W_c = W_c.T
 
     return W_p, b_p, W_c, b_c
 
@@ -320,16 +375,34 @@ class UniversalLoRATrunkLoader:
         self.norms.eval()
 
     def load_norm_weights(self, heads_sd: dict):
-        """Loads LayerNorm weights and biases from head state dict."""
+        """Loads LayerNorm weights and biases from head state dict after resetting to identity."""
         with torch.no_grad():
+            # First reset every ln in self.norms to identity so weights/biases from previous checkpoint never bleed
+            for ln in self.norms:
+                ln.weight.data.fill_(1.0)
+                if hasattr(ln, "bias") and ln.bias is not None:
+                    ln.bias.data.zero_()
+
+            # Support all norm key prefixes: norms.{i}, layer_norms.{i}, ln.{i}, norm.{i}
             for i, ln in enumerate(self.norms):
-                w_k = f'norms.{i}.weight'
-                b_k = f'norms.{i}.bias'
-                if w_k in heads_sd:
-                    ln.weight.copy_(heads_sd[w_k].to(ln.weight.device, ln.weight.dtype))
-                if b_k in heads_sd:
-                    if hasattr(ln, 'bias') and ln.bias is not None:
+                for pfx in ("norms", "layer_norms", "ln", "norm"):
+                    w_k = f"{pfx}.{i}.weight"
+                    b_k = f"{pfx}.{i}.bias"
+                    if w_k in heads_sd:
+                        ln.weight.copy_(heads_sd[w_k].to(ln.weight.device, ln.weight.dtype))
+                    elif f"{pfx}.{i}" in heads_sd and hasattr(heads_sd[f"{pfx}.{i}"], "shape") and heads_sd[f"{pfx}.{i}"].shape == ln.weight.shape:
+                        ln.weight.copy_(heads_sd[f"{pfx}.{i}"].to(ln.weight.device, ln.weight.dtype))
+
+                    if b_k in heads_sd and hasattr(ln, "bias") and ln.bias is not None:
                         ln.bias.copy_(heads_sd[b_k].to(ln.bias.device, ln.bias.dtype))
+
+            # Check for stacked 2D tensor: norms_weight or norms.weight of shape (len(self.layers), H)
+            for stk in ("norms_weight", "norms.weight", "layer_norms.weight", "ln.weight"):
+                if stk in heads_sd and hasattr(heads_sd[stk], "ndim") and heads_sd[stk].ndim == 2:
+                    stk_t = heads_sd[stk]
+                    if stk_t.shape[0] == len(self.norms):
+                        for i, ln in enumerate(self.norms):
+                            ln.weight.copy_(stk_t[i].to(ln.weight.device, ln.weight.dtype))
 
     def _extract_batch_ids(self, id_list: List[List[int]], batch_size: int = 8) -> np.ndarray:
         order = np.argsort([len(x) for x in id_list], kind="stable")
@@ -362,7 +435,8 @@ class UniversalLoRATrunkLoader:
             torch.cuda.empty_cache()
 
 def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List[int], default_max_len: int = 447) -> dict:
-    """Reads keep, layers, max_len, end_id, and labels dynamically from meta.json."""
+    """Reads keep, layers, max_len, end_id, and labels dynamically from meta.json or infers from adapter weights."""
+    ckpt_dir = Path(ckpt_dir)
     meta_p = ckpt_dir / "meta.json"
     labels = list(LABELS)
     keep = default_keep
@@ -383,6 +457,26 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
                     break
         except Exception:
             pass
+    else:
+        # Infer exact layer depth from adapter weights (e.g. l24 vs l27)
+        max_l = infer_adapter_max_layer(ckpt_dir)
+        if max_l == 24:
+            keep = 24
+            layers = [2, 4, 6, 8, 12, 16, 20, 24]
+        elif max_l == 27:
+            keep = 27
+            layers = [2, 4, 6, 9, 13, 17, 22, 27]
+        elif max_l == 32:
+            keep = 32
+            layers = [3, 5, 8, 11, 16, 21, 27, 32]
+        elif max_l is not None:
+            keep = max_l
+        else:
+            dir_str = str(ckpt_dir).lower()
+            if any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "l24x")):
+                keep = 24
+                layers = [2, 4, 6, 8, 12, 16, 20, 24]
+
     return {"keep": keep, "layers": layers, "max_len": max_len, "end_id": end_id, "labels": labels}
 
 def extract_deberta_checkpoint(

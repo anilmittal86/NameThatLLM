@@ -340,3 +340,97 @@ def test_optimize_weights_and_blend_prunes_bad_model_and_weights_individually(tm
     assert weights_map["Strong-Anchor"] > 0.0, "Strong anchor model must retain positive weight"
     assert "wpca_dp" in weights_map
     assert weights_map["wpca_dp"] == 0.22
+
+
+def test_infer_adapter_max_layer_selects_l24_layers_on_14b(tmp_path: Path):
+    """Verify that an adapter whose max layer index is 23 (l24) sets keep=24 and [2, 4, 6, 8, 12, 16, 20, 24]."""
+    from safetensors.torch import save_file
+    import torch
+    from namethatllm.neural_extractor import infer_adapter_max_layer, read_checkpoint_meta
+
+    ckpt_dir = tmp_path / "mock_l24_adapter"
+    ckpt_dir.mkdir()
+
+    # Create dummy adapter with layer 23 modified (0-indexed layer 23 = layer 24)
+    dummy_tensors = {
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 16),
+        "base_model.model.model.layers.12.self_attn.q_proj.lora_A.weight": torch.randn(4, 16),
+        "base_model.model.model.layers.23.self_attn.q_proj.lora_A.weight": torch.randn(4, 16),
+    }
+    save_file(dummy_tensors, str(ckpt_dir / "adapter_model.safetensors"))
+
+    max_l = infer_adapter_max_layer(ckpt_dir)
+    assert max_l == 24, f"Expected max layer 24, got {max_l}"
+
+    # Verify read_checkpoint_meta automatically infers [2, 4, 6, 8, 12, 16, 20, 24] even if defaults were 27
+    meta = read_checkpoint_meta(
+        ckpt_dir,
+        default_keep=27,
+        default_layers=[2, 4, 6, 9, 13, 17, 22, 27],
+    )
+    assert meta["keep"] == 24
+    assert meta["layers"] == [2, 4, 6, 8, 12, 16, 20, 24]
+
+
+def test_load_norm_weights_resets_stale_biases():
+    """Verify that load_norm_weights resets stale weights/biases to 1.0 and 0.0 before loading new keys."""
+    import torch
+    import torch.nn as nn
+    from namethatllm.neural_extractor import UniversalLoRATrunkLoader
+
+    # Create mock loader structure
+    class MockTrunk:
+        def __init__(self):
+            self.layers = [2, 4, 6, 8, 12, 16, 20, 24]
+            self.norms = nn.ModuleList([nn.LayerNorm(16) for _ in self.layers])
+
+    trunk = MockTrunk()
+
+    # Pollute norms with stale weights from previous checkpoint
+    for ln in trunk.norms:
+        ln.weight.data.fill_(4.5)
+        ln.bias.data.fill_(1.2)
+
+    # Call load_norm_weights method directly with empty dict
+    UniversalLoRATrunkLoader.load_norm_weights(trunk, {})
+
+    # Verify all norms were cleanly reset to identity (weight=1.0, bias=0.0)
+    for ln in trunk.norms:
+        assert torch.allclose(ln.weight, torch.ones(16))
+        assert torch.allclose(ln.bias, torch.zeros(16))
+
+    # Now load with alternate layer_norms prefix
+    heads_sd = {
+        "layer_norms.0.weight": torch.full((16,), 2.0),
+        "layer_norms.0.bias": torch.full((16,), -0.5),
+    }
+    UniversalLoRATrunkLoader.load_norm_weights(trunk, heads_sd)
+    assert torch.allclose(trunk.norms[0].weight, torch.full((16,), 2.0))
+    assert torch.allclose(trunk.norms[0].bias, torch.full((16,), -0.5))
+    assert torch.allclose(trunk.norms[1].weight, torch.ones(16))
+    assert torch.allclose(trunk.norms[1].bias, torch.zeros(16))
+
+
+def test_enable_ablation_probe_toggle(tmp_path: Path):
+    """Verify UnseenStepwiseAuditor handles enable_ablation_probe=False (empty unseen) without errors."""
+    from namethatllm.ablation import UnseenStepwiseAuditor
+
+    n_test = 20
+    # Empty unseen partition
+    auditor = UnseenStepwiseAuditor(y_unseen=np.array([], dtype=int), groups_unseen=np.array([], dtype=int), N_test=n_test)
+
+    m1_te = np.random.randn(n_test, K)
+    m2_te = np.random.randn(n_test, K)
+    auditor.add_model("Model-A", tier="Main", weight=0.60, unseen_log_probs=np.zeros((0, K)), test_log_probs=m1_te)
+    auditor.add_model("Model-B", tier="Comp", weight=0.40, unseen_log_probs=np.zeros((0, K)), test_log_probs=m2_te)
+
+    # In frozen mode (optimize_on_unseen=False or len(y_unseen) < 36), weights are taken directly from config
+    P_mix, weights_map, _ = auditor.optimize_weights_and_blend(
+        working_dir=tmp_path,
+        optimize_on_unseen=False,
+    )
+
+    assert P_mix.shape == (n_test, K)
+    np.testing.assert_allclose(P_mix.sum(axis=1), 1.0, rtol=1e-5)
+    assert weights_map["Model-A"] == 0.60
+    assert weights_map["Model-B"] == 0.40

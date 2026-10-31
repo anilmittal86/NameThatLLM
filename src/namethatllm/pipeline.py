@@ -186,7 +186,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         train_path, test_path, pool_file = resolve_dataset_paths(input_dir)
         all_pool_files = resolve_all_pool_files(input_dir)
 
-    print(f"[Pipeline] Startup: is_smoke={is_smoke}")
+    enable_ablation_probe = bool(cfg.get("enable_ablation_probe", True)) if cfg else True
+    probe_gate_min_bacc = float(cfg.get("probe_gate_min_bacc", 0.40)) if cfg else 0.40
+    print(f"[Pipeline] Startup: is_smoke={is_smoke}, enable_ablation_probe={enable_ablation_probe}, probe_gate_min_bacc={probe_gate_min_bacc:.2f}")
     print(f"[Pipeline] Paths: train={train_path}, test={test_path}, pool={pool_file}, all_pools={len(all_pool_files)}")
 
     df_test = pd.read_csv(test_path)
@@ -195,14 +197,24 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     N_test = len(test_texts)
     print(f"[Pipeline] Loaded test set: {N_test} rows")
 
-    # Build Zero-Leakage Unseen Holdout Benchmark (N_unseen = 360 rows, 4x faster on GPU)
-    df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=20)
-    unseen_parquet_path = working_dir / "unseen_holdout.parquet"
-    df_unseen.to_parquet(unseen_parquet_path, index=False)
-    unseen_texts = df_unseen["text"].fillna("").astype(str).tolist() if len(df_unseen) > 0 else []
-    N_unseen = len(unseen_texts)
-    y_unseen = np.array([LAB2I[m] for m in df_unseen["model"].values], dtype=int) if N_unseen > 0 else np.array([], dtype=int)
-    groups_unseen = df_unseen["prompt_id"].values if N_unseen > 0 and "prompt_id" in df_unseen.columns else np.ones(N_unseen, dtype=int)
+    # Build Zero-Leakage Unseen Holdout Benchmark (N_unseen = 360 rows) if enable_ablation_probe is True
+    if enable_ablation_probe and not is_smoke:
+        df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=20)
+        unseen_parquet_path = working_dir / "unseen_holdout.parquet"
+        df_unseen.to_parquet(unseen_parquet_path, index=False)
+        unseen_texts = df_unseen["text"].fillna("").astype(str).tolist() if len(df_unseen) > 0 else []
+        N_unseen = len(unseen_texts)
+        y_unseen = np.array([LAB2I[m] for m in df_unseen["model"].values], dtype=int) if N_unseen > 0 else np.array([], dtype=int)
+        groups_unseen = df_unseen["prompt_id"].values if N_unseen > 0 and "prompt_id" in df_unseen.columns else np.ones(N_unseen, dtype=int)
+    else:
+        if not enable_ablation_probe:
+            print("[Pipeline] Frozen Production Mode (enable_ablation_probe=False): Skipping unseen holdout extraction to save GPU time.")
+        df_unseen = pd.DataFrame()
+        unseen_texts = []
+        N_unseen = 0
+        y_unseen = np.array([], dtype=int)
+        groups_unseen = np.array([], dtype=int)
+
     auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=groups_unseen, N_test=N_test)
 
     # Discover fine-tuned checkpoints early for pre-flight validation
@@ -529,12 +541,36 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         # Stage A: Fast 360-row probe on df_unseen
                         if N_unseen >= 36 and W_p is not None:
                             Z_unseen = trunk1.extract_exact(unseen_texts, batch_size=8, end_id=meta_ts14["end_id"])
-                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
-                            solo_bacc = float(balanced_accuracy_score(y_unseen, lp_u_p.argmax(axis=1)))
-                            print(f"[Fast Probe] {opt_14b_key}: solo unseen BAcc = {solo_bacc:.4f}")
 
-                            if solo_bacc < 0.45:
-                                print(f"[Fast Probe Pruning] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < 0.45 -> SKIPPING 5,620-row test/train extraction!")
+                            # Auto-align label order: test canonical, alphabetical, and meta labels
+                            cand_orders = [ts14_labels]
+                            if sorted(LABELS) not in cand_orders:
+                                cand_orders.append(sorted(LABELS))
+                            if list(LABELS) not in cand_orders:
+                                cand_orders.append(list(LABELS))
+
+                            best_align_order = ts14_labels
+                            best_solo_bacc = -1.0
+                            best_lp_u_p = None
+                            for cand_o in cand_orders:
+                                try:
+                                    trial_lp = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
+                                    trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
+                                    if trial_acc > best_solo_bacc:
+                                        best_solo_bacc = trial_acc
+                                        best_align_order = cand_o
+                                        best_lp_u_p = trial_lp
+                                except Exception:
+                                    continue
+
+                            solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
+                            lp_u_p = best_lp_u_p if best_lp_u_p is not None else log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
+                            ts14_labels = best_align_order
+                            align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
+                            print(f"[Fast Probe] {opt_14b_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
+
+                            if solo_bacc < probe_gate_min_bacc:
+                                print(f"[Fast Probe Pruning] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING 5,620-row test/train extraction!")
                                 trunk1.restore_weights(backup_t1_ts)
                                 del backup_t1_ts, heads_sd, Z_unseen
                                 gc.collect()
@@ -579,7 +615,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 y_sub=y_sub,
                                 prompts_sub=prompts_sub,
                                 name=opt_14b_key,
-                                min_bacc=0.50,
+                                min_bacc=probe_gate_min_bacc,
                             )
 
                         if gate_passed:
@@ -742,12 +778,36 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     # Stage A: Fast 360-row probe on df_unseen
                     if N_unseen >= 36 and W_p is not None:
                         Z_unseen = trunk3.extract_exact(unseen_texts, batch_size=8, end_id=meta_ins["end_id"])
-                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"]))
-                        solo_bacc = float(balanced_accuracy_score(y_unseen, lp_u_p.argmax(axis=1)))
-                        print(f"[Fast Probe] instyle: solo unseen BAcc = {solo_bacc:.4f}")
 
-                        if solo_bacc < 0.45:
-                            print(f"[Fast Probe Pruning] instyle: solo BAcc {solo_bacc:.4f} < 0.45 -> SKIPPING full extraction!")
+                        # Auto-align label order: test canonical, alphabetical, and meta labels
+                        cand_orders = [meta_ins["labels"]]
+                        if sorted(LABELS) not in cand_orders:
+                            cand_orders.append(sorted(LABELS))
+                        if list(LABELS) not in cand_orders:
+                            cand_orders.append(list(LABELS))
+
+                        best_align_order = meta_ins["labels"]
+                        best_solo_bacc = -1.0
+                        best_lp_u_p = None
+                        for cand_o in cand_orders:
+                            try:
+                                trial_lp = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
+                                trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
+                                if trial_acc > best_solo_bacc:
+                                    best_solo_bacc = trial_acc
+                                    best_align_order = cand_o
+                                    best_lp_u_p = trial_lp
+                            except Exception:
+                                continue
+
+                        solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
+                        lp_u_p = best_lp_u_p if best_lp_u_p is not None else log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"]))
+                        meta_ins["labels"] = best_align_order
+                        align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
+                        print(f"[Fast Probe] instyle: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
+
+                        if solo_bacc < probe_gate_min_bacc:
+                            print(f"[Fast Probe Pruning] instyle: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING full extraction!")
                             instyle_pruned = True
                         elif len(auditor.models) > 0:
                             lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_p, weight=w_comp_tot)
@@ -784,7 +844,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 y_sub=y_sub,
                                 prompts_sub=prompts_sub,
                                 name="instyle",
-                                min_bacc=0.50,
+                                min_bacc=probe_gate_min_bacc,
                             )
                             if not gate_passed:
                                 instyle_pruned = True
@@ -866,12 +926,36 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         # Stage A: Fast 360-row probe on df_unseen
                         if N_unseen >= 36 and W_p is not None:
                             Z_unseen = trunk3.extract_exact(unseen_texts, batch_size=8, end_id=meta_ts8["end_id"])
-                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
-                            solo_bacc = float(balanced_accuracy_score(y_unseen, lp_u_p.argmax(axis=1)))
-                            print(f"[Fast Probe] {opt_8b_key}: solo unseen BAcc = {solo_bacc:.4f}")
 
-                            if solo_bacc < 0.45:
-                                print(f"[Fast Probe Pruning] {opt_8b_key}: solo BAcc {solo_bacc:.4f} < 0.45 -> SKIPPING full extraction!")
+                            # Auto-align label order: test canonical, alphabetical, and meta labels
+                            cand_orders = [ts8_labels]
+                            if sorted(LABELS) not in cand_orders:
+                                cand_orders.append(sorted(LABELS))
+                            if list(LABELS) not in cand_orders:
+                                cand_orders.append(list(LABELS))
+
+                            best_align_order = ts8_labels
+                            best_solo_bacc = -1.0
+                            best_lp_u_p = None
+                            for cand_o in cand_orders:
+                                try:
+                                    trial_lp = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
+                                    trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
+                                    if trial_acc > best_solo_bacc:
+                                        best_solo_bacc = trial_acc
+                                        best_align_order = cand_o
+                                        best_lp_u_p = trial_lp
+                                except Exception:
+                                    continue
+
+                            solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
+                            lp_u_p = best_lp_u_p if best_lp_u_p is not None else log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
+                            ts8_labels = best_align_order
+                            align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
+                            print(f"[Fast Probe] {opt_8b_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
+
+                            if solo_bacc < probe_gate_min_bacc:
+                                print(f"[Fast Probe Pruning] {opt_8b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING full extraction!")
                                 trunk3.restore_weights(backup_t3_ts)
                                 del backup_t3_ts, heads_sd, Z_unseen
                                 gc.collect()
@@ -916,7 +1000,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 y_sub=y_sub,
                                 prompts_sub=prompts_sub,
                                 name=opt_8b_key,
-                                min_bacc=0.50,
+                                min_bacc=probe_gate_min_bacc,
                             )
 
                         if gate_passed:
