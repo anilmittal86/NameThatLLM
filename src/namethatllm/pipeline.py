@@ -121,7 +121,7 @@ def auto_align_and_verify_head(
         print(f"[Gate] {name}: Pre-trained head BAcc = {best_acc:.4f} < {min_bacc:.2f}; probing 5-fold OOF LogReg readout...")
 
     if len(y_sub) >= 90 and len(np.unique(prompts_sub)) >= 5:
-        scale = float(np.sqrt(Z_tr.shape[1]))
+        scale = float(np.sqrt(Z_tr.shape[1])) / 8.0
         Z_scaled = Z_tr / scale
         gkf = GroupKFold(n_splits=5)
         oof_preds = np.zeros(len(y_sub), dtype=int)
@@ -410,6 +410,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 w_main_c = model_weights.get("qwen3_14b_p2", {}).get("twin_weight", main_members.get("lora_qwen3_14b", {}).get("twin_weight", 0.12))
                 lp_u_p = np.zeros((0, K), dtype=np.float32)
                 lp_u_c = np.zeros((0, K), dtype=np.float32)
+                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                 if W_p is not None:
                     lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
                     LOGIT_MAIN += lp_p * w_main_p
@@ -432,7 +433,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if W_p is not None:
                     w_tot_14b = w_main_p + (w_main_c if W_c is not None else 0.0)
                     lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_14b) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                    lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_14b)
+                    lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c_blend if W_c is not None else 0.0)) / max(1e-8, w_tot_14b)
                     auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
                 # wPCA + DP Posterior + Spectral Bank
@@ -480,6 +481,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 lp_p = None
                 lp_u_p = np.zeros((0, K), dtype=np.float32)
                 lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                 lp_u_c = np.zeros((0, K), dtype=np.float32)
                 if W_p is not None:
                     lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p1_labels))
@@ -499,7 +501,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if W_p is not None:
                     w_tot_p1 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
                     lp_u_p1 = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_p1) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                    lp_te_p1 = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_p1)
+                    lp_te_p1 = (w_comp_p * lp_p + (w_comp_c * lp_c_blend if W_c is not None else 0.0)) / max(1e-8, w_tot_p1)
                     auditor.add_model("Qwen3-14B Part-1", tier="Comp", weight=w_tot_p1, unseen_log_probs=lp_u_p1, test_log_probs=lp_te_p1)
 
                 res_p1 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_p1", 0.35))
@@ -660,6 +662,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     lp_u_c = np.zeros((0, K), dtype=np.float32)
                             else:
                                 lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                                 lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                             res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_14b_key, 0.25))
@@ -675,7 +678,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if W_p is not None and lp_p is not None:
                                 w_tot_ts14 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
                                 lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_ts14) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                                lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_ts14)
+                                lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c_blend if W_c is not None else 0.0)) / max(1e-8, w_tot_ts14)
                                 auditor.add_model(name=opt_14b_key, tier="Comp", weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
@@ -698,73 +701,89 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 2: Qwen2.5-14B (48 layers, hidden=5120)
         # ==============================================================================
         base_q25_14b = verified_bases.get("qwen25_14b") or find_base_model(input_dir, "qwen2", 5120, 48)
-        if base_q25_14b and ("qwen25_14b_p2" in ckpts or "qwen25_14b_inhouse" in ckpts):
-            p2_key = "qwen25_14b_p2" if "qwen25_14b_p2" in ckpts else "qwen25_14b_inhouse"
-            print(f"[Pipeline] Loading Trunk 2: Qwen2.5-14B ({p2_key}) from {base_q25_14b}...")
-            p2_dir = ckpts[p2_key]
-            meta_q25 = read_checkpoint_meta(p2_dir, default_keep=32, default_layers=[3, 5, 8, 11, 16, 21, 27, 32], default_max_len=447)
-            trunk2 = UniversalLoRATrunkLoader(base_q25_14b, keep_layers=meta_q25["keep"], layers=meta_q25["layers"], max_len=meta_q25["max_len"])
-            merged = merge_lora(trunk2.model, p2_dir, sign=+1.0)
-            if not merged and not is_smoke:
-                raise RuntimeError(f"Failed to merge required LoRA adapter at {p2_dir}")
-            heads_sd = load_head_file(p2_dir)
-            trunk2.load_norm_weights(heads_sd)
-            W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-            if W_p is None and not is_smoke:
-                raise RuntimeError(f"Required classification head W_p is None for {p2_dir}")
-            p2_labels = meta_q25["labels"]
+        if base_q25_14b and any(k in ckpts for k in ("qwen25_14b_p2", "qwen25_14b_inhouse")):
+            trunk2 = None
+            for q25_key in ("qwen25_14b_p2", "qwen25_14b_inhouse"):
+                if q25_key not in ckpts:
+                    continue
+                p2_dir = ckpts[q25_key]
+                meta_q25 = read_checkpoint_meta(p2_dir, default_keep=32, default_layers=[3, 5, 8, 11, 16, 21, 27, 32], default_max_len=447)
+                if trunk2 is None:
+                    print(f"[Pipeline] Loading Trunk 2: Qwen2.5-14B ({q25_key}) from {base_q25_14b}...")
+                    trunk2 = UniversalLoRATrunkLoader(base_q25_14b, keep_layers=meta_q25["keep"], layers=meta_q25["layers"], max_len=meta_q25["max_len"])
+                else:
+                    trunk2.set_active_layers(meta_q25["layers"], meta_q25["max_len"])
+                backup_t2 = trunk2.snapshot_weights(p2_dir)
+                merged = merge_lora(trunk2.model, p2_dir, sign=+1.0)
+                if not merged and not is_smoke:
+                    raise RuntimeError(f"Failed to merge required LoRA adapter at {p2_dir}")
+                heads_sd = load_head_file(p2_dir)
+                trunk2.load_norm_weights(heads_sd)
+                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+                if W_p is None and not is_smoke:
+                    raise RuntimeError(f"Required classification head W_p is None for {p2_dir}")
+                p2_labels = meta_q25["labels"]
 
-            Z_all = trunk2.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_q25["end_id"])
-            Z_te = Z_all[:N_test]
-            Z_unseen = Z_all[N_test : N_test + N_unseen]
-            Z_tr = Z_all[N_test + N_unseen :]
-            update_hybrid_groups(Z_te, prior_scales.get("qwen25_14b_p2", 0.85))
+                Z_all = trunk2.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_q25["end_id"])
+                Z_te = Z_all[:N_test]
+                Z_unseen = Z_all[N_test : N_test + N_unseen]
+                Z_tr = Z_all[N_test + N_unseen :]
+                update_hybrid_groups(Z_te, prior_scales.get(q25_key, 0.85))
 
-            w_main_p = model_weights.get("qwen25_14b_p2", {}).get("plain_weight", main_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.24))
-            w_main_c = model_weights.get("qwen25_14b_p2", {}).get("twin_weight", main_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.10))
-            lp_u_p = np.zeros((0, K), dtype=np.float32)
-            lp_u_c = np.zeros((0, K), dtype=np.float32)
-            if W_p is not None:
-                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
-                LOGIT_MAIN += lp_p * w_main_p
-                w_comp_p = comp_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.20)
-                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                if N_unseen > 0:
-                    lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
+                w_main_p = model_weights.get(q25_key, {}).get("plain_weight", main_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.24))
+                w_main_c = model_weights.get(q25_key, {}).get("twin_weight", main_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.10))
+                lp_u_p = np.zeros((0, K), dtype=np.float32)
+                lp_u_c = np.zeros((0, K), dtype=np.float32)
+                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                if W_p is not None:
+                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
+                    LOGIT_MAIN += lp_p * w_main_p
+                    w_comp_p = comp_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.20)
+                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                    if N_unseen > 0:
+                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
 
-            if W_c is not None:
-                lp_c85, valid_c85 = compute_centered_logits(Z_te, groups_085, W_c, b_c, p2_labels)
-                LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
-                lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, p2_labels)
-                lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, p2_labels)
-                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                w_comp_c = comp_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.08)
-                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                if N_unseen > 0:
-                    lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
+                if W_c is not None:
+                    lp_c85, valid_c85 = compute_centered_logits(Z_te, groups_085, W_c, b_c, p2_labels)
+                    LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
+                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, p2_labels)
+                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, p2_labels)
+                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                    w_comp_c = comp_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.08)
+                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                    if N_unseen > 0:
+                        lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
 
-            if W_p is not None:
-                w_tot_q25 = w_main_p + (w_main_c if W_c is not None else 0.0)
-                lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_q25) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_q25)
-                auditor.add_model("Qwen2.5-14B Part-2", tier="Main", weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
+                if W_p is not None:
+                    w_tot_q25 = w_main_p + (w_main_c if W_c is not None else 0.0)
+                    lp_model_u = (w_main_p * lp_u_p + (w_main_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_q25) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
+                    lp_model_te = (w_main_p * lp_p + (w_main_c * lp_c_blend if W_c is not None else 0.0)) / max(1e-8, w_tot_q25)
+                    aud_name = "Qwen2.5-14B Part-2" if q25_key == "qwen25_14b_p2" else "Qwen2.5-14B In-House"
+                    auditor.add_model(aud_name, tier="Main", weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
-            res_q25 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen25_14b_p2", 0.10))
-            U_te = transform_lowram(Z_te, res_q25)
-            lp_dp = scores_exact_dp(U_te, groups_065, res_q25, D_hybrid)
-            dp_posteriors.append((dp_weights.get("q25_14b", 0.24), softmax(lp_dp, axis=1)))
+                res_q25 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(q25_key, 0.10))
+                U_te = transform_lowram(Z_te, res_q25)
+                lp_dp = scores_exact_dp(U_te, groups_065, res_q25, D_hybrid)
+                dp_posteriors.append((dp_weights.get("q25_14b", 0.24), softmax(lp_dp, axis=1)))
 
-            S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_q25, prior_scales.get("qwen25_14b_p2", 0.85))
-            spectral_blocks_tr.append(S_tr)
-            spectral_blocks_te.append(S_te)
+                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_q25, prior_scales.get(q25_key, 0.85))
+                spectral_blocks_tr.append(S_tr)
+                spectral_blocks_te.append(S_te)
 
-            trunk2.free_memory()
-            del trunk2, Z_all, Z_tr, Z_te, heads_sd, res_q25, U_te
-            if "Z_unseen" in locals():
-                del Z_unseen
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                trunk2.restore_weights(backup_t2)
+                del backup_t2, Z_all, Z_tr, Z_te, heads_sd, res_q25, U_te
+                if "Z_unseen" in locals():
+                    del Z_unseen
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if trunk2 is not None:
+                trunk2.free_memory()
+                del trunk2
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # ==============================================================================
         # TRUNK 3: Qwen3-8B (36 layers, hidden=4096)
@@ -894,6 +913,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 lp_u_c = np.zeros((0, K), dtype=np.float32)
                         else:
                             lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                            lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                             lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                         res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
@@ -909,7 +929,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         if W_p is not None and lp_p is not None:
                             w_tot_ins = w_comp_p + (w_comp_c if W_c is not None else 0.0)
                             lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_ins) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                            lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_ins)
+                            lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c_blend if W_c is not None else 0.0)) / max(1e-8, w_tot_ins)
                             auditor.add_model("Qwen3-8B In-Style", tier="Comp", weight=w_tot_ins, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                     trunk3.restore_weights(backup_t3)
@@ -1069,6 +1089,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     lp_u_c = np.zeros((0, K), dtype=np.float32)
                             else:
                                 lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                                 lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                             res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
@@ -1084,7 +1105,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if W_p is not None and lp_p is not None:
                                 w_tot_ts8 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
                                 lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if W_c is not None else 0.0)) / max(1e-8, w_tot_ts8) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                                lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if W_c is not None else 0.0)) / max(1e-8, w_tot_ts8)
+                                lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c_blend if W_c is not None else 0.0)) / max(1e-8, w_tot_ts8)
                                 auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_tot_ts8, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_8b_key} rejected by gate; excluded from logits and spectral bank.")
@@ -1182,11 +1203,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             lp_u_c = np.zeros((0, K), dtype=np.float32)
                     else:
                         lp_c85 = np.zeros((N_test, K), dtype=np.float32)
+                        lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                         lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                     w_tot_cl = w_comp_p + (w_comp_c if (W_c is not None and W_c.shape[0] == 18) else 0.0)
                     lp_m_u = (w_comp_p * lp_u_p + (w_comp_c * lp_u_c if (W_c is not None and W_c.shape[0] == 18) else 0.0)) / max(1e-8, w_tot_cl) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                    lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c85 if (W_c is not None and W_c.shape[0] == 18) else 0.0)) / max(1e-8, w_tot_cl)
+                    lp_m_te = (w_comp_p * lp_p + (w_comp_c * lp_c_blend if (W_c is not None and W_c.shape[0] == 18) else 0.0)) / max(1e-8, w_tot_cl)
                     auditor.add_model("Qwen3-8B Claude Head", tier="Comp", weight=w_tot_cl, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                 res_cl = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_claude", 0.35))
@@ -1213,8 +1235,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # ==============================================================================
         # TRUNK 4: DeBERTa-v3-Large
         # ==============================================================================
-        if "deberta_p2" in ckpts or "deberta_inhouse" in ckpts:
-            deb_key = "deberta_p2" if "deberta_p2" in ckpts else "deberta_inhouse"
+        for deb_key in ("deberta_p2", "deberta_inhouse"):
+            if deb_key not in ckpts:
+                continue
             deb_dir = ckpts[deb_key]
             base_deb_dir = verified_bases.get("deberta_v3_large") or find_base_model(input_dir, "deberta", 1024, 24)
             print(f"[Pipeline] Loading Trunk 4: DeBERTa-v3 ({deb_key}) from {deb_dir}...")
@@ -1226,14 +1249,15 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
             if W_p_deb is None and not is_smoke:
                 raise RuntimeError(f"Required classification head W_p is None for {deb_dir}")
-            update_hybrid_groups(Z_te_deb, prior_scales.get("deberta_p2", 0.80))
+            update_hybrid_groups(Z_te_deb, prior_scales.get(deb_key, 0.80))
 
-            w_main_deb = model_weights.get("deberta_p2", {}).get("plain_weight", main_members.get("deberta_v3_large", {}).get("plain_weight", 0.25))
+            w_main_deb = model_weights.get(deb_key, {}).get("plain_weight", main_members.get("deberta_v3_large", {}).get("plain_weight", 0.25))
             w_comp_deb = comp_members.get("deberta_v3_large", {}).get("plain_weight", 0.18)
-            w_comp_c = model_weights.get("deberta_p2", {}).get("twin_weight", comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06))
+            w_comp_c = model_weights.get(deb_key, {}).get("twin_weight", comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06))
             lp_p_deb = None
             lp_u_deb = np.zeros((0, K), dtype=np.float32)
             lp_c85_deb = np.zeros((N_test, K), dtype=np.float32)
+            lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
             lp_u_c_deb = np.zeros((0, K), dtype=np.float32)
 
             if W_p_deb is not None:
@@ -1255,19 +1279,25 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             if W_p_deb is not None and lp_p_deb is not None:
                 w_tot_deb = w_main_deb + (w_comp_c if W_c_deb is not None else 0.0)
                 lp_m_u = (w_main_deb * lp_u_deb + (w_comp_c * lp_u_c_deb if W_c_deb is not None else 0.0)) / max(1e-8, w_tot_deb) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                lp_m_te = (w_main_deb * lp_p_deb + (w_comp_c * lp_c85_deb if W_c_deb is not None else 0.0)) / max(1e-8, w_tot_deb)
-                auditor.add_model("DeBERTa-v3-Large", tier="Main", weight=w_tot_deb, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
+                lp_m_te = (w_main_deb * lp_p_deb + (w_comp_c * lp_c_blend if W_c_deb is not None else 0.0)) / max(1e-8, w_tot_deb)
+                aud_name = "DeBERTa-v3-Large" if deb_key == "deberta_p2" else "DeBERTa-InHouse"
+                auditor.add_model(aud_name, tier="Main", weight=w_tot_deb, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
-            res_deb = fit_shared_gaussian_lowram(Z_tr_deb, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("deberta_p2", 0.10))
+            res_deb = fit_shared_gaussian_lowram(Z_tr_deb, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(deb_key, 0.10))
             U_te = transform_lowram(Z_te_deb, res_deb)
             lp_dp = scores_exact_dp(U_te, groups_065, res_deb, D_hybrid)
             dp_posteriors.append((dp_weights.get("deberta", 0.20), softmax(lp_dp, axis=1)))
 
-            S_tr, S_te = make_spectral_blocks(Z_tr_deb, Z_te_deb, res_deb, prior_scales.get("deberta_p2", 0.80))
+            S_tr, S_te = make_spectral_blocks(Z_tr_deb, Z_te_deb, res_deb, prior_scales.get(deb_key, 0.80))
             spectral_blocks_tr.append(S_tr)
             spectral_blocks_te.append(S_te)
 
             del Z_tr_deb, Z_te_deb, Z_test_all, res_deb, U_te
+            if "Z_unseen_deb" in locals():
+                del Z_unseen_deb
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if "Z_unseen_deb" in locals():
                 del Z_unseen_deb
             gc.collect()

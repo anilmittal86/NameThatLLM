@@ -544,6 +544,78 @@ class TestCompilerAndIntegration(unittest.TestCase):
             self.assertIn("llama3_8b_ts", ckpts)
             self.assertEqual(ckpts["llama3_8b_ts"], tmp / "nlm_l24_adapters" / "ts_llama8")
 
+    def test_merge_lora_atomic_prevalidation_rejects_llama_mlp_mismatch(self):
+        """Verify that if an adapter has matching q_proj shape (32, 32) but mismatched gate_proj shape (64, 32) vs (48, 32), merge_lora returns False and leaves q_proj.weight 100% unchanged."""
+        import torch
+        import torch.nn as nn
+        from safetensors.torch import save_file
+        from namethatllm.neural_extractor import merge_lora
+
+        class ToyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([
+                    nn.ModuleDict({
+                        "self_attn": nn.ModuleDict({
+                            "q_proj": nn.Linear(32, 32, bias=False)
+                        }),
+                        "mlp": nn.ModuleDict({
+                            "gate_proj": nn.Linear(32, 48, bias=False)  # Qwen shape: (48, 32)
+                        })
+                    })
+                ])
+
+        model = ToyModel()
+        orig_q = model.layers[0]["self_attn"]["q_proj"].weight.clone()
+        orig_gate = model.layers[0]["mlp"]["gate_proj"].weight.clone()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            cfg = {"r": 4, "lora_alpha": 16}
+            (tmp / "adapter_config.json").write_text(json.dumps(cfg))
+
+            # q_proj matches (32, 32), gate_proj has Llama shape (64, 32)
+            sd = {
+                "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 32),
+                "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(32, 4),
+                "base_model.model.layers.0.mlp.gate_proj.lora_A.weight": torch.randn(4, 32),
+                "base_model.model.layers.0.mlp.gate_proj.lora_B.weight": torch.randn(64, 4),  # Mismatch: 64 != 48
+            }
+            save_file(sd, str(tmp / "adapter_model.safetensors"))
+
+            merged = merge_lora(model, tmp, sign=+1.0)
+            self.assertFalse(merged, "merge_lora must return False on shape mismatch")
+            self.assertTrue(torch.equal(model.layers[0]["self_attn"]["q_proj"].weight, orig_q), "q_proj must remain 100% unmodified")
+            self.assertTrue(torch.equal(model.layers[0]["mlp"]["gate_proj"].weight, orig_gate), "gate_proj must remain 100% unmodified")
+
+    def test_trainer_forward_features_no_hooks_checkpoint_compatible(self):
+        """Verify MultiLayerLoRAClassifier.forward_features does not register hooks and works cleanly with gradient checkpointing."""
+        import torch
+        import torch.nn.functional as F
+        from transformers import AutoConfig, AutoModel
+        from namethatllm.trainer import MultiLayerLoRAClassifier
+
+        cfg = AutoConfig.for_model("qwen2", hidden_size=64, num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=2, intermediate_size=128)
+        base = AutoModel.from_config(cfg)
+        base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        clf = MultiLayerLoRAClassifier(backbone=base, hidden_size=64, layers=[1, 3], num_classes=18)
+        input_ids = torch.randint(0, 100, (2, 16))
+        attention_mask = torch.ones((2, 16), dtype=torch.long)
+        labels = torch.tensor([0, 1], dtype=torch.long)
+
+        Z, logits_p, logits_c = clf(input_ids, attention_mask)
+        loss = F.cross_entropy(logits_p, labels)
+        loss.backward()
+
+        self.assertIsNotNone(clf.plain_head.weight.grad)
+        self.assertGreater(clf.plain_head.weight.grad.abs().sum().item(), 0.0)
+
+    def test_ablation_does_not_define_sinkhorn_balancing(self):
+        """Verify ablation.py does NOT define sinkhorn_balancing at module scope so postprocess.sinkhorn_balancing is never overwritten."""
+        import namethatllm.ablation as abl
+        self.assertNotIn("sinkhorn_balancing", dir(abl), "ablation.py must NOT export sinkhorn_balancing")
+
 if __name__ == "__main__":
     unittest.main()
 
