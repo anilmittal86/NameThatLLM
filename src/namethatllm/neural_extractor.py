@@ -71,21 +71,33 @@ def _resolve_module_name(k: str, state_dict: dict) -> Optional[str]:
     return None
 
 def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool:
-    """In-place merges or unmerges (+1.0 or -1.0) a LoRA adapter directly into trunk weights."""
+    """
+    Atomically merges or unmerges (+1.0 or -1.0) a LoRA adapter into trunk weights.
+    Pre-validates all tensor shapes BEFORE mutating any weights so an incompatible
+    architecture (e.g. Llama vs Qwen) never partially corrupts the trunk.
+    """
     weights_path = adapter_path / "adapter_model.safetensors"
     if not weights_path.exists():
         weights_path = adapter_path / "adapter" / "adapter_model.safetensors"
     if not weights_path.exists():
         return False
 
-    sd = load_file(str(weights_path))
+    try:
+        sd = load_file(str(weights_path))
+    except Exception as e:
+        print(f"[merge_lora] Could not load {weights_path}: {e}")
+        return False
+
     cfg_p = adapter_path / "adapter_config.json"
     if not cfg_p.exists():
         cfg_p = adapter_path / "adapter" / "adapter_config.json"
     scale = 1.0
     if cfg_p.exists():
-        c = json.load(open(cfg_p))
-        scale = float(c.get("lora_alpha", 16)) / float(c.get("r", 16))
+        try:
+            c = json.load(open(cfg_p))
+            scale = float(c.get("lora_alpha", 16)) / float(c.get("r", 16))
+        except Exception:
+            scale = 1.0
 
     state_dict = dict(model.named_modules())
     pairs = {}
@@ -97,17 +109,33 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
                 if m_name is not None:
                     pairs[m_name] = (sd[k], sd[b_key])
 
+    if not pairs:
+        return False
+
+    # Pass 1: Pre-validate all shapes before modifying any weight in `model`
+    for m_name, (A, B) in pairs.items():
+        mod = state_dict.get(m_name)
+        if mod is None or not hasattr(mod, "weight"):
+            continue
+        expected_shape = (B.shape[0], A.shape[1])
+        if tuple(mod.weight.shape) != expected_shape:
+            print(
+                f"[merge_lora] Architecture mismatch on {m_name} in {adapter_path.name}: "
+                f"trunk weight {tuple(mod.weight.shape)} != adapter delta {expected_shape}. Aborting merge."
+            )
+            return False
+
+    # Pass 2: All shapes verified — apply in-place update
     applied = 0
     with torch.no_grad():
         for m_name, (A, B) in pairs.items():
-            if m_name in state_dict:
-                mod = state_dict[m_name]
-                if hasattr(mod, "weight"):
-                    A_d = A.to(mod.weight.device, dtype=torch.float32)
-                    B_d = B.to(mod.weight.device, dtype=torch.float32)
-                    delta = (B_d @ A_d) * (scale * sign)
-                    mod.weight.data.add_(delta.to(mod.weight.dtype))
-                    applied += 1
+            mod = state_dict.get(m_name)
+            if mod is not None and hasattr(mod, "weight"):
+                A_d = A.to(mod.weight.device, dtype=torch.float32)
+                B_d = B.to(mod.weight.device, dtype=torch.float32)
+                delta = (B_d @ A_d) * (scale * sign)
+                mod.weight.data.add_(delta.to(mod.weight.dtype))
+                applied += 1
     return applied > 0
 
 @torch.no_grad()

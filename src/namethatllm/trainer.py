@@ -54,31 +54,6 @@ def _disable_final_norm(mod: nn.Module) -> None:
         if curr is not None and hasattr(curr, parts[-1]) and getattr(curr, parts[-1]) is not None:
             setattr(curr, parts[-1], nn.Identity())
 
-def _find_decoder_layer_list(backbone: nn.Module) -> Optional[nn.ModuleList]:
-    """Finds the main sequence of transformer/decoder layer modules within a model."""
-    for path in [
-        "model.layers",
-        "base_model.model.layers",
-        "base_model.model.model.layers",
-        "layers",
-        "encoder.layer",
-        "deberta.encoder.layer",
-        "base_model.encoder.layer",
-        "transformer.h",
-        "base_model.transformer.h",
-    ]:
-        curr = backbone
-        ok = True
-        for p in path.split("."):
-            if hasattr(curr, p):
-                curr = getattr(curr, p)
-            else:
-                ok = False
-                break
-        if ok and isinstance(curr, (nn.ModuleList, list, tuple)):
-            return curr
-    return None
-
 class MultiLayerLoRAClassifier(nn.Module):
     """
     Universal Multi-Layer LoRA sequence classifier with dedicated per-layer
@@ -140,56 +115,6 @@ class MultiLayerLoRAClassifier(nn.Module):
         den = m.sum(dim=1, keepdim=True).clamp(min=1e-5)
         first_device = input_ids.device
 
-        dec_layers = _find_decoder_layer_list(self.backbone)
-        can_use_hooks = (
-            dec_layers is not None
-            and all((0 <= (l - 1) < len(dec_layers)) for l in self.layers)
-        )
-
-        if can_use_hooks:
-            hooked_pooled = {}
-            handles = []
-            for idx, l in enumerate(self.layers):
-                norm = self.norms[idx]
-                layer_mod = dec_layers[l - 1]
-
-                def _make_hook(norm_layer, l_idx):
-                    def _hook(mod, inp, out):
-                        h = out[0] if isinstance(out, tuple) else out
-                        h = h.float()
-                        ldev = h.device
-                        m_l = m.to(ldev)
-                        den_l = den.to(ldev)
-                        h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
-                        pooled = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
-                        if next(norm_layer.parameters()).device != ldev:
-                            norm_layer.to(ldev)
-                        normed = norm_layer(pooled)
-                        hooked_pooled[l_idx] = normed.to(first_device)
-                    return _hook
-
-                handles.append(layer_mod.register_forward_hook(_make_hook(norm, idx)))
-
-            try:
-                try:
-                    self.backbone(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=False,
-                        return_dict=True,
-                        use_cache=False
-                    )
-                except TypeError:
-                    self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-            finally:
-                for h in handles:
-                    h.remove()
-
-            if len(hooked_pooled) == len(self.layers):
-                pooled_list = [hooked_pooled[idx] for idx in range(len(self.layers))]
-                return torch.cat(pooled_list, dim=-1)
-
-        # Fallback to output_hidden_states=True
         try:
             outputs = self.backbone(
                 input_ids=input_ids,
@@ -199,7 +124,11 @@ class MultiLayerLoRAClassifier(nn.Module):
                 use_cache=False
             )
         except TypeError:
-            outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            )
 
         hidden_states = getattr(outputs, "hidden_states", outputs)
         pooled_list = []

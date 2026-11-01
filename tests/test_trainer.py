@@ -5,11 +5,13 @@ Unit and Integration Tests for namethatllm.trainer
 
 import unittest
 import math
+import json
 from pathlib import Path
 import tempfile
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from types import SimpleNamespace
 
 from namethatllm.config import LABELS, K
@@ -428,6 +430,105 @@ class TestTrainer(unittest.TestCase):
             repo_root / "kernels" / "training" / "lora_training.ipynb"
         )
         self.assertTrue(trn_out.exists())
+
+    def test_merge_lora_atomic_rejection_on_mlp_shape_mismatch(self):
+        """Verify merge_lora atomically rejects mismatched adapter (e.g. Llama vs Qwen) without partial mutation."""
+        from namethatllm.neural_extractor import merge_lora
+        from safetensors.torch import save_file
+
+        class DummyTrunk(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([
+                    nn.ModuleDict({
+                        "self_attn": nn.ModuleDict({
+                            "q_proj": nn.Linear(64, 64, bias=False),
+                        }),
+                        "mlp": nn.ModuleDict({
+                            "up_proj": nn.Linear(64, 128, bias=False),  # Qwen shape: out=128, in=64
+                        })
+                    })
+                ])
+
+        trunk = DummyTrunk()
+        orig_q = trunk.layers[0]["self_attn"]["q_proj"].weight.clone()
+        orig_up = trunk.layers[0]["mlp"]["up_proj"].weight.clone()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            cfg = {"r": 4, "lora_alpha": 16}
+            (tmp / "adapter_config.json").write_text(json.dumps(cfg))
+
+            # q_proj matches (out=64, in=64), but up_proj has Llama shape (out=256, in=64)
+            sd = {
+                "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.randn(4, 64),
+                "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.randn(64, 4),
+                "base_model.model.layers.0.mlp.up_proj.lora_A.weight": torch.randn(4, 64),
+                "base_model.model.layers.0.mlp.up_proj.lora_B.weight": torch.randn(256, 4),  # Mismatch: out=256 != 128
+            }
+            save_file(sd, str(tmp / "adapter_model.safetensors"))
+
+            merged = merge_lora(trunk, tmp, sign=+1.0)
+            self.assertFalse(merged, "merge_lora must return False on shape mismatch")
+            # Verify 100% untouched: q_proj must NOT have been mutated even though its shape matched!
+            self.assertTrue(torch.equal(trunk.layers[0]["self_attn"]["q_proj"].weight, orig_q), "q_proj must remain 100% unmodified")
+            self.assertTrue(torch.equal(trunk.layers[0]["mlp"]["up_proj"].weight, orig_up), "up_proj must remain 100% unmodified")
+
+    def test_multilayer_lora_gradient_checkpointing_backward_pass(self):
+        """Verify MultiLayerLoRAClassifier forward + loss.backward() with gradient checkpointing does not raise CheckpointError."""
+        from transformers import AutoConfig, AutoModel
+
+        cfg = AutoConfig.for_model(
+            "qwen2",
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            intermediate_size=128
+        )
+        base = AutoModel.from_config(cfg)
+        base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        clf = MultiLayerLoRAClassifier(
+            backbone=base,
+            hidden_size=64,
+            layers=[1, 3],
+            num_classes=18
+        )
+
+        input_ids = torch.randint(0, 100, (2, 16))
+        attention_mask = torch.ones((2, 16), dtype=torch.long)
+        labels = torch.tensor([0, 1], dtype=torch.long)
+
+        Z, logits_p, logits_c = clf(input_ids, attention_mask)
+        loss = F.cross_entropy(logits_p, labels)
+        loss.backward()
+
+        self.assertIsNotNone(clf.plain_head.weight.grad)
+        self.assertGreater(clf.plain_head.weight.grad.abs().sum().item(), 0.0)
+
+    def test_inspect_checkpoint_dim_and_keep_ignores_1d_norms(self):
+        """Verify _inspect_checkpoint_dim_and_keep ignores 1D norms.0.weight and returns 2D plain.weight dimension."""
+        from namethatllm.config import _inspect_checkpoint_dim_and_keep
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            meta = {"cfg": {"keep": 27, "backbone": "qwen3-14b"}}
+            (tmp / "meta.json").write_text(json.dumps(meta))
+
+            sd = {
+                "norms.0.weight": torch.ones(5120),  # 1D tensor
+                "norms.0.bias": torch.zeros(5120),
+                "plain.weight": torch.randn(18, 40960),  # 2D tensor: dim=40960
+                "plain.bias": torch.zeros(18),
+            }
+            save_file(sd, str(tmp / "heads.safetensors"))
+
+            dim, keep, backbone = _inspect_checkpoint_dim_and_keep(tmp)
+            self.assertEqual(dim, 40960, "dim must be 40960 (from 2D plain.weight), NOT 5120 (from 1D norms)")
+            self.assertEqual(keep, 27)
+            self.assertEqual(backbone, "qwen3-14b")
 
 if __name__ == "__main__":
     unittest.main()

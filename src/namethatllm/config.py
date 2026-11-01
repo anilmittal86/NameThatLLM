@@ -213,9 +213,15 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
         elif 'q8v5' in p_str:
             if 'qwen3_8b_v5' not in ckpts or (not is_fold):
                 ckpts['qwen3_8b_v5'] = p.parent
-        elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'l24x_q3b8' in p_str or 'll8v5' in p_str:
+        elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'l24x_q3b8' in p_str:
             if 'qwen3_8b_ts' not in ckpts or (not is_fold):
                 ckpts['qwen3_8b_ts'] = p.parent
+        elif 'll8v5' in p_str:
+            if 'llama3_8b_v5' not in ckpts or (not is_fold):
+                ckpts['llama3_8b_v5'] = p.parent
+        elif 'ts_llama8' in p_str:
+            if 'llama3_8b_ts' not in ckpts or (not is_fold):
+                ckpts['llama3_8b_ts'] = p.parent
         elif 'lora8b_v1' in p_str:
             ckpts['qwen3_8b_p1'] = p.parent
         elif 'ts_q25_7b' in p_str or 'l24x_q25_7b' in p_str:

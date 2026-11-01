@@ -514,6 +514,36 @@ class TestCompilerAndIntegration(unittest.TestCase):
             self.assertIn("qwen3_8b", verified_bases)
             self.assertIn("deberta_v3_large", verified_bases)
 
+    def test_find_checkpoints_does_not_route_llama_to_qwen3_8b_ts(self):
+        """Verify find_checkpoints strictly isolates Llama adapters from Qwen3-8B to prevent MLP shape crashes."""
+        from namethatllm.config import find_checkpoints
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            # Create Llama adapter directories
+            (tmp / "nlm_l24_adapters_v5" / "ll8v5").mkdir(parents=True)
+            (tmp / "nlm_l24_adapters_v5" / "ll8v5" / "heads.pt").write_bytes(b"mock")
+            (tmp / "nlm_l24_adapters" / "ts_llama8").mkdir(parents=True)
+            (tmp / "nlm_l24_adapters" / "ts_llama8" / "heads.pt").write_bytes(b"mock")
+
+            # Create Qwen adapter directories
+            (tmp / "nlm_l24_adapters" / "ts_q3b8").mkdir(parents=True)
+            (tmp / "nlm_l24_adapters" / "ts_q3b8" / "heads.pt").write_bytes(b"mock")
+            (tmp / "nlm_l24_adapters_v5" / "q8v5").mkdir(parents=True)
+            (tmp / "nlm_l24_adapters_v5" / "q8v5" / "heads.pt").write_bytes(b"mock")
+
+            ckpts = find_checkpoints(tmp)
+            self.assertIn("qwen3_8b_ts", ckpts)
+            self.assertEqual(ckpts["qwen3_8b_ts"], tmp / "nlm_l24_adapters" / "ts_q3b8")
+            self.assertIn("qwen3_8b_v5", ckpts)
+            self.assertEqual(ckpts["qwen3_8b_v5"], tmp / "nlm_l24_adapters_v5" / "q8v5")
+
+            # Verify Llama checkpoints are isolated and never mapped to qwen3_8b_ts
+            self.assertIn("llama3_8b_v5", ckpts)
+            self.assertEqual(ckpts["llama3_8b_v5"], tmp / "nlm_l24_adapters_v5" / "ll8v5")
+            self.assertIn("llama3_8b_ts", ckpts)
+            self.assertEqual(ckpts["llama3_8b_ts"], tmp / "nlm_l24_adapters" / "ts_llama8")
+
 if __name__ == "__main__":
     unittest.main()
 

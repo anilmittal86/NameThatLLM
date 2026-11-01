@@ -35,8 +35,6 @@ def _ablation_sinkhorn(P: np.ndarray, iters: int = 200, eps: float = 1e-12) -> n
         P /= (P.sum(axis=0, keepdims=True) / (target_col * P.shape[0])).clip(min=eps)
     return P / P.sum(axis=1, keepdims=True).clip(min=eps)
 
-sinkhorn_balancing = _ablation_sinkhorn
-
 def _fast_sinkhorn_bacc(lp_mat: np.ndarray, y_true: np.ndarray, iters: int = 40) -> float:
     """Computes balanced accuracy after fast Sinkhorn mass equalization."""
     P = softmax(lp_mat, axis=1)
