@@ -53,6 +53,7 @@ from .postprocess import (
     apply_unified_handwriting_shield,
     apply_curly_quote_shield,
     sinkhorn_balancing,
+    apply_typobayes_postprocess,
     generate_submission
 )
 from .ablation import build_unseen_holdout_dataset, UnseenStepwiseAuditor
@@ -371,15 +372,20 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     comp_lora_posteriors: List[Tuple[float, np.ndarray]] = []
     P_spectral = None
 
+    df_train = pd.read_csv(train_path)
+    train_sub_texts: List[str] = []
+    y_sub: np.ndarray = np.array([LAB2I[m] for m in df_train["model"].values], dtype=int) if "model" in df_train.columns else np.array([], dtype=int)
+    prompts_sub: np.ndarray = df_train["prompt_id"].values if "prompt_id" in df_train.columns else np.array([])
+    N_tr_sub: int = 0
+
     if has_neural:
         import torch
 
-        df_tr = pd.read_csv(train_path)
         rng = np.random.RandomState(42)
-        u_p = df_tr["prompt_id"].unique()
+        u_p = df_train["prompt_id"].unique()
         sel_prompts = rng.choice(u_p, size=min(90, len(u_p)), replace=False)
-        sub_idx = df_tr[df_tr["prompt_id"].isin(sel_prompts)].index.values
-        train_sub = df_tr.loc[sub_idx].reset_index(drop=True)
+        sub_idx = df_train[df_train["prompt_id"].isin(sel_prompts)].index.values
+        train_sub = df_train.loc[sub_idx].reset_index(drop=True)
         train_sub_texts = train_sub["text"].fillna("").astype(str).tolist()
         y_sub = np.array([LAB2I[m] for m in train_sub["model"]])
         prompts_sub = train_sub["prompt_id"].values
@@ -1107,17 +1113,28 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     trunk3.load_norm_weights(heads_sd_cl)
 
                 W_p, b_p, W_c, b_c = None, None, None, None
+                W_spec, b_spec = None, None
+                ro_labels = None
                 readouts_file = claude_dir / "readouts.npz"
                 if readouts_file.exists():
-                    rnpz = np.load(str(readouts_file), allow_pickle=True)
-                    for wk, bk in [("plain_coef", "plain_intercept"), ("plain.weight", "plain.bias")]:
-                        if wk in rnpz and bk in rnpz and rnpz[wk].shape[0] == 18:
-                            W_p, b_p = rnpz[wk], rnpz[bk]
-                            break
-                    for wk, bk in [("center_coef", "center_intercept"), ("center.weight", "center.bias")]:
-                        if wk in rnpz and bk in rnpz and rnpz[wk].shape[0] == 18:
-                            W_c, b_c = rnpz[wk], rnpz[bk]
-                            break
+                    with np.load(str(readouts_file), allow_pickle=True) as rnpz:
+                        if "classes" in rnpz:
+                            ro_labels = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in rnpz["classes"]]
+                        elif "labels" in rnpz:
+                            ro_labels = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in rnpz["labels"]]
+                        for wk, bk in [("plain_coef", "plain_intercept"), ("plain.weight", "plain.bias")]:
+                            if wk in rnpz and bk in rnpz and rnpz[wk].shape[0] == 18:
+                                W_p, b_p = np.array(rnpz[wk]), np.array(rnpz[bk])
+                                break
+                        for wk, bk in [("center_coef", "center_intercept"), ("center.weight", "center.bias")]:
+                            if wk in rnpz and bk in rnpz and rnpz[wk].shape[0] == 18:
+                                W_c, b_c = np.array(rnpz[wk]), np.array(rnpz[bk])
+                                break
+                        if "claude_coef" in rnpz and "claude_intercept" in rnpz:
+                            if rnpz["claude_coef"].shape[0] == 5:
+                                W_spec, b_spec = np.array(rnpz["claude_coef"]), np.array(rnpz["claude_intercept"])
+                                if "claude_classes" in rnpz:
+                                    claude_classes = list(rnpz["claude_classes"])
                 if W_p is None and heads_sd_cl:
                     cand_W, cand_b, cand_Wc, cand_bc = resolve_head_tensors(heads_sd_cl)
                     if cand_W is not None and cand_W.shape[0] == 18:
@@ -1125,14 +1142,14 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         if cand_Wc is not None and cand_Wc.shape[0] == 18:
                             W_c, b_c = cand_Wc, cand_bc
 
-                W_spec, b_spec = None, None
-                if readouts_file.exists():
-                    rnpz = np.load(str(readouts_file), allow_pickle=True)
-                    if "claude_coef" in rnpz and "claude_intercept" in rnpz:
-                        if rnpz["claude_coef"].shape[0] == 5:
-                            W_spec, b_spec = rnpz["claude_coef"], rnpz["claude_intercept"]
-                            if "claude_classes" in rnpz:
-                                claude_classes = list(rnpz["claude_classes"])
+                # Ensure ro_labels is a valid 18-class label list (defaults to sorted(LABELS) alphabetical order)
+                if ro_labels is None or len(ro_labels) != 18 or set(ro_labels) != set(LABELS):
+                    cand_meta = meta_cl.get("labels", [])
+                    if len(cand_meta) == 18 and set(cand_meta) == set(LABELS):
+                        ro_labels = list(cand_meta)
+                    else:
+                        ro_labels = sorted(LABELS)
+
                 if W_spec is None:
                     spec_file = claude_dir / "claude_head.safetensors"
                     if spec_file.exists():
@@ -1159,21 +1176,21 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if W_p is not None and W_p.shape[0] == 18:
                     w_comp_p = model_weights.get("qwen3_8b_claude", {}).get("plain_weight", comp_members.get("ntl_claude_head", {}).get("plain_weight", 0.10))
                     w_comp_c = model_weights.get("qwen3_8b_claude", {}).get("twin_weight", comp_members.get("ntl_claude_head", {}).get("twin_weight", 0.04))
-                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, LABELS))
+                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ro_labels))
                     comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
                     if N_unseen > 0:
-                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, LABELS))
+                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ro_labels))
                     else:
                         lp_u_p = np.zeros((0, K), dtype=np.float32)
 
                     if W_c is not None and W_c.shape[0] == 18:
-                        lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, LABELS)
-                        lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, LABELS)
-                        lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, LABELS)
+                        lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ro_labels)
+                        lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ro_labels)
+                        lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ro_labels)
                         lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
                         comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                         if N_unseen > 0:
-                            lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, LABELS)
+                            lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ro_labels)
                         else:
                             lp_u_c = np.zeros((0, K), dtype=np.float32)
                     else:
@@ -1392,9 +1409,31 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         continuous_hw_weight=continuous_hw_weight,
     )
 
-    # 300-Step Sinkhorn Mass Balancing
-    sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 300)
-    P_final = sinkhorn_balancing(P_mix, iters=sinkhorn_iters)
+    # Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
+    sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
+    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
+    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
+    train_prior = np.bincount(y_sub, minlength=18).astype(np.float64) + 1.0 if len(y_sub) > 0 else None
+    P_final = sinkhorn_balancing(
+        P_mix,
+        iters=sinkhorn_iters,
+        sinkhorn_strength=sinkhorn_strength,
+        target_mix=sinkhorn_target_mix,
+        train_prior=train_prior
+    )
+
+    # TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
+    if post_cfg.get("enable_typobayes", True):
+        P_final = apply_typobayes_postprocess(
+            P_final,
+            train_texts=train_sub_texts if len(train_sub_texts) > 0 else df_train["text"].fillna("").astype(str).tolist(),
+            y_train=y_sub if len(y_sub) > 0 else df_train["model"].values,
+            test_texts=test_texts,
+            labels=LABELS,
+            kappa=float(post_cfg.get("typobayes_kappa", 24.0)),
+            evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
+            evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
+        )
 
     # Auditing and forward stepwise ablation report
     test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])

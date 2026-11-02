@@ -375,7 +375,10 @@ class UniversalLoRATrunkLoader:
         else:
             self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32, low_cpu_mem_usage=True)
 
-        # Disable final trunk norm so last layer is not double normalized
+        # Preserve original final trunk norm before optionally disabling
+        self.orig_final_norm = getattr(self.model, "norm", None) or getattr(getattr(self.model, "model", None), "norm", None)
+
+        # Default: disable final trunk norm for two-stage models
         if hasattr(self.model, "norm"):
             self.model.norm = nn.Identity()
         elif hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
@@ -393,6 +396,14 @@ class UniversalLoRATrunkLoader:
 
         self.norms.eval()
         self.first_dev = next(self.model.parameters()).device
+
+    def set_final_norm(self, enabled: bool):
+        """Restores original trunk norm when enabled=True, disables with nn.Identity() when False."""
+        target = self.orig_final_norm if enabled and self.orig_final_norm is not None else nn.Identity()
+        if hasattr(self.model, "norm"):
+            self.model.norm = target
+        elif hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+            self.model.model.norm = target
 
     def snapshot_weights(self, adapter_path: Path) -> dict:
         """Saves CPU fp16 copies of trunk modules modified by adapter."""
@@ -476,11 +487,14 @@ class UniversalLoRATrunkLoader:
         return Z
 
     @torch.no_grad()
-    def extract_exact(self, texts: List[str], batch_size: int = 8, end_id: int = 151643) -> np.ndarray:
+    def extract_exact(self, texts: List[str], batch_size: int = 8, end_id: Optional[int] = 151643) -> np.ndarray:
         t0 = time.time()
         self.total_rescued = 0
         raw_ids = self.tok(list(texts), add_special_tokens=False, truncation=True, max_length=self.max_len)["input_ids"]
-        ids = [x + [end_id] for x in raw_ids]
+        if end_id is not None:
+            ids = [x + [end_id] for x in raw_ids]
+        else:
+            ids = raw_ids
         Z = self._extract_batch_ids(ids, batch_size=batch_size)
         print(f"[Extractor] Extracted {len(texts)} samples in {time.time() - t0:.2f}s (Total BF16 Rescued Rows: {self.total_rescued}).")
         return Z
@@ -529,12 +543,20 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
         elif max_l is not None:
             keep = max_l
         else:
-            dir_str = str(ckpt_dir).lower()
-            if any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "l24x")):
+            dir_str = str(ckpt_dir).lower().replace("\\", "/")
+            if any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x")):
                 keep = 24
                 layers = [2, 4, 6, 8, 12, 16, 20, 24]
 
-    return {"keep": keep, "layers": layers, "max_len": max_len, "end_id": end_id, "labels": labels}
+    dir_str = str(ckpt_dir).lower().replace("\\", "/")
+    is_dhruv = any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x"))
+    no_final_norm = False if is_dhruv else True
+    if is_dhruv:
+        max_len = 384
+        end_id = None
+        labels = sorted(LABELS)
+
+    return {"keep": keep, "layers": layers, "max_len": max_len, "end_id": end_id, "no_final_norm": no_final_norm, "labels": labels}
 
 def extract_deberta_checkpoint(
     ckpt_dir: Path,
@@ -547,14 +569,21 @@ def extract_deberta_checkpoint(
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], list]:
     """
     Dedicated feature extractor for DeBERTa-v3-large sequence classification checkpoints.
-    Probes drop_first_token and tokenization settings on train.csv to guarantee optimal accuracy.
+    Supports both single-layer encoder (Layer 24 float32 last_hidden_state) and multi-layer heads.
     """
     dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    tok_dir = str(base_deb_dir if base_deb_dir else ckpt_dir)
-    tok = AutoTokenizer.from_pretrained(tok_dir, use_fast=True)
 
     heads_sd = load_head_file(ckpt_dir)
     W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+
+    # Load tokenizer from encoder directory if available, matching exact training setup
+    if (ckpt_dir / "encoder").exists():
+        tok_dir = str(ckpt_dir / "encoder")
+    elif base_deb_dir and (base_deb_dir / "config.json").exists():
+        tok_dir = str(base_deb_dir)
+    else:
+        tok_dir = str(ckpt_dir)
+    tok = AutoTokenizer.from_pretrained(tok_dir, use_fast=True)
 
     meta = read_checkpoint_meta(ckpt_dir, default_keep=24, default_layers=[3, 6, 9, 12, 15, 18, 21, 24], default_max_len=max_len)
     ckpt_labels = meta["labels"]
@@ -583,8 +612,9 @@ def extract_deberta_checkpoint(
         except Exception:
             load_src = model_src
 
+    # CRITICAL: Always use torch.float32 for DeBERTa-v3 to avoid FP16 overflow!
     try:
-        model = AutoModel.from_pretrained(str(load_src), torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(dev)
+        model = AutoModel.from_pretrained(str(load_src), torch_dtype=torch.float32).to(dev)
     finally:
         if staged and stage_dir.exists():
             shutil.rmtree(stage_dir, ignore_errors=True)
@@ -592,53 +622,69 @@ def extract_deberta_checkpoint(
     model.eval()
 
     hidden_dim = model.config.hidden_size
-    if W_p is not None and W_p.shape[1] > 0:
-        expected_layers = W_p.shape[1] // hidden_dim
-        if len(layers) != expected_layers:
-            norm_keys = [k for k in heads_sd if k.startswith("norms.") and k.endswith(".weight")]
-            if len(norm_keys) == expected_layers:
-                layers = layers[:expected_layers] if len(layers) > expected_layers else list(range(expected_layers))
-            elif len(layers) > expected_layers:
-                layers = layers[:expected_layers]
+    has_norm_keys = any(k.startswith("norms.") and k.endswith(".weight") for k in heads_sd)
+    is_single_last_layer = (W_p is not None and W_p.shape[1] == hidden_dim and not has_norm_keys)
 
-    norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in layers]).to(dev).float()
-    with torch.no_grad():
-        for i, ln in enumerate(norms):
-            w_k = f"norms.{i}.weight"
-            b_k = f"norms.{i}.bias"
-            if w_k in heads_sd:
-                ln.weight.copy_(heads_sd[w_k].to(dev, ln.weight.dtype))
-            if b_k in heads_sd:
-                ln.bias.copy_(heads_sd[b_k].to(dev, ln.bias.dtype))
-    norms.eval()
+    if not is_single_last_layer:
+        if W_p is not None and W_p.shape[1] > 0:
+            expected_layers = W_p.shape[1] // hidden_dim
+            if len(layers) != expected_layers:
+                norm_keys = [k for k in heads_sd if k.startswith("norms.") and k.endswith(".weight")]
+                if len(norm_keys) == expected_layers:
+                    layers = layers[-expected_layers:] if len(layers) > expected_layers else list(range(expected_layers))
+                elif len(layers) > expected_layers:
+                    layers = layers[-expected_layers:]
 
-    def pool_texts(txt_list: List[str], drop_first: bool = True) -> np.ndarray:
+        norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in layers]).to(dev).float()
+        with torch.no_grad():
+            for i, ln in enumerate(norms):
+                w_k = f"norms.{i}.weight"
+                b_k = f"norms.{i}.bias"
+                if w_k in heads_sd:
+                    ln.weight.copy_(heads_sd[w_k].to(dev, ln.weight.dtype))
+                if b_k in heads_sd:
+                    ln.bias.copy_(heads_sd[b_k].to(dev, ln.bias.dtype))
+        norms.eval()
+    else:
+        norms = None
+
+    def pool_texts(txt_list: List[str], drop_first: bool = False) -> np.ndarray:
+        out_dim = hidden_dim if is_single_last_layer else (len(layers) * hidden_dim)
         if len(txt_list) == 0:
-            return np.zeros((0, len(layers) * hidden_dim), dtype=np.float32)
+            return np.zeros((0, out_dim), dtype=np.float32)
         order = np.argsort([len(t) for t in txt_list], kind="stable")
-        all_vecs = np.zeros((len(txt_list), len(layers) * hidden_dim), dtype=np.float32)
+        all_vecs = np.zeros((len(txt_list), out_dim), dtype=np.float32)
         for s in range(0, len(order), batch_size):
             idx = order[s : s + batch_size]
             chunk = [txt_list[i] for i in idx]
             enc = tok(chunk, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
             enc = {k: v.to(dev) for k, v in enc.items()}
             with torch.no_grad():
-                hs = model(**enc, output_hidden_states=True).hidden_states
-                m = enc["attention_mask"].unsqueeze(-1).float()
-                if drop_first:
-                    m[:, 0, :] = 0.0
-                den = m.sum(dim=1).clamp(min=1.0)
-                pooled = [((torch.nan_to_num(hs[l].float(), nan=0.0, posinf=1e4, neginf=-1e4) * m).sum(dim=1) / den) for l in layers]
-                out = torch.cat([norms[i](pooled[i]) for i in range(len(layers))], dim=-1)
-                all_vecs[idx] = out.cpu().numpy()
+                if is_single_last_layer:
+                    out_hs = model(**enc).last_hidden_state
+                    m = enc["attention_mask"].unsqueeze(-1).float()
+                    if drop_first:
+                        m[:, 0, :] = 0.0
+                    den = m.sum(dim=1).clamp(min=1.0)
+                    pooled = (torch.nan_to_num(out_hs.float(), nan=0.0, posinf=1e4, neginf=-1e4) * m).sum(dim=1) / den
+                    all_vecs[idx] = pooled.cpu().numpy()
+                else:
+                    hs = model(**enc, output_hidden_states=True).hidden_states
+                    m = enc["attention_mask"].unsqueeze(-1).float()
+                    if drop_first:
+                        m[:, 0, :] = 0.0
+                    den = m.sum(dim=1).clamp(min=1.0)
+                    pooled = [((torch.nan_to_num(hs[l].float(), nan=0.0, posinf=1e4, neginf=-1e4) * m).sum(dim=1) / den) for l in layers]
+                    out = torch.cat([norms[i](pooled[i]) for i in range(len(layers))], dim=-1)
+                    all_vecs[idx] = out.cpu().numpy()
         return all_vecs
 
     # Probe drop_first_token on train.csv[:180]
     probe_n = min(180, len(texts_train))
-    best_drop = True
+    best_drop = False if is_single_last_layer else True
     if probe_n > 0 and W_p is not None:
         best_acc = -1.0
-        for cand_drop in [True, False]:
+        for cand_drop in ([False, True] if is_single_last_layer else [True, False]):
             z_pr = pool_texts(texts_train[:probe_n], drop_first=cand_drop)
             preds = align_cols(z_pr @ W_p.T + b_p, ckpt_labels).argmax(axis=1)
             acc = float((preds == y_train[:probe_n]).mean())
@@ -647,10 +693,13 @@ def extract_deberta_checkpoint(
                 best_drop = cand_drop
         print(f"[DeBERTa Extractor] Probed drop_first={best_drop} (accuracy = {best_acc:.4f})")
 
+    out_dim = hidden_dim if is_single_last_layer else (len(layers) * hidden_dim)
     Z_test = pool_texts(texts_test, drop_first=best_drop)
-    Z_train = pool_texts(texts_train, drop_first=best_drop) if len(texts_train) > 0 else np.zeros((0, len(layers) * hidden_dim), dtype=np.float32)
+    Z_train = pool_texts(texts_train, drop_first=best_drop) if len(texts_train) > 0 else np.zeros((0, out_dim), dtype=np.float32)
 
-    del model, norms
+    del model
+    if norms is not None:
+        del norms
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

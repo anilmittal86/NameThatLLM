@@ -264,6 +264,43 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
 
     return ckpts
 
+def find_fold_adapters(input_dir: Optional[Path], prefix: str) -> List[Path]:
+    """Scans input_dir for all adapter/head directories matching prefix, prefix_f*, prefix_fold*, prefix-f*."""
+    if input_dir is None:
+        input_dir = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
+
+    matches: Set[Path] = set()
+    prefix_lower = prefix.lower()
+
+    candidate_files = (
+        list(input_dir.rglob('heads.safetensors')) +
+        list(input_dir.rglob('heads.pt')) +
+        list(input_dir.rglob('adapter_model.safetensors'))
+    )
+    for f in candidate_files:
+        p = f.parent
+        p_name = p.name.lower()
+        if p_name in ('adapter', 'checkpoint'):
+            p = p.parent
+            p_name = p.name.lower()
+
+        p_str = str(p).lower().replace('\\', '/')
+        if prefix_lower in p_name or prefix_lower in p_str:
+            # Check pattern: exact match or prefix followed by _ or - or fold
+            tokens = p_name.replace('-', '_').split('_')
+            matched = False
+            for t in tokens:
+                if t == prefix_lower or t.startswith(prefix_lower):
+                    matched = True
+                    break
+            if not matched and prefix_lower in p_str:
+                matched = True
+
+            if matched:
+                matches.add(p)
+
+    return sorted(list(matches), key=lambda x: str(x).lower())
+
 def validate_production_assets(
     input_dir: Path,
     train_path: Path,

@@ -11,6 +11,8 @@ import re
 import sys
 import time
 import hashlib
+import unicodedata
+import collections
 import subprocess
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
@@ -56,6 +58,10 @@ def _text_hash(text: str) -> str:
     """Normalized SHA1 hash of whitespace-collapsed text to guarantee zero exact/near-exact leakage."""
     norm = " ".join(str(text).strip().split())
     return hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
+
+def _norm_text_key(value: Any) -> str:
+    """Normalized NFKC string key for exact deduplication."""
+    return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', str(value or ''))).strip()
 
 FUNCTION_WORDS = set(
     "a an the and or but if while although because as so than that which who whom whose "
@@ -214,6 +220,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     test_texts = df_te['text'].fillna('').astype(str).tolist()
     fit_texts = df_tr['text'].fillna('').astype(str).tolist()
     fit_y = np.array([LAB2I[m] for m in df_tr['model']])
+    fit_sw = np.ones(len(df_tr), dtype=np.float32)  # Official train rows get 1.00
+    seen_texts = {_norm_text_key(t) for t in fit_texts}
     len_tr_raw = len(df_tr)
 
     # 1. Compute stopword TF-IDF distance matrix and topic clusters (t=0.85) on test
@@ -248,31 +256,36 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         except Exception as e:
             print(f"[Lexical] Note: Could not read {unseen_parquet}: {e}")
 
-    # 2. Load pool parquet files if present (supports single path or list)
+    # 2. Load pool parquet files if present with source weights
     pool_candidates = [pool_file] if isinstance(pool_file, (str, Path)) else (pool_file if isinstance(pool_file, list) else [])
-    pool_dfs = []
     for pf in pool_candidates:
         if pf and os.path.exists(pf):
             try:
                 p_df = pd.read_parquet(pf, columns=['text', 'model'])
                 p_df = p_df[p_df['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
-                pool_dfs.append(p_df)
+                pf_name = str(pf).lower().replace('\\', '/')
+                # Matched clean gets 0.50, general scraped pool gets 0.35
+                src_w = 0.50 if ('matched' in pf_name or 'clean' in pf_name) else 0.35
+
+                keep_mask = []
+                for t in p_df['text'].values:
+                    k = _norm_text_key(t)
+                    h = _text_hash(t)
+                    ok = bool(k) and (k not in seen_texts) and (h not in unseen_hashes)
+                    keep_mask.append(ok)
+                    if ok:
+                        seen_texts.add(k)
+                p_df = p_df.loc[keep_mask].reset_index(drop=True)
+                if len(p_df) > 0:
+                    p_texts = p_df['text'].fillna('').astype(str).tolist()
+                    p_y = p_df['model'].map(LAB2I).values
+                    p_sw = np.full(len(p_df), src_w, dtype=np.float32)
+                    fit_texts.extend(p_texts)
+                    fit_y = np.r_[fit_y, p_y]
+                    fit_sw = np.r_[fit_sw, p_sw]
+                    print(f"[Lexical] Added {len(p_df)} rows from {Path(pf).name} with source weight {src_w}")
             except Exception as e:
                 print(f"[Lexical] Note: Could not read pool {pf}: {e}")
-    if pool_dfs:
-        df_pool = pd.concat(pool_dfs, ignore_index=True).drop_duplicates(subset=['text'])
-        if unseen_hashes:
-            pool_hashes = [_text_hash(t) for t in df_pool['text']]
-            mask_clean = [h not in unseen_hashes for h in pool_hashes]
-            n_dropped = len(df_pool) - sum(mask_clean)
-            if n_dropped > 0:
-                print(f"[Lexical] Quarantined {n_dropped} pool rows that overlapped with unseen holdout.")
-            df_pool = df_pool[mask_clean].reset_index(drop=True)
-        print(f"[Lexical] Merged {len(pool_dfs)} pool file(s): {len(df_pool)} unique rows.")
-        fit_texts += df_pool['text'].fillna('').astype(str).tolist()
-        fit_y = np.r_[fit_y, df_pool['model'].map(LAB2I).values]
-        del df_pool, pool_dfs
-        gc.collect()
 
     # 3. Canonical 4 Views (from NTL two-stage LoRA part two)
     VIEWS_4V = [
@@ -328,9 +341,9 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     X_te_4v = sparse.hstack(te_mats_4v, format="csr")
     X_unseen_4v = sparse.hstack(unseen_mats_4v, format="csr") if unseen_mats_4v else None
 
-    # OUTPUT 1: Pure 4-View LinearSVC (C=0.5, uniform 1.0 sample weights)
-    svc_main = LinearSVC(C=0.5, random_state=42, max_iter=3000, tol=1e-3)
-    svc_main.fit(X_tr_4v, fit_y)
+    # OUTPUT 1: Pure 4-View LinearSVC (C=0.5, class_weight='balanced', source sample weights)
+    svc_main = LinearSVC(C=0.5, random_state=42, max_iter=5000, tol=1e-3, class_weight="balanced")
+    svc_main.fit(X_tr_4v, fit_y, sample_weight=fit_sw)
     logits_svc_main = svc_main.decision_function(X_te_4v)
     log_p_svc_main = log_softmax(logits_svc_main)
 
@@ -339,7 +352,36 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     else:
         unseen_log_p_svc_main = np.zeros((0, K), dtype=np.float32)
 
-    # OUTPUT 2: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
+    # OUTPUT 2: Stamatatos Text Distortion Model (keeps top-100 words, masks rest with '*')
+    wre = re.compile(r"[A-Za-z’']+")
+    cnt = collections.Counter(w.lower() for t in fit_texts for w in wre.findall(t))
+    distort_keep = {w for w, _ in cnt.most_common(100)}
+    dist_fn = lambda arr: [wre.sub(lambda m_: m_.group(0) if m_.group(0).lower() in distort_keep else '*', t) for t in arr]
+
+    D_tr = dist_fn(fit_texts)
+    D_te = dist_fn(test_texts)
+    D_unseen = dist_fn(unseen_texts) if unseen_texts else []
+
+    vs_dist = [
+        TfidfVectorizer(sublinear_tf=True, lowercase=False, analyzer='char', ngram_range=(2, 6), min_df=2 if len(fit_texts) >= 50 else 1),
+        TfidfVectorizer(sublinear_tf=True, lowercase=True, token_pattern=r"[^\s]+", ngram_range=(1, 3), min_df=2 if len(fit_texts) >= 50 else 1)
+    ]
+    Xa_dist = sparse.hstack([v_.fit_transform(D_tr) for v_ in vs_dist], format="csr")
+    Xb_dist = sparse.hstack([v_.transform(D_te) for v_ in vs_dist], format="csr")
+    Xu_dist = sparse.hstack([v_.transform(D_unseen) for v_ in vs_dist], format="csr") if unseen_texts else None
+
+    lr_distort = LogisticRegression(C=10.0, max_iter=3000, random_state=42)
+    lr_distort.fit(Xa_dist, fit_y, sample_weight=fit_sw)
+    P_distort = lr_distort.predict_proba(Xb_dist)
+    log_p_distort = lr_distort.predict_log_proba(Xb_dist)
+    if Xu_dist is not None and Xu_dist.shape[0] > 0:
+        P_unseen_distort = lr_distort.predict_proba(Xu_dist)
+        log_p_unseen_distort = lr_distort.predict_log_proba(Xu_dist)
+    else:
+        P_unseen_distort = None
+        log_p_unseen_distort = None
+
+    # OUTPUT 3: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
     # Continuous Handwriting & Punctuation Density Features + Dedicated Classifier
     hw_tr_raw, _ = extract_handwriting_and_orthographic_features(fit_texts)
     hw_te_raw, rule_flags_te = extract_handwriting_and_orthographic_features(test_texts)
@@ -394,18 +436,21 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         X_te_5v = sparse.hstack([X_te_4v, te_cw], format="csr")
         X_unseen_5v = sparse.hstack([X_unseen_4v, unseen_cw], format="csr") if unseen_cw is not None else None
 
-    svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3)
-    svc_comp.fit(X_tr_5v, fit_y)
+    svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3, class_weight="balanced")
+    svc_comp.fit(X_tr_5v, fit_y, sample_weight=fit_sw)
     P_svc_comp = softmax(svc_comp.decision_function(X_te_5v), axis=1)
 
     sgd_comp = SGDClassifier(loss='log_loss', alpha=1e-4, max_iter=1500, random_state=42)
-    sgd_comp.fit(X_tr_5v, fit_y)
+    sgd_comp.fit(X_tr_5v, fit_y, sample_weight=fit_sw)
     P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
 
     if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
         P_unseen_svc = softmax(svc_comp.decision_function(X_unseen_5v), axis=1)
         P_unseen_sgd = sgd_comp.predict_proba(X_unseen_5v)
-        P_unseen_comp = 0.55 * P_unseen_svc + 0.45 * P_unseen_sgd
+        if P_unseen_distort is not None:
+            P_unseen_comp = 0.40 * P_unseen_svc + 0.25 * P_unseen_sgd + 0.15 * P_unseen_svc + 0.20 * P_unseen_distort
+        else:
+            P_unseen_comp = 0.55 * P_unseen_svc + 0.45 * P_unseen_sgd
         log_p_unseen_comp = np.log(np.clip(P_unseen_comp, 1e-9, 1.0))
     else:
         log_p_unseen_comp = None
@@ -435,7 +480,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         del svc_twin, X_te_twin, G_t, X_te_twin_c
         gc.collect()
 
-    P_lex_comp = 0.50 * P_svc_comp + 0.35 * P_sgd_comp + 0.15 * P_twin_comp
+    P_lex_comp = 0.40 * P_svc_comp + 0.25 * P_sgd_comp + 0.15 * P_twin_comp + 0.20 * P_distort
     log_p_lex_comp = np.log(np.clip(P_lex_comp, 1e-9, 1.0))
 
     # 4 Within-Family Specialist Refiners
@@ -483,6 +528,10 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     np.save(working_dir / 'rule_flags_test.npy', rule_flags_te)
     np.save(working_dir / 'unseen_log_p_svc_main.npy', unseen_log_p_svc_main)
     np.save(working_dir / 'unseen_p_lex_comp.npy', unseen_p_lex_comp_final)
+    if log_p_distort is not None:
+        np.save(working_dir / 'log_p_distort.npy', log_p_distort)
+    if log_p_unseen_distort is not None:
+        np.save(working_dir / 'unseen_log_p_distort.npy', log_p_unseen_distort)
 
     return {
         "log_p_svc_main": log_p_svc_main,
@@ -493,6 +542,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         "rule_flags_test": rule_flags_te,
         "unseen_log_p_svc_main": unseen_log_p_svc_main,
         "unseen_p_lex_comp": unseen_p_lex_comp_final,
+        "log_p_distort": log_p_distort,
+        "unseen_log_p_distort": log_p_unseen_distort,
     }
 
 if __name__ == "__main__":

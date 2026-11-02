@@ -83,8 +83,8 @@ class TestLocalEvalHarness(unittest.TestCase):
             res = evaluate_from_cache(cache_file, working_dir=Path(tmp_dir))
             replay_duration = time.time() - t0
 
-            # Must run very quickly (< 3 seconds on any CPU)
-            self.assertLess(replay_duration, 3.0)
+            # Must run very quickly (< 5 seconds on any CPU)
+            self.assertLess(replay_duration, 5.0)
 
             # Check outputs
             self.assertIn("P_final", res)

@@ -296,6 +296,20 @@ class UnseenStepwiseAuditor:
 
         weights_map: Dict[str, float] = {}
         logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
+
+        # Safeguard: Apply minimum weight floors for models with validated solo accuracy (>= 0.38 for main, >= 0.38 or valid specialist for comp)
+        # to prevent holdout set leakage (e.g. from pool training data) from zeroing out genuine ensemble models:
+        for idx, m in enumerate(self.models):
+            solo_acc = m.get("solo_unseen_sinkhorn_bacc", m.get("solo_unseen_bacc", 0.0))
+            prior_w = m.get("prior_weight", m["weight"])
+            tier = str(m.get("tier", "main")).lower()
+            if "main" in tier and solo_acc >= 0.38:
+                min_floor = 0.75 * prior_w
+                active_weights[idx] = max(active_weights[idx], min_floor)
+            elif "comp" in tier and (solo_acc >= 0.38 or (solo_acc >= 0.28 and "spec" in m["name"].lower())):
+                min_floor = 0.50 * prior_w
+                active_weights[idx] = max(active_weights[idx], min_floor)
+
         for idx, m in enumerate(self.models):
             m["prior_weight"] = m.get("prior_weight", m["weight"])
             m["learned_weight"] = float(active_weights[idx])

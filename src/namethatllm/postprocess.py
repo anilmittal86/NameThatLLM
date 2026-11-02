@@ -171,17 +171,126 @@ def apply_curly_quote_shield(
         continuous_hw_weight=0.0,
     )
 
-def sinkhorn_balancing(P: np.ndarray, iters: int = 300) -> np.ndarray:
-    """Official 300-step exact multiplicative Sinkhorn column mass balancing."""
-    if len(P) < 50:
+def sinkhorn_balancing(
+    P: np.ndarray,
+    iters: int = 300,
+    sinkhorn_strength: float = 1.0,
+    target_mix: float = 1.0,
+    train_prior: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Sinkhorn column mass balancing.
+    Supports both:
+    1. Exact equal column mass balancing (sinkhorn_strength=1.0, target_mix=1.0, train_prior=None)
+    2. Prior-shrunk soft balancing (sinkhorn_strength < 1.0, e.g. 0.65, target_mix=0.35, train_prior=...)
+    """
+    if len(P) < 18 or sinkhorn_strength <= 0.0:
         return P
-    P = np.clip(P.astype(np.float64), 1e-12, 1.0)
-    target_col = 1.0 / P.shape[1]
+
+    P_work = np.clip(P.astype(np.float64), 1e-12, 1.0)
+    K_cols = P_work.shape[1]
+
+    # Target column marginal
+    if train_prior is not None:
+        p_train = np.clip(train_prior.astype(np.float64), 1e-6, None)
+        p_train /= p_train.sum()
+    else:
+        p_train = np.full(K_cols, 1.0 / K_cols, dtype=np.float64)
+
+    if target_mix < 1.0:
+        pred_marg = np.clip(P_work.mean(axis=0), 1e-6, None)
+        pred_marg /= pred_marg.sum()
+        rho = float(np.clip(target_mix, 0.0, 1.0))
+        target_col = (1.0 - rho) * pred_marg + rho * p_train
+        target_col = np.clip(target_col, 1e-6, None)
+        target_col /= target_col.sum()
+    else:
+        target_col = p_train
+
+    Q = P_work.copy()
     for _ in range(iters):
-        P /= P.sum(axis=1, keepdims=True).clip(min=1e-12)
-        P /= (P.sum(axis=0, keepdims=True) / (target_col * P.shape[0])).clip(min=1e-12)
-    P /= P.sum(axis=1, keepdims=True).clip(min=1e-12)
-    return P
+        Q /= Q.sum(axis=1, keepdims=True).clip(min=1e-12)
+        Q *= (len(Q) * target_col[None, :]) / Q.sum(axis=0, keepdims=True).clip(min=1e-12)
+    Q /= Q.sum(axis=1, keepdims=True).clip(min=1e-12)
+
+    if sinkhorn_strength >= 1.0:
+        return Q
+
+    # Soft logarithmic mixture between original P and balanced Q
+    log_P = (1.0 - sinkhorn_strength) * np.log(np.clip(P_work, 1e-12, None)) + sinkhorn_strength * np.log(np.clip(Q, 1e-12, None))
+    return softmax(log_P, axis=1)
+
+def apply_typobayes_postprocess(
+    P_or_logP: np.ndarray,
+    train_texts: List[str],
+    y_train: np.ndarray,
+    test_texts: List[str],
+    labels: list = LABELS,
+    kappa: float = 24.0,
+    evidence_scale: float = 1.2,
+    evidence_cap: float = 0.30,
+) -> np.ndarray:
+    """
+    Applies the official Judith 0.664 (v38A) Hierarchical Beta-Bernoulli 37-Marker TypoBayes
+    postprocessing to the calibrated log-probabilities/probabilities.
+    """
+    if len(train_texts) == 0 or len(test_texts) == 0 or len(y_train) == 0:
+        return P_or_logP
+
+    y_tr = np.array([LAB2I[y] if isinstance(y, str) else int(y) for y in y_train], dtype=int)
+    marks = [
+        ' — ', '—', '–', '’', '‘', '“', '”', '«', '»', '"', ';', ':', '(', ')', '[', ']',
+        '**', '`', '…', '•', '\n', '\n\n', 'e.g.', 'i.e.', 'However,', 'Overall,',
+        'In conclusion', 'Therefore,', 'Moreover,', '\t', ' - ', ' = ', '\n- ', '\n1.', '###', '```', '> '
+    ]
+    K_cls = len(labels)
+    Xtr = np.array([[float(m in t) for m in marks] for t in train_texts], dtype=np.float32)
+    Xte = np.array([[float(m in t) for m in marks] for t in test_texts], dtype=np.float32)
+    freq = np.bincount(y_tr, minlength=K_cls).astype(np.float64)
+    hits = np.stack([Xtr[y_tr == k].sum(axis=0) for k in range(K_cls)], axis=0).astype(np.float64)
+
+    # Hierarchical Beta-Bernoulli smoothing: class-specific marker rates shrink toward the global rate.
+    global_rate = (Xtr.sum(axis=0) + 2.0) / (len(Xtr) + 4.0)
+    rate = (hits + kappa * global_rate[None, :]) / (freq[:, None] + kappa)
+    rate = np.clip(rate, 0.01, 0.99)
+    global_rate = np.clip(global_rate, 0.01, 0.99)
+
+    log_rate = np.log(rate)
+    log_not_rate = np.log1p(-rate)
+    base_log_rate = np.log(global_rate)
+    base_log_not_rate = np.log1p(-global_rate)
+
+    # Weight markers by how consistently they separate classes, capped to avoid one marker dominating.
+    signal = np.sqrt(np.mean((rate - global_rate[None, :]) ** 2, axis=0))
+    med_signal = float(np.median(signal[signal > 0])) if np.any(signal > 0) else 1.0
+    fw = signal / max(med_signal, 1e-6)
+    fw = np.clip(fw, 0.25, 2.0)
+
+    # Matrix form: weighted Bernoulli log likelihood ratio for each class.
+    evidence = (Xte * fw[None, :]) @ log_rate.T + ((1.0 - Xte) * fw[None, :]) @ log_not_rate.T
+    evidence -= (((Xte * fw[None, :]) @ base_log_rate) + (((1.0 - Xte) * fw[None, :]) @ base_log_not_rate))[:, None]
+    evidence -= evidence.mean(axis=1, keepdims=True)
+    evidence = np.clip(evidence_scale * evidence / max(float(fw.sum()), 1e-6), -evidence_cap, evidence_cap)
+
+    # Input can be log-probabilities or probabilities
+    if np.all(P_or_logP <= 0.0) and not np.all(P_or_logP == 0.0):
+        raw_logP = P_or_logP.copy()
+        probs = softmax(raw_logP, axis=1)
+    else:
+        probs = P_or_logP.copy()
+        raw_logP = np.log(np.clip(probs, 1e-12, 1.0))
+
+    sorted_p = np.sort(probs, axis=1)
+    margin = sorted_p[:, -1] - sorted_p[:, -2]
+    confidence_gate = np.clip((0.60 - margin) / 0.60, 0.0, 1.0)
+    word_count = np.array([len(re.findall(r'\b\w+\b', str(t))) for t in test_texts], dtype=np.float32)
+    length_gate = np.clip(np.sqrt(np.maximum(word_count, 1.0) / 80.0), 0.40, 1.0)
+    active_markers = Xte.sum(axis=1)
+    coverage_gate = np.clip(np.sqrt((active_markers + 1.0) / 4.0), 0.45, 1.0)
+    gate = confidence_gate * length_gate * coverage_gate
+
+    safe_logits = raw_logP + gate[:, None] * evidence
+    return softmax(safe_logits, axis=1)
 
 def generate_submission(
     P_final: np.ndarray,

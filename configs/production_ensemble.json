@@ -152,7 +152,13 @@
     "straight_contr_log_penalty": 0.0,
     "curly_contr_log_penalty": 0.0,
     "continuous_hw_weight": 0.0,
-    "sinkhorn_iterations": 300,
+    "sinkhorn_iterations": 100,
+    "sinkhorn_strength": 0.65,
+    "sinkhorn_target_mix": 0.35,
+    "enable_typobayes": true,
+    "typobayes_kappa": 24.0,
+    "typobayes_evidence_scale": 1.2,
+    "typobayes_evidence_cap": 0.30,
     "max_cluster_size": 14
   }
 }

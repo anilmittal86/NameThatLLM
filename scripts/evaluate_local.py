@@ -43,6 +43,7 @@ from namethatllm.postprocess import (
     apply_claude_specialist_gate,
     apply_unified_handwriting_shield,
     sinkhorn_balancing,
+    apply_typobayes_postprocess,
 )
 
 
@@ -336,7 +337,7 @@ def evaluate_from_cache(
     raw_npz.close()
 
     cfg = load_config(config_path)
-    post_cfg = cfg.get("postprocessing", {})
+    post_cfg = cfg.get("postprocess", cfg.get("postprocessing", {}))
 
     N_test = int(data["N_test"][0])
     N_unseen = int(data["N_unseen"][0])
@@ -407,15 +408,38 @@ def evaluate_from_cache(
             continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.04),
         )
 
-        # 4. 300-Step Sinkhorn Mass Balancing
-        sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 300)
-        P_final = sinkhorn_balancing(P_mix, iters=sinkhorn_iters)
+        # 4. Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
+        sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
+        sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
+        sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
+        train_prior = np.bincount(y_unseen, minlength=18).astype(np.float64) + 1.0 if len(y_unseen) > 0 else None
+        P_final = sinkhorn_balancing(
+            P_mix,
+            iters=sinkhorn_iters,
+            sinkhorn_strength=sinkhorn_strength,
+            target_mix=sinkhorn_target_mix,
+            train_prior=train_prior
+        )
+
+        # 5. TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
+        if post_cfg.get("enable_typobayes", True) and "test_texts" in data and "train_texts" in data:
+            P_final = apply_typobayes_postprocess(
+                P_final,
+                train_texts=list(data["train_texts"]),
+                y_train=data.get("y_train", y_unseen),
+                test_texts=test_texts,
+                labels=LABELS,
+                kappa=float(post_cfg.get("typobayes_kappa", 24.0)),
+                evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
+                evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
+            )
 
         test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
         df_report = auditor.print_and_save_report(report_dir, final_test_preds=test_final_preds)
 
     replay_time = time.time() - t0
     print(f"\n[Cache Evaluator] Replay completed in {replay_time:.4f}s across {len(model_names)} models and {num_extra} extra streams!")
+    print(f"[Cache Evaluator] Active Weights Map: {active_weights_map}")
     return {
         "P_final": P_final,
         "weights_map": active_weights_map,

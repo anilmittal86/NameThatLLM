@@ -16,6 +16,7 @@ from namethatllm.postprocess import (
     build_orthographic_penalty_matrix,
     apply_curly_quote_shield,
     sinkhorn_balancing,
+    apply_typobayes_postprocess,
     generate_submission
 )
 from namethatllm.config import LABELS, K, LAB2I, FAMILIES, softmax
@@ -142,6 +143,25 @@ class TestPostprocess(unittest.TestCase):
         self.assertTrue(np.allclose(P_sink.sum(axis=1), 1.0))
         target_col = N / 18.0
         self.assertTrue(np.allclose(P_sink.sum(axis=0), target_col, atol=1e-10))
+
+    def test_typobayes_postprocess(self):
+        train_texts = [
+            "Normal sample without marks",
+            "Sample with — spaced em dash",
+            "Sample with “curly quotes”",
+            "Sample with ‘apostrophe’",
+        ]
+        y_train = np.array([0, 1, 2, 3])
+        test_texts = [
+            "Test text with — spaced em dash",
+            "Test text with “curly quotes”",
+        ]
+        P_in = np.ones((len(test_texts), 18)) / 18.0
+        P_out = apply_typobayes_postprocess(P_in, train_texts, y_train, test_texts)
+        self.assertEqual(P_out.shape, (len(test_texts), 18))
+        self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0))
+        # P_out should shift slightly based on typographical evidence
+        self.assertFalse(np.allclose(P_in, P_out))
 
     def test_generate_submission_schema(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
