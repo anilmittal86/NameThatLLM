@@ -65,6 +65,10 @@ The production codebase solves this through **Within-Prompt Covariance Analysis 
 
 The production pipeline is organized into 5 decoupled, memory-isolated modules executing sequentially within Kaggle's 30 GB RAM and 2-hour GPU limits:
 
+<p align="center">
+  <img src="assets/inference_pipeline_architecture.jpg" alt="Inference Pipeline Architecture" width="750"/>
+</p>
+
 ```
                           [ 4,000 Mystery Passages (test.csv) ]
                                             │
@@ -482,7 +486,11 @@ $$\text{Final Leaderboard Score (0.622)} = \text{Ablation Raw Baseline (0.567)} 
 
 ## 10. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `lora_training.ipynb`)
 
-Module 5 provides the end-to-end training and artifact generation pipeline used to build our in-house multi-layer LoRA checkpoints (such as `anilmittal/ntl-inhouse-two-stage-lora24`).
+Module 5 provides the end-to-end training and artifact generation pipeline used to build our in-house multi-layer LoRA checkpoints (such as `anilmittal/ntl-inhouse-two-stage-lora24` and the new champion `export_champion_qwen3_14b`).
+
+<p align="center">
+  <img src="assets/model_lineage_and_provenance.jpg" alt="Model Lineage & Dataset Provenance" width="750"/>
+</p>
 
 ### 1. 2x T4 Multi-GPU Memory Balancing & Non-Reentrant Gradient Checkpointing
 To train Qwen3-8B across Kaggle's dual T4 GPUs (15 GB VRAM each) without OOM or CUDA context crashes:
@@ -520,12 +528,12 @@ The repository enforces a **Single Source of Truth** architecture:
   1. [`kaggle_submission.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/submission/kaggle_submission.ipynb) (Inference pipeline)
   2. [`lora_training.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/training/lora_training.ipynb) (Training pipeline)
 
-### Running the 41 Unit Tests:
+### Running the 61 Unit Tests:
 ```powershell
 python -m pytest tests -v
 ```
 
-All 41 tests cover every component across 8 test suites:
+All 61 tests cover every component across 7 comprehensive test suites:
 1. `test_ablation.py` (4 tests): Whitespace text hashing, crash-proof negative/string group sanitization, 0-leakage holdout benchmark generation, greedy forward selection and all-2^M subset search.
 2. `test_compiler_and_integration.py` (8 tests): AST parity, single-source bundling, multi-key checkpoint discovery, end-to-end smoke pipeline, full mock-neural pipeline, LayerNorm specifications.
 3. `test_lexical.py` (5 tests): Shape patterns, function word preservation, punctuation retention, dual lexical outputs, continuous handwriting feature extraction.

@@ -4,7 +4,7 @@
 [![Codebase Architecture](https://img.shields.io/badge/Architecture-Modular%20PyPA%20Package-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
 [![In-House Checkpoint](https://img.shields.io/badge/In--House%20LoRA24-73.19%25%20Validation%20BAcc-brightgreen)](https://www.kaggle.com/datasets/anilmittal/ntl-inhouse-two-stage-lora24)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-41%20Passed-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-61%20Passed-brightgreen)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
 A competition-grade, memory-isolated machine learning solution for the **Kaggle "Name That LLM"** competition. The objective is to identify which of 18 specific Large Language Models authored an unattributed response passage.
@@ -14,6 +14,10 @@ A competition-grade, memory-isolated machine learning solution for the **Kaggle 
 ## 1. System Overview
 
 The production system operates as a **two-tier, memory-isolated ensemble** combining 4 foundation model trunks, 10 fine-tuned LoRA/encoder checkpoints (including our in-house Two-Stage LoRA24 model, achieving **73.19% live validation accuracy**), multi-pool lexical engines, within-prompt stylometric covariance analysis, exact subset dynamic programming, an unsupervised **0.6441 OOF Joint Spectral Bank**, and unified Bayesian orthographic postprocessing.
+
+<p align="center">
+  <img src="assets/inference_pipeline_architecture.jpg" alt="Inference Pipeline Architecture" width="750"/>
+</p>
 
 ```
                           [ 4,000 Mystery Passages (test.csv) ]
@@ -153,6 +157,14 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5
 - **Closed-Form Dual Ridge Head Calibration (`fit_ridge_heads`)**: Ultra-fast dual formulation $(N \times N)$ Ridge regression with label smoothing (0.10) to pre-calibrate and post-calibrate classification heads.
 - **Inference-Compliant Export**: Produces exact `adapter/`, `heads.safetensors`, `meta.json`, and `wPCA_bank.npz` files for instant plug-and-play mounting.
 
+### Model Lineage & Dataset Provenance Map
+
+The diagram below details the provenance of all fine-tuned adapters, showing how externally pre-trained datasets and models trained locally with `trainer.py` are discovered and ingested by the unified inference pipeline:
+
+<p align="center">
+  <img src="assets/model_lineage_and_provenance.jpg" alt="Model Lineage & Dataset Provenance Map" width="750"/>
+</p>
+
 ---
 
 ## 5. Benchmark & Submission History
@@ -203,7 +215,7 @@ NameThatLLM/
 │   ├── trainer.py                       # Two-stage LoRA training engine, micro-batching, Ridge heads
 │   ├── ablation.py                      # Zero-leakage unseen holdout benchmark, greedy selection, LOO attribution
 │   └── pipeline.py                      # Top-level orchestrator connecting Modules 1 through 4
-└── tests/                               # Comprehensive unit and integration test suite (41 tests)
+└── tests/                               # Comprehensive unit and integration test suite (61 tests)
     ├── test_ablation.py                 # Zero-leakage holdout benchmark, greedy selection, LOO attribution
     ├── test_compiler_and_integration.py # AST validation, compiler checks, mock-neural integration
     ├── test_lexical.py                  # Tokenizers, shape patterns, stopwords, dual lexical outputs
@@ -224,7 +236,7 @@ pip install -e . --no-deps
 ```
 
 ### 2. Running Unit & Integration Tests
-Run the complete 41-test suite:
+Run the complete 61-test suite:
 ```powershell
 python -m pytest tests -v
 ```
