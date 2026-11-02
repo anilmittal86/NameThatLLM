@@ -1405,4 +1405,52 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     elapsed = time.time() - start_time
     print(f"[Pipeline] Submission generated successfully in {elapsed:.2f}s: {out_parquet} ({len(df_sub)} rows)")
 
+    # Export compact local evaluation cache for sub-second offline local tuning
+    try:
+        if len(groups_unseen) > 0:
+            try:
+                g_u = np.asarray(groups_unseen, dtype=np.int32)
+            except (ValueError, TypeError):
+                g_u = (pd.factorize(groups_unseen)[0] + 1).astype(np.int32)
+        else:
+            g_u = np.array([], dtype=np.int32)
+
+        cache_dict = {
+            "N_test": np.array([N_test], dtype=np.int32),
+            "N_unseen": np.array([N_unseen], dtype=np.int32),
+            "y_unseen": y_unseen.astype(np.int32) if len(y_unseen) > 0 else np.array([], dtype=np.int32),
+            "groups_unseen": g_u,
+            "D_tfidf": D_tfidf.astype(np.float32) if ("D_tfidf" in locals() and D_tfidf is not None) else np.zeros((0, 0), dtype=np.float32),
+            "D_hybrid": D_hybrid.astype(np.float32) if ("D_hybrid" in locals() and D_hybrid is not None) else np.zeros((0, 0), dtype=np.float32),
+            "groups_085": groups_085.astype(np.int32) if ("groups_085" in locals() and groups_085 is not None) else np.zeros(0, dtype=np.int32),
+            "model_names": np.array([m["name"] for m in auditor.models], dtype=object),
+            "model_tiers": np.array([m["tier"] for m in auditor.models], dtype=object),
+            "model_prior_weights": np.array([m.get("prior_weight", m["weight"]) for m in auditor.models], dtype=np.float64),
+            "model_learned_weights": np.array([m["weight"] for m in auditor.models], dtype=np.float64),
+            "P_final": P_final.astype(np.float32),
+            "test_texts": np.array(test_texts, dtype=object),
+        }
+        for idx, m in enumerate(auditor.models):
+            cache_dict[f"m_{idx}_unseen_lp"] = m["unseen_lp"].astype(np.float32)
+            cache_dict[f"m_{idx}_test_lp"] = m["test_lp"].astype(np.float32)
+        if "rule_flags_test" in locals() and rule_flags_test is not None:
+            cache_dict["rule_flags_test"] = rule_flags_test.astype(np.float32)
+        if "log_p_handwriting" in locals() and log_p_handwriting is not None:
+            cache_dict["log_p_handwriting"] = log_p_handwriting.astype(np.float32)
+        if "claude_spec_logits" in locals() and claude_spec_logits is not None:
+            cache_dict["claude_spec_logits"] = claude_spec_logits.astype(np.float32)
+        if "claude_classes" in locals() and claude_classes is not None:
+            cache_dict["claude_classes"] = np.array(claude_classes, dtype=object)
+        for ex_idx, (ex_name, ex_w, ex_lp) in enumerate(extra_streams):
+            cache_dict[f"extra_{ex_idx}_name"] = np.array([ex_name], dtype=object)
+            cache_dict[f"extra_{ex_idx}_weight"] = np.array([ex_w], dtype=np.float64)
+            cache_dict[f"extra_{ex_idx}_lp"] = ex_lp.astype(np.float32)
+        cache_dict["num_extra"] = np.array([len(extra_streams)], dtype=np.int32)
+
+        cache_file_path = working_dir / "local_eval_cache.npz"
+        np.savez_compressed(cache_file_path, **cache_dict)
+        print(f"[Pipeline] Exported compact local evaluation cache: {cache_file_path} ({cache_file_path.stat().st_size} bytes)")
+    except Exception as e:
+        print(f"[Pipeline] Note: Could not write local_eval_cache.npz: {e}")
+
     return df_sub, out_parquet

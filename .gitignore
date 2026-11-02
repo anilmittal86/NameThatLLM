@@ -13,6 +13,8 @@ venv/
 
 # Local data, logs, and scratch directories
 local_data/
+kaggle_logs/
+references/
 artifacts/
 output/
 output_*/
