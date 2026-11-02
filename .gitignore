@@ -41,6 +41,9 @@ powershell.exe
 *.parquet
 *.joblib
 
+# Allow tracked neural evaluation cache
+!local_data/local_eval_cache.npz
+
 # Git & OS
 .DS_Store
 Thumbs.db
