@@ -301,21 +301,19 @@ Applies all discrete orthographic rules and continuous handwriting densities in 
 
 $$\log P_{\text{out}} = \text{softmax}\left(\log P_{\text{mix}} + B_{\text{disc}} \cdot W_{\text{pen}} + w_{\text{hw}} \cdot \log P_{\text{hw}}\right)$$
 
-#### The 4 Discrete Orthographic Rules ($W_{\text{pen}}$, shape $4 \times 18$):
-1. **Rule 1 (Typographic Curly Quotes)**: `‘, ’, “, ”` appearing anywhere in the passage.
-   - Claude (5 models) and GLM (2 models) strictly output straight ASCII quotes (`'`) in standard prose.
-   - Applies $-1.00$ log-penalty to all 5 Claude and 2 GLM classes ($\approx 0.368$ probability multiplier).
-2. **Rule 2 (Multi Em-Dashes)**: $\ge 2$ em-dashes (`—`) in non-code prose.
-   - Google Gemini rarely outputs multiple em-dashes in prose.
-   - Applies $-0.45$ log-penalty to all 4 Gemini models.
-3. **Rule 3 (Pure Straight Prose Contractions)**: $\ge 2$ straight contractions (`It's`, `don't`) and 0 curly apostrophes in non-code prose.
-   - `gpt-5.6-sol` consistently uses curly apostrophes in contractions.
-   - Applies $-0.60$ log-penalty to `gpt-5.6-sol`.
-4. **Rule 4 (Curly Prose Contractions)**: $\ge 1$ curly contraction in non-code prose.
-   - Reinforces $-0.40$ log-penalty on Claude and GLM classes.
+#### Discrete Orthographic Rules ($W_{\text{pen}}$, shape $4 \times 18$):
+1. **Rule 1 (Typographic Curly Quotes — ACTIVE in Production)**: `‘, ’, “, ”` appearing anywhere in the passage.
+   - Claude (5 models) and GLM (2 models) strictly output straight ASCII quotes (`'`) in standard prose without explicit prompt instructions.
+   - Applies a $-1.00$ log-penalty to all 5 Claude and 2 GLM classes (`curly_quote_multiplier = 0.36787944117144233`, $\approx 0.368$ probability multiplier).
+2. **Rule 2 (Multi Em-Dashes — Turned Off in Production Config)**: $\ge 2$ em-dashes (`—`) in non-code prose.
+   - Set to `0.0` in `configs/production_ensemble.json` (`multi_em_dash_log_penalty: 0.0`) because out-of-distribution prompts caused false-positive penalties on Gemini models.
+3. **Rule 3 (Pure Straight Prose Contractions — Turned Off in Production Config)**: $\ge 2$ straight contractions (`It's`, `don't`) and 0 curly apostrophes in non-code prose.
+   - Set to `0.0` in `configs/production_ensemble.json` (`straight_contr_log_penalty: 0.0`) to avoid misclassifying `gpt-5.6-sol`.
+4. **Rule 4 (Curly Prose Contractions — Turned Off in Production Config)**: $\ge 1$ curly contraction in non-code prose.
+   - Set to `0.0` in `configs/production_ensemble.json` (`curly_contr_log_penalty: 0.0`).
 
 #### Continuous Handwriting Density Integration:
-- Blends the 26-feature continuous handwriting classifier output: $+ 0.04 \cdot \log P_{\text{hw}}$.
+- The engine supports blending the 26-feature continuous handwriting classifier output (`log_p_handwriting`), but it is zeroed out in production (`continuous_hw_weight: 0.0`) based on ablation benchmarks to avoid diluting the deep neural representations.
 - Re-normalizes rows to the probability simplex.
 
 ### 4. Official 300-Step Multiplicative Sinkhorn-Knopp Mass Balancing

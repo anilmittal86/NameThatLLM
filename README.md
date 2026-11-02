@@ -50,9 +50,8 @@ The production system operates as a **two-tier, memory-isolated ensemble** combi
 │  MODULE 4: TWO-TIER CONVEX FUSION, SPECIALIST GATE & UNIFIED POSTPROCESSING                          │
 │  - Two-Tier Convex Fusion: P_mix = 0.85 * R_main + 0.15 * P_comp                                     │
 │  - Vectorized Claude Specialist Gate with exact marginal mass preservation                          │
-│  - Unified Handwriting & Orthographic Shield:                                                        │
-│      * Code-block stripped non-code prose discrete rule subtraction: log P += rule_flags @ W_pen    │
-│      * Continuous 26-feature handwriting log-likelihood blend: log P += 0.04 * log_p_handwriting    │
+│  - Typographic Curly-Quote Shield (Rule 1 Active; Rules 2-4 & Continuous HW ablated in config):      │
+│      * Typographic curly quote penalty (-1.0 on Claude & GLM): log P += rule_flags @ W_pen           │
 │  - Official 300-step multiplicative Sinkhorn-Knopp column mass balancing (column sums = N / 18)      │
 │  - Output: /kaggle/working/submission.parquet                                                        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -136,13 +135,9 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5
   Guarantees the robust Part-Two baseline while harvesting incremental orthogonal signal from secondary models.
 - **Vectorized Claude Specialist Gate**: Mass-preserving probability refinement within the Claude sibling classes:
   $$P_{\text{claude}} = 0.85 \cdot P_{\text{prior}} + 0.15 \cdot (\text{mass} \cdot P_{\text{specialist}})$$
-- **Unified Handwriting & Orthographic Shield**:
-  - Builds $(4, 18)$ log-penalty matrix $W_{\text{pen}}$:
-    - Rule 1 (curly quotes `‘, ’, “, ”`): $-1.00$ log-penalty on Claude (5) and GLM (2)
-    - Rule 2 ($\ge 2$ prose em-dashes `—`): $-0.45$ log-penalty on Gemini (4)
-    - Rule 3 ($\ge 2$ straight contractions in non-code prose): $-0.60$ log-penalty on `gpt-5.6-sol`
-    - Rule 4 ($\ge 1$ curly contraction in non-code prose): $-0.40$ reinforcement on Claude & GLM
-  - Vectorized application: $\log P \mathrel{+}= B_{\text{disc}} W_{\text{pen}} + 0.04 \cdot \log P_{\text{hw}}$
+- **Typographic Curly-Quote Shield (`postprocess.py`)**:
+  - **Rule 1 (Active)**: Typographic curly quotes (`‘, ’, “, ”`) impose a $-1.00$ log-penalty ($\times 0.3679$ probability multiplier, `curly_quote_multiplier = 0.36787944117144233`) on all Claude (5) and GLM (2) classes. Claude and GLM virtually never produce curly quotes in default prose, making this a near-zero error invariant.
+  - **Rules 2–4 & Continuous HW (Ablated / Turned Off in Config)**: The engine supports additional rules (em-dashes, contractions, and continuous handwriting density), but empirical ablation testing demonstrated that Rules 2–4 caused false positives on out-of-distribution prompts. Thus, `configs/production_ensemble.json` deliberately zeros them out (`multi_em_dash_log_penalty: 0.0`, `straight_contr_log_penalty: 0.0`, `curly_contr_log_penalty: 0.0`, `continuous_hw_weight: 0.0`) to preserve accuracy.
   - Re-normalizes rows to the probability simplex.
 - **300-Step Multiplicative Sinkhorn-Knopp Mass Balancing**: Iteratively rescales row and column marginals, equalizing predicted class mass to $N/18$.
 
