@@ -321,7 +321,7 @@ def validate_production_assets(
 
     # 4. Verify all required fine-tuned checkpoints
     default_req_ckpts = [
-        "qwen3_14b_p2", "qwen3_14b_p1", "qwen25_14b_p2",
+        "qwen3_14b_p2", "qwen25_14b_p2",
         "deberta_p2", "qwen3_8b_claude"
     ]
     req_ckpts = req.get("required_checkpoints", default_req_ckpts)

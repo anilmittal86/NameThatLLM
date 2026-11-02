@@ -26,16 +26,16 @@
     ],
     "required_checkpoints": [
       "qwen3_14b_p2",
-      "qwen3_14b_p1",
       "qwen25_14b_p2",
       "deberta_p2",
       "qwen3_8b_claude"
     ],
     "optional_checkpoints": [
       "instyle",
+      "qwen3_14b_inhouse",
+      "qwen3_14b_p1",
       "qwen3_14b_ts",
       "qwen3_14b_v5",
-      "qwen3_14b_inhouse",
       "qwen25_14b_inhouse",
       "deberta_inhouse",
       "qwen3_8b_ts",

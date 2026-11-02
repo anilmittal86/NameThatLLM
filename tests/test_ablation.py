@@ -501,3 +501,70 @@ def test_ablation_sinkhorn_and_prior_weight_preservation(tmp_path: Path):
     # Report evaluates Poison-2 at prior weight (0.40) rather than 0.0
     df_rep = auditor.print_and_save_report(working_dir=tmp_path, final_test_preds=np.zeros(20, dtype=int))
     assert (tmp_path / "unseen_stepwise_ablation.csv").exists()
+
+
+def test_combine_plain_and_twin_lp_preserves_singleton_temperature():
+    """Verify that singleton rows where lp_twin is 0 preserve logit temperature without compression."""
+    from scipy.special import log_softmax, softmax
+    from namethatllm.pipeline import _combine_plain_and_twin_lp
+
+    np.random.seed(42)
+    lp_p = np.random.randn(50, 18)
+    lp_twin_zeros = np.zeros_like(lp_p)
+
+    # 1. lp_twin is None
+    out_none = _combine_plain_and_twin_lp(lp_p, None, 0.35, 0.10)
+    np.testing.assert_allclose(out_none, log_softmax(lp_p, axis=1), atol=1e-6)
+
+    # 2. lp_twin is zeros (singleton rows)
+    out_zeros = _combine_plain_and_twin_lp(lp_p, lp_twin_zeros, 0.35, 0.10)
+    np.testing.assert_allclose(out_zeros, log_softmax(lp_p, axis=1), atol=1e-6)
+
+    # Contrast with naive linear averaging which flattens temperature
+    naive = (0.35 * lp_p + 0.10 * lp_twin_zeros) / 0.45
+    entropy_orig = -np.sum(softmax(lp_p, axis=1) * log_softmax(lp_p, axis=1), axis=1).mean()
+    entropy_naive = -np.sum(softmax(naive, axis=1) * log_softmax(naive, axis=1), axis=1).mean()
+    assert entropy_naive > entropy_orig, "Naive blend artificially compresses singleton logit temperature"
+
+    # 3. Active twin contributes with exact ratio w_twin / w_plain
+    lp_twin_active = np.random.randn(50, 18)
+    out_active = _combine_plain_and_twin_lp(lp_p, lp_twin_active, 0.40, 0.10)
+    expected = log_softmax(lp_p + (0.10 / 0.40) * lp_twin_active, axis=1)
+    np.testing.assert_allclose(out_active, expected, atol=1e-6)
+
+
+def test_multi_scale_evaluate_marginal_lift_rescues_high_weight_candidate():
+    """Verify multi-scale search rescues a candidate that has negative lift at rigid 1.0*weight but positive lift at smaller multiplier."""
+    from scipy.special import log_softmax
+    from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc
+
+    np.random.seed(42)
+    y_unseen = np.tile(np.arange(18), 10)  # 180 samples
+    auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=np.arange(180), N_test=50)
+
+    # Base model with moderate confidence: ~80% accuracy
+    lp_base = np.random.randn(180, 18) * 0.5
+    for i, y in enumerate(y_unseen):
+        if i % 5 != 0:
+            lp_base[i, y] += 1.8
+    auditor.add_model("Base-1", "Main", 0.60, lp_base, np.zeros((50, 18)))
+    base_bacc = _fast_sinkhorn_bacc(0.60 * lp_base, y_unseen)
+
+    # Candidate model: highly complementary on the base model's errors (i % 5 == 0)
+    # but has loud errors on other rows.
+    # At large weight (0.50), its loud errors destroy accuracy (rigid lift < 0).
+    # At smaller multiplier (e.g. 0.15 * 0.50), its complementary signal lifts accuracy (multi-scale lift > 0).
+    lp_cand = np.random.randn(180, 18) * 0.5
+    for i, y in enumerate(y_unseen):
+        if i % 5 == 0:
+            lp_cand[i, y] += 3.5
+        else:
+            lp_cand[i, (y + 1) % 18] += 2.8
+
+    # Rigid 1.0 weight delta
+    rigid_lift = _fast_sinkhorn_bacc(0.60 * lp_base + 0.50 * log_softmax(lp_cand, axis=1), y_unseen) - base_bacc
+    assert rigid_lift < -0.10, f"Candidate must have steep negative lift at rigid weight, got {rigid_lift}"
+
+    # Multi-scale marginal lift search rescues the candidate
+    lift = auditor.evaluate_marginal_lift(lp_cand, weight=0.50)
+    assert lift > 0.0, f"Multi-scale search must rescue candidate with positive lift, got {lift}"

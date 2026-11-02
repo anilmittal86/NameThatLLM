@@ -240,13 +240,8 @@ class UnseenStepwiseAuditor:
 
         def _composite_obj(lp_mat: np.ndarray) -> Tuple[float, float]:
             P = softmax(lp_mat, axis=1)
-            if len(P) >= 18:
-                P_s = _ablation_sinkhorn(P, iters=60)
-            else:
-                P_s = P
+            P_s = _ablation_sinkhorn(P, iters=60) if len(P) >= 18 else P
             bacc = float(balanced_accuracy_score(self.y_unseen, P_s.argmax(axis=1)))
-            # Smooth cross-entropy tie-breaker so models that improve probability calibration
-            # on ties are kept rather than zeroed out by discrete 360-row quantization!
             nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(self.y_unseen)), self.y_unseen], 1e-9, 1.0))))
             return bacc - 0.015 * nll, bacc
 
@@ -259,34 +254,38 @@ class UnseenStepwiseAuditor:
         cum_u_lp = active_weights[first_idx] * self.models[first_idx]["unseen_lp"]
         best_obj, best_bacc = _composite_obj(cum_u_lp)
 
-        for idx in order[1:]:
-            m_info = self.models[idx]
-            prior_w = m_info["weight"]
-            u_lp = m_info["unseen_lp"]
-            is_main_anchor = (m_info.get("tier") == "Main" and m_info["solo_unseen_sinkhorn_bacc"] >= 0.45)
+        remaining = list(order[1:])
+        multipliers = [0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 1.25]
 
-            # Core Main anchors search [0.50..1.50] * prior_w (never dropped on 360-row noise unless adversarial < 0.45)
-            multipliers = [0.50, 0.75, 1.00, 1.25, 1.50] if is_main_anchor else [0.25, 0.50, 0.75, 1.00, 1.25, 1.50]
-            best_m_w = prior_w if is_main_anchor else 0.0
-            best_m_obj = -1e9 if is_main_anchor else best_obj
-            best_m_bacc = best_bacc
+        # At each step, test ALL remaining models across all weight multipliers
+        # and add the (model, weight) pair that maximizes the composite objective
+        while remaining:
+            step_best_idx = None
+            step_best_w = 0.0
+            step_best_obj = best_obj
+            step_best_bacc = best_bacc
 
-            for mult in multipliers:
-                cand_w = prior_w * mult
-                trial_lp = cum_u_lp + cand_w * u_lp
-                obj_val, bacc_val = _composite_obj(trial_lp)
-                if obj_val > best_m_obj + 1e-6:
-                    best_m_obj = obj_val
-                    best_m_bacc = bacc_val
-                    best_m_w = cand_w
+            for idx in remaining:
+                prior_w = self.models[idx]["weight"]
+                u_lp = self.models[idx]["unseen_lp"]
+                for mult in multipliers:
+                    cand_w = prior_w * mult
+                    trial_lp = cum_u_lp + cand_w * u_lp
+                    obj_val, bacc_val = _composite_obj(trial_lp)
+                    if obj_val > step_best_obj + 1e-6:
+                        step_best_obj = obj_val
+                        step_best_bacc = bacc_val
+                        step_best_idx = idx
+                        step_best_w = cand_w
 
-            if best_m_w > 0.0:
-                active_weights[idx] = best_m_w
-                cum_u_lp = cum_u_lp + best_m_w * u_lp
-                best_obj = best_m_obj
-                best_bacc = best_m_bacc
+            if step_best_idx is not None and step_best_w > 0.0:
+                active_weights[step_best_idx] = step_best_w
+                cum_u_lp = cum_u_lp + step_best_w * self.models[step_best_idx]["unseen_lp"]
+                best_obj = step_best_obj
+                best_bacc = step_best_bacc
+                remaining.remove(step_best_idx)
             else:
-                active_weights[idx] = 0.0
+                break
 
         weights_map: Dict[str, float] = {}
         logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
@@ -317,24 +316,36 @@ class UnseenStepwiseAuditor:
         weight: float = 1.0,
     ) -> float:
         """
-        Calculates the marginal change in balanced accuracy on `df_unseen`
-        if `candidate_unseen_lp` with `weight` were added to the currently registered models.
-        Returns Delta BAcc.
+        Multi-scale marginal lift search: tests adding `candidate_unseen_lp` across
+        multipliers [0.05, 0.10, 0.15, 0.25, 0.35, 0.50, 0.75, 1.00] * weight
+        and returns the maximum Delta BAcc achieved at any positive scale.
         """
         if len(self.y_unseen) == 0 or len(candidate_unseen_lp) != len(self.y_unseen) or len(self.models) == 0:
             return 0.0
 
         cum_unseen_lp = np.zeros((len(self.y_unseen), K), dtype=np.float64)
         for m in self.models:
-            cum_unseen_lp += m["weight"] * m["unseen_lp"]
+            w_m = m["weight"] if m["weight"] > 0 else m.get("prior_weight", 0.15)
+            cum_unseen_lp += w_m * m["unseen_lp"]
 
         cur_bacc = _fast_sinkhorn_bacc(cum_unseen_lp, self.y_unseen, iters=40)
-
         cand_lp = log_softmax(np.asarray(candidate_unseen_lp, dtype=np.float64), axis=1)
-        new_unseen_lp = cum_unseen_lp + float(weight) * cand_lp
-        new_bacc = _fast_sinkhorn_bacc(new_unseen_lp, self.y_unseen, iters=40)
 
-        return new_bacc - cur_bacc
+        best_lift = -1.0
+        full_weight_lift = 0.0
+        for mult in (0.05, 0.10, 0.15, 0.25, 0.35, 0.50, 0.75, 1.00):
+            cand_w = float(weight) * mult
+            new_unseen_lp = cum_unseen_lp + cand_w * cand_lp
+            new_bacc = _fast_sinkhorn_bacc(new_unseen_lp, self.y_unseen, iters=40)
+            lift = new_bacc - cur_bacc
+            if mult == 1.00:
+                full_weight_lift = lift
+            if lift > best_lift:
+                best_lift = lift
+
+        if best_lift <= 0.0:
+            return float(full_weight_lift)
+        return float(best_lift)
 
     def print_and_save_report(self, working_dir: Path, final_test_preds: Optional[np.ndarray] = None) -> pd.DataFrame:
         if not self.models or len(self.y_unseen) == 0:
