@@ -175,8 +175,15 @@ class UnseenStepwiseAuditor:
     3. Table 3 — Exhaustive All-2^M Subset Search & Leave-One-Out (LOO) Attribution.
     """
     def __init__(self, y_unseen: np.ndarray, groups_unseen: np.ndarray, N_test: int):
-        self.y_unseen = np.asarray(y_unseen, dtype=int)
-        self.groups_unseen = np.asarray(groups_unseen, dtype=int)
+        self.y_unseen = np.asarray(y_unseen, dtype=int) if len(y_unseen) > 0 else np.array([], dtype=int)
+        if groups_unseen is not None and len(groups_unseen) > 0:
+            try:
+                self.groups_unseen = np.asarray(groups_unseen, dtype=int)
+            except (ValueError, TypeError):
+                codes, _ = pd.factorize(groups_unseen)
+                self.groups_unseen = (codes + 1).astype(int)
+        else:
+            self.groups_unseen = np.array([], dtype=int)
         self.N_test = int(N_test)
         self.models: List[Dict[str, Any]] = []
 
