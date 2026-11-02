@@ -295,6 +295,8 @@ class TestCompilerAndIntegration(unittest.TestCase):
                     self.layers = layers
                     if max_len is not None:
                         self.max_len = max_len
+                def set_final_norm(self, enabled):
+                    pass
                 def load_norm_weights(self, heads_sd):
                     pass
                 def extract_exact(self, texts, batch_size=8, end_id=151643):

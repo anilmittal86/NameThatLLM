@@ -28,6 +28,7 @@ from .config import (
     LABELS, K, LAB2I, FAMILIES, PRIOR_SCALES,
     softmax, log_softmax, align_cols,
     resolve_dataset_paths, resolve_all_pool_files, find_base_model, find_checkpoints,
+    find_fold_adapters,
     validate_production_assets
 )
 from .lexical_engine import run_lexical_engine
@@ -479,15 +480,31 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             # Checkpoint 1B / Optional Two-Stage LoRA24 & Part-1
             for opt_14b_key in ("qwen3_14b_inhouse", "qwen3_14b_ts", "qwen3_14b_v5", "qwen3_14b_p1"):
                 if opt_14b_key in ckpts:
-                    ts14_dir = ckpts[opt_14b_key]
+                    primary_ts14_dir = ckpts[opt_14b_key]
+                    prefix_14b = "q14v5" if "v5" in opt_14b_key else "ts_q3b14" if "ts" in opt_14b_key else opt_14b_key
+                    found_14b_folds = find_fold_adapters(input_dir, prefix_14b)
+
+                    def _is_fold_14b(p: Path) -> bool:
+                        nm = p.name.lower()
+                        return any(f"_f{i}" in nm or f"-f{i}" in nm or f"_fold{i}" in nm for i in range(10))
+
+                    folds_only_14b = sorted([p for p in found_14b_folds if _is_fold_14b(p)], key=lambda x: str(x).lower())
+                    full_only_14b = [p for p in found_14b_folds if not _is_fold_14b(p)]
+                    if not full_only_14b:
+                        full_only_14b = [primary_ts14_dir]
+                    fold_dirs_14b = folds_only_14b + full_only_14b
+                    ts14_dir = fold_dirs_14b[-1]
+
                     def_layers_14b = [2, 4, 6, 9, 13, 17, 21, 24] if opt_14b_key == "qwen3_14b_p1" else [2, 4, 6, 8, 12, 16, 20, 24]
                     meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=24, default_layers=def_layers_14b, default_max_len=447)
                     trunk1.set_active_layers(meta_ts14["layers"], meta_ts14["max_len"])
+                    trunk1.set_final_norm(not meta_ts14["no_final_norm"])
                     backup_t1_ts = trunk1.snapshot_weights(ts14_dir)
                     merged = merge_lora(trunk1.model, ts14_dir, sign=+1.0)
                     if not merged:
                         print(f"[Pipeline] Optional checkpoint {opt_14b_key} failed to merge LoRA; skipping.")
                         trunk1.restore_weights(backup_t1_ts)
+                        trunk1.set_final_norm(False)
                     else:
                         heads_sd = load_head_file(ts14_dir)
                         trunk1.load_norm_weights(heads_sd)
@@ -544,6 +561,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 else:
                                     print(f"[Fast Probe Pruning] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING 5,620-row test/train extraction!")
                                     trunk1.restore_weights(backup_t1_ts)
+                                    trunk1.set_final_norm(False)
                                     del backup_t1_ts, heads_sd, Z_unseen
                                     gc.collect()
                                     if torch.cuda.is_available():
@@ -554,6 +572,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 if lift < -0.002:
                                     print(f"[Fast Probe Pruning] {opt_14b_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING 5,620-row test/train extraction!")
                                     trunk1.restore_weights(backup_t1_ts)
+                                    trunk1.set_final_norm(False)
                                     del backup_t1_ts, heads_sd, Z_unseen
                                     gc.collect()
                                     if torch.cuda.is_available():
@@ -561,75 +580,133 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     continue
                                 print(f"[Fast Probe] {opt_14b_key}: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
 
-                            # Stage B: Extract test and train
-                            Z_te_tr = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
-                            Z_te = Z_te_tr[:N_test]
-                            Z_tr = Z_te_tr[N_test:]
-                            del Z_te_tr
+                        # Stage B: Extract test and train (with multi-fold averaging if multiple folds discovered)
+                        num_14b_folds = len(fold_dirs_14b)
+                        if num_14b_folds > 1:
+                            trunk1.restore_weights(backup_t1_ts)
+                            del backup_t1_ts
+
+                            P_p_acc = np.zeros((N_test, K), dtype=np.float64)
+                            P_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            has_any_c = False
+                            Z_te = None
+                            Z_tr = None
+                            print(f"[Pipeline] {opt_14b_key}: extracting & averaging across {num_14b_folds} fold adapters...")
+
+                            for f_idx, f_dir in enumerate(fold_dirs_14b):
+                                is_last = (f_idx == num_14b_folds - 1)
+                                f_meta = read_checkpoint_meta(f_dir, default_keep=24, default_layers=def_layers_14b, default_max_len=447)
+                                trunk1.set_active_layers(f_meta["layers"], f_meta["max_len"])
+                                trunk1.set_final_norm(not f_meta["no_final_norm"])
+                                f_backup = trunk1.snapshot_weights(f_dir)
+                                f_merged = merge_lora(trunk1.model, f_dir, sign=+1.0)
+                                if not f_merged:
+                                    trunk1.restore_weights(f_backup)
+                                    continue
+                                f_heads_sd = load_head_file(f_dir)
+                                trunk1.load_norm_weights(f_heads_sd)
+                                f_W_p, f_b_p, f_W_c, f_b_c = resolve_head_tensors(f_heads_sd)
+                                f_labels = f_meta["labels"]
+
+                                if is_last:
+                                    Z_te_tr = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_tr[:N_test]
+                                    Z_tr = Z_te_tr[N_test:]
+                                    Z_te = f_Z_te
+                                    del Z_te_tr
+                                else:
+                                    f_Z_te = trunk1.extract_exact(test_texts, batch_size=8, end_id=f_meta["end_id"])
+
+                                if f_W_p is not None:
+                                    p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
+                                    P_p_acc += p_fold / num_14b_folds
+                                if f_W_c is not None:
+                                    has_any_c = True
+                                    lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
+                                    lp_c72_f, _ = compute_centered_logits(f_Z_te, groups_072, f_W_c, f_b_c, f_labels)
+                                    lp_c60_f, _ = compute_centered_logits(f_Z_te, groups_060, f_W_c, f_b_c, f_labels)
+                                    c_blend_f = w85 * lp_c85_f + w72 * lp_c72_f + w60 * lp_c60_f
+                                    P_c_acc += softmax(c_blend_f, axis=1) / num_14b_folds
+
+                                trunk1.restore_weights(f_backup)
+                                del f_backup, f_heads_sd, f_Z_te
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+
+                            trunk1.set_final_norm(False)
+                            lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0))
+                            lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            gate_passed = True
+                            backup_t1_ts = None
                         else:
-                            Z_all = trunk1.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
-                            Z_te = Z_all[:N_test]
-                            Z_unseen = Z_all[N_test : N_test + N_unseen]
-                            Z_tr = Z_all[N_test + N_unseen :]
-                            del Z_all
-
-                        gate_passed = True
-                        if not is_smoke and len(y_sub) >= 180:
-                            gate_passed, W_p, b_p, W_c, b_c, ts14_labels, _ = auto_align_and_verify_head(
-                                Z_tr=Z_tr,
-                                W_p=W_p,
-                                b_p=b_p,
-                                W_c=W_c,
-                                b_c=b_c,
-                                ckpt_labels=ts14_labels,
-                                y_sub=y_sub,
-                                prompts_sub=prompts_sub,
-                                name=opt_14b_key,
-                                min_bacc=probe_gate_min_bacc,
-                            )
-
-                        if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
-                            lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
-                            if W_c is not None:
-                                lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts14_labels)
-                                lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
+                            if N_unseen >= 36 and W_p is not None:
+                                Z_te_tr = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                                Z_te = Z_te_tr[:N_test]
+                                Z_tr = Z_te_tr[N_test:]
+                                del Z_te_tr
                             else:
-                                lp_u_fitted = lp_u_p_fit
-                            fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
-                            print(f"[Post-Fit Probe] {opt_14b_key}: unseen BAcc = {fitted_bacc:.4f}")
-                            if fitted_bacc < probe_gate_min_bacc:
-                                print(f"[Post-Fit Pruning] {opt_14b_key}: fitted unseen BAcc {fitted_bacc:.4f} < {probe_gate_min_bacc:.2f} -> rejecting checkpoint!")
-                                gate_passed = False
-                            elif len(auditor.models) > 0:
-                                fitted_lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_fitted, weight=w_comp_tot)
-                                if fitted_lift < -0.002:
-                                    print(f"[Post-Fit Pruning] {opt_14b_key}: fitted marginal lift {fitted_lift:+.4f} < -0.002 -> rejecting checkpoint!")
+                                Z_all = trunk1.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                                Z_te = Z_all[:N_test]
+                                Z_unseen = Z_all[N_test : N_test + N_unseen]
+                                Z_tr = Z_all[N_test + N_unseen :]
+                                del Z_all
+
+                            gate_passed = True
+                            if not is_smoke and len(y_sub) >= 180:
+                                gate_passed, W_p, b_p, W_c, b_c, ts14_labels, _ = auto_align_and_verify_head(
+                                    Z_tr=Z_tr,
+                                    W_p=W_p,
+                                    b_p=b_p,
+                                    W_c=W_c,
+                                    b_c=b_c,
+                                    ckpt_labels=ts14_labels,
+                                    y_sub=y_sub,
+                                    prompts_sub=prompts_sub,
+                                    name=opt_14b_key,
+                                    min_bacc=probe_gate_min_bacc,
+                                )
+
+                            if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
+                                lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
+                                if W_c is not None:
+                                    lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts14_labels)
+                                    lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
+                                else:
+                                    lp_u_fitted = lp_u_p_fit
+                                fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
+                                print(f"[Post-Fit Probe] {opt_14b_key}: unseen BAcc = {fitted_bacc:.4f}")
+                                if fitted_bacc < probe_gate_min_bacc:
+                                    print(f"[Post-Fit Pruning] {opt_14b_key}: fitted unseen BAcc {fitted_bacc:.4f} < {probe_gate_min_bacc:.2f} -> rejecting checkpoint!")
                                     gate_passed = False
+                                elif len(auditor.models) > 0:
+                                    fitted_lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_fitted, weight=w_comp_tot)
+                                    if fitted_lift < -0.002:
+                                        print(f"[Post-Fit Pruning] {opt_14b_key}: fitted marginal lift {fitted_lift:+.4f} < -0.002 -> rejecting checkpoint!")
+                                        gate_passed = False
+
+                            if gate_passed:
+                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
+                                if W_c is not None:
+                                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
+                                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
+                                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
+                                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                else:
+                                    lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
 
                         if gate_passed:
-                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
-                            if N_unseen > 0 and W_p is not None:
-                                lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
-                            else:
-                                lp_u_p = np.zeros((0, K), dtype=np.float32)
                             pr_sc = prior_scales.get(opt_14b_key, 0.50)
                             update_hybrid_groups(Z_te, pr_sc)
-                            if W_p is not None:
-                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                            if W_c is not None:
-                                lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
-                                lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
-                                lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
-                                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                                if N_unseen > 0:
-                                    lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts14_labels)
-                                else:
-                                    lp_u_c = np.zeros((0, K), dtype=np.float32)
+                            if num_14b_folds > 1:
+                                comp_lora_posteriors.append((w_comp_p, P_p_acc))
+                                if has_any_c:
+                                    comp_lora_posteriors.append((w_comp_c, P_c_acc))
                             else:
-                                lp_c85 = np.zeros((N_test, K), dtype=np.float32)
-                                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                                lp_u_c = np.zeros((0, K), dtype=np.float32)
+                                if W_p is not None and lp_p is not None:
+                                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                                if W_c is not None:
+                                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
                             def_dp_14b = 0.08 if opt_14b_key == "qwen3_14b_p1" else 0.10
                             def_se_14b = 0.35 if opt_14b_key == "qwen3_14b_p1" else 0.25
@@ -643,17 +720,20 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             spectral_blocks_te.append(S_te)
                             del res_ts14, U_te
 
-                            if W_p is not None and lp_p is not None:
-                                w_tot_ts14 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
-                                lp_m_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_comp_p, w_comp_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c)
+                            if lp_p is not None:
+                                w_tot_ts14 = w_comp_p + (w_comp_c if (has_any_c if num_14b_folds > 1 else W_c is not None) else 0.0)
+                                lp_m_u = lp_u if N_unseen > 0 and 'lp_u' in locals() else np.zeros((0, K), dtype=np.float32)
+                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if (has_any_c if num_14b_folds > 1 else W_c is not None) else None, w_comp_p, w_comp_c)
                                 aud_name_14b = "Qwen3-14B Part-1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
                                 auditor.add_model(name=aud_name_14b, tier="Comp", weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
 
-                        trunk1.restore_weights(backup_t1_ts)
-                        del backup_t1_ts, Z_tr, Z_te, heads_sd
+                        if backup_t1_ts is not None:
+                            trunk1.restore_weights(backup_t1_ts)
+                            del backup_t1_ts
+                        trunk1.set_final_norm(False)
+                        del Z_tr, Z_te, heads_sd
                         if "Z_unseen" in locals():
                             del Z_unseen
                         gc.collect()
@@ -682,6 +762,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     trunk2 = UniversalLoRATrunkLoader(base_q25_14b, keep_layers=meta_q25["keep"], layers=meta_q25["layers"], max_len=meta_q25["max_len"])
                 else:
                     trunk2.set_active_layers(meta_q25["layers"], meta_q25["max_len"])
+                trunk2.set_final_norm(not meta_q25["no_final_norm"])
                 backup_t2 = trunk2.snapshot_weights(p2_dir)
                 merged = merge_lora(trunk2.model, p2_dir, sign=+1.0)
                 if not merged and not is_smoke:
@@ -740,6 +821,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 spectral_blocks_te.append(S_te)
 
                 trunk2.restore_weights(backup_t2)
+                trunk2.set_final_norm(False)
                 del backup_t2, Z_all, Z_tr, Z_te, heads_sd, res_q25, U_te
                 if "Z_unseen" in locals():
                     del Z_unseen
@@ -921,14 +1003,30 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             # Optional Checkpoints on Trunk 3: Two-Stage LoRA24 (qwen3_8b_ts, qwen3_8b_v5, qwen3_8b_inhouse)
             for opt_8b_key in ("qwen3_8b_ts", "qwen3_8b_v5", "qwen3_8b_inhouse"):
                 if opt_8b_key in ckpts:
-                    ts8_dir = ckpts[opt_8b_key]
+                    primary_ts8_dir = ckpts[opt_8b_key]
+                    prefix_8b = "q8v5" if "v5" in opt_8b_key else "ts_q3b8" if "ts" in opt_8b_key else opt_8b_key
+                    found_8b_folds = find_fold_adapters(input_dir, prefix_8b)
+
+                    def _is_fold_8b(p: Path) -> bool:
+                        nm = p.name.lower()
+                        return any(f"_f{i}" in nm or f"-f{i}" in nm or f"_fold{i}" in nm for i in range(10))
+
+                    folds_only_8b = sorted([p for p in found_8b_folds if _is_fold_8b(p)], key=lambda x: str(x).lower())
+                    full_only_8b = [p for p in found_8b_folds if not _is_fold_8b(p)]
+                    if not full_only_8b:
+                        full_only_8b = [primary_ts8_dir]
+                    fold_dirs_8b = folds_only_8b + full_only_8b
+                    ts8_dir = fold_dirs_8b[-1]
+
                     meta_ts8 = read_checkpoint_meta(ts8_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
                     trunk3.set_active_layers(meta_ts8["layers"], meta_ts8["max_len"])
+                    trunk3.set_final_norm(not meta_ts8["no_final_norm"])
                     backup_t3_ts = trunk3.snapshot_weights(ts8_dir)
                     merged = merge_lora(trunk3.model, ts8_dir, sign=+1.0)
                     if not merged:
                         print(f"[Pipeline] Optional checkpoint {opt_8b_key} failed to merge LoRA; skipping.")
                         trunk3.restore_weights(backup_t3_ts)
+                        trunk3.set_final_norm(False)
                     else:
                         heads_sd = load_head_file(ts8_dir)
                         trunk3.load_norm_weights(heads_sd)
@@ -982,6 +1080,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 else:
                                     print(f"[Fast Probe Pruning] {opt_8b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING full extraction!")
                                     trunk3.restore_weights(backup_t3_ts)
+                                    trunk3.set_final_norm(False)
                                     del backup_t3_ts, heads_sd, Z_unseen
                                     gc.collect()
                                     if torch.cuda.is_available():
@@ -992,6 +1091,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 if lift < -0.002:
                                     print(f"[Fast Probe Pruning] {opt_8b_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING full extraction!")
                                     trunk3.restore_weights(backup_t3_ts)
+                                    trunk3.set_final_norm(False)
                                     del backup_t3_ts, heads_sd, Z_unseen
                                     gc.collect()
                                     if torch.cuda.is_available():
@@ -999,79 +1099,137 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     continue
                                 print(f"[Fast Probe] {opt_8b_key}: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
 
-                            # Stage B: Extract test and train
-                            Z_te_tr = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
-                            Z_te = Z_te_tr[:N_test]
-                            Z_tr = Z_te_tr[N_test:]
-                            del Z_te_tr
+                        # Stage B: Extract test and train (with multi-fold averaging if multiple folds discovered)
+                        num_8b_folds = len(fold_dirs_8b)
+                        if num_8b_folds > 1:
+                            trunk3.restore_weights(backup_t3_ts)
+                            del backup_t3_ts
+
+                            P_p_acc = np.zeros((N_test, K), dtype=np.float64)
+                            P_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            has_any_c = False
+                            Z_te = None
+                            Z_tr = None
+                            print(f"[Pipeline] {opt_8b_key}: extracting & averaging across {num_8b_folds} fold adapters...")
+
+                            for f_idx, f_dir in enumerate(fold_dirs_8b):
+                                is_last = (f_idx == num_8b_folds - 1)
+                                f_meta = read_checkpoint_meta(f_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
+                                trunk3.set_active_layers(f_meta["layers"], f_meta["max_len"])
+                                trunk3.set_final_norm(not f_meta["no_final_norm"])
+                                f_backup = trunk3.snapshot_weights(f_dir)
+                                f_merged = merge_lora(trunk3.model, f_dir, sign=+1.0)
+                                if not f_merged:
+                                    trunk3.restore_weights(f_backup)
+                                    continue
+                                f_heads_sd = load_head_file(f_dir)
+                                trunk3.load_norm_weights(f_heads_sd)
+                                f_W_p, f_b_p, f_W_c, f_b_c = resolve_head_tensors(f_heads_sd)
+                                f_labels = f_meta["labels"]
+
+                                if is_last:
+                                    Z_te_tr = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_tr[:N_test]
+                                    Z_tr = Z_te_tr[N_test:]
+                                    Z_te = f_Z_te
+                                    del Z_te_tr
+                                else:
+                                    f_Z_te = trunk3.extract_exact(test_texts, batch_size=8, end_id=f_meta["end_id"])
+
+                                if f_W_p is not None:
+                                    p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
+                                    P_p_acc += p_fold / num_8b_folds
+                                if f_W_c is not None:
+                                    has_any_c = True
+                                    lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
+                                    lp_c72_f, _ = compute_centered_logits(f_Z_te, groups_072, f_W_c, f_b_c, f_labels)
+                                    lp_c60_f, _ = compute_centered_logits(f_Z_te, groups_060, f_W_c, f_b_c, f_labels)
+                                    c_blend_f = w85 * lp_c85_f + w72 * lp_c72_f + w60 * lp_c60_f
+                                    P_c_acc += softmax(c_blend_f, axis=1) / num_8b_folds
+
+                                trunk3.restore_weights(f_backup)
+                                del f_backup, f_heads_sd, f_Z_te
+                                gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+
+                            trunk3.set_final_norm(False)
+                            lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0))
+                            lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            gate_passed = True
+                            backup_t3_ts = None
                         else:
-                            Z_all = trunk3.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
-                            Z_te = Z_all[:N_test]
-                            Z_unseen = Z_all[N_test : N_test + N_unseen]
-                            Z_tr = Z_all[N_test + N_unseen :]
-                            del Z_all
-
-                        gate_passed = True
-                        if not is_smoke and len(y_sub) >= 180:
-                            gate_passed, W_p, b_p, W_c, b_c, ts8_labels, _ = auto_align_and_verify_head(
-                                Z_tr=Z_tr,
-                                W_p=W_p,
-                                b_p=b_p,
-                                W_c=W_c,
-                                b_c=b_c,
-                                ckpt_labels=ts8_labels,
-                                y_sub=y_sub,
-                                prompts_sub=prompts_sub,
-                                name=opt_8b_key,
-                                min_bacc=probe_gate_min_bacc,
-                            )
-
-                        if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
-                            lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
-                            if W_c is not None:
-                                lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts8_labels)
-                                lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
+                            if N_unseen >= 36 and W_p is not None:
+                                Z_te_tr = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                                Z_te = Z_te_tr[:N_test]
+                                Z_tr = Z_te_tr[N_test:]
+                                del Z_te_tr
                             else:
-                                lp_u_fitted = lp_u_p_fit
-                            fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
-                            print(f"[Post-Fit Probe] {opt_8b_key}: unseen BAcc = {fitted_bacc:.4f}")
-                            if fitted_bacc < probe_gate_min_bacc:
-                                print(f"[Post-Fit Pruning] {opt_8b_key}: fitted unseen BAcc {fitted_bacc:.4f} < {probe_gate_min_bacc:.2f} -> rejecting checkpoint!")
-                                gate_passed = False
-                            elif len(auditor.models) > 0:
-                                fitted_lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_fitted, weight=w_comp_tot)
-                                if fitted_lift < -0.002:
-                                    print(f"[Post-Fit Pruning] {opt_8b_key}: fitted marginal lift {fitted_lift:+.4f} < -0.002 -> rejecting checkpoint!")
+                                Z_all = trunk3.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                                Z_te = Z_all[:N_test]
+                                Z_unseen = Z_all[N_test : N_test + N_unseen]
+                                Z_tr = Z_all[N_test + N_unseen :]
+                                del Z_all
+
+                            gate_passed = True
+                            if not is_smoke and len(y_sub) >= 180:
+                                gate_passed, W_p, b_p, W_c, b_c, ts8_labels, _ = auto_align_and_verify_head(
+                                    Z_tr=Z_tr,
+                                    W_p=W_p,
+                                    b_p=b_p,
+                                    W_c=W_c,
+                                    b_c=b_c,
+                                    ckpt_labels=ts8_labels,
+                                    y_sub=y_sub,
+                                    prompts_sub=prompts_sub,
+                                    name=opt_8b_key,
+                                    min_bacc=probe_gate_min_bacc,
+                                )
+
+                            if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
+                                lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
+                                if W_c is not None:
+                                    lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts8_labels)
+                                    lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
+                                else:
+                                    lp_u_fitted = lp_u_p_fit
+                                fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
+                                print(f"[Post-Fit Probe] {opt_8b_key}: unseen BAcc = {fitted_bacc:.4f}")
+                                if fitted_bacc < probe_gate_min_bacc:
+                                    print(f"[Post-Fit Pruning] {opt_8b_key}: fitted unseen BAcc {fitted_bacc:.4f} < {probe_gate_min_bacc:.2f} -> rejecting checkpoint!")
                                     gate_passed = False
+                                elif len(auditor.models) > 0:
+                                    fitted_lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_fitted, weight=w_comp_tot)
+                                    if fitted_lift < -0.002:
+                                        print(f"[Post-Fit Pruning] {opt_8b_key}: fitted marginal lift {fitted_lift:+.4f} < -0.002 -> rejecting checkpoint!")
+                                        gate_passed = False
+
+                            if gate_passed:
+                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
+                                if W_c is not None:
+                                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
+                                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
+                                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
+                                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                else:
+                                    lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
 
                         if gate_passed:
-                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
-                            if N_unseen > 0 and W_p is not None:
-                                lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
-                            else:
-                                lp_u_p = np.zeros((0, K), dtype=np.float32)
                             def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
                             def_se = 0.40 if opt_8b_key == "qwen3_8b_inhouse" else 0.35
                             pr_sc = prior_scales.get(opt_8b_key, def_pr)
                             se_fl = se_floors.get(opt_8b_key, def_se)
 
                             update_hybrid_groups(Z_te, pr_sc)
-                            if W_p is not None:
-                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                            if W_c is not None:
-                                lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
-                                lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
-                                lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
-                                lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
-                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                                if N_unseen > 0:
-                                    lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts8_labels)
-                                else:
-                                    lp_u_c = np.zeros((0, K), dtype=np.float32)
+                            if num_8b_folds > 1:
+                                comp_lora_posteriors.append((w_comp_p, P_p_acc))
+                                if has_any_c:
+                                    comp_lora_posteriors.append((w_comp_c, P_c_acc))
                             else:
-                                lp_c85 = np.zeros((N_test, K), dtype=np.float32)
-                                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                                lp_u_c = np.zeros((0, K), dtype=np.float32)
+                                if W_p is not None and lp_p is not None:
+                                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                                if W_c is not None:
+                                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
                             res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
                             U_te = transform_lowram(Z_te, res_ts8)
@@ -1083,16 +1241,19 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             spectral_blocks_te.append(S_te)
                             del res_ts8, U_te
 
-                            if W_p is not None and lp_p is not None:
-                                w_tot_ts8 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
-                                lp_m_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_comp_p, w_comp_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
-                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c)
+                            if lp_p is not None:
+                                w_tot_ts8 = w_comp_p + (w_comp_c if (has_any_c if num_8b_folds > 1 else W_c is not None) else 0.0)
+                                lp_m_u = lp_u if N_unseen > 0 and 'lp_u' in locals() else np.zeros((0, K), dtype=np.float32)
+                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if (has_any_c if num_8b_folds > 1 else W_c is not None) else None, w_comp_p, w_comp_c)
                                 auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_tot_ts8, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_8b_key} rejected by gate; excluded from logits and spectral bank.")
 
-                        trunk3.restore_weights(backup_t3_ts)
-                        del backup_t3_ts, Z_tr, Z_te, heads_sd
+                        if backup_t3_ts is not None:
+                            trunk3.restore_weights(backup_t3_ts)
+                            del backup_t3_ts
+                        trunk3.set_final_norm(False)
+                        del Z_tr, Z_te, heads_sd
                         if "Z_unseen" in locals():
                             del Z_unseen
                         gc.collect()

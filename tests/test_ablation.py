@@ -74,7 +74,7 @@ def test_build_unseen_holdout_dataset_quarantine(tmp_path: Path):
     train_path = input_dir / "train.csv"
     df_train.to_csv(train_path, index=False)
 
-    # 2. Contaminated pool_v4.parquet
+    # 2. Contaminated pool_v4.parquet and nlm_pool_v5.parquet
     pool_v4_texts = [
         "Pool v4 sentence delta.",
         "Pool v4 sentence epsilon.",
@@ -87,25 +87,39 @@ def test_build_unseen_holdout_dataset_quarantine(tmp_path: Path):
     p4_dir.mkdir()
     df_p4.to_parquet(p4_dir / "pool_v4.parquet")
 
-    # 3. Candidate corpus with both contaminated and strictly unseen texts
+    pool_v5_texts = [
+        "Pool v5 sentence zeta.",
+        "Pool v5 sentence eta.",
+    ]
+    df_p5 = pd.DataFrame({
+        "text": pool_v5_texts,
+        "model": [LABELS[5], LABELS[6]],
+    })
+    p5_dir = input_dir / "pool_v5_ds"
+    p5_dir.mkdir()
+    df_p5.to_parquet(p5_dir / "nlm_pool_v5.parquet")
+
+    # 3. Candidate disjoint openrouter corpus with contaminated and strictly unseen texts
     unseen_texts = [f"Unseen topic text {i} for model {LABELS[i % K]} with stylized vocabulary." for i in range(72)]
     candidate_texts = (
-        train_texts  # contaminated (should be excluded)
+        train_texts    # contaminated (should be excluded)
         + pool_v4_texts  # contaminated (should be excluded)
-        + unseen_texts  # genuine unseen candidates
+        + pool_v5_texts  # contaminated (should be excluded)
+        + unseen_texts   # genuine unseen candidates
     )
     candidate_models = (
         [LABELS[0], LABELS[1], LABELS[2]]
         + [LABELS[3], LABELS[4]]
+        + [LABELS[5], LABELS[6]]
         + [LABELS[i % K] for i in range(72)]
     )
     df_cand = pd.DataFrame({
         "text": candidate_texts,
         "model": candidate_models,
     })
-    cand_dir = input_dir / "nlm_pool_v5_ds"
+    cand_dir = input_dir / "openrouter_harvest_ds"
     cand_dir.mkdir()
-    df_cand.to_parquet(cand_dir / "nlm_pool_v5.parquet")
+    df_cand.to_parquet(cand_dir / "openrouter_harvest.parquet")
 
     # Run build_unseen_holdout_dataset
     df_unseen, holdout_hashes = build_unseen_holdout_dataset(
@@ -118,7 +132,8 @@ def test_build_unseen_holdout_dataset_quarantine(tmp_path: Path):
     # Verification: zero leakage
     train_hashes = {_text_hash(t) for t in train_texts}
     p4_hashes = {_text_hash(t) for t in pool_v4_texts}
-    contaminated = train_hashes | p4_hashes
+    p5_hashes = {_text_hash(t) for t in pool_v5_texts}
+    contaminated = train_hashes | p4_hashes | p5_hashes
 
     assert len(df_unseen) > 0, "Should have sampled unseen passages."
     assert len(holdout_hashes.intersection(contaminated)) == 0, "No contaminated text may appear in holdout_hashes!"
@@ -568,3 +583,30 @@ def test_multi_scale_evaluate_marginal_lift_rescues_high_weight_candidate():
     # Multi-scale marginal lift search rescues the candidate
     lift = auditor.evaluate_marginal_lift(lp_cand, weight=0.50)
     assert lift > 0.0, f"Multi-scale search must rescue candidate with positive lift, got {lift}"
+
+
+def test_find_fold_adapters_discovery_and_ordering(tmp_path: Path):
+    """Verifies find_fold_adapters discovers all 5 folds + full data adapter for q14v5 and q8v5."""
+    from namethatllm.config import find_fold_adapters
+    from safetensors.torch import save_file
+    import torch
+
+    # Create dummy dataset folder structure matching dhruvtibarewal/nlm-l24-adapters-v5
+    ds_dir = tmp_path / "nlm-l24-adapters-v5"
+    ds_dir.mkdir()
+
+    names = ["q14v5_f0", "q14v5_f1", "q14v5_f2", "q14v5_f3", "q14v5_f4", "q14v5", "unrelated_model"]
+    for nm in names:
+        p = ds_dir / nm
+        p.mkdir()
+        save_file({"plain.weight": torch.randn(18, 100)}, str(p / "heads.safetensors"))
+
+    # Test q14v5 prefix search
+    found = find_fold_adapters(tmp_path, "q14v5")
+    found_names = [p.name for p in found]
+    assert len(found) == 6, f"Expected 6 fold adapters, got {len(found)}: {found_names}"
+    assert "q14v5" in found_names
+    for i in range(5):
+        assert f"q14v5_f{i}" in found_names
+    assert "unrelated_model" not in found_names
+
