@@ -39,6 +39,24 @@ sys.path.insert(0, str(WORKSPACE_DIR / "src"))
 from namethatllm.config import LABELS, K, LAB2I, FAMILIES
 from namethatllm.lexical_engine import run_lexical_engine
 from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc
+
+CANONICAL_NAME_MAP: Dict[str, str] = {
+    "LinearSVC (4-View)": "svc_4view",
+    "Lexical Comp (5-View)": "lexical_5v",
+    "Qwen3-14B Part-2": "qwen3_14b_p2",
+    "Qwen3-14B In-House": "qwen3_14b_inhouse",
+    "DeBERTa-v3-Large": "deberta_p2",
+    "DeBERTa-InHouse": "deberta_inhouse",
+    "Qwen3-8B Claude Head": "qwen3_8b_claude",
+    "Qwen2.5-14B Part-2": "qwen25_14b_p2",
+    "Qwen3-8B In-Style": "instyle",
+    "Qwen3-8B In-House": "qwen3_8b_inhouse",
+    "qwen3_8b_v5": "qwen3_8b_v5",
+    "qwen3_14b_v5": "qwen3_14b_v5",
+    "wpca_dp": "wpca_dp",
+    "spectral_bank": "spectral_bank",
+}
+
 from namethatllm.postprocess import (
     apply_claude_specialist_gate,
     apply_all_family_confidence_gates,
@@ -455,10 +473,99 @@ def print_npz_ablation_diagnostics(
     print("=" * 115)
 
 
+
+def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
+    """
+    Stepwise forward greedy analysis on zero-leakage models:
+    Evaluates solo Sinkhorn BAcc to pick Base Model (Step 0), then iteratively adds
+    1 model at a time searching a weight grid, reporting Marginal Lift and Top 3 Contenders.
+    """
+    if "y_unseen" not in data or len(data["y_unseen"]) < 18:
+        print("[Stepwise] Cannot run stepwise analysis: unseen holdout is missing or too small.")
+        return
+
+    y = data["y_unseen"].astype(int)
+    model_names = [str(x) for x in data["model_names"]]
+
+    # Collect zero-leakage models
+    candidates: Dict[str, np.ndarray] = {}
+    sorted_labels = sorted(LABELS)
+    perm = [sorted_labels.index(lbl) for lbl in LABELS]
+
+    for idx, name in enumerate(model_names):
+        c_name = CANONICAL_NAME_MAP.get(name, name)
+        # Skip v5 models contaminated with nlm_pool_v5 holdout leakage
+        if "v5" in c_name.lower():
+            continue
+        u_lp = data[f"m_{idx}_unseen_lp"].copy()
+        # Fix label alignment for claude head if applicable
+        if c_name == "qwen3_8b_claude":
+            u_lp = u_lp[:, perm]
+        candidates[c_name] = u_lp
+
+    if not candidates:
+        return
+
+    def fast_sinkhorn_bacc(lp: np.ndarray) -> float:
+        P = softmax(lp, axis=1)
+        for _ in range(60):
+            P = P / np.maximum(P.sum(axis=0, keepdims=True), 1e-12) / 18.0
+            P = P / np.maximum(P.sum(axis=1, keepdims=True), 1e-12)
+        return float(balanced_accuracy_score(y, P.argmax(axis=1)))
+
+    weight_grid = [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00]
+
+    solo_scores = {k: fast_sinkhorn_bacc(v) for k, v in candidates.items()}
+    sorted_solo = sorted(solo_scores.items(), key=lambda x: x[1], reverse=True)
+    base_model, base_bacc = sorted_solo[0]
+    top3_base = ", ".join([f"{k} ({s:.4f})" for k, s in sorted_solo[:3]])
+
+    print("\n" + "=" * 125)
+    print(" ZERO-LEAKAGE STEPWISE GREEDY MODEL & WEIGHT SELECTION (With Sinkhorn Balancing)")
+    print("=" * 125)
+    print(f"{'Step':<16} | {'Selected Model':<20} | {'Selected Weight':<15} | {'Ensemble BAcc':<14} | {'Marginal Lift':<14} | {'Top 3 Contenders Evaluated at this Step'}")
+    print("-" * 125)
+    print(f"{'Base model -Step':<16} | {base_model:<20} | {'1.00 (Anchor)':<15} | {base_bacc:<14.4f} | {'Baseline':<14} | {top3_base}")
+
+    ensemble_lp = candidates[base_model].copy()
+    cur_bacc = base_bacc
+    remaining = [k for k in candidates.keys() if k != base_model]
+
+    step_num = 1
+    while remaining:
+        cand_evals = []
+        for cand in remaining:
+            cand_lp = candidates[cand]
+            best_w = 0.0
+            best_bacc = 0.0
+            for w in weight_grid:
+                trial = ensemble_lp + w * cand_lp
+                bacc = fast_sinkhorn_bacc(trial)
+                if bacc > best_bacc:
+                    best_bacc = bacc
+                    best_w = w
+            cand_evals.append((cand, best_w, best_bacc, best_bacc - cur_bacc))
+
+        cand_evals.sort(key=lambda x: x[2], reverse=True)
+        best_cand, best_w, best_bacc, best_lift = cand_evals[0]
+        top3_str = ", ".join([f"{c} (w={w:.2f}, {b:.4f}, {l:+.4f})" for c, w, b, l in cand_evals[:3]])
+
+        step_label = f"Model {step_num} - Step"
+        print(f"{step_label:<16} | {best_cand:<20} | {best_w:<15.2f} | {best_bacc:<14.4f} | {best_lift:<+14.4f} | {top3_str}")
+
+        ensemble_lp = ensemble_lp + best_w * candidates[best_cand]
+        cur_bacc = best_bacc
+        remaining.remove(best_cand)
+        step_num += 1
+
+    print("=" * 125 + "\n")
+
 def evaluate_from_cache(
     cache_path: Path,
     config_path: Optional[Path] = None,
     working_dir: Optional[Path] = None,
+    strict_config: bool = True,
+    run_stepwise: bool = False,
 ) -> Dict[str, Any]:
     """
     Benchmark B: Sub-second offline replay of cached neural representations.
@@ -475,6 +582,8 @@ def evaluate_from_cache(
 
     cfg = load_config(config_path)
     post_cfg = cfg.get("postprocess", cfg.get("postprocessing", {}))
+    cfg_weights = cfg.get("model_weights", {})
+    lock_priors = bool(cfg.get("lock_prior_weights", True))
 
     N_test = int(data["N_test"][0])
     N_unseen = int(data["N_unseen"][0])
@@ -486,19 +595,86 @@ def evaluate_from_cache(
 
     auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=groups_unseen, N_test=N_test)
 
-    for idx, (name, tier, prior_w) in enumerate(zip(model_names, model_tiers, model_prior_weights)):
+    active_models_summary = []
+    pruned_models_summary = []
+    added_names = set()
+
+    for idx, (raw_name, tier, prior_w) in enumerate(zip(model_names, model_tiers, model_prior_weights)):
+        canon_name = CANONICAL_NAME_MAP.get(raw_name, raw_name)
         u_lp = data[f"m_{idx}_unseen_lp"]
         t_lp = data[f"m_{idx}_test_lp"]
-        auditor.add_model(name=name, tier=tier, weight=prior_w, unseen_log_probs=u_lp, test_log_probs=t_lp)
+
+        if strict_config and cfg_weights:
+            if canon_name in cfg_weights:
+                mw = cfg_weights[canon_name]
+                cfg_w = float(mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0))
+                if cfg_w > 0.0:
+                    auditor.add_model(name=canon_name, tier=tier, weight=cfg_w, unseen_log_probs=u_lp, test_log_probs=t_lp)
+                    active_models_summary.append((canon_name, cfg_w, tier))
+                    added_names.add(canon_name)
+                else:
+                    pruned_models_summary.append((f"{raw_name} ({canon_name})", f"Weight is {cfg_w:.2f} (Specialist Gate Only / Pruned)"))
+            else:
+                pruned_models_summary.append((f"{raw_name} ({canon_name})", "Not in active ensemble config"))
+        else:
+            auditor.add_model(name=canon_name, tier=tier, weight=prior_w, unseen_log_probs=u_lp, test_log_probs=t_lp)
+            active_models_summary.append((canon_name, prior_w, tier))
+            added_names.add(canon_name)
 
     # Reconstruct extra streams
     extra_streams: List[Tuple[str, float, np.ndarray]] = []
+    active_extras_summary = []
     num_extra = int(data["num_extra"][0]) if "num_extra" in data else 0
     for ex_idx in range(num_extra):
-        ex_name = str(data[f"extra_{ex_idx}_name"][0])
+        raw_ex_name = str(data[f"extra_{ex_idx}_name"][0])
+        canon_ex_name = CANONICAL_NAME_MAP.get(raw_ex_name, raw_ex_name)
         ex_w = float(data[f"extra_{ex_idx}_weight"][0])
         ex_lp = data[f"extra_{ex_idx}_lp"]
-        extra_streams.append((ex_name, ex_w, ex_lp))
+
+        if strict_config and cfg_weights:
+            if canon_ex_name in cfg_weights:
+                cfg_ex_w = float(cfg_weights[canon_ex_name].get("plain_weight", ex_w))
+                if cfg_ex_w > 0.0:
+                    extra_streams.append((canon_ex_name, cfg_ex_w, ex_lp))
+                    active_extras_summary.append((canon_ex_name, cfg_ex_w))
+                    added_names.add(canon_ex_name)
+                else:
+                    pruned_models_summary.append((f"{raw_ex_name} ({canon_ex_name})", f"Weight is {cfg_ex_w:.2f}"))
+            else:
+                pruned_models_summary.append((f"{raw_ex_name} ({canon_ex_name})", "Not in active ensemble config"))
+        else:
+            extra_streams.append((canon_ex_name, ex_w, ex_lp))
+            active_extras_summary.append((canon_ex_name, ex_w))
+            added_names.add(canon_ex_name)
+
+    missing_models_summary = []
+    if strict_config and cfg_weights:
+        for k, mw in cfg_weights.items():
+            tot_w = float(mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0))
+            if tot_w > 0.0 and k not in added_names:
+                missing_models_summary.append((k, tot_w))
+
+    print("\n" + "=" * 90)
+    print(f" CONFIG-DRIVEN ROSTER AUDIT (strict_config={strict_config})")
+    print("=" * 90)
+    print(f" Active Models in Ensemble ({len(active_models_summary)}):")
+    for name, w, tier in active_models_summary:
+        print(f"   - {name:<22}: weight = {w:<5.2f} ({tier})")
+    print(f" Active Extra Streams ({len(active_extras_summary)}):")
+    for name, w in active_extras_summary:
+        print(f"   - {name:<22}: weight = {w:<5.2f}")
+    if pruned_models_summary:
+        print(f" Pruned / Excluded Models ({len(pruned_models_summary)}):")
+        for name, reason in pruned_models_summary:
+            print(f"   - {name:<22}: {reason}")
+    if missing_models_summary:
+        print(f" Configured Models Missing in Cache ({len(missing_models_summary)}):")
+        for name, w in missing_models_summary:
+            print(f"   - {name:<22}: Config weight = {w:<5.2f} (To be extracted / mounted)")
+    print("=" * 90)
+
+    if run_stepwise:
+        print_stepwise_greedy_table(data)
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
         report_dir = Path(tmp_dir) if working_dir is None else Path(working_dir)
@@ -509,7 +685,15 @@ def evaluate_from_cache(
             working_dir=report_dir,
             extra_test_log_probs=extra_streams,
             optimize_on_unseen=optimize_on_unseen,
+            lock_prior_weights=lock_priors,
         )
+
+        for raw_name in model_names:
+            c_name = CANONICAL_NAME_MAP.get(raw_name, raw_name)
+            if c_name not in active_weights_map:
+                active_weights_map[c_name] = 0.0
+            if raw_name not in active_weights_map:
+                active_weights_map[raw_name] = 0.0
         R_main = P_mix.copy()
 
         # 2. Claude Specialist Gate
@@ -610,8 +794,12 @@ def evaluate_from_cache(
 
 def main():
     parser = argparse.ArgumentParser(description="NameThatLLM - Fail-Fast Local Evaluation & Ablation Harness")
-    parser.add_argument("--mode", choices=["split", "cache", "simulate"], default="split",
-                        help="Evaluation mode: 'split' (prompt-grouped holdout), 'cache' (replay local_eval_cache.npz), or 'simulate' (synthetic cache).")
+    parser.add_argument("--mode", choices=["split", "cache", "simulate", "stepwise"], default="split",
+                        help="Evaluation mode: 'split' (prompt-grouped holdout), 'cache' (replay local_eval_cache.npz), 'simulate' (synthetic cache), or 'stepwise' (zero-leakage stepwise analysis).")
+    parser.add_argument("--strict-config", action=argparse.BooleanOptionalAction, default=True,
+                        help="Strictly filter cache models against configs/production_ensemble.json (default: True).")
+    parser.add_argument("--stepwise", action="store_true",
+                        help="Run zero-leakage stepwise forward greedy selection analysis.")
     parser.add_argument("--train-path", type=str, default="local_data/train.csv",
                         help="Path to train.csv for --mode split.")
     parser.add_argument("--cache-file", type=str, default="local_data/local_eval_cache.npz",
@@ -641,16 +829,27 @@ def main():
             print(f"[Simulate] Synthesizing realistic 10-model multi-trunk cache at {sim_cache}...")
             generate_synthetic_cache(sim_cache)
             evaluate_from_cache(sim_cache, config_path=Path(args.config) if args.config else None)
-    elif args.mode == "cache":
+    elif args.mode in ("cache", "stepwise"):
+        run_stepwise = (args.mode == "stepwise" or args.stepwise)
         c_path = Path(args.cache_file)
         if not c_path.exists():
             print(f"[Warning] Cache file {c_path} not found; falling back to --mode simulate...")
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
                 sim_cache = Path(tmp_dir) / "sim_eval_cache.npz"
                 generate_synthetic_cache(sim_cache)
-                evaluate_from_cache(sim_cache, config_path=Path(args.config) if args.config else None)
+                evaluate_from_cache(
+                    sim_cache,
+                    config_path=Path(args.config) if args.config else None,
+                    strict_config=args.strict_config,
+                    run_stepwise=run_stepwise,
+                )
         else:
-            evaluate_from_cache(c_path, config_path=Path(args.config) if args.config else None)
+            evaluate_from_cache(
+                c_path,
+                config_path=Path(args.config) if args.config else None,
+                strict_config=args.strict_config,
+                run_stepwise=run_stepwise,
+            )
 
 
 if __name__ == "__main__":

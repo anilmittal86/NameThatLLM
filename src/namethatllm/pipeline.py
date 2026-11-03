@@ -337,7 +337,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     ]
     u_lp_svc = unseen_log_p_svc_main if (N_unseen > 0 and len(unseen_log_p_svc_main) == N_unseen) else np.zeros((N_unseen, K), dtype=np.float32)
     auditor.add_model(
-        name="LinearSVC (4-View)",
+        name="svc_4view",
         tier="Main",
         weight=svc_weight,
         unseen_log_probs=u_lp_svc,
@@ -345,7 +345,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     )
     u_p_lex = unseen_p_lex_comp if (N_unseen > 0 and len(unseen_p_lex_comp) == N_unseen) else (np.ones((N_unseen, K), dtype=np.float32) / float(K))
     auditor.add_model(
-        name="Lexical Comp (5-View)",
+        name="lexical_5v",
         tier="Comp",
         weight=lex_comp_weight,
         unseen_log_probs=np.log(np.clip(u_p_lex, 1e-9, 1.0)),
@@ -480,7 +480,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     w_tot_14b = w_main_p + (w_main_c if W_c is not None else 0.0)
                     lp_model_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_main_p, w_main_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
                     lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_main_p, w_main_c)
-                    auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
+                    auditor.add_model("qwen3_14b_p2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
                 # wPCA + DP Posterior + Spectral Bank
                 res_p2 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_p2", 0.10))
@@ -751,7 +751,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 w_tot_ts14 = w_comp_p + (w_comp_c if (has_any_c if num_14b_folds > 1 else W_c is not None) else 0.0)
                                 lp_m_u = lp_u if N_unseen > 0 and 'lp_u' in locals() else np.zeros((0, K), dtype=np.float32)
                                 lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if (has_any_c if num_14b_folds > 1 else W_c is not None) else None, w_comp_p, w_comp_c)
-                                aud_name_14b = "Qwen3-14B Part-1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
+                                aud_name_14b = opt_14b_key
                                 auditor.add_model(name=aud_name_14b, tier="Comp", weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
@@ -835,7 +835,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     w_tot_q25 = w_main_p + (w_main_c if W_c is not None else 0.0)
                     lp_model_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_main_p, w_main_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
                     lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_main_p, w_main_c)
-                    aud_name = "Qwen2.5-14B Part-2" if q25_key == "qwen25_14b_p2" else "Qwen2.5-14B In-House"
+                    aud_name = q25_key
                     auditor.add_model(aud_name, tier="Main", weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
                 res_q25 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(q25_key, 0.10))
@@ -1238,7 +1238,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         twin_c_te = lp_c_blend if (W_c is not None and W_c.shape[0] == 18) else None
                         lp_m_u = _combine_plain_and_twin_lp(lp_u_p, twin_c_u, w_comp_p, w_comp_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
                         lp_m_te = _combine_plain_and_twin_lp(lp_p, twin_c_te, w_comp_p, w_comp_c)
-                        auditor.add_model("Qwen3-8B Claude Head", tier="Comp", weight=w_tot_cl, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
+                        auditor.add_model("qwen3_8b_claude", tier="Comp", weight=w_tot_cl, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                 res_cl = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_claude", 0.35))
                 U_te = transform_lowram(Z_te, res_cl)
@@ -1327,7 +1327,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 w_tot_deb = w_main_deb + (w_comp_c if W_c_deb is not None else 0.0)
                 lp_m_u = _combine_plain_and_twin_lp(lp_u_deb, lp_u_c_deb if W_c_deb is not None else None, w_main_deb, w_comp_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32)
                 lp_m_te = _combine_plain_and_twin_lp(lp_p_deb, lp_c_blend if W_c_deb is not None else None, w_main_deb, w_comp_c)
-                aud_name = "DeBERTa-v3-Large" if deb_key == "deberta_p2" else "DeBERTa-InHouse"
+                aud_name = deb_key
                 auditor.add_model(aud_name, tier="Main", weight=w_tot_deb, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
             res_deb = fit_shared_gaussian_lowram(Z_tr_deb, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(deb_key, 0.10))
@@ -1402,7 +1402,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     # 4. MODULE 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration
     print("[Pipeline] Module 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration...")
     extra_streams: List[Tuple[str, float, np.ndarray]] = []
-    w_dp = model_weights.get("wpca_dp", {}).get("plain_weight", 0.22)
+    w_dp = model_weights.get("wpca_dp", {}).get("plain_weight", 0.35)
     if dp_posteriors:
         tot_dp_w = sum(w for w, _ in dp_posteriors)
         P_dp_comb = sum(w * P_dp for w, P_dp in dp_posteriors) / max(1e-8, tot_dp_w)
@@ -1410,7 +1410,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     elif is_smoke:
         extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(mock_p_dp, 1e-9, 1.0))))
 
-    w_sb = model_weights.get("spectral_bank", {}).get("plain_weight", 0.12)
+    w_sb = model_weights.get("spectral_bank", {}).get("plain_weight", 0.20)
     if "P_spectral" in locals() and P_spectral is not None:
         extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral, 1e-9, 1.0))))
     elif is_smoke:
@@ -1418,10 +1418,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     if len(auditor.models) > 0:
         optimize_on_unseen = (N_unseen >= 36 and not is_smoke)
+        lock_priors = bool(cfg.get("lock_prior_weights", True))
         P_mix, active_weights_map, df_ablation = auditor.optimize_weights_and_blend(
             working_dir=working_dir,
             extra_test_log_probs=extra_streams,
             optimize_on_unseen=optimize_on_unseen,
+            lock_prior_weights=lock_priors,
         )
         print(f"[Pipeline] Flat log-space ensemble active weights: {active_weights_map}")
         R_main = P_mix

@@ -162,7 +162,7 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
     strictly_disjoint = df_pool_unseen[~df_pool_unseen["_hash"].isin(v5_hashes)]
-    if strictly_disjoint["model"].nunique() >= 12 and len(strictly_disjoint) >= 180:
+    if strictly_disjoint["model"].nunique() >= 10 and len(strictly_disjoint) >= 90:
         df_pool_unseen = strictly_disjoint
 
     # Stratified balanced sampling across all 18 classes
@@ -256,6 +256,7 @@ class UnseenStepwiseAuditor:
         working_dir: Path,
         extra_test_log_probs: Optional[List[Tuple[str, float, np.ndarray]]] = None,
         optimize_on_unseen: bool = True,
+        lock_prior_weights: bool = False,
     ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
         """
         1. Runs Greedy Forward Stepwise Selection + Coordinate Line Search on `df_unseen`
@@ -295,75 +296,86 @@ class UnseenStepwiseAuditor:
         M = len(self.models)
         order = sorted(range(M), key=lambda i: self.models[i]["solo_unseen_sinkhorn_bacc"], reverse=True)
 
-        active_weights = np.zeros(M, dtype=np.float64)
-        valid_candidates = [i for i in order if self.models[i]["solo_unseen_sinkhorn_bacc"] >= 0.30 and self.models[i]["weight"] > 0.0]
-        if not valid_candidates:
+        if lock_prior_weights:
+            active_weights = np.zeros(M, dtype=np.float64)
             for idx, m in enumerate(self.models):
-                active_weights[idx] = m["weight"]
-        else:
-            first_idx = valid_candidates[0]
-            m_first = self.models[first_idx]
-            mults_first = (0.75, 1.00, 1.25) if m_first["solo_unseen_sinkhorn_bacc"] >= 0.38 else (0.25, 0.50, 0.75, 1.00)
-            best_first_w = m_first["weight"]
-            best_first_obj = -1e9
-            best_first_bacc = 0.0
-            for mult in mults_first:
-                cand_w = m_first["weight"] * mult
-                obj_val, bacc_val = _composite_obj(cand_w * m_first["unseen_lp"])
-                if obj_val > best_first_obj:
-                    best_first_obj = obj_val
-                    best_first_bacc = bacc_val
-                    best_first_w = cand_w
-            active_weights[first_idx] = best_first_w
-            cum_u_lp = active_weights[first_idx] * m_first["unseen_lp"]
-            best_obj = best_first_obj
-            best_bacc = best_first_bacc
-
-            remaining = list(valid_candidates[1:])
-            while remaining:
-                step_best_idx = None
-                step_best_w = 0.0
-                step_best_obj = best_obj
-                step_best_bacc = best_bacc
-
-                for idx in remaining:
-                    m_info = self.models[idx]
-                    prior_w = m_info["weight"]
-                    u_lp = m_info["unseen_lp"]
-                    solo_s = m_info["solo_unseen_sinkhorn_bacc"]
-
-                    if solo_s < 0.30 or prior_w <= 0.0:
-                        continue
-
-                    mults = (0.75, 1.00, 1.25) if solo_s >= 0.38 else (0.25, 0.50, 0.75, 1.00)
-                    for mult in mults:
-                        cand_w = prior_w * mult
-                        trial_lp = cum_u_lp + cand_w * u_lp
-                        obj_val, bacc_val = _composite_obj(trial_lp)
-                        if obj_val > step_best_obj + 1e-6:
-                            step_best_obj = obj_val
-                            step_best_bacc = bacc_val
-                            step_best_idx = idx
-                            step_best_w = cand_w
-
-                if step_best_idx is not None and step_best_w > 0.0:
-                    active_weights[step_best_idx] = step_best_w
-                    cum_u_lp = cum_u_lp + step_best_w * self.models[step_best_idx]["unseen_lp"]
-                    best_obj = step_best_obj
-                    best_bacc = step_best_bacc
-                    remaining.remove(step_best_idx)
+                prior_w = float(m.get("prior_weight", m["weight"]))
+                solo_s = float(m.get("solo_unseen_sinkhorn_bacc", 0.0))
+                if solo_s < 0.30 or prior_w <= 0.0:
+                    active_weights[idx] = 0.0
                 else:
-                    break
-
-        # Post-loop enforcement:
-        # 1. Enforce 0.75 * prior_weight floor on all validated models (solo_unseen_sinkhorn_bacc >= 0.38 and weight > 0)
-        #    so nlm_pool_v5 holdout leakage on qwen3_14b_v5 never zeroes out Part-2, in-house, DeBERTa, or LinearSVC!
-        # 2. Prune any model with solo_unseen_sinkhorn_bacc < 0.30 or weight <= 0 to strictly 0.0.
-        for idx, m_info in enumerate(self.models):
-            if m_info["solo_unseen_sinkhorn_bacc"] < 0.30 or m_info["weight"] <= 0.0:
-                active_weights[idx] = 0.0
-            elif m_info["solo_unseen_sinkhorn_bacc"] >= 0.38 and m_info["weight"] > 0.0:
-                active_weights[idx] = max(active_weights[idx], 0.75 * m_info["weight"])
+                    active_weights[idx] = prior_w
+        else:
+            active_weights = np.zeros(M, dtype=np.float64)
+            valid_candidates = [i for i in order if self.models[i]["solo_unseen_sinkhorn_bacc"] >= 0.30 and self.models[i]["weight"] > 0.0]
+            if not valid_candidates:
+                for idx, m in enumerate(self.models):
+                    active_weights[idx] = m["weight"]
+            else:
+                first_idx = valid_candidates[0]
+                m_first = self.models[first_idx]
+                mults_first = (0.75, 1.00, 1.25) if m_first["solo_unseen_sinkhorn_bacc"] >= 0.38 else (0.25, 0.50, 0.75, 1.00)
+                best_first_w = m_first["weight"]
+                best_first_obj = -1e9
+                best_first_bacc = 0.0
+                for mult in mults_first:
+                    cand_w = m_first["weight"] * mult
+                    obj_val, bacc_val = _composite_obj(cand_w * m_first["unseen_lp"])
+                    if obj_val > best_first_obj:
+                        best_first_obj = obj_val
+                        best_first_bacc = bacc_val
+                        best_first_w = cand_w
+                active_weights[first_idx] = best_first_w
+                cum_u_lp = active_weights[first_idx] * m_first["unseen_lp"]
+                best_obj = best_first_obj
+                best_bacc = best_first_bacc
+    
+                remaining = list(valid_candidates[1:])
+                while remaining:
+                    step_best_idx = None
+                    step_best_w = 0.0
+                    step_best_obj = best_obj
+                    step_best_bacc = best_bacc
+    
+                    for idx in remaining:
+                        m_info = self.models[idx]
+                        prior_w = m_info["weight"]
+                        u_lp = m_info["unseen_lp"]
+                        solo_s = m_info["solo_unseen_sinkhorn_bacc"]
+    
+                        if solo_s < 0.30 or prior_w <= 0.0:
+                            continue
+    
+                        mults = (0.75, 1.00, 1.25) if solo_s >= 0.38 else (0.25, 0.50, 0.75, 1.00)
+                        for mult in mults:
+                            cand_w = prior_w * mult
+                            trial_lp = cum_u_lp + cand_w * u_lp
+                            obj_val, bacc_val = _composite_obj(trial_lp)
+                            if obj_val > step_best_obj + 1e-6:
+                                step_best_obj = obj_val
+                                step_best_bacc = bacc_val
+                                step_best_idx = idx
+                                step_best_w = cand_w
+    
+                    if step_best_idx is not None and step_best_w > 0.0:
+                        active_weights[step_best_idx] = step_best_w
+                        cum_u_lp = cum_u_lp + step_best_w * self.models[step_best_idx]["unseen_lp"]
+                        best_obj = step_best_obj
+                        best_bacc = step_best_bacc
+                        remaining.remove(step_best_idx)
+                    else:
+                        break
+    
+        if not lock_prior_weights:
+            # Post-loop enforcement:
+            # 1. Enforce 0.75 * prior_weight floor on all validated models (solo_unseen_sinkhorn_bacc >= 0.38 and weight > 0)
+            #    so nlm_pool_v5 holdout leakage on qwen3_14b_v5 never zeroes out Part-2, in-house, DeBERTa, or LinearSVC!
+            # 2. Prune any model with solo_unseen_sinkhorn_bacc < 0.30 or weight <= 0 to strictly 0.0.
+            for idx, m_info in enumerate(self.models):
+                if m_info["solo_unseen_sinkhorn_bacc"] < 0.30 or m_info["weight"] <= 0.0:
+                    active_weights[idx] = 0.0
+                elif m_info["solo_unseen_sinkhorn_bacc"] >= 0.38 and m_info["weight"] > 0.0:
+                    active_weights[idx] = max(active_weights[idx], 0.75 * m_info["weight"])
 
         weights_map: Dict[str, float] = {}
         logit_flat = np.zeros((self.N_test, K), dtype=np.float64)

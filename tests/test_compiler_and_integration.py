@@ -651,17 +651,17 @@ class TestCompilerAndIntegration(unittest.TestCase):
         self.assertIn("qwen25_14b_p2", mock_ckpts)
 
     def test_evaluate_from_cache_preserves_validated_models_and_prunes_broken(self):
-        """Verify offline cache evaluator retains >= 0.75 * prior_weight on validated models and 0.0 on broken models."""
+        """Verify offline cache evaluator retains >= 0.75 * prior_weight on validated models and 0.0 on broken/pruned models."""
         from scripts.evaluate_local import evaluate_from_cache
         cache_path = Path("local_data/local_eval_cache.npz")
         if cache_path.exists():
             res = evaluate_from_cache(cache_path)
             w = res["weights_map"]
-            self.assertGreater(w.get("Qwen3-14B Part-2", 0.0), 0.30)
-            self.assertGreater(w.get("Qwen2.5-14B Part-2", 0.0), 0.20)
-            self.assertGreater(w.get("LinearSVC (4-View)", 0.0), 0.40)
-            self.assertEqual(w.get("Qwen3-8B Claude Head", 0.0), 0.0)
-            self.assertEqual(w.get("DeBERTa-v3-Large", 0.0), 0.0)
+            self.assertGreater(w.get("qwen3_14b_p2", 0.0), 0.30)
+            self.assertEqual(w.get("qwen25_14b_p2", 0.0), 0.0)
+            self.assertGreater(w.get("svc_4view", 0.0), 0.40)
+            self.assertEqual(w.get("qwen3_8b_claude", 0.0), 0.0)
+            self.assertEqual(w.get("deberta_p2", 0.0), 0.0)
 
 if __name__ == "__main__":
     unittest.main()
