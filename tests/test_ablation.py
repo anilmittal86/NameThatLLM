@@ -30,6 +30,10 @@ def test_text_hash_normalization():
     assert h1 == h2, "Whitespace normalization must make hashes identical."
     assert h1 != h3, "Different texts must yield different hashes."
     assert len(h1) == 40, "SHA-1 hash must be 40 hexadecimal characters."
+    t4 = "**Hello world! This is a test.**"
+    t5 = "Hello \u00a0 world! This is a test."
+    assert _text_hash(t4) == h1, "Markdown bold wrapper must be stripped."
+    assert _text_hash(t5) == h1, "NFKC normalization must collapse non-breaking space."
 
 
 def test_compute_centered_logits_handles_negative_and_string_groups():

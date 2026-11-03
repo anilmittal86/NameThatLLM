@@ -43,8 +43,11 @@ def _fast_sinkhorn_bacc(lp_mat: np.ndarray, y_true: np.ndarray, iters: int = 40)
     return float(balanced_accuracy_score(y_true, P.argmax(axis=1)))
 
 def _text_hash(text: str) -> str:
-    """Normalized SHA1 hash of whitespace-collapsed text to guarantee zero exact/near-exact leakage."""
-    norm = " ".join(str(text).strip().split())
+    """Normalized SHA1 hash of NFKC whitespace-collapsed text to guarantee zero exact/near-exact leakage."""
+    import re, unicodedata
+    s = unicodedata.normalize("NFKC", str(text or "")).strip()
+    s = re.sub(r"^\*\*(.*)\*\*$", r"\1", s).strip()
+    norm = " ".join(s.split())
     return hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
 
 def build_unseen_holdout_dataset(
@@ -88,11 +91,53 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
 
-    # 3. Collect candidate passages from external/harvest/clean corpora
+    # 3. Collect candidate passages in canonical trainer quarantine order
     candidate_dfs = []
     seen_paths = set()
 
-    # Priority 1: Check files whose path (filename or directory) mentions openrouter, harvest, passages, or generations
+    def _process_candidate_file(p: Path) -> Optional[pd.DataFrame]:
+        try:
+            df_c = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+            if "label" in df_c.columns and "model" not in df_c.columns:
+                df_c = df_c.rename(columns={"label": "model"})
+            finish_col = next((c for c in ["finish_reason", "finish"] if c in df_c.columns), None)
+            if finish_col:
+                df_c = df_c[df_c[finish_col].astype(str).str.lower().eq("stop")]
+                df_c = df_c[df_c["text"].fillna("").astype(str).str.split().str.len().between(25, 360)]
+            if "text" in df_c.columns and "model" in df_c.columns:
+                keep_cols = [c for c in ["id", "prompt_id", "text", "model"] if c in df_c.columns]
+                df_c = df_c[keep_cols].dropna(subset=["text", "model"]).copy()
+                df_c = df_c[df_c["model"].isin(LABELS)]
+                df_c["_hash"] = [_text_hash(t) for t in df_c["text"]]
+                df_c = df_c[~df_c["_hash"].isin(contaminated_hashes)]
+                if len(df_c) > 0:
+                    return df_c
+        except Exception:
+            pass
+        return None
+
+    candidate_patterns = [
+        "nlm_matched_clean.parquet",
+        "nlm_pool_v5.parquet",
+        "nlm_pool_v2.parquet",
+        "*openrouter*.parquet",
+        "*openrouter*.csv",
+        "*harvest*.parquet",
+        "*harvest*.csv",
+    ]
+    for pat in candidate_patterns:
+        for p in input_dir.rglob(pat):
+            if p in seen_paths:
+                continue
+            p_name = p.name.lower()
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+                continue
+            seen_paths.add(p)
+            df_c = _process_candidate_file(p)
+            if df_c is not None:
+                candidate_dfs.append(df_c)
+
+    # Also scan any directory or file matching openrouter, harvest, passages, generations
     for ext in ["*.parquet", "*.csv"]:
         for p in input_dir.rglob(ext):
             if p in seen_paths:
@@ -103,22 +148,11 @@ def build_unseen_holdout_dataset(
                 continue
             if any(k in p_str for k in ["openrouter", "harvest", "passages", "generations"]):
                 seen_paths.add(p)
-                try:
-                    df_c = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-                    if "label" in df_c.columns and "model" not in df_c.columns:
-                        df_c = df_c.rename(columns={"label": "model"})
-                    if "text" in df_c.columns and "model" in df_c.columns:
-                        keep_cols = [c for c in ["id", "prompt_id", "text", "model"] if c in df_c.columns]
-                        df_c = df_c[keep_cols].dropna(subset=["text", "model"]).copy()
-                        df_c = df_c[df_c["model"].isin(LABELS)]
-                        df_c["_hash"] = [_text_hash(t) for t in df_c["text"]]
-                        df_c = df_c[~df_c["_hash"].isin(contaminated_hashes)]
-                        if len(df_c) > 0:
-                            candidate_dfs.append(df_c)
-                except Exception:
-                    pass
+                df_c = _process_candidate_file(p)
+                if df_c is not None:
+                    candidate_dfs.append(df_c)
 
-    # Priority 2: Fallback to any other non-training parquet/csv (e.g. nlm_matched_clean, nlm_pool_v5, nlm_pool_v2)
+    # Fallback to any remaining non-training parquet/csv if still empty
     if not candidate_dfs:
         for ext in ["*.parquet", "*.csv"]:
             for p in input_dir.rglob(ext):
@@ -128,20 +162,9 @@ def build_unseen_holdout_dataset(
                 if any(x in p_name for x in ["train", "test", "submission", "pool_v4", "pool_v1"]):
                     continue
                 seen_paths.add(p)
-                try:
-                    df_c = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-                    if "label" in df_c.columns and "model" not in df_c.columns:
-                        df_c = df_c.rename(columns={"label": "model"})
-                    if "text" in df_c.columns and "model" in df_c.columns:
-                        keep_cols = [c for c in ["id", "prompt_id", "text", "model"] if c in df_c.columns]
-                        df_c = df_c[keep_cols].dropna(subset=["text", "model"]).copy()
-                        df_c = df_c[df_c["model"].isin(LABELS)]
-                        df_c["_hash"] = [_text_hash(t) for t in df_c["text"]]
-                        df_c = df_c[~df_c["_hash"].isin(contaminated_hashes)]
-                        if len(df_c) > 0:
-                            candidate_dfs.append(df_c)
-                except Exception:
-                    pass
+                df_c = _process_candidate_file(p)
+                if df_c is not None:
+                    candidate_dfs.append(df_c)
 
     if not candidate_dfs:
         return pd.DataFrame(columns=["id", "prompt_id", "text", "model", "_hash"]), set()
@@ -157,14 +180,21 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
     strictly_disjoint = df_pool_unseen[~df_pool_unseen["_hash"].isin(v5_hashes)]
-    if strictly_disjoint["model"].nunique() >= 10 and len(strictly_disjoint) >= 36:
+    if (
+        strictly_disjoint["model"].nunique() == K
+        and (strictly_disjoint["model"].value_counts() >= samples_per_class).all()
+    ):
         df_pool_unseen = strictly_disjoint
 
     # Stratified balanced sampling across all 18 classes
+    # Per-class disjoint preference: for each class m in LABELS, use strictly_disjoint
+    # if it has >= samples_per_class rows for class m; otherwise use df_pool_unseen!
     rng = np.random.RandomState(seed)
     sampled_parts = []
     for m in LABELS:
-        sub = df_pool_unseen[df_pool_unseen["model"] == m]
+        sub_dis = strictly_disjoint[strictly_disjoint["model"] == m]
+        sub_all = df_pool_unseen[df_pool_unseen["model"] == m]
+        sub = sub_dis if len(sub_dis) >= samples_per_class else (sub_dis if len(sub_dis) >= len(sub_all) else sub_all)
         if len(sub) > 0:
             n_take = min(samples_per_class, len(sub))
             idx = rng.choice(sub.index.values, size=n_take, replace=False)

@@ -472,6 +472,94 @@ def print_npz_ablation_diagnostics(
         print(f"{name:<25} | {w:<10.2f} | {loo_bacc:<9.4f} | {sign_bacc:<18} | {loo_nll:<8.4f} | {sign_nll:<10} | {verdict:<15}")
     print("=" * 115)
 
+    print_per_class_accuracy_table(auditor, active_weights_map)
+
+
+def print_per_class_accuracy_table(
+    auditor: UnseenStepwiseAuditor,
+    active_weights_map: Dict[str, float],
+) -> pd.DataFrame:
+    """
+    Table D: Per-Class Accuracy (Recall) across all 18 classes for every model in the cache
+    plus the calibrated ensemble, alongside the Top Confused Sister/Cross-Family class per author.
+    """
+    from sklearn.metrics import confusion_matrix
+
+    y_true = auditor.y_unseen
+    models = auditor.models
+    if len(y_true) < 18 or len(models) == 0:
+        return pd.DataFrame()
+
+    # Compute Clean Ensemble (excluding leaked v5 models if non-v5 models exist) and Full Ensemble
+    clean_models = [m for m in models if "v5" not in m["name"].lower() and float(active_weights_map.get(m["name"], m["weight"])) > 0]
+    eval_models = clean_models if len(clean_models) >= 2 else [m for m in models if float(active_weights_map.get(m["name"], m["weight"])) > 0]
+
+    ens_lp = np.zeros((len(y_true), K), dtype=np.float64)
+    for m in eval_models:
+        w = float(active_weights_map.get(m["name"], m["weight"]))
+        if w > 0:
+            ens_lp += w * m["unseen_lp"]
+    P_ens = softmax(ens_lp, axis=1)
+    for _ in range(60):
+        P_ens /= np.maximum(P_ens.sum(axis=0, keepdims=True), 1e-12) / float(K)
+        P_ens /= np.maximum(P_ens.sum(axis=1, keepdims=True), 1e-12)
+    ens_preds = P_ens.argmax(axis=1)
+
+    # Per-model predictions after 60-step Sinkhorn
+    model_preds: Dict[str, np.ndarray] = {}
+    for m in models:
+        P_m = softmax(m["unseen_lp"], axis=1)
+        for _ in range(60):
+            P_m /= np.maximum(P_m.sum(axis=0, keepdims=True), 1e-12) / float(K)
+            P_m /= np.maximum(P_m.sum(axis=1, keepdims=True), 1e-12)
+        model_preds[m["name"]] = P_m.argmax(axis=1)
+
+    cm_ens = confusion_matrix(y_true, ens_preds, labels=list(range(K)))
+
+    print("\n" + "=" * 130)
+    print(" TABLE D: PER-CLASS ACCURACY (RECALL) ACROSS ALL 18 AUTHOR CLASSES & TOP CONFUSED SISTER PAIRS")
+    print("=" * 130)
+
+    # Short column headers for each model
+    m_names = [m["name"] for m in models]
+    short_hdrs = [n[:12] for n in m_names]
+    hdr_str = " | ".join(f"{h:<12}" for h in short_hdrs)
+    print(f"{'Class / Author Label':<24} | {'N':<3} | {hdr_str} | {'Clean Ens':<10} | {'Most Confused With (Ens)'}")
+    print("-" * 130)
+
+    rows_out = []
+    for c_idx, label in enumerate(LABELS):
+        mask_c = (y_true == c_idx)
+        n_c = int(mask_c.sum())
+        rec_ens = float((ens_preds[mask_c] == c_idx).mean()) if n_c > 0 else 0.0
+
+        # Find top confused class in ensemble
+        row_cm = cm_ens[c_idx].copy()
+        row_cm[c_idx] = 0
+        if row_cm.sum() > 0:
+            top_err_idx = int(row_cm.argmax())
+            top_err_cnt = int(row_cm[top_err_idx])
+            confused_str = f"{LABELS[top_err_idx]} ({top_err_cnt}/{n_c})"
+        else:
+            confused_str = "None (100%)"
+
+        m_rec_strs = []
+        row_dict = {"class_idx": c_idx, "label": label, "n_samples": n_c, "clean_ens_bacc": rec_ens}
+        for m_name in m_names:
+            r_m = float((model_preds[m_name][mask_c] == c_idx).mean()) if n_c > 0 else 0.0
+            row_dict[m_name] = r_m
+            m_rec_strs.append(f"{r_m:<12.4f}")
+
+        print(f"{label:<24} | {n_c:<3d} | {' | '.join(m_rec_strs)} | {rec_ens:<10.4f} | {confused_str}")
+        rows_out.append(row_dict)
+
+    print("-" * 130)
+    mean_m_strs = [f"{float(np.mean([r[m_name] for r in rows_out])):<12.4f}" for m_name in m_names]
+    mean_ens = float(np.mean([r["clean_ens_bacc"] for r in rows_out]))
+    print(f"{'MEAN BALANCED ACCURACY':<24} | {len(y_true):<3d} | {' | '.join(mean_m_strs)} | {mean_ens:<10.4f} |")
+    print("=" * 130)
+    return pd.DataFrame(rows_out)
+
 
 
 def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:

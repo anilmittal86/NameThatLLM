@@ -55,8 +55,11 @@ def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
 
 def _text_hash(text: str) -> str:
-    """Normalized SHA1 hash of whitespace-collapsed text to guarantee zero exact/near-exact leakage."""
-    norm = " ".join(str(text).strip().split())
+    """Normalized SHA1 hash of NFKC whitespace-collapsed text to guarantee zero exact/near-exact leakage."""
+    import re, unicodedata
+    s = unicodedata.normalize("NFKC", str(text or "")).strip()
+    s = re.sub(r"^\*\*(.*)\*\*$", r"\1", s).strip()
+    norm = " ".join(s.split())
     return hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
 
 def _norm_text_key(value: Any) -> str:
