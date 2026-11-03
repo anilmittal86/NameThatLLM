@@ -320,6 +320,141 @@ def generate_synthetic_cache(
     return output_path
 
 
+
+def print_npz_ablation_diagnostics(
+    auditor: UnseenStepwiseAuditor,
+    active_weights_map: Dict[str, float],
+) -> None:
+    """
+    Comprehensive .npz Ablation Diagnostics:
+    - Table A: Effective Vote Share & Logit Scale Audit (Nominal vs. Actual Impact).
+    - Table B: Pairwise Prediction Agreement & Error-Rescue Matrix vs. 14B Anchor.
+    - Table C: Leave-One-Out (LOO) & Clean-Subset Ablation (Disjoint Non-v5 Subset).
+    """
+    y_unseen = auditor.y_unseen
+    models = auditor.models
+    if len(y_unseen) < 18 or len(models) == 0:
+        return
+
+    print("\n" + "=" * 115)
+    print(" TABLE A: EFFECTIVE VOTE SHARE & LOGIT SCALE AUDIT (Why Nominal Weights Mislead)")
+    print("=" * 115)
+    print(f"{'Model / Checkpoint':<25} | {'Nominal Wt':<10} | {'LP_std':<8} | {'Gap (1-2)':<9} | {'Effective Share':<15} | {'Learned Wt':<10} | {'Solo BAcc':<9} | {'Sink BAcc':<9}")
+    print("-" * 115)
+
+    eff_powers = []
+    for m in models:
+        u_lp = m["unseen_lp"]
+        w = float(m.get("prior_weight", m["weight"]))
+        lp_std = float(u_lp.std(axis=1).mean()) if len(u_lp) > 0 else 0.0
+        eff_powers.append(w * lp_std)
+    total_eff_power = sum(eff_powers)
+
+    for idx, m in enumerate(models):
+        name = m["name"]
+        w_nom = float(m.get("prior_weight", m["weight"]))
+        w_learned = float(active_weights_map.get(name, m["weight"]))
+        u_lp = m["unseen_lp"]
+        lp_std = float(u_lp.std(axis=1).mean()) if len(u_lp) > 0 else 0.0
+        sorted_lp = np.sort(u_lp, axis=1) if len(u_lp) > 0 else np.zeros((0, 2))
+        gap = float(np.mean(sorted_lp[:, -1] - sorted_lp[:, -2])) if len(sorted_lp) > 0 else 0.0
+        eff_share = (eff_powers[idx] / max(1e-9, total_eff_power)) * 100.0
+        solo_raw = float(m.get("solo_unseen_bacc", 0.0))
+        solo_sink = float(m.get("solo_unseen_sinkhorn_bacc", 0.0))
+
+        print(f"{name:<25} | {w_nom:<10.2f} | {lp_std:<8.3f} | {gap:<9.3f} | {eff_share:<14.1f}% | {w_learned:<10.2f} | {solo_raw:<9.4f} | {solo_sink:<9.4f}")
+    print("=" * 115)
+
+    print("\n" + "=" * 115)
+    print(" TABLE B: PAIRWISE PREDICTION AGREEMENT & ERROR-RESCUE MATRIX (vs Primary 14B Anchor)")
+    print("=" * 115)
+    anchor_idx = None
+    for i, m in enumerate(models):
+        if "14B Part-2" in m["name"] or "qwen3_14b_p2" in m["name"]:
+            anchor_idx = i
+            break
+    if anchor_idx is None:
+        cand_14b = [i for i, m in enumerate(models) if "14b" in m["name"].lower()]
+        anchor_idx = max(cand_14b, key=lambda i: models[i]["weight"]) if cand_14b else 0
+
+    anchor_m = models[anchor_idx]
+    anchor_name = anchor_m["name"]
+    anchor_preds = anchor_m["unseen_lp"].argmax(axis=1)
+    anchor_wrong = (anchor_preds != y_unseen)
+    n_anchor_err = int(anchor_wrong.sum())
+
+    print(f"Primary Anchor: {anchor_name} | Total Unseen Errors: {n_anchor_err}/{len(y_unseen)} ({n_anchor_err/len(y_unseen)*100.0:.1f}%)")
+    print("-" * 115)
+    print(f"{'Model / Checkpoint':<25} | {'Tier':<6} | {'Solo BAcc':<9} | {'Agreement w/ Anchor':<21} | {'Errors Rescued':<16} | {'Rescue Rate':<11}")
+    print("-" * 115)
+
+    for m in models:
+        name = m["name"]
+        tier = m["tier"]
+        u_lp = m["unseen_lp"]
+        preds = u_lp.argmax(axis=1) if len(u_lp) > 0 else np.array([])
+        solo_bacc = float(m.get("solo_unseen_bacc", 0.0))
+        agree_pct = float(np.mean(preds == anchor_preds) * 100.0) if len(preds) > 0 else 0.0
+        rescued = int((anchor_wrong & (preds == y_unseen)).sum()) if len(preds) > 0 else 0
+        rescue_rate = (rescued / max(1, n_anchor_err)) * 100.0
+
+        is_anchor_mark = " (Anchor)" if name == anchor_name else ""
+        print(f"{name + is_anchor_mark:<25} | {tier:<6} | {solo_bacc:<9.4f} | {agree_pct:<20.1f}% | {rescued:>3d} / {n_anchor_err:<8d} | {rescue_rate:<10.1f}%")
+    print("=" * 115)
+
+    print("\n" + "=" * 115)
+    print(" TABLE C: LEAVE-ONE-OUT (LOO) & CLEAN-SUBSET ABLATION (Excluding nlm_pool_v5 Contamination)")
+    print("=" * 115)
+
+    clean_models = [m for m in models if "v5" not in m["name"].lower()]
+    print(f"Clean Disjoint Subset: {len(clean_models)} models ([{', '.join(m['name'] for m in clean_models)}])")
+    print("-" * 115)
+
+    def _eval_subset_lp(subset_lps, weights):
+        if not subset_lps:
+            return 0.0, 99.0
+        cum_lp = np.zeros_like(subset_lps[0], dtype=np.float64)
+        for lp_i, w_i in zip(subset_lps, weights):
+            if w_i > 0:
+                cum_lp += w_i * lp_i
+        P = softmax(cum_lp, axis=1)
+        P_s = P.copy()
+        for _ in range(100):
+            P_s = P_s / np.maximum(P_s.sum(axis=0, keepdims=True), 1e-12) / 18.0
+            P_s = P_s / np.maximum(P_s.sum(axis=1, keepdims=True), 1e-12)
+        bacc = float(balanced_accuracy_score(y_unseen, P_s.argmax(axis=1)))
+        nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(y_unseen)), y_unseen], 1e-9, 1.0))))
+        return bacc, nll
+
+    clean_lps = [m["unseen_lp"] for m in clean_models]
+    clean_ws = [float(active_weights_map.get(m["name"], m["weight"])) for m in clean_models]
+
+    base_clean_bacc, base_clean_nll = _eval_subset_lp(clean_lps, clean_ws)
+    print(f"Clean Subset Baseline: Sinkhorn BAcc = {base_clean_bacc:.4f} | NLL = {base_clean_nll:.4f}")
+    print("-" * 115)
+    print(f"{'Excluded Model':<25} | {'Active Wt':<10} | {'LOO BAcc':<9} | {'Delta BAcc (Drop)':<18} | {'LOO NLL':<8} | {'Delta NLL':<10} | {'Verdict':<15}")
+    print("-" * 115)
+
+    for i, m in enumerate(clean_models):
+        name = m["name"]
+        w = clean_ws[i]
+        if w <= 0.0:
+            print(f"{name:<25} | {w:<10.2f} | {'N/A':<9} | {'N/A':<18} | {'N/A':<8} | {'N/A':<10} | {'Already Pruned':<15}")
+            continue
+
+        loo_lps = [lp for j, lp in enumerate(clean_lps) if j != i]
+        loo_ws = [wt for j, wt in enumerate(clean_ws) if j != i]
+        loo_bacc, loo_nll = _eval_subset_lp(loo_lps, loo_ws)
+        delta_bacc = base_clean_bacc - loo_bacc
+        delta_nll = loo_nll - base_clean_nll
+
+        verdict = "Essential (+)" if delta_bacc > 0.005 else "Beneficial (+)" if delta_bacc >= 0.000 else "Neutral/Hurts (-)"
+        sign_bacc = f"+{delta_bacc:.4f}" if delta_bacc >= 0 else f"{delta_bacc:.4f}"
+        sign_nll = f"+{delta_nll:.4f}" if delta_nll >= 0 else f"{delta_nll:.4f}"
+        print(f"{name:<25} | {w:<10.2f} | {loo_bacc:<9.4f} | {sign_bacc:<18} | {loo_nll:<8.4f} | {sign_nll:<10} | {verdict:<15}")
+    print("=" * 115)
+
+
 def evaluate_from_cache(
     cache_path: Path,
     config_path: Optional[Path] = None,
@@ -460,6 +595,7 @@ def evaluate_from_cache(
 
         test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
         df_report = auditor.print_and_save_report(report_dir, final_test_preds=test_final_preds)
+        print_npz_ablation_diagnostics(auditor, active_weights_map)
 
     replay_time = time.time() - t0
     print(f"\n[Cache Evaluator] Replay completed in {replay_time:.4f}s across {len(model_names)} models and {num_extra} extra streams!")

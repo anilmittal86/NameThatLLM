@@ -246,9 +246,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     cfg_model_weights = cfg.get("model_weights", {})
     DEFAULT_ALLOWED_CKPTS = {
         "qwen3_14b_p2", "qwen3_14b_v5", "qwen3_14b_inhouse",
-        "qwen25_14b_p2", "qwen25_14b_inhouse",
         "deberta_p2", "deberta_inhouse",
-        "qwen3_8b_v5", "qwen3_8b_claude", "llama3_8b_v5",
+        "qwen3_8b_claude",
     }
     if "required_checkpoints" in req_assets or "optional_checkpoints" in req_assets:
         allowed_ckpts = set(req_assets.get("required_checkpoints", [])) | set(req_assets.get("optional_checkpoints", []))

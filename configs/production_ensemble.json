@@ -20,39 +20,29 @@
     "require_pool_parquet": true,
     "required_base_models": [
       { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 },
-      { "name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48 },
       { "name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36 },
       { "name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24 }
     ],
     "required_checkpoints": [
       "qwen3_14b_p2",
-      "qwen25_14b_p2",
       "deberta_p2",
       "qwen3_8b_claude"
     ],
     "optional_checkpoints": [
       "qwen3_14b_v5",
-      "qwen3_14b_inhouse",
-      "qwen25_14b_inhouse",
-      "deberta_inhouse",
-      "qwen3_8b_v5",
-      "llama3_8b_v5"
+      "qwen3_14b_inhouse"
     ]
   },
   "model_weights": {
     "qwen3_14b_v5":       { "plain_weight": 0.45, "twin_weight": 0.15 },
     "qwen3_14b_p2":       { "plain_weight": 0.38, "twin_weight": 0.14 },
-    "qwen3_14b_inhouse":  { "plain_weight": 0.40, "twin_weight": 0.14 },
-    "qwen25_14b_p2":      { "plain_weight": 0.28, "twin_weight": 0.10 },
-    "qwen25_14b_inhouse": { "plain_weight": 0.28, "twin_weight": 0.10 },
-    "deberta_p2":         { "plain_weight": 0.26, "twin_weight": 0.10 },
+    "qwen3_14b_inhouse":  { "plain_weight": 0.38, "twin_weight": 0.14 },
+    "deberta_p2":         { "plain_weight": 0.28, "twin_weight": 0.10 },
     "deberta_inhouse":    { "plain_weight": 0.24, "twin_weight": 0.08 },
-    "qwen3_8b_v5":        { "plain_weight": 0.26, "twin_weight": 0.09 },
-    "llama3_8b_v5":       { "plain_weight": 0.22, "twin_weight": 0.08 },
-    "svc_4view":          { "plain_weight": 0.35, "twin_weight": 0.00 },
-    "lexical_5v":         { "plain_weight": 0.10, "twin_weight": 0.00 },
-    "wpca_dp":            { "plain_weight": 0.30, "twin_weight": 0.00 },
-    "spectral_bank":      { "plain_weight": 0.15, "twin_weight": 0.00 },
+    "svc_4view":          { "plain_weight": 1.25, "twin_weight": 0.00 },
+    "lexical_5v":         { "plain_weight": 0.25, "twin_weight": 0.00 },
+    "wpca_dp":            { "plain_weight": 0.35, "twin_weight": 0.00 },
+    "spectral_bank":      { "plain_weight": 0.20, "twin_weight": 0.00 },
     "qwen3_8b_claude":    { "plain_weight": 0.00, "twin_weight": 0.00 }
   },
   "main_stack": {
@@ -60,11 +50,6 @@
     "members": {
       "lora_qwen3_14b": {
         "plain_weight": 0.40,
-        "twin_weight": 0.10,
-        "twin_clustering": "groups_085"
-      },
-      "lora_qwen25_14b": {
-        "plain_weight": 0.20,
         "twin_weight": 0.10,
         "twin_clustering": "groups_085"
       },
@@ -83,7 +68,6 @@
     },
     "lora_members": {
       "lora_qwen3_14b": { "plain_weight": 0.30, "twin_weight": 0.10 },
-      "lora_qwen25_14b": { "plain_weight": 0.20, "twin_weight": 0.08 },
       "ntl_claude_head": { "plain_weight": 0.14, "twin_weight": 0.05 },
       "deberta_v3_large": { "plain_weight": 0.18, "twin_weight": 0.06 }
     },
