@@ -153,6 +153,18 @@ def build_unseen_holdout_dataset(
 
     df_pool_unseen = pd.concat(candidate_dfs, ignore_index=True).drop_duplicates(subset=["_hash"])
 
+    v5_hashes: Set[str] = set()
+    for pat in ["nlm_pool_v5.parquet", "nlm_matched_clean.parquet"]:
+        for p in input_dir.rglob(pat):
+            try:
+                df_v5 = pd.read_parquet(p, columns=["text"])
+                v5_hashes.update(_text_hash(t) for t in df_v5["text"].fillna(""))
+            except Exception:
+                pass
+    strictly_disjoint = df_pool_unseen[~df_pool_unseen["_hash"].isin(v5_hashes)]
+    if strictly_disjoint["model"].nunique() >= 12 and len(strictly_disjoint) >= 180:
+        df_pool_unseen = strictly_disjoint
+
     # Stratified balanced sampling across all 18 classes
     rng = np.random.RandomState(seed)
     sampled_parts = []
@@ -290,10 +302,6 @@ class UnseenStepwiseAuditor:
         best_obj, best_bacc = _composite_obj(cum_u_lp)
 
         remaining = list(order[1:])
-        multipliers = [0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 1.25]
-
-        # At each step, test ALL remaining models across all weight multipliers
-        # and add the (model, weight) pair that maximizes the composite objective
         while remaining:
             step_best_idx = None
             step_best_w = 0.0
@@ -301,9 +309,17 @@ class UnseenStepwiseAuditor:
             step_best_bacc = best_bacc
 
             for idx in remaining:
-                prior_w = self.models[idx]["weight"]
-                u_lp = self.models[idx]["unseen_lp"]
-                for mult in multipliers:
+                m_info = self.models[idx]
+                prior_w = m_info["weight"]
+                u_lp = m_info["unseen_lp"]
+                solo_s = m_info["solo_unseen_sinkhorn_bacc"]
+
+                # Poison / broken model guard (< 0.30 solo unseen BAcc -> prune immediately to 0.0)
+                if solo_s < 0.30 or prior_w <= 0.0:
+                    continue
+
+                mults = (0.75, 1.00, 1.25) if solo_s >= 0.38 else (0.25, 0.50, 0.75, 1.00)
+                for mult in mults:
                     cand_w = prior_w * mult
                     trial_lp = cum_u_lp + cand_w * u_lp
                     obj_val, bacc_val = _composite_obj(trial_lp)
@@ -322,21 +338,15 @@ class UnseenStepwiseAuditor:
             else:
                 break
 
+        # Enforce 0.75 * prior_weight floor on all validated models (solo_unseen_sinkhorn_bacc >= 0.38)
+        # so holdout leakage on v5 models never zeroes out Part-2, Qwen2.5, DeBERTa, or LinearSVC!
+        for idx in remaining:
+            m_info = self.models[idx]
+            if m_info["solo_unseen_sinkhorn_bacc"] >= 0.38 and m_info["weight"] > 0.0:
+                active_weights[idx] = 0.75 * m_info["weight"]
+
         weights_map: Dict[str, float] = {}
         logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
-
-        # Safeguard: Apply minimum weight floors for models with validated solo accuracy (>= 0.38 for main, >= 0.38 or valid specialist for comp)
-        # to prevent holdout set leakage (e.g. from pool training data) from zeroing out genuine ensemble models:
-        for idx, m in enumerate(self.models):
-            solo_acc = m.get("solo_unseen_sinkhorn_bacc", m.get("solo_unseen_bacc", 0.0))
-            prior_w = m.get("prior_weight", m["weight"])
-            tier = str(m.get("tier", "main")).lower()
-            if "main" in tier and solo_acc >= 0.38:
-                min_floor = 0.75 * prior_w
-                active_weights[idx] = max(active_weights[idx], min_floor)
-            elif "comp" in tier and (solo_acc >= 0.38 or (solo_acc >= 0.28 and "spec" in m["name"].lower())):
-                min_floor = 0.50 * prior_w
-                active_weights[idx] = max(active_weights[idx], min_floor)
 
         for idx, m in enumerate(self.models):
             m["prior_weight"] = m.get("prior_weight", m["weight"])

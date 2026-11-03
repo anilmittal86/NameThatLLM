@@ -6,9 +6,9 @@ Unit and Integration Tests for namethatllm.spectral_bank
 import unittest
 import numpy as np
 
-from namethatllm.spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
+from namethatllm.spectral_bank import fit_joint_spectral_bank, make_spectral_blocks, fit_within_family_spectral_gates
 from namethatllm.wpca_gaussian import fit_shared_gaussian_lowram
-from namethatllm.config import K, PRIOR_SCALES
+from namethatllm.config import K, PRIOR_SCALES, FAMILIES, softmax
 
 class TestSpectralBank(unittest.TestCase):
     def test_make_spectral_blocks(self):
@@ -78,6 +78,35 @@ class TestSpectralBank(unittest.TestCase):
         self.assertEqual(P_spec.shape, (N_te, 18))
         self.assertTrue(np.allclose(P_spec.sum(axis=1), 1.0))
         self.assertGreater(oof_bacc, 0.0)
+
+    def test_fit_within_family_spectral_gates_execution(self):
+        np.random.seed(42)
+        N_tr = 180
+        N_te = 20
+        d = 64
+
+        tr_blocks = [np.random.randn(N_tr, d).astype(np.float32) for _ in range(2)]
+        te_blocks = [np.random.randn(N_te, d).astype(np.float32) for _ in range(2)]
+
+        prompts_sub = np.repeat(np.arange(10), 18)
+        y_sub = np.tile(np.arange(18), 10)
+
+        D_tfidf = np.random.uniform(0.1, 0.9, size=(N_te, N_te))
+        np.fill_diagonal(D_tfidf, 0.0)
+        D_neural = D_tfidf.copy()
+
+        family_gates = fit_within_family_spectral_gates(
+            tr_blocks, te_blocks, y_sub, prompts_sub,
+            D_tfidf=D_tfidf, D_neural_sum=D_neural, D_neural_weight_total=1.0,
+            N_test=N_te, max_cluster_size=14
+        )
+
+        self.assertIsInstance(family_gates, dict)
+        for fam_name, gate_lp in family_gates.items():
+            cols = FAMILIES[fam_name]
+            self.assertEqual(gate_lp.shape, (N_te, len(cols)))
+            p = softmax(gate_lp, axis=1)
+            self.assertTrue(np.allclose(p.sum(axis=1), 1.0, atol=1e-5))
 
 if __name__ == "__main__":
     unittest.main()

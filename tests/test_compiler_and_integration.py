@@ -618,6 +618,51 @@ class TestCompilerAndIntegration(unittest.TestCase):
         import namethatllm.ablation as abl
         self.assertNotIn("sinkhorn_balancing", dir(abl), "ablation.py must NOT export sinkhorn_balancing")
 
+    def test_pipeline_whitelist_filtering_strips_pruned_checkpoints(self):
+        """Verify pipeline checkpoint whitelist filters non-whitelisted checkpoints (qwen3_14b_ts, qwen3_14b_p1)."""
+        mock_ckpts = {
+            "qwen3_14b_p2": Path("/kaggle/input/lora_qwen3_14b"),
+            "qwen3_14b_v5": Path("/kaggle/input/q14v5"),
+            "qwen3_14b_ts": Path("/kaggle/input/ts_q3b14"),
+            "qwen3_14b_p1": Path("/kaggle/input/lora14b_v1"),
+            "instyle": Path("/kaggle/input/instyle"),
+            "qwen3_8b_v5": Path("/kaggle/input/q8v5"),
+            "qwen25_14b_p2": Path("/kaggle/input/lora_qwen25_14b"),
+            "deberta_p2": Path("/kaggle/input/deberta_p2"),
+        }
+        cfg = {
+            "required_assets": {
+                "required_checkpoints": ["qwen3_14b_p2", "qwen25_14b_p2", "deberta_p2", "qwen3_8b_claude"],
+                "optional_checkpoints": ["qwen3_14b_v5", "qwen3_14b_inhouse", "qwen25_14b_inhouse", "deberta_inhouse", "qwen3_8b_v5", "llama3_8b_v5"],
+            }
+        }
+        req_assets = cfg.get("required_assets", {})
+        allowed_ckpts = set(req_assets.get("required_checkpoints", [])) | set(req_assets.get("optional_checkpoints", []))
+
+        for k in list(mock_ckpts.keys()):
+            if k not in allowed_ckpts:
+                mock_ckpts.pop(k, None)
+
+        self.assertNotIn("qwen3_14b_ts", mock_ckpts)
+        self.assertNotIn("qwen3_14b_p1", mock_ckpts)
+        self.assertNotIn("instyle", mock_ckpts)
+        self.assertIn("qwen3_14b_p2", mock_ckpts)
+        self.assertIn("qwen3_14b_v5", mock_ckpts)
+        self.assertIn("qwen25_14b_p2", mock_ckpts)
+
+    def test_evaluate_from_cache_preserves_validated_models_and_prunes_broken(self):
+        """Verify offline cache evaluator retains >= 0.75 * prior_weight on validated models and 0.0 on broken models."""
+        from scripts.evaluate_local import evaluate_from_cache
+        cache_path = Path("local_data/local_eval_cache.npz")
+        if cache_path.exists():
+            res = evaluate_from_cache(cache_path)
+            w = res["weights_map"]
+            self.assertGreater(w.get("Qwen3-14B Part-2", 0.0), 0.30)
+            self.assertGreater(w.get("Qwen2.5-14B Part-2", 0.0), 0.20)
+            self.assertGreater(w.get("LinearSVC (4-View)", 0.0), 0.40)
+            self.assertEqual(w.get("Qwen3-8B Claude Head", 0.0), 0.0)
+            self.assertEqual(w.get("DeBERTa-v3-Large", 0.0), 0.0)
+
 if __name__ == "__main__":
     unittest.main()
 

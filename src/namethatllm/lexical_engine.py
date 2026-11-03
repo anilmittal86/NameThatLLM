@@ -225,7 +225,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     len_tr_raw = len(df_tr)
 
     # 1. Compute stopword TF-IDF distance matrix and topic clusters (t=0.85) on test
-    Xt_tfidf = TfidfVectorizer(stop_words='english', sublinear_tf=True, max_features=100000, dtype=np.float32).fit_transform(test_texts)
+    Xt_tfidf = TfidfVectorizer(
+        stop_words='english',
+        sublinear_tf=True,
+        min_df=2 if len(test_texts) >= 20 else 1,
+        max_df=0.08 if len(test_texts) >= 50 else 1.0,
+        max_features=100000,
+        dtype=np.float32
+    ).fit_transform(test_texts)
     if len(test_texts) >= 2:
         D = np.clip(1.0 - (Xt_tfidf @ Xt_tfidf.T).toarray(), 0.0, None)
         np.fill_diagonal(D, 0.0)

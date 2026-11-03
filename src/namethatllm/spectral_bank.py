@@ -103,3 +103,64 @@ def fit_joint_spectral_bank(
 
     return P_spectral, oof_bacc
 
+def fit_within_family_spectral_gates(
+    spectral_tr_blocks: List[np.ndarray],
+    spectral_te_blocks: List[np.ndarray],
+    y_sub: np.ndarray,
+    prompts_sub: np.ndarray,
+    D_tfidf: np.ndarray,
+    D_neural_sum: np.ndarray,
+    D_neural_weight_total: float,
+    N_test: int,
+    max_cluster_size: int = 14,
+) -> Dict[str, np.ndarray]:
+    """
+    Fits plain + prompt-centered LogisticRegression sibling specialist gates
+    on the stacked cross-backbone spectral features for each provider family
+    ('gpt', 'gemini', 'claude', 'glm').
+    Returns dict mapping family_name -> (N_test, len(fam_cols)) log-probabilities.
+    """
+    from .config import FAMILIES, log_softmax
+    if len(spectral_tr_blocks) == 0 or N_test == 0:
+        return {}
+    X_tr = np.hstack(spectral_tr_blocks)
+    X_te = np.hstack(spectral_te_blocks)
+
+    X_tr_c = X_tr.copy()
+    for p in np.unique(prompts_sub):
+        m = (prompts_sub == p)
+        if m.sum() > 1:
+            X_tr_c[m] -= X_tr_c[m].mean(axis=0, keepdims=True)
+
+    X_te_c = X_te.copy()
+    D_neural_final = D_neural_sum / max(1e-6, D_neural_weight_total) if D_neural_weight_total > 0 else D_tfidf
+    D_hybrid_final = 0.55 * D_tfidf + 0.45 * D_neural_final
+    g65 = fcluster(linkage(squareform(D_hybrid_final, checks=False), method="average"), t=0.65, criterion="distance") if N_test >= 2 else np.ones(N_test, dtype=int)
+    safe_groups = split_oversized_clusters_dist(D_hybrid_final, g65, max_cluster_size=max_cluster_size)
+    if N_test >= 2:
+        for g in np.unique(safe_groups):
+            m = (safe_groups == g)
+            if m.sum() > 1:
+                X_te_c[m] -= X_te_c[m].mean(axis=0, keepdims=True)
+            else:
+                X_te_c[m] = 0.0
+    else:
+        X_te_c = np.zeros_like(X_te)
+
+    family_gates: Dict[str, np.ndarray] = {}
+    for fam_name, fam_cols in FAMILIES.items():
+        mask_tr = np.isin(y_sub, fam_cols)
+        if mask_tr.sum() >= 30 and len(np.unique(y_sub[mask_tr])) == len(fam_cols):
+            sub_y = np.array([fam_cols.index(int(c)) for c in y_sub[mask_tr]], dtype=int)
+            clf_p = LogisticRegression(C=0.10, max_iter=1000, class_weight="balanced", random_state=42)
+            clf_p.fit(X_tr[mask_tr], sub_y)
+            lp_p = clf_p.predict_log_proba(X_te)
+
+            clf_c = LogisticRegression(C=0.06, max_iter=1000, class_weight="balanced", random_state=42)
+            clf_c.fit(X_tr_c[mask_tr], sub_y)
+            lp_c = clf_c.predict_log_proba(X_te_c)
+
+            family_gates[fam_name] = log_softmax(0.65 * lp_p + 0.35 * lp_c, axis=1)
+    return family_gates
+
+

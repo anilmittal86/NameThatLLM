@@ -8,12 +8,77 @@ and official 300-step exact multiplicative Sinkhorn mass balancing.
 
 import re
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import pandas as pd
 
-from .config import LABELS, K, LAB2I, FAMILIES, softmax
+from .config import LABELS, K, LAB2I, FAMILIES, softmax, log_softmax
 from .lexical_engine import extract_handwriting_and_orthographic_features
+
+def apply_all_family_confidence_gates(
+    P_mix: np.ndarray,
+    family_gates: Optional[Dict[str, np.ndarray]],
+    max_strength: float = 0.20,
+    margin_thr: float = 0.45,
+) -> np.ndarray:
+    """
+    Confidence-aware within-family sibling reranker across all 4 families
+    ('gpt', 'gemini', 'claude', 'glm'). Preserves exact family probability mass
+    while resolving low-margin sibling confusions.
+    """
+    if not family_gates:
+        return P_mix
+    P_out = P_mix.astype(np.float64).copy()
+    for fam_name, gate_lp in family_gates.items():
+        if fam_name not in FAMILIES:
+            continue
+        cols = FAMILIES[fam_name]
+        if gate_lp is None or gate_lp.shape != (len(P_out), len(cols)):
+            continue
+        sub_p = np.clip(P_out[:, cols], 1e-12, 1.0)
+        tot_mass = sub_p.sum(axis=1, keepdims=True)
+        base_rel_p = sub_p / tot_mass
+        sp = np.sort(base_rel_p, axis=1)
+        margin = sp[:, -1] - sp[:, -2]
+        strength = np.clip((margin_thr - margin) / max(margin_thr, 1e-6), 0.0, 1.0)[:, None] * float(max_strength)
+        base_lp = np.log(np.clip(base_rel_p, 1e-12, 1.0))
+        gate_p = softmax(gate_lp, axis=1)
+        gate_lp_norm = np.log(np.clip(gate_p, 1e-12, 1.0))
+        mixed_rel_p = softmax((1.0 - strength) * base_lp + strength * gate_lp_norm, axis=1)
+        P_out[:, cols] = tot_mass * mixed_rel_p
+    return P_out / P_out.sum(axis=1, keepdims=True).clip(min=1e-12)
+
+def apply_cluster_uniqueness_repulsion(
+    P_mix: np.ndarray,
+    groups: Optional[np.ndarray],
+    strength: float = 0.35,
+    iters: int = 3,
+) -> np.ndarray:
+    """
+    Enforces soft at-most-once author uniqueness within each detected test prompt
+    cluster (2 <= size <= 18) via cavity mean-field repulsion before global Sinkhorn.
+    """
+    N = len(P_mix)
+    if N < 18 or groups is None or len(groups) != N or strength <= 0.0:
+        return P_mix
+    _, inv_g = np.unique(np.asarray(groups, dtype=str), return_inverse=True)
+    safe_g = inv_g + 1
+    sz = np.bincount(safe_g)[safe_g]
+    valid_g = np.unique(safe_g[(sz >= 2) & (sz <= 18)])
+    if len(valid_g) == 0:
+        return P_mix
+
+    log_P0 = np.log(np.clip(P_mix.astype(np.float64), 1e-12, 1.0))
+    q = P_mix.astype(np.float64).copy()
+    for _ in range(iters):
+        L = log_P0.copy()
+        for g in valid_g:
+            m = (safe_g == g)
+            q_g = q[m]
+            lo = np.log(np.clip(1.0 - q_g, 1e-4, 1.0))
+            L[m] += float(strength) * (lo.sum(axis=0, keepdims=True) - lo)
+        q = softmax(L, axis=1)
+    return q
 
 def blend_main_and_complementary(
     LOGIT_MAIN: np.ndarray,

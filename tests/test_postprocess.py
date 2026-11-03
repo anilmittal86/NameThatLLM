@@ -12,6 +12,8 @@ import tempfile
 from namethatllm.postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
+    apply_all_family_confidence_gates,
+    apply_cluster_uniqueness_repulsion,
     apply_unified_handwriting_shield,
     build_orthographic_penalty_matrix,
     apply_curly_quote_shield,
@@ -178,6 +180,42 @@ class TestPostprocess(unittest.TestCase):
             df_read = pd.read_parquet(p_path)
             self.assertEqual(len(df_read), 10)
             self.assertTrue(df_read["model"].isin(LABELS).all())
+
+    def test_apply_all_family_confidence_gates_preserves_simplex(self):
+        np.random.seed(42)
+        N = 25
+        P_in = softmax(np.random.randn(N, 18), axis=1)
+        family_gates = {
+            "gpt": np.random.randn(N, len(FAMILIES["gpt"])),
+            "gemini": np.random.randn(N, len(FAMILIES["gemini"])),
+            "claude": np.random.randn(N, len(FAMILIES["claude"])),
+            "glm": np.random.randn(N, len(FAMILIES["glm"])),
+        }
+        P_out = apply_all_family_confidence_gates(P_in, family_gates, max_strength=0.20)
+        self.assertEqual(P_out.shape, (N, 18))
+        self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0, atol=1e-6))
+        # Total mass for unaffected columns must be preserved
+        kimi_col = [17]
+        self.assertTrue(np.allclose(P_in[:, kimi_col], P_out[:, kimi_col], atol=1e-5))
+
+    def test_apply_cluster_uniqueness_repulsion_preserves_simplex(self):
+        np.random.seed(42)
+        N = 20
+        P_in = softmax(np.random.randn(N, 18), axis=1)
+        # Cluster of 5 items, cluster of 3 items, and singletons
+        groups = np.array([1, 1, 1, 1, 1, 2, 2, 2] + list(range(3, 15)))
+        P_out = apply_cluster_uniqueness_repulsion(P_in, groups, strength=0.35, iters=3)
+        self.assertEqual(P_out.shape, (N, 18))
+        self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0, atol=1e-6))
+
+    def test_soft_prior_shrunk_sinkhorn_preserves_simplex(self):
+        np.random.seed(42)
+        N = 100
+        P_in = softmax(np.random.randn(N, 18), axis=1)
+        train_prior = np.ones(18)
+        P_out = sinkhorn_balancing(P_in, iters=100, sinkhorn_strength=0.65, target_mix=0.35, train_prior=train_prior)
+        self.assertEqual(P_out.shape, (N, 18))
+        self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0, atol=1e-6))
 
 if __name__ == "__main__":
     unittest.main()

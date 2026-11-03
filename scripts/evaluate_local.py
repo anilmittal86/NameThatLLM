@@ -41,6 +41,8 @@ from namethatllm.lexical_engine import run_lexical_engine
 from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc
 from namethatllm.postprocess import (
     apply_claude_specialist_gate,
+    apply_all_family_confidence_gates,
+    apply_cluster_uniqueness_repulsion,
     apply_unified_handwriting_shield,
     sinkhorn_balancing,
     apply_typobayes_postprocess,
@@ -390,6 +392,18 @@ def evaluate_from_cache(
                 gate_weight=gate_weight,
             )
 
+        # 2b. 4-Family Confidence Gates
+        family_gates = {}
+        for fam_k in FAMILIES.keys():
+            if f"gate_{fam_k}_lp" in data:
+                family_gates[fam_k] = data[f"gate_{fam_k}_lp"]
+        if family_gates:
+            P_mix = apply_all_family_confidence_gates(
+                P_mix=P_mix,
+                family_gates=family_gates,
+                max_strength=post_cfg.get("family_gate_strength", 0.20),
+            )
+
         # 3. Unified Handwriting & Orthographic Shield
         test_texts = list(data["test_texts"]) if "test_texts" in data else [""] * N_test
         rule_flags = data["rule_flags_test"] if "rule_flags_test" in data else None
@@ -407,6 +421,16 @@ def evaluate_from_cache(
             curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", -0.40),
             continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.04),
         )
+
+        # 3b. Cavity Cluster Uniqueness Repulsion
+        groups_065 = data.get("groups_065", data.get("groups_085", None))
+        if groups_065 is not None:
+            P_mix = apply_cluster_uniqueness_repulsion(
+                P_mix=P_mix,
+                groups=groups_065,
+                strength=post_cfg.get("cluster_repulsion_strength", 0.35),
+                iters=3,
+            )
 
         # 4. Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
         sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
