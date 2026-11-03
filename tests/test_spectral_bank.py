@@ -8,7 +8,7 @@ import numpy as np
 
 from namethatllm.spectral_bank import fit_joint_spectral_bank, make_spectral_blocks, fit_within_family_spectral_gates
 from namethatllm.wpca_gaussian import fit_shared_gaussian_lowram
-from namethatllm.config import K, PRIOR_SCALES, FAMILIES, softmax
+from namethatllm.config import K, PRIOR_SCALES, FAMILIES, SPECIALIST_GROUPS, softmax
 
 class TestSpectralBank(unittest.TestCase):
     def test_make_spectral_blocks(self):
@@ -103,7 +103,7 @@ class TestSpectralBank(unittest.TestCase):
 
         self.assertIsInstance(family_gates, dict)
         for fam_name, gate_lp in family_gates.items():
-            cols = FAMILIES[fam_name]
+            cols = SPECIALIST_GROUPS.get(fam_name, FAMILIES.get(fam_name))
             self.assertEqual(gate_lp.shape, (N_te, len(cols)))
             p = softmax(gate_lp, axis=1)
             self.assertTrue(np.allclose(p.sum(axis=1), 1.0, atol=1e-5))

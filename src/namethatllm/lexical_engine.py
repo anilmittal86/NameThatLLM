@@ -43,6 +43,22 @@ FAMILIES = {
     "glm": [15, 16],
 }
 
+# The 6 lowest-recall classes from Table D that require extra pool capacity and margin priority
+HARD_CLASS_INDICES = [3, 7, 13, 15, 16, 17]  # gpt-5.6-terra, gemini-3.7-flash, claude-fable-5, glm-5.3, glm-5.3-flash, kimi-k3
+
+# Extended specialist groups: includes the 4 provider families PLUS the cross-family
+# Straight-Quote / Chinese Frontier confusion cluster (opus-4-8, fable-5, qwen3.8-max, glm-5.3, glm-5.3-flash, kimi-k3)
+# and high-confusion sibling sub-clusters!
+SPECIALIST_GROUPS = {
+    "gpt": [0, 1, 2, 3, 4],
+    "gpt_56_triad": [1, 2, 3],           # gpt-5.6-luna vs gpt-5.6-sol vs gpt-5.6-terra
+    "gemini": [5, 6, 7, 8],
+    "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
+    "claude": [9, 10, 11, 12, 13],
+    "glm": [15, 16],                     # glm-5.3 vs glm-5.3-flash
+    "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
+}
+
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     """Numerically stable softmax."""
     c = np.max(x, axis=axis, keepdims=True)
@@ -303,7 +319,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
                 for t_val, m_val in zip(p_df['text'].values, p_df['model'].values):
                     c_idx = LAB2I[m_val]
-                    if total_class_counts[c_idx] >= MAX_TOTAL_POOL_PER_CLASS:
+                    max_tot_c = int(1.4 * MAX_TOTAL_POOL_PER_CLASS) if c_idx in HARD_CLASS_INDICES else MAX_TOTAL_POOL_PER_CLASS
+                    if total_class_counts[c_idx] >= max_tot_c:
                         continue
                     k = _norm_text_key(t_val)
                     if not k or k in seen_texts:
@@ -314,7 +331,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                     t_str = str(t_val)
                     total_class_counts[c_idx] += 1
 
-                    if core_class_counts[c_idx] < MAX_CORE_POOL_PER_CLASS:
+                    max_core_c = int(1.5 * MAX_CORE_POOL_PER_CLASS) if c_idx in HARD_CLASS_INDICES else MAX_CORE_POOL_PER_CLASS
+                    if core_class_counts[c_idx] < max_core_c:
                         core_class_counts[c_idx] += 1
                         core_add_t.append(t_str)
                         core_add_y.append(c_idx)
@@ -490,12 +508,16 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         X_te_5v = sparse.hstack([X_te_4v, te_cw], format="csr")
         X_unseen_5v = sparse.hstack([X_unseen_4v, unseen_cw], format="csr") if unseen_cw is not None else None
 
+    comp_core_sw = core_sw.copy()
+    hard_mask = np.isin(core_y, HARD_CLASS_INDICES)
+    comp_core_sw[hard_mask] *= 1.20
+
     svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3, class_weight="balanced")
-    svc_comp.fit(X_core_5v, core_y, sample_weight=core_sw)
+    svc_comp.fit(X_core_5v, core_y, sample_weight=comp_core_sw)
     P_svc_comp = softmax(svc_comp.decision_function(X_te_5v), axis=1)
 
     sgd_comp = SGDClassifier(loss='log_loss', alpha=1e-4, max_iter=1500, random_state=42)
-    sgd_comp.fit(X_core_5v, core_y, sample_weight=core_sw)
+    sgd_comp.fit(X_core_5v, core_y, sample_weight=comp_core_sw)
     P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
 
     # Compute baseline probabilities
@@ -553,37 +575,40 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     P_lex_comp = 0.40 * P_svc_comp + 0.25 * P_sgd_comp + 0.15 * P_twin_comp + 0.20 * P_distort
     log_p_lex_comp = np.log(np.clip(P_lex_comp, 1e-9, 1.0))
 
-    # 4 Within-Family Specialist Refiners
-    beta = 0.25
-    for fam_name, fam_cols in FAMILIES.items():
-        fam_mask = np.isin(core_y, fam_cols)
-        if fam_mask.sum() > 50:
-            sub_y = core_y[fam_mask]
-            sub_lab2i = {c: i for i, c in enumerate(fam_cols)}
+    # 4 Specialist Group Refiners (4 provider families + 3 targeted tie-breaker groups)
+    for grp_name, grp_cols in SPECIALIST_GROUPS.items():
+        grp_mask = np.isin(core_y, grp_cols)
+        if grp_mask.sum() > 50:
+            sub_y = core_y[grp_mask]
+            sub_lab2i = {c: i for i, c in enumerate(grp_cols)}
             sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y])
 
-            spec_svc = LinearSVC(C=0.40, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
-            spec_svc.fit(X_core_5v[fam_mask], sub_y_mapped)
+            is_main_fam = grp_name in FAMILIES
+            beta_grp = 0.25 if is_main_fam else 0.20
+            c_val = 0.40 if is_main_fam else 0.35
+
+            spec_svc = LinearSVC(C=c_val, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
+            spec_svc.fit(X_core_5v[grp_mask], sub_y_mapped, sample_weight=comp_core_sw[grp_mask])
             df_spec = spec_svc.decision_function(X_te_5v)
             logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
             P_spec = softmax(logits_spec, axis=1)
 
-            P_prior = P_lex_comp[:, fam_cols]
+            P_prior = P_lex_comp[:, grp_cols]
             P_prior_norm = P_prior / (P_prior.sum(axis=1, keepdims=True) + 1e-12)
-            P_refined = (1.0 - beta) * P_prior_norm + beta * P_spec
+            P_refined = (1.0 - beta_grp) * P_prior_norm + beta_grp * P_spec
 
             log_ratio = np.log(np.clip(P_refined, 1e-9, 1.0)) - np.log(np.clip(P_prior_norm, 1e-9, 1.0))
-            log_p_lex_comp[:, fam_cols] += log_ratio
+            log_p_lex_comp[:, grp_cols] += log_ratio
 
             if log_p_unseen_comp is not None:
                 df_spec_u = spec_svc.decision_function(X_unseen_5v)
                 logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
                 P_spec_u = softmax(logits_spec_u, axis=1)
-                P_prior_u = P_unseen_comp[:, fam_cols]
+                P_prior_u = P_unseen_comp[:, grp_cols]
                 P_prior_u_norm = P_prior_u / (P_prior_u.sum(axis=1, keepdims=True) + 1e-12)
-                P_refined_u = (1.0 - beta) * P_prior_u_norm + beta * P_spec_u
+                P_refined_u = (1.0 - beta_grp) * P_prior_u_norm + beta_grp * P_spec_u
                 log_ratio_u = np.log(np.clip(P_refined_u, 1e-9, 1.0)) - np.log(np.clip(P_prior_u_norm, 1e-9, 1.0))
-                log_p_unseen_comp[:, fam_cols] += log_ratio_u
+                log_p_unseen_comp[:, grp_cols] += log_ratio_u
 
     P_lex_comp_final = softmax(log_p_lex_comp, axis=1)
     unseen_p_lex_comp_final = softmax(log_p_unseen_comp, axis=1) if log_p_unseen_comp is not None else np.zeros((0, K), dtype=np.float32)

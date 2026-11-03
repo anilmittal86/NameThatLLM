@@ -27,6 +27,22 @@ FAMILIES = {
     "glm": [15, 16],
 }
 
+# The 6 lowest-recall classes from Table D that require extra pool capacity and margin priority
+HARD_CLASS_INDICES = [3, 7, 13, 15, 16, 17]  # gpt-5.6-terra, gemini-3.7-flash, claude-fable-5, glm-5.3, glm-5.3-flash, kimi-k3
+
+# Extended specialist groups: includes the 4 provider families PLUS the cross-family
+# Straight-Quote / Chinese Frontier confusion cluster (opus-4-8, fable-5, qwen3.8-max, glm-5.3, glm-5.3-flash, kimi-k3)
+# and high-confusion sibling sub-clusters!
+SPECIALIST_GROUPS = {
+    "gpt": [0, 1, 2, 3, 4],
+    "gpt_56_triad": [1, 2, 3],           # gpt-5.6-luna vs gpt-5.6-sol vs gpt-5.6-terra
+    "gemini": [5, 6, 7, 8],
+    "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
+    "claude": [9, 10, 11, 12, 13],
+    "glm": [15, 16],                     # glm-5.3 vs glm-5.3-flash
+    "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
+}
+
 PRIOR_SCALES = {
     "qwen3_14b_p2": 1.00,
     "qwen3_14b_inhouse": 1.00,

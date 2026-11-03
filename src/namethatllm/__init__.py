@@ -7,7 +7,7 @@ Ensemble package for LLM passage attribution.
 __version__ = "0.42.0"
 
 from .config import (
-    LABELS, K, LAB2I, FAMILIES, align_cols, log_softmax, softmax,
+    LABELS, K, LAB2I, FAMILIES, HARD_CLASS_INDICES, SPECIALIST_GROUPS, align_cols, log_softmax, softmax,
     resolve_dataset_paths, resolve_all_pool_files, validate_production_assets
 )
 from .lexical_engine import (
@@ -65,7 +65,7 @@ from .pipeline import run_submission_pipeline, auto_align_and_verify_head
 
 __all__ = [
     "__version__",
-    "LABELS", "K", "LAB2I", "FAMILIES", "align_cols", "log_softmax", "softmax",
+    "LABELS", "K", "LAB2I", "FAMILIES", "HARD_CLASS_INDICES", "SPECIALIST_GROUPS", "align_cols", "log_softmax", "softmax",
     "resolve_dataset_paths", "resolve_all_pool_files", "validate_production_assets",
     "run_lexical_engine", "extract_handwriting_features", "extract_handwriting_and_orthographic_features",
     "fit_handwriting_model", "shape_text", "function_text", "FUNCTION_WORDS", "STOP_WORDS",

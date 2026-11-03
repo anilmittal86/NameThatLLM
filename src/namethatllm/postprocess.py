@@ -12,7 +12,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import pandas as pd
 
-from .config import LABELS, K, LAB2I, FAMILIES, softmax, log_softmax
+from .config import LABELS, K, LAB2I, FAMILIES, SPECIALIST_GROUPS, softmax, log_softmax
 from .lexical_engine import extract_handwriting_and_orthographic_features
 
 def apply_all_family_confidence_gates(
@@ -22,30 +22,38 @@ def apply_all_family_confidence_gates(
     margin_thr: float = 0.45,
 ) -> np.ndarray:
     """
-    Confidence-aware within-family sibling reranker across all 4 families
-    ('gpt', 'gemini', 'claude', 'glm'). Preserves exact family probability mass
-    while resolving low-margin sibling confusions.
+    Confidence-aware within-family and cross-family specialist reranker across
+    all groups in SPECIALIST_GROUPS (4 families + 3 tie-breaker groups).
+    Preserves exact probability mass while resolving low-margin confusions.
     """
     if not family_gates:
         return P_mix
     P_out = P_mix.astype(np.float64).copy()
     for fam_name, gate_lp in family_gates.items():
-        if fam_name not in FAMILIES:
+        cols = SPECIALIST_GROUPS.get(fam_name, FAMILIES.get(fam_name))
+        if cols is None:
             continue
-        cols = FAMILIES[fam_name]
         if gate_lp is None or gate_lp.shape != (len(P_out), len(cols)):
             continue
-        sub_p = np.clip(P_out[:, cols], 1e-12, 1.0)
+
+        if fam_name == "frontier_and_fable":
+            row_mask = np.isin(P_out.argmax(axis=1), cols)
+            if not row_mask.any():
+                continue
+        else:
+            row_mask = np.ones(len(P_out), dtype=bool)
+
+        sub_p = np.clip(P_out[np.ix_(row_mask, cols)], 1e-12, 1.0)
         tot_mass = sub_p.sum(axis=1, keepdims=True)
         base_rel_p = sub_p / tot_mass
         sp = np.sort(base_rel_p, axis=1)
         margin = sp[:, -1] - sp[:, -2]
         strength = np.clip((margin_thr - margin) / max(margin_thr, 1e-6), 0.0, 1.0)[:, None] * float(max_strength)
         base_lp = np.log(np.clip(base_rel_p, 1e-12, 1.0))
-        gate_p = softmax(gate_lp, axis=1)
+        gate_p = softmax(gate_lp[row_mask], axis=1)
         gate_lp_norm = np.log(np.clip(gate_p, 1e-12, 1.0))
         mixed_rel_p = softmax((1.0 - strength) * base_lp + strength * gate_lp_norm, axis=1)
-        P_out[:, cols] = tot_mass * mixed_rel_p
+        P_out[np.ix_(row_mask, cols)] = tot_mass * mixed_rel_p
     return P_out / P_out.sum(axis=1, keepdims=True).clip(min=1e-12)
 
 def apply_cluster_uniqueness_repulsion(

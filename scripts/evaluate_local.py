@@ -36,7 +36,7 @@ from sklearn.model_selection import GroupKFold
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKSPACE_DIR / "src"))
 
-from namethatllm.config import LABELS, K, LAB2I, FAMILIES
+from namethatllm.config import LABELS, K, LAB2I, FAMILIES, SPECIALIST_GROUPS
 from namethatllm.lexical_engine import run_lexical_engine
 from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc
 
@@ -799,9 +799,9 @@ def evaluate_from_cache(
                 gate_weight=gate_weight,
             )
 
-        # 2b. 4-Family Confidence Gates
+        # 2b. Specialist Confidence Gates (4 families + 3 targeted tie-breaker groups)
         family_gates = {}
-        for fam_k in FAMILIES.keys():
+        for fam_k in SPECIALIST_GROUPS.keys():
             if f"gate_{fam_k}_lp" in data:
                 family_gates[fam_k] = data[f"gate_{fam_k}_lp"]
         if family_gates:

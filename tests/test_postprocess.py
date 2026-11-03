@@ -198,6 +198,16 @@ class TestPostprocess(unittest.TestCase):
         kimi_col = [17]
         self.assertTrue(np.allclose(P_in[:, kimi_col], P_out[:, kimi_col], atol=1e-5))
 
+    def test_apply_all_family_confidence_gates_with_specialist_groups(self):
+        from namethatllm.config import SPECIALIST_GROUPS
+        np.random.seed(42)
+        N = 30
+        P_in = softmax(np.random.randn(N, 18), axis=1)
+        gates = {k: np.random.randn(N, len(v)) for k, v in SPECIALIST_GROUPS.items()}
+        P_out = apply_all_family_confidence_gates(P_in, gates, max_strength=0.20)
+        self.assertEqual(P_out.shape, (N, 18))
+        self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0, atol=1e-6))
+
     def test_apply_cluster_uniqueness_repulsion_preserves_simplex(self):
         np.random.seed(42)
         N = 20

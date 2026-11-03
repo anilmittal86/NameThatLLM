@@ -120,7 +120,8 @@ def fit_within_family_spectral_gates(
     ('gpt', 'gemini', 'claude', 'glm').
     Returns dict mapping family_name -> (N_test, len(fam_cols)) log-probabilities.
     """
-    from .config import FAMILIES, log_softmax
+    from .config import SPECIALIST_GROUPS, FAMILIES, log_softmax
+
     if len(spectral_tr_blocks) == 0 or N_test == 0:
         return {}
     X_tr = np.hstack(spectral_tr_blocks)
@@ -147,10 +148,12 @@ def fit_within_family_spectral_gates(
     else:
         X_te_c = np.zeros_like(X_te)
 
+    groups_dict = SPECIALIST_GROUPS if SPECIALIST_GROUPS else FAMILIES
     family_gates: Dict[str, np.ndarray] = {}
-    for fam_name, fam_cols in FAMILIES.items():
+    for fam_name, fam_cols in groups_dict.items():
         mask_tr = np.isin(y_sub, fam_cols)
-        if mask_tr.sum() >= 30 and len(np.unique(y_sub[mask_tr])) == len(fam_cols):
+        min_samples = 20 if len(fam_cols) <= 3 else 30
+        if mask_tr.sum() >= min_samples and len(np.unique(y_sub[mask_tr])) == len(fam_cols):
             sub_y = np.array([fam_cols.index(int(c)) for c in y_sub[mask_tr]], dtype=int)
             clf_p = LogisticRegression(C=0.10, max_iter=1000, class_weight="balanced", random_state=42)
             clf_p.fit(X_tr[mask_tr], sub_y)
