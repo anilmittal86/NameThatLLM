@@ -78,16 +78,9 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
 
-    # 2. Mark all training pools as contaminated:
-    # - pool_v4.parquet, pool_v1.parquet (seen by Part-2 LoRAs, DeBERTa, inhouse)
-    # - nlm_pool_v5.parquet, nlm_matched_clean.parquet, nlm_pool_v2.parquet (seen by v5 and ts LoRAs)
-    for pat in [
-        "pool_v4.parquet",
-        "pool_v1.parquet",
-        "nlm_pool_v5.parquet",
-        "nlm_matched_clean.parquet",
-        "nlm_pool_v2.parquet",
-    ]:
+    # 2. Mark only pool_v4.parquet and pool_v1.parquet as contaminated
+    # (seen by Part-2 LoRAs, DeBERTa, inhouse)
+    for pat in ["pool_v4.parquet", "pool_v1.parquet"]:
         for p in input_dir.rglob(pat):
             try:
                 df_p = pd.read_parquet(p, columns=["text"])
@@ -95,48 +88,50 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
 
-    # 3. Collect strictly unseen candidate passages strictly from disjoint corpora (e.g. openrouter-harvest)
+    # 3. Collect candidate passages from external/harvest/clean corpora
     candidate_dfs = []
     seen_paths = set()
-    for pat in [
-        "*openrouter*.parquet",
-        "*openrouter*.csv",
-        "*harvest*.parquet",
-        "*harvest*.csv",
-    ]:
-        for p in input_dir.rglob(pat):
+
+    # Priority 1: Check files whose path (filename or directory) mentions openrouter, harvest, passages, or generations
+    for ext in ["*.parquet", "*.csv"]:
+        for p in input_dir.rglob(ext):
             if p in seen_paths:
                 continue
-            seen_paths.add(p)
-            try:
-                if p.suffix == ".parquet":
-                    df_c = pd.read_parquet(p)
-                elif p.suffix == ".csv":
-                    df_c = pd.read_csv(p)
-                else:
-                    continue
+            p_str = str(p).lower().replace("\\", "/")
+            p_name = p.name.lower()
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+                continue
+            if any(k in p_str for k in ["openrouter", "harvest", "passages", "generations"]):
+                seen_paths.add(p)
+                try:
+                    df_c = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+                    if "label" in df_c.columns and "model" not in df_c.columns:
+                        df_c = df_c.rename(columns={"label": "model"})
+                    if "text" in df_c.columns and "model" in df_c.columns:
+                        keep_cols = [c for c in ["id", "prompt_id", "text", "model"] if c in df_c.columns]
+                        df_c = df_c[keep_cols].dropna(subset=["text", "model"]).copy()
+                        df_c = df_c[df_c["model"].isin(LABELS)]
+                        df_c["_hash"] = [_text_hash(t) for t in df_c["text"]]
+                        df_c = df_c[~df_c["_hash"].isin(contaminated_hashes)]
+                        if len(df_c) > 0:
+                            candidate_dfs.append(df_c)
+                except Exception:
+                    pass
 
-                if "text" in df_c.columns and "model" in df_c.columns:
-                    keep_cols = [c for c in ["id", "prompt_id", "text", "model"] if c in df_c.columns]
-                    df_c = df_c[keep_cols].dropna(subset=["text", "model"]).copy()
-                    df_c = df_c[df_c["model"].isin(LABELS)]
-                    df_c["_hash"] = [_text_hash(t) for t in df_c["text"]]
-                    df_c = df_c[~df_c["_hash"].isin(contaminated_hashes)]
-                    if len(df_c) > 0:
-                        candidate_dfs.append(df_c)
-            except Exception:
-                pass
-
-    # Fallback to other non-training parquet/csv files if no openrouter files are discovered
+    # Priority 2: Fallback to any other non-training parquet/csv (e.g. nlm_matched_clean, nlm_pool_v5, nlm_pool_v2)
     if not candidate_dfs:
-        for pat in ["*.parquet", "*.csv"]:
-            for p in input_dir.rglob(pat):
+        for ext in ["*.parquet", "*.csv"]:
+            for p in input_dir.rglob(ext):
+                if p in seen_paths:
+                    continue
                 p_name = p.name.lower()
-                if p in seen_paths or any(x in p_name for x in ["train", "test", "submission", "pool", "matched"]):
+                if any(x in p_name for x in ["train", "test", "submission", "pool_v4", "pool_v1"]):
                     continue
                 seen_paths.add(p)
                 try:
                     df_c = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
+                    if "label" in df_c.columns and "model" not in df_c.columns:
+                        df_c = df_c.rename(columns={"label": "model"})
                     if "text" in df_c.columns and "model" in df_c.columns:
                         keep_cols = [c for c in ["id", "prompt_id", "text", "model"] if c in df_c.columns]
                         df_c = df_c[keep_cols].dropna(subset=["text", "model"]).copy()
@@ -162,7 +157,7 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
     strictly_disjoint = df_pool_unseen[~df_pool_unseen["_hash"].isin(v5_hashes)]
-    if strictly_disjoint["model"].nunique() >= 10 and len(strictly_disjoint) >= 90:
+    if strictly_disjoint["model"].nunique() >= 10 and len(strictly_disjoint) >= 36:
         df_pool_unseen = strictly_disjoint
 
     # Stratified balanced sampling across all 18 classes

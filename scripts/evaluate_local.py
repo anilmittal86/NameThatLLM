@@ -129,7 +129,7 @@ def evaluate_prompt_split(
 
     df_tr = pd.read_csv(train_path)
     cfg = load_config(config_path)
-    post_cfg = cfg.get("postprocessing", {})
+    post_cfg = cfg.get("postprocess", cfg.get("postprocessing", {}))
     t0 = time.time()
 
     if "prompt_id" not in df_tr.columns:
@@ -206,10 +206,10 @@ def evaluate_prompt_split(
                 log_p_handwriting=lp_hw,
                 rule_flags=rule_flags,
                 curly_quote_multiplier=multiplier,
-                multi_em_dash_log_penalty=post_cfg.get("multi_em_dash_log_penalty", -0.45),
-                straight_contr_log_penalty=post_cfg.get("straight_contr_log_penalty", -0.60),
-                curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", -0.40),
-                continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.04),
+                multi_em_dash_log_penalty=post_cfg.get("multi_em_dash_log_penalty", 0.0),
+                straight_contr_log_penalty=post_cfg.get("straight_contr_log_penalty", 0.0),
+                curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", 0.0),
+                continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.0),
             )
             preds_shield = p_shield.argmax(axis=1)
             bacc_shield = float(balanced_accuracy_score(y_val, preds_shield))
@@ -735,10 +735,10 @@ def evaluate_from_cache(
             log_p_handwriting=log_p_hw,
             rule_flags=rule_flags,
             curly_quote_multiplier=multiplier,
-            multi_em_dash_log_penalty=post_cfg.get("multi_em_dash_log_penalty", -0.45),
-            straight_contr_log_penalty=post_cfg.get("straight_contr_log_penalty", -0.60),
-            curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", -0.40),
-            continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.04),
+            multi_em_dash_log_penalty=post_cfg.get("multi_em_dash_log_penalty", 0.0),
+            straight_contr_log_penalty=post_cfg.get("straight_contr_log_penalty", 0.0),
+            curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", 0.0),
+            continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.0),
         )
 
         # 3b. Cavity Cluster Uniqueness Repulsion
@@ -751,11 +751,30 @@ def evaluate_from_cache(
                 iters=3,
             )
 
+        # Load train_texts and y_train if available in data or fallback to local_data/train.csv
+        train_texts_list = list(data["train_texts"]) if "train_texts" in data else []
+        y_train_arr = data["y_train"].astype(int) if "y_train" in data else np.array([], dtype=int)
+        default_train_csv = WORKSPACE_DIR / "local_data" / "train.csv"
+        if len(train_texts_list) == 0 and default_train_csv.exists():
+            try:
+                df_tr_local = pd.read_csv(default_train_csv)
+                if "text" in df_tr_local.columns and "model" in df_tr_local.columns:
+                    train_texts_list = df_tr_local["text"].fillna("").astype(str).tolist()
+                    y_train_arr = np.array([LAB2I[m] for m in df_tr_local["model"].values if m in LAB2I], dtype=int)
+            except Exception:
+                pass
+
         # 4. Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
         sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
         sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
         sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
-        train_prior = np.bincount(y_unseen, minlength=18).astype(np.float64) + 1.0 if len(y_unseen) > 0 else None
+        if len(y_train_arr) > 0:
+            train_prior = np.bincount(y_train_arr, minlength=18).astype(np.float64) + 1.0
+        elif len(y_unseen) > 0:
+            train_prior = np.bincount(y_unseen, minlength=18).astype(np.float64) + 1.0
+        else:
+            train_prior = None
+
         P_final = sinkhorn_balancing(
             P_mix,
             iters=sinkhorn_iters,
@@ -765,11 +784,11 @@ def evaluate_from_cache(
         )
 
         # 5. TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
-        if post_cfg.get("enable_typobayes", True) and "test_texts" in data and "train_texts" in data:
+        if post_cfg.get("enable_typobayes", True) and "test_texts" in data and len(train_texts_list) > 0:
             P_final = apply_typobayes_postprocess(
                 P_final,
-                train_texts=list(data["train_texts"]),
-                y_train=data.get("y_train", y_unseen),
+                train_texts=train_texts_list,
+                y_train=y_train_arr if len(y_train_arr) == len(train_texts_list) else y_unseen,
                 test_texts=test_texts,
                 labels=LABELS,
                 kappa=float(post_cfg.get("typobayes_kappa", 24.0)),

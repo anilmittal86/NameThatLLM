@@ -451,19 +451,13 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     sgd_comp.fit(X_tr_5v, fit_y, sample_weight=fit_sw)
     P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
 
-    if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
-        P_unseen_svc = softmax(svc_comp.decision_function(X_unseen_5v), axis=1)
-        P_unseen_sgd = sgd_comp.predict_proba(X_unseen_5v)
-        if P_unseen_distort is not None:
-            P_unseen_comp = 0.40 * P_unseen_svc + 0.25 * P_unseen_sgd + 0.15 * P_unseen_svc + 0.20 * P_unseen_distort
-        else:
-            P_unseen_comp = 0.55 * P_unseen_svc + 0.45 * P_unseen_sgd
-        log_p_unseen_comp = np.log(np.clip(P_unseen_comp, 1e-9, 1.0))
-    else:
-        log_p_unseen_comp = None
+    # Compute baseline probabilities
+    P_unseen_svc = softmax(svc_comp.decision_function(X_unseen_5v), axis=1) if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else None
+    P_unseen_sgd = sgd_comp.predict_proba(X_unseen_5v) if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else None
 
     # Style Twin on groups_085
     P_twin_comp = P_svc_comp.copy()
+    P_unseen_twin = P_unseen_svc.copy() if P_unseen_svc is not None else None
     if twin_rows_085.any() and len_tr_raw >= 18:
         X_train_only = X_tr_5v[:len_tr_raw]
         u_tr, inv_tr = np.unique(df_tr['prompt_id'].values, return_inverse=True)
@@ -484,8 +478,30 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
         X_te_twin_c = X_te_twin - G_t @ (G_t.T @ X_te_twin)
         P_twin_comp[twin_rows_085] = softmax(svc_twin.decision_function(X_te_twin_c), axis=1)
+
+        if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
+            if "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_unseen_5v.shape[0]:
+                u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
+                counts_u = np.bincount(inv_u)
+                vals_u = (1.0 / counts_u[inv_u]).astype(np.float32)
+                G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u)), inv_u)), shape=(len(inv_u), len(u_u)), dtype=np.float32)
+                X_unseen_twin_c = X_unseen_5v - G_u @ (G_u.T @ X_unseen_5v)
+                P_unseen_twin = softmax(svc_twin.decision_function(X_unseen_twin_c), axis=1)
+                del G_u, X_unseen_twin_c
+            else:
+                P_unseen_twin = softmax(svc_twin.decision_function(X_unseen_5v), axis=1)
+
         del svc_twin, X_te_twin, G_t, X_te_twin_c
         gc.collect()
+
+    if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
+        if P_unseen_distort is not None:
+            P_unseen_comp = 0.40 * P_unseen_svc + 0.25 * P_unseen_sgd + 0.15 * P_unseen_twin + 0.20 * P_unseen_distort
+        else:
+            P_unseen_comp = 0.55 * P_unseen_svc + 0.45 * P_unseen_sgd
+        log_p_unseen_comp = np.log(np.clip(P_unseen_comp, 1e-9, 1.0))
+    else:
+        log_p_unseen_comp = None
 
     P_lex_comp = 0.40 * P_svc_comp + 0.25 * P_sgd_comp + 0.15 * P_twin_comp + 0.20 * P_distort
     log_p_lex_comp = np.log(np.clip(P_lex_comp, 1e-9, 1.0))

@@ -518,8 +518,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     fold_dirs_14b = folds_only_14b + full_only_14b
                     ts14_dir = fold_dirs_14b[-1]
 
-                    def_layers_14b = [2, 4, 6, 8, 12, 16, 20, 24]
-                    meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=24, default_layers=def_layers_14b, default_max_len=447)
+                    def_keep_14b = 27 if opt_14b_key == "qwen3_14b_inhouse" else 24
+                    def_layers_14b = [2, 4, 6, 9, 13, 17, 22, 27] if opt_14b_key == "qwen3_14b_inhouse" else [2, 4, 6, 8, 12, 16, 20, 24]
+                    meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=def_keep_14b, default_layers=def_layers_14b, default_max_len=447)
                     if opt_14b_key == "qwen3_14b_inhouse" and meta_ts14.get("keep", 24) < 27:
                         print(f"[Pipeline] Skipping qwen3_14b_inhouse because keep={meta_ts14.get('keep', 24)} < 27 (old 24L checkpoint)")
                         continue
@@ -613,16 +614,18 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             trunk1.restore_weights(backup_t1_ts)
                             del backup_t1_ts
 
-                            P_p_acc = np.zeros((N_test, K), dtype=np.float64)
-                            P_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            lp_p_acc = np.zeros((N_test, K), dtype=np.float64)
+                            lp_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            lp_u_p_acc = np.zeros((N_unseen, K), dtype=np.float64) if N_unseen > 0 else None
+                            lp_u_c_acc = np.zeros((N_unseen, K), dtype=np.float64) if N_unseen > 0 else None
                             has_any_c = False
                             Z_te = None
                             Z_tr = None
-                            print(f"[Pipeline] {opt_14b_key}: extracting & averaging across {num_14b_folds} fold adapters...")
+                            print(f"[Pipeline] {opt_14b_key}: extracting & averaging across {num_14b_folds} fold adapters in log-space...")
 
                             for f_idx, f_dir in enumerate(fold_dirs_14b):
                                 is_last = (f_idx == num_14b_folds - 1)
-                                f_meta = read_checkpoint_meta(f_dir, default_keep=24, default_layers=def_layers_14b, default_max_len=447)
+                                f_meta = read_checkpoint_meta(f_dir, default_keep=def_keep_14b, default_layers=def_layers_14b, default_max_len=447)
                                 trunk1.set_active_layers(f_meta["layers"], f_meta["max_len"])
                                 trunk1.set_final_norm(not f_meta["no_final_norm"])
                                 f_backup = trunk1.snapshot_weights(f_dir)
@@ -636,34 +639,48 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 f_labels = f_meta["labels"]
 
                                 if is_last:
-                                    Z_te_tr = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
-                                    f_Z_te = Z_te_tr[:N_test]
-                                    Z_tr = Z_te_tr[N_test:]
+                                    extract_batch = test_texts + (unseen_texts if N_unseen > 0 else []) + train_sub_texts
+                                    Z_te_u_tr = trunk1.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_u_tr[:N_test]
+                                    f_Z_u = Z_te_u_tr[N_test : N_test + N_unseen] if N_unseen > 0 else None
+                                    Z_tr = Z_te_u_tr[N_test + N_unseen :]
                                     Z_te = f_Z_te
-                                    del Z_te_tr
+                                    del Z_te_u_tr
                                 else:
-                                    f_Z_te = trunk1.extract_exact(test_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    extract_batch = test_texts + (unseen_texts if N_unseen > 0 else [])
+                                    Z_te_u = trunk1.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_u[:N_test]
+                                    f_Z_u = Z_te_u[N_test : N_test + N_unseen] if N_unseen > 0 else None
+                                    del Z_te_u
 
                                 if f_W_p is not None:
-                                    p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
-                                    P_p_acc += p_fold / num_14b_folds
+                                    lp_p_acc += log_softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1) / num_14b_folds
+                                    if N_unseen > 0 and f_Z_u is not None:
+                                        lp_u_p_acc += log_softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1) / num_14b_folds
                                 if f_W_c is not None:
                                     has_any_c = True
                                     lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
                                     lp_c72_f, _ = compute_centered_logits(f_Z_te, groups_072, f_W_c, f_b_c, f_labels)
                                     lp_c60_f, _ = compute_centered_logits(f_Z_te, groups_060, f_W_c, f_b_c, f_labels)
                                     c_blend_f = w85 * lp_c85_f + w72 * lp_c72_f + w60 * lp_c60_f
-                                    P_c_acc += softmax(c_blend_f, axis=1) / num_14b_folds
+                                    lp_c_acc += c_blend_f / num_14b_folds
+                                    if N_unseen > 0 and f_Z_u is not None:
+                                        lp_u_c_f, _ = compute_centered_logits(f_Z_u, groups_unseen, f_W_c, f_b_c, f_labels)
+                                        lp_u_c_acc += lp_u_c_f / num_14b_folds
 
                                 trunk1.restore_weights(f_backup)
                                 del f_backup, f_heads_sd, f_Z_te
+                                if "f_Z_u" in locals() and f_Z_u is not None:
+                                    del f_Z_u
                                 gc.collect()
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
 
                             trunk1.set_final_norm(False)
-                            lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0))
-                            lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            lp_p = lp_p_acc
+                            lp_c_blend = lp_c_acc if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            if N_unseen > 0 and lp_u_p_acc is not None:
+                                lp_u = _combine_plain_and_twin_lp(lp_u_p_acc, lp_u_c_acc if has_any_c else None, w_comp_p, w_comp_c)
                             gate_passed = True
                             backup_t1_ts = None
                         else:
@@ -726,9 +743,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             pr_sc = prior_scales.get(opt_14b_key, 0.50)
                             update_hybrid_groups(Z_te, pr_sc)
                             if num_14b_folds > 1:
-                                comp_lora_posteriors.append((w_comp_p, P_p_acc))
+                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
                                 if has_any_c:
-                                    comp_lora_posteriors.append((w_comp_c, P_c_acc))
+                                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                             else:
                                 if W_p is not None and lp_p is not None:
                                     comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
@@ -976,12 +993,14 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             trunk3.restore_weights(backup_t3_ts)
                             del backup_t3_ts
 
-                            P_p_acc = np.zeros((N_test, K), dtype=np.float64)
-                            P_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            lp_p_acc = np.zeros((N_test, K), dtype=np.float64)
+                            lp_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            lp_u_p_acc = np.zeros((N_unseen, K), dtype=np.float64) if N_unseen > 0 else None
+                            lp_u_c_acc = np.zeros((N_unseen, K), dtype=np.float64) if N_unseen > 0 else None
                             has_any_c = False
                             Z_te = None
                             Z_tr = None
-                            print(f"[Pipeline] {opt_8b_key}: extracting & averaging across {num_8b_folds} fold adapters...")
+                            print(f"[Pipeline] {opt_8b_key}: extracting & averaging across {num_8b_folds} fold adapters in log-space...")
 
                             for f_idx, f_dir in enumerate(fold_dirs_8b):
                                 is_last = (f_idx == num_8b_folds - 1)
@@ -999,34 +1018,48 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 f_labels = f_meta["labels"]
 
                                 if is_last:
-                                    Z_te_tr = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
-                                    f_Z_te = Z_te_tr[:N_test]
-                                    Z_tr = Z_te_tr[N_test:]
+                                    extract_batch = test_texts + (unseen_texts if N_unseen > 0 else []) + train_sub_texts
+                                    Z_te_u_tr = trunk3.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_u_tr[:N_test]
+                                    f_Z_u = Z_te_u_tr[N_test : N_test + N_unseen] if N_unseen > 0 else None
+                                    Z_tr = Z_te_u_tr[N_test + N_unseen :]
                                     Z_te = f_Z_te
-                                    del Z_te_tr
+                                    del Z_te_u_tr
                                 else:
-                                    f_Z_te = trunk3.extract_exact(test_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    extract_batch = test_texts + (unseen_texts if N_unseen > 0 else [])
+                                    Z_te_u = trunk3.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_u[:N_test]
+                                    f_Z_u = Z_te_u[N_test : N_test + N_unseen] if N_unseen > 0 else None
+                                    del Z_te_u
 
                                 if f_W_p is not None:
-                                    p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
-                                    P_p_acc += p_fold / num_8b_folds
+                                    lp_p_acc += log_softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1) / num_8b_folds
+                                    if N_unseen > 0 and f_Z_u is not None:
+                                        lp_u_p_acc += log_softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1) / num_8b_folds
                                 if f_W_c is not None:
                                     has_any_c = True
                                     lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
                                     lp_c72_f, _ = compute_centered_logits(f_Z_te, groups_072, f_W_c, f_b_c, f_labels)
                                     lp_c60_f, _ = compute_centered_logits(f_Z_te, groups_060, f_W_c, f_b_c, f_labels)
                                     c_blend_f = w85 * lp_c85_f + w72 * lp_c72_f + w60 * lp_c60_f
-                                    P_c_acc += softmax(c_blend_f, axis=1) / num_8b_folds
+                                    lp_c_acc += c_blend_f / num_8b_folds
+                                    if N_unseen > 0 and f_Z_u is not None:
+                                        lp_u_c_f, _ = compute_centered_logits(f_Z_u, groups_unseen, f_W_c, f_b_c, f_labels)
+                                        lp_u_c_acc += lp_u_c_f / num_8b_folds
 
                                 trunk3.restore_weights(f_backup)
                                 del f_backup, f_heads_sd, f_Z_te
+                                if "f_Z_u" in locals() and f_Z_u is not None:
+                                    del f_Z_u
                                 gc.collect()
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
 
                             trunk3.set_final_norm(False)
-                            lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0))
-                            lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            lp_p = lp_p_acc
+                            lp_c_blend = lp_c_acc if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            if N_unseen > 0 and lp_u_p_acc is not None:
+                                lp_u = _combine_plain_and_twin_lp(lp_u_p_acc, lp_u_c_acc if has_any_c else None, w_comp_p, w_comp_c)
                             gate_passed = True
                             backup_t3_ts = None
                         else:
@@ -1093,9 +1126,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                             update_hybrid_groups(Z_te, pr_sc)
                             if num_8b_folds > 1:
-                                comp_lora_posteriors.append((w_comp_p, P_p_acc))
+                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
                                 if has_any_c:
-                                    comp_lora_posteriors.append((w_comp_c, P_c_acc))
+                                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                             else:
                                 if W_p is not None and lp_p is not None:
                                     comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
@@ -1469,10 +1502,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     # Unified Handwriting & Orthographic Shield (discrete Bayesian rules + continuous handwriting density)
     default_curly_multiplier = float(np.exp(-1.0))
     multiplier = post_cfg.get("curly_quote_multiplier", default_curly_multiplier)
-    multi_em_dash_log_pen = post_cfg.get("multi_em_dash_log_penalty", -0.45)
-    straight_contr_log_pen = post_cfg.get("straight_contr_log_penalty", -0.60)
-    curly_contr_log_pen = post_cfg.get("curly_contr_log_penalty", -0.40)
-    continuous_hw_weight = post_cfg.get("continuous_hw_weight", 0.04)
+    multi_em_dash_log_pen = post_cfg.get("multi_em_dash_log_penalty", 0.0)
+    straight_contr_log_pen = post_cfg.get("straight_contr_log_penalty", 0.0)
+    curly_contr_log_pen = post_cfg.get("curly_contr_log_penalty", 0.0)
+    continuous_hw_weight = post_cfg.get("continuous_hw_weight", 0.0)
 
     P_mix = apply_unified_handwriting_shield(
         P_mix=P_mix,
