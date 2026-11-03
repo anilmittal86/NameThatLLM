@@ -100,7 +100,12 @@ def resolve_all_pool_files(input_dir: Optional[Path] = None) -> List[Path]:
     if input_dir is None:
         input_dir = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
     pool_files: List[Path] = []
-    pool_patterns = ['nlm_pool_v5.parquet', 'pool_v4.parquet', 'nlm_matched_clean.parquet', 'nlm_pool_v2.parquet']
+    pool_patterns = [
+        'nlm_matched_clean.parquet',
+        'pool_v4.parquet',
+        'nlm_pool_v5.parquet',
+        'nlm_pool_v2.parquet',
+    ]
     for pat in pool_patterns:
         for p in input_dir.rglob(pat):
             if p not in pool_files:

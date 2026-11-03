@@ -263,36 +263,79 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         except Exception as e:
             print(f"[Lexical] Note: Could not read {unseen_parquet}: {e}")
 
-    # 2. Load pool parquet files if present with source weights
+    # 2. Load pool parquet files if present with source weights & stratified two-tier caps
+    core_texts = list(fit_texts)
+    core_y = fit_y.copy()
+    core_sw = fit_sw.copy()
+    extra_fit_texts: List[str] = []
+    extra_fit_y: List[int] = []
+    extra_fit_sw: List[float] = []
+
+    MAX_CORE_POOL_PER_CLASS = 700
+    MAX_TOTAL_POOL_PER_CLASS = 2400
+    core_class_counts = np.zeros(K, dtype=int)
+    total_class_counts = np.zeros(K, dtype=int)
+    rng_pool = np.random.RandomState(42)
+
     pool_candidates = [pool_file] if isinstance(pool_file, (str, Path)) else (pool_file if isinstance(pool_file, list) else [])
     for pf in pool_candidates:
         if pf and os.path.exists(pf):
             try:
                 p_df = pd.read_parquet(pf, columns=['text', 'model'])
                 p_df = p_df[p_df['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
-                pf_name = str(pf).lower().replace('\\', '/')
-                # Matched clean gets 0.50, general scraped pool gets 0.35
-                src_w = 0.50 if ('matched' in pf_name or 'clean' in pf_name) else 0.35
+                pf_filename = Path(pf).name.lower()
+                is_matched_clean = ('matched' in pf_filename or 'clean' in pf_filename)
+                src_w = 0.50 if is_matched_clean else 0.35
 
-                keep_mask = []
-                for t in p_df['text'].values:
-                    k = _norm_text_key(t)
-                    h = _text_hash(t)
-                    ok = bool(k) and (k not in seen_texts) and (h not in unseen_hashes)
-                    keep_mask.append(ok)
-                    if ok:
-                        seen_texts.add(k)
-                p_df = p_df.loc[keep_mask].reset_index(drop=True)
-                if len(p_df) > 0:
-                    p_texts = p_df['text'].fillna('').astype(str).tolist()
-                    p_y = p_df['model'].map(LAB2I).values
-                    p_sw = np.full(len(p_df), src_w, dtype=np.float32)
-                    fit_texts.extend(p_texts)
-                    fit_y = np.r_[fit_y, p_y]
-                    fit_sw = np.r_[fit_sw, p_sw]
-                    print(f"[Lexical] Added {len(p_df)} rows from {Path(pf).name} with source weight {src_w}")
+                # Filter to competition passage length (25..360 words) when pool is large
+                if len(p_df) > 5000:
+                    w_counts = p_df['text'].astype(str).str.split().str.len()
+                    p_df = p_df[w_counts.between(25, 360)].copy()
+
+                # Shuffle deterministically before stratified cap
+                p_df = p_df.sample(frac=1.0, random_state=rng_pool).reset_index(drop=True)
+
+                fit_add_t, fit_add_y, fit_add_sw = [], [], []
+                core_add_t, core_add_y, core_add_sw = [], [], []
+
+                for t_val, m_val in zip(p_df['text'].values, p_df['model'].values):
+                    c_idx = LAB2I[m_val]
+                    if total_class_counts[c_idx] >= MAX_TOTAL_POOL_PER_CLASS:
+                        continue
+                    k = _norm_text_key(t_val)
+                    if not k or k in seen_texts:
+                        continue
+                    if unseen_hashes and _text_hash(t_val) in unseen_hashes:
+                        continue
+                    seen_texts.add(k)
+                    t_str = str(t_val)
+                    total_class_counts[c_idx] += 1
+
+                    if core_class_counts[c_idx] < MAX_CORE_POOL_PER_CLASS:
+                        core_class_counts[c_idx] += 1
+                        core_add_t.append(t_str)
+                        core_add_y.append(c_idx)
+                        core_add_sw.append(src_w)
+                    else:
+                        fit_add_t.append(t_str)
+                        fit_add_y.append(c_idx)
+                        fit_add_sw.append(src_w)
+
+                if core_add_t:
+                    core_texts.extend(core_add_t)
+                    core_y = np.r_[core_y, np.array(core_add_y, dtype=int)]
+                    core_sw = np.r_[core_sw, np.array(core_add_sw, dtype=np.float32)]
+                if fit_add_t:
+                    extra_fit_texts.extend(fit_add_t)
+                    extra_fit_y.extend(fit_add_y)
+                    extra_fit_sw.extend(fit_add_sw)
+                print(f"[Lexical] Added {len(core_add_t) + len(fit_add_t)} rows (core={len(core_add_t)}) from {Path(pf).name} with source weight {src_w}")
             except Exception as e:
                 print(f"[Lexical] Note: Could not read pool {pf}: {e}")
+
+    fit_texts = core_texts + extra_fit_texts
+    fit_y = np.r_[core_y, np.array(extra_fit_y, dtype=int)] if extra_fit_y else core_y
+    fit_sw = np.r_[core_sw, np.array(extra_fit_sw, dtype=np.float32)] if extra_fit_sw else core_sw
 
     # 3. Canonical 4 Views (from NTL two-stage LoRA part two)
     VIEWS_4V = [
@@ -347,9 +390,10 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     X_tr_4v = sparse.hstack(tr_mats_4v, format="csr")
     X_te_4v = sparse.hstack(te_mats_4v, format="csr")
     X_unseen_4v = sparse.hstack(unseen_mats_4v, format="csr") if unseen_mats_4v else None
+    X_core_4v = X_tr_4v[:len(core_texts)]
 
     # OUTPUT 1: Pure 4-View LinearSVC (C=0.5, class_weight='balanced', source sample weights)
-    svc_main = LinearSVC(C=0.5, random_state=42, max_iter=5000, tol=1e-3, class_weight="balanced")
+    svc_main = LinearSVC(C=0.5, dual=True, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
     svc_main.fit(X_tr_4v, fit_y, sample_weight=fit_sw)
     logits_svc_main = svc_main.decision_function(X_te_4v)
     log_p_svc_main = log_softmax(logits_svc_main)
@@ -359,26 +403,26 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     else:
         unseen_log_p_svc_main = np.zeros((0, K), dtype=np.float32)
 
-    # OUTPUT 2: Stamatatos Text Distortion Model (keeps top-100 words, masks rest with '*')
+    # OUTPUT 2: Stamatatos Text Distortion Model (trained strictly on core_texts with feature caps)
     wre = re.compile(r"[A-Za-z’']+")
-    cnt = collections.Counter(w.lower() for t in fit_texts for w in wre.findall(t))
+    cnt = collections.Counter(w.lower() for t in core_texts for w in wre.findall(t))
     distort_keep = {w for w, _ in cnt.most_common(100)}
     dist_fn = lambda arr: [wre.sub(lambda m_: m_.group(0) if m_.group(0).lower() in distort_keep else '*', t) for t in arr]
 
-    D_tr = dist_fn(fit_texts)
+    D_tr = dist_fn(core_texts)
     D_te = dist_fn(test_texts)
     D_unseen = dist_fn(unseen_texts) if unseen_texts else []
 
     vs_dist = [
-        TfidfVectorizer(sublinear_tf=True, lowercase=False, analyzer='char', ngram_range=(2, 6), min_df=2 if len(fit_texts) >= 50 else 1),
-        TfidfVectorizer(sublinear_tf=True, lowercase=True, token_pattern=r"[^\s]+", ngram_range=(1, 3), min_df=2 if len(fit_texts) >= 50 else 1)
+        TfidfVectorizer(sublinear_tf=True, lowercase=False, analyzer='char', ngram_range=(2, 6), max_features=100000, dtype=np.float32, min_df=2 if len(core_texts) >= 50 else 1),
+        TfidfVectorizer(sublinear_tf=True, lowercase=True, token_pattern=r"[^\s]+", ngram_range=(1, 3), max_features=60000, dtype=np.float32, min_df=2 if len(core_texts) >= 50 else 1)
     ]
     Xa_dist = sparse.hstack([v_.fit_transform(D_tr) for v_ in vs_dist], format="csr")
     Xb_dist = sparse.hstack([v_.transform(D_te) for v_ in vs_dist], format="csr")
     Xu_dist = sparse.hstack([v_.transform(D_unseen) for v_ in vs_dist], format="csr") if unseen_texts else None
 
-    lr_distort = LogisticRegression(C=10.0, max_iter=3000, random_state=42)
-    lr_distort.fit(Xa_dist, fit_y, sample_weight=fit_sw)
+    lr_distort = LogisticRegression(C=10.0, max_iter=500, random_state=42)
+    lr_distort.fit(Xa_dist, core_y, sample_weight=core_sw)
     P_distort = lr_distort.predict_proba(Xb_dist)
     log_p_distort = lr_distort.predict_log_proba(Xb_dist)
     if Xu_dist is not None and Xu_dist.shape[0] > 0:
@@ -389,14 +433,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         log_p_unseen_distort = None
 
     # OUTPUT 3: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
-    # Continuous Handwriting & Punctuation Density Features + Dedicated Classifier
-    hw_tr_raw, _ = extract_handwriting_and_orthographic_features(fit_texts)
+    # Continuous Handwriting & Punctuation Density Features + Dedicated Classifier (fit strictly on df_tr train.csv)
+    hw_tr_raw, _ = extract_handwriting_and_orthographic_features(fit_texts[:len_tr_raw])
     hw_te_raw, rule_flags_te = extract_handwriting_and_orthographic_features(test_texts)
     scaler = StandardScaler()
     hw_tr = np.clip(scaler.fit_transform(hw_tr_raw), -5.0, 5.0).astype(np.float32)
     hw_te = np.clip(scaler.transform(hw_te_raw), -5.0, 5.0).astype(np.float32)
 
-    lp_hw = fit_handwriting_model(hw_tr, fit_y, hw_te, df_tr, groups_085, twin_rows_085, len_tr_raw)
+    lp_hw = fit_handwriting_model(hw_tr, fit_y[:len_tr_raw], hw_te, df_tr, groups_085, twin_rows_085, len_tr_raw)
 
     tok = None
     if qwen_tok_dir and os.path.exists(qwen_tok_dir):
@@ -419,7 +463,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 out_strs.extend(" ".join(map(str, ids)) for ids in batch_ids)
             return out_strs
 
-        fit_bpe_strs = batch_bpe_strings(fit_texts)
+        fit_bpe_strs = batch_bpe_strings(core_texts)
         test_bpe_strs = batch_bpe_strings(test_texts)
         unseen_bpe_strs = batch_bpe_strings(unseen_texts) if unseen_texts else []
         v_bpe = TfidfVectorizer(
@@ -431,24 +475,24 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         unseen_bpe = v_bpe.transform(unseen_bpe_strs) * 0.8 if unseen_texts else None
         del fit_bpe_strs, test_bpe_strs, unseen_bpe_strs, v_bpe
         gc.collect()
-        X_tr_5v = sparse.hstack([X_tr_4v, tr_bpe], format="csr")
+        X_core_5v = sparse.hstack([X_core_4v, tr_bpe], format="csr")
         X_te_5v = sparse.hstack([X_te_4v, te_bpe], format="csr")
         X_unseen_5v = sparse.hstack([X_unseen_4v, unseen_bpe], format="csr") if unseen_bpe is not None else None
     else:
         v_cw = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=75000, sublinear_tf=True, dtype=np.float32)
-        tr_cw = v_cw.fit_transform(fit_texts) * 0.8
+        tr_cw = v_cw.fit_transform(core_texts) * 0.8
         te_cw = v_cw.transform(test_texts) * 0.8
         unseen_cw = v_cw.transform(unseen_texts) * 0.8 if unseen_texts else None
-        X_tr_5v = sparse.hstack([X_tr_4v, tr_cw], format="csr")
+        X_core_5v = sparse.hstack([X_core_4v, tr_cw], format="csr")
         X_te_5v = sparse.hstack([X_te_4v, te_cw], format="csr")
         X_unseen_5v = sparse.hstack([X_unseen_4v, unseen_cw], format="csr") if unseen_cw is not None else None
 
     svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3, class_weight="balanced")
-    svc_comp.fit(X_tr_5v, fit_y, sample_weight=fit_sw)
+    svc_comp.fit(X_core_5v, core_y, sample_weight=core_sw)
     P_svc_comp = softmax(svc_comp.decision_function(X_te_5v), axis=1)
 
     sgd_comp = SGDClassifier(loss='log_loss', alpha=1e-4, max_iter=1500, random_state=42)
-    sgd_comp.fit(X_tr_5v, fit_y, sample_weight=fit_sw)
+    sgd_comp.fit(X_core_5v, core_y, sample_weight=core_sw)
     P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
 
     # Compute baseline probabilities
@@ -459,7 +503,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     P_twin_comp = P_svc_comp.copy()
     P_unseen_twin = P_unseen_svc.copy() if P_unseen_svc is not None else None
     if twin_rows_085.any() and len_tr_raw >= 18:
-        X_train_only = X_tr_5v[:len_tr_raw]
+        X_train_only = X_core_5v[:len_tr_raw]
         u_tr, inv_tr = np.unique(df_tr['prompt_id'].values, return_inverse=True)
         counts_tr = np.bincount(inv_tr)
         vals_tr = (1.0 / counts_tr[inv_tr]).astype(np.float32)
@@ -467,7 +511,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         X_train_c = X_train_only - G @ (G.T @ X_train_only)
 
         svc_twin = LinearSVC(C=0.30, random_state=42, max_iter=2500)
-        svc_twin.fit(X_train_c, fit_y[:len_tr_raw])
+        svc_twin.fit(X_train_c, core_y[:len_tr_raw])
         del X_train_only, G, X_train_c
         gc.collect()
 
@@ -509,14 +553,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     # 4 Within-Family Specialist Refiners
     beta = 0.25
     for fam_name, fam_cols in FAMILIES.items():
-        fam_mask = np.isin(fit_y, fam_cols)
+        fam_mask = np.isin(core_y, fam_cols)
         if fam_mask.sum() > 50:
-            sub_y = fit_y[fam_mask]
+            sub_y = core_y[fam_mask]
             sub_lab2i = {c: i for i, c in enumerate(fam_cols)}
             sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y])
 
             spec_svc = LinearSVC(C=0.40, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
-            spec_svc.fit(X_tr_5v[fam_mask], sub_y_mapped)
+            spec_svc.fit(X_core_5v[fam_mask], sub_y_mapped)
             df_spec = spec_svc.decision_function(X_te_5v)
             logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
             P_spec = softmax(logits_spec, axis=1)
@@ -598,7 +642,7 @@ if __name__ == "__main__":
         test_path = Path('local_data') / 'test.csv'
 
     pool_files: List[Path] = []
-    for pat in ['nlm_pool_v5.parquet', 'pool_v4.parquet', 'nlm_matched_clean.parquet', 'nlm_pool_v2.parquet']:
+    for pat in ['nlm_matched_clean.parquet', 'pool_v4.parquet', 'nlm_pool_v5.parquet', 'nlm_pool_v2.parquet']:
         for p in input_dir.rglob(pat):
             if p not in pool_files:
                 pool_files.append(p)

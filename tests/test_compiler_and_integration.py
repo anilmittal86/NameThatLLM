@@ -419,8 +419,8 @@ class TestCompilerAndIntegration(unittest.TestCase):
             pd.DataFrame({"text": ["b"], "model": ["gpt-5.5"]}).to_parquet(p_v4)
             pools = resolve_all_pool_files(tmp)
             self.assertEqual(len(pools), 2)
-            self.assertEqual(pools[0].name, "nlm_pool_v5.parquet")
-            self.assertEqual(pools[1].name, "pool_v4.parquet")
+            self.assertEqual(pools[0].name, "pool_v4.parquet")
+            self.assertEqual(pools[1].name, "nlm_pool_v5.parquet")
 
     def test_preflight_validation_raises_on_missing_assets_when_not_smoke(self):
         """Pre-flight asset validation fails closed immediately when NTL_SMOKE=0 and assets are missing."""

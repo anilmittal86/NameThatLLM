@@ -123,5 +123,56 @@ class TestLexicalEngine(unittest.TestCase):
         self.assertEqual(rules[1, 0], 1.0)  # Curly apostrophe \u2019 triggers Rule 1
         self.assertEqual(rules[1, 3], 1.0)  # Curly contraction triggers Rule 4
 
+    def test_pool_source_weight_filename_check_and_core_prefix(self):
+        import tempfile
+        from namethatllm.config import LABELS, K
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            nested_matched_clean = tmp / "nlm-matched-clean"
+            nested_matched_clean.mkdir(parents=True, exist_ok=True)
+
+            # File 1: nlm_pool_v5.parquet inside directory named 'nlm-matched-clean'
+            p_v5 = nested_matched_clean / "nlm_pool_v5.parquet"
+            # File 2: nlm_matched_clean.parquet
+            p_matched = tmp / "nlm_matched_clean.parquet"
+
+            df_pool = pd.DataFrame({
+                "text": [f"Pool passage {i} with sufficient competition passage length for verification." for i in range(18)],
+                "model": [LABELS[i % K] for i in range(18)]
+            })
+            df_pool.to_parquet(p_v5)
+            df_pool.to_parquet(p_matched)
+
+            # Check filename logic: nlm_pool_v5 in matched-clean dir must get 0.35, while matched_clean gets 0.50
+            fn_v5 = p_v5.name.lower()
+            is_matched_v5 = ("matched" in fn_v5 or "clean" in fn_v5)
+            src_w_v5 = 0.50 if is_matched_v5 else 0.35
+            self.assertEqual(src_w_v5, 0.35, "nlm_pool_v5.parquet must receive 0.35 even inside nlm-matched-clean folder")
+
+            fn_matched = p_matched.name.lower()
+            is_matched_clean = ("matched" in fn_matched or "clean" in fn_matched)
+            src_w_matched = 0.50 if is_matched_clean else 0.35
+            self.assertEqual(src_w_matched, 0.50, "nlm_matched_clean.parquet must receive 0.50")
+
+            # Check run_lexical_engine execution with pools and verify output shapes
+            tr_file = tmp / "train.csv"
+            pd.DataFrame({
+                "id": list(range(18)),
+                "prompt_id": [0] * 18,
+                "text": [f"Train passage {i} with good length." for i in range(18)],
+                "model": [LABELS[i % K] for i in range(18)]
+            }).to_csv(tr_file, index=False)
+
+            te_file = tmp / "test.csv"
+            pd.DataFrame({
+                "id": [100, 101],
+                "text": ["Test passage 1 with good length.", "Test passage 2 with good length."]
+            }).to_csv(te_file, index=False)
+
+            res = run_lexical_engine(tr_file, te_file, pool_file=[p_matched, p_v5], qwen_tok_dir="", working_dir=tmp / "out")
+            self.assertEqual(res["log_p_svc_main"].shape, (2, 18))
+            self.assertEqual(res["p_lex_comp"].shape, (2, 18))
+
 if __name__ == "__main__":
     unittest.main()
