@@ -41,7 +41,8 @@ SPECIALIST_GROUPS = {
     "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
     "gemini_37_38_pair": [7, 8],         # Dedicated 1-vs-1 binary tie-breaker for gemini-3.7-flash vs gemini-3.8-flash!
     "claude": [9, 10, 11, 12, 13],
-    "glm": [15, 16],                     # glm-5.3 vs glm-5.3-flash
+    "glm": [15, 16],                     # Dedicated 1-vs-1 binary tie-breaker for glm-5.3 vs glm-5.3-flash!
+    "glm_kimi_triad": [15, 16, 17],      # Resolves glm-5.3 <-> glm-5.3-flash <-> kimi-k3 confusion!
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
     "kimi_gpt55_qwen": [0, 14, 17],      # resolves kimi-k3 <-> gpt-5.5 <-> qwen3.8-max confusion!
 }

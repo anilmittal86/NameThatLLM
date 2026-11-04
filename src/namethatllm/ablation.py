@@ -197,17 +197,15 @@ def build_unseen_holdout_dataset(
         strictly_disjoint["model"].nunique() == K
         and (strictly_disjoint["model"].value_counts() >= samples_per_class).all()
     ):
-        df_pool_unseen = strictly_disjoint
+        pool_to_sample = strictly_disjoint
+    else:
+        pool_to_sample = df_pool_unseen
 
-    # Stratified balanced sampling across all 18 classes
-    # Per-class disjoint preference: for each class m in LABELS, use strictly_disjoint
-    # if it has >= samples_per_class rows for class m; otherwise use df_pool_unseen!
+    # Stratified balanced sampling across all 18 classes from a single consistent pool
     rng = np.random.RandomState(seed)
     sampled_parts = []
     for m in LABELS:
-        sub_dis = strictly_disjoint[strictly_disjoint["model"] == m].reset_index(drop=True)
-        sub_all = df_pool_unseen[df_pool_unseen["model"] == m].reset_index(drop=True)
-        sub = sub_dis if len(sub_dis) >= samples_per_class else (sub_dis if len(sub_dis) >= len(sub_all) else sub_all)
+        sub = pool_to_sample[pool_to_sample["model"] == m].reset_index(drop=True)
         if len(sub) > 0:
             n_take = min(samples_per_class, len(sub))
             idx = rng.choice(len(sub), size=n_take, replace=False)

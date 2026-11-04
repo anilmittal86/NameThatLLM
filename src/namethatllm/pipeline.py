@@ -392,9 +392,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     has_neural = len(ckpts) > 0 and not is_smoke
     spectral_blocks_tr: List[np.ndarray] = []
     spectral_blocks_te: List[np.ndarray] = []
+    spectral_blocks_unseen: List[np.ndarray] = []
     dp_posteriors: List[Tuple[float, np.ndarray]] = []
+    dp_posteriors_unseen: List[Tuple[float, np.ndarray]] = []
     comp_lora_posteriors: List[Tuple[float, np.ndarray]] = []
+    claude_spec_logits_unseen: Optional[np.ndarray] = None
     P_spectral = None
+    P_spectral_unseen = None
 
     df_train = pd.read_csv(train_path)
     train_sub_texts: List[str] = []
@@ -419,7 +423,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
         spectral_blocks_tr: List[np.ndarray] = []
         spectral_blocks_te: List[np.ndarray] = []
+        spectral_blocks_unseen: List[np.ndarray] = []
         dp_posteriors: List[Tuple[float, np.ndarray]] = []
+        dp_posteriors_unseen: List[Tuple[float, np.ndarray]] = []
         comp_lora_posteriors: List[Tuple[float, np.ndarray]] = []
 
         # ==============================================================================
@@ -492,6 +498,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_p2, prior_scales.get("qwen3_14b_p2", 1.00))
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
+                if N_unseen > 0 and "Z_unseen" in locals() and Z_unseen is not None:
+                    U_u = transform_lowram(Z_unseen, res_p2)
+                    lp_dp_u = scores_exact_dp(U_u, groups_unseen, res_p2, None)
+                    dp_posteriors_unseen.append((dp_weights.get("q3_14b", 0.38), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_p2, prior_scales.get("qwen3_14b_p2", 1.00))
+                    spectral_blocks_unseen.append(S_u)
+                    del U_u, S_u
 
                 trunk1.restore_weights(backup_t1)
                 del backup_t1, Z_all, Z_tr, Z_te, heads_sd, res_p2, U_te
@@ -776,6 +789,14 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, pr_sc)
                             spectral_blocks_tr.append(S_tr)
                             spectral_blocks_te.append(S_te)
+                            if N_unseen > 0 and "Z_unseen" in locals() and Z_unseen is not None:
+                                U_u = transform_lowram(Z_unseen, res_ts14)
+                                lp_dp_u = scores_exact_dp(U_u, groups_unseen, res_ts14, None)
+                                dp_w_ts14 = dp_weights.get(opt_14b_key, dp_weights.get("part1_14b" if opt_14b_key == "qwen3_14b_p1" else "q3_14b_ts", def_dp_14b))
+                                dp_posteriors_unseen.append((dp_w_ts14, softmax(lp_dp_u, axis=1)))
+                                _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ts14, pr_sc)
+                                spectral_blocks_unseen.append(S_u)
+                                del U_u, S_u
                             del res_ts14, U_te
 
                             if lp_p is not None:
@@ -877,6 +898,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_q25, prior_scales.get(q25_key, 0.85))
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
+                if N_unseen > 0 and "Z_unseen" in locals() and Z_unseen is not None:
+                    U_u = transform_lowram(Z_unseen, res_q25)
+                    lp_dp_u = scores_exact_dp(U_u, groups_unseen, res_q25, None)
+                    dp_posteriors_unseen.append((dp_weights.get("q25_14b", 0.24), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_q25, prior_scales.get(q25_key, 0.85))
+                    spectral_blocks_unseen.append(S_u)
+                    del U_u, S_u
 
                 trunk2.restore_weights(backup_t2)
                 trunk2.set_final_norm(False)
@@ -1170,6 +1198,14 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, pr_sc)
                             spectral_blocks_tr.append(S_tr)
                             spectral_blocks_te.append(S_te)
+                            if N_unseen > 0 and "Z_unseen" in locals() and Z_unseen is not None:
+                                U_u = transform_lowram(Z_unseen, res_ts8)
+                                lp_dp_u = scores_exact_dp(U_u, groups_unseen, res_ts8, None)
+                                dp_w_ts8 = dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10))
+                                dp_posteriors_unseen.append((dp_w_ts8, softmax(lp_dp_u, axis=1)))
+                                _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ts8, pr_sc)
+                                spectral_blocks_unseen.append(S_u)
+                                del U_u, S_u
                             del res_ts8, U_te
 
                             if lp_p is not None:
@@ -1264,6 +1300,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                 if W_spec is not None and W_spec.shape[0] == 5:
                     claude_spec_logits = Z_te @ W_spec.T + b_spec
+                    if N_unseen > 0 and "Z_unseen" in locals() and Z_unseen is not None:
+                        claude_spec_logits_unseen = Z_unseen @ W_spec.T + b_spec
 
                 if W_p is not None and W_p.shape[0] == 18:
                     w_comp_p = model_weights.get("qwen3_8b_claude", {}).get("plain_weight", comp_members.get("ntl_claude_head", {}).get("plain_weight", 0.0))
@@ -1308,6 +1346,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_cl, prior_scales.get("qwen3_8b_claude", 0.30))
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
+                if N_unseen > 0 and "Z_unseen" in locals() and Z_unseen is not None:
+                    U_u = transform_lowram(Z_unseen, res_cl)
+                    lp_dp_u = scores_exact_dp(U_u, groups_unseen, res_cl, None)
+                    dp_posteriors_unseen.append((dp_weights.get("claude_8b", 0.04), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_cl, prior_scales.get("qwen3_8b_claude", 0.30))
+                    spectral_blocks_unseen.append(S_u)
+                    del U_u, S_u
 
                 merge_lora(trunk3.model, claude_dir, sign=-1.0)
                 del Z_all, Z_tr, Z_te, res_cl, U_te
@@ -1398,6 +1443,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             S_tr, S_te = make_spectral_blocks(Z_tr_deb, Z_te_deb, res_deb, prior_scales.get(deb_key, 0.80))
             spectral_blocks_tr.append(S_tr)
             spectral_blocks_te.append(S_te)
+            if N_unseen > 0 and "Z_unseen_deb" in locals() and Z_unseen_deb is not None:
+                U_u = transform_lowram(Z_unseen_deb, res_deb)
+                lp_dp_u = scores_exact_dp(U_u, groups_unseen, res_deb, None)
+                dp_posteriors_unseen.append((dp_weights.get("deberta", 0.20), softmax(lp_dp_u, axis=1)))
+                _, S_u = make_spectral_blocks(Z_tr_deb, Z_unseen_deb, res_deb, prior_scales.get(deb_key, 0.80))
+                spectral_blocks_unseen.append(S_u)
+                del U_u, S_u
 
             del Z_tr_deb, Z_te_deb, Z_test_all, res_deb, U_te
             if "Z_unseen_deb" in locals():
@@ -1446,6 +1498,21 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             )
             print(f"[Pipeline] Joint Spectral Bank fitted (OOF BAcc = {oof_score:.4f})")
             COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))
+            if len(spectral_blocks_unseen) > 0 and N_unseen > 0:
+                P_spectral_unseen, _ = fit_joint_spectral_bank(
+                    spectral_blocks_tr,
+                    spectral_blocks_unseen,
+                    y_sub,
+                    prompts_sub,
+                    D_tfidf=None,
+                    D_neural_sum=None,
+                    D_neural_weight_total=0.0,
+                    N_test=N_unseen,
+                    plain_C=plain_C,
+                    center_C=center_C,
+                    center_blend=center_blend,
+                    max_cluster_size=max_cl
+                )
 
     elif is_smoke:
         print("[Pipeline] Smoke mode active: synthesizing high-fidelity mock representations...")
@@ -1462,6 +1529,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     # 4. MODULE 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration
     print("[Pipeline] Module 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration...")
     extra_streams: List[Tuple[str, float, np.ndarray]] = []
+    extra_streams_unseen: List[Tuple[str, float, np.ndarray]] = []
     w_dp = model_weights.get("wpca_dp", {}).get("plain_weight", 0.35)
     if dp_posteriors:
         tot_dp_w = sum(w for w, _ in dp_posteriors)
@@ -1470,11 +1538,19 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     elif is_smoke:
         extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(mock_p_dp, 1e-9, 1.0))))
 
+    if dp_posteriors_unseen:
+        tot_dp_u_w = sum(w for w, _ in dp_posteriors_unseen)
+        P_dp_u_comb = sum(w * P_dp for w, P_dp in dp_posteriors_unseen) / max(1e-8, tot_dp_u_w)
+        extra_streams_unseen.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_u_comb, 1e-9, 1.0))))
+
     w_sb = model_weights.get("spectral_bank", {}).get("plain_weight", 0.20)
     if "P_spectral" in locals() and P_spectral is not None:
         extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral, 1e-9, 1.0))))
     elif is_smoke:
         extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(mock_p_spec, 1e-9, 1.0))))
+
+    if "P_spectral_unseen" in locals() and P_spectral_unseen is not None:
+        extra_streams_unseen.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral_unseen, 1e-9, 1.0))))
 
     if len(auditor.models) > 0:
         optimize_on_unseen = (N_unseen >= 36 and not is_smoke)
@@ -1515,6 +1591,24 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             hw_tr=hw_tr_gate,
             hw_te=hw_te_gate,
         )
+        family_gates_unseen = {}
+        if len(spectral_blocks_unseen) > 0 and N_unseen > 0:
+            hw_u_gate = lex_out.get("hw_unseen") if "lex_out" in locals() and isinstance(lex_out, dict) else None
+            if hw_u_gate is None and (working_dir / "hw_unseen.npy").exists():
+                hw_u_gate = np.load(working_dir / "hw_unseen.npy")
+            family_gates_unseen = fit_within_family_spectral_gates(
+                spectral_blocks_tr,
+                spectral_blocks_unseen,
+                y_sub,
+                prompts_sub,
+                None,
+                None,
+                0.0,
+                N_unseen,
+                max_cluster_size=max_cl,
+                hw_tr=hw_tr_gate,
+                hw_te=hw_u_gate,
+            )
 
     # Claude Specialist Gate (Vectorized)
     gate_weight = post_cfg.get("claude_specialist_weight", 0.15)
@@ -1642,7 +1736,20 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             cache_dict[f"extra_{ex_idx}_name"] = np.array([ex_name], dtype=object)
             cache_dict[f"extra_{ex_idx}_weight"] = np.array([ex_w], dtype=np.float64)
             cache_dict[f"extra_{ex_idx}_lp"] = ex_lp.astype(np.float32)
+            if ex_idx < len(extra_streams_unseen):
+                cache_dict[f"extra_{ex_idx}_unseen_lp"] = extra_streams_unseen[ex_idx][2].astype(np.float32)
         cache_dict["num_extra"] = np.array([len(extra_streams)], dtype=np.int32)
+        if "claude_spec_logits_unseen" in locals() and claude_spec_logits_unseen is not None:
+            cache_dict["claude_spec_logits_unseen"] = claude_spec_logits_unseen.astype(np.float32)
+        if "family_gates_unseen" in locals() and family_gates_unseen:
+            for fam_k, fam_lp in family_gates_unseen.items():
+                cache_dict[f"gate_{fam_k}_unseen_lp"] = fam_lp.astype(np.float32)
+        if "unseen_texts" in locals() and unseen_texts:
+            cache_dict["unseen_texts"] = np.array(unseen_texts, dtype=object)
+        if "train_sub_texts" in locals() and train_sub_texts:
+            cache_dict["train_texts"] = np.array(train_sub_texts, dtype=object)
+        if "y_sub" in locals() and y_sub is not None:
+            cache_dict["y_train"] = np.asarray(y_sub, dtype=np.int32)
 
         cache_file_path = working_dir / "local_eval_cache.npz"
         np.savez_compressed(cache_file_path, **cache_dict)

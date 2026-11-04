@@ -36,7 +36,7 @@ def apply_all_family_confidence_gates(
         if gate_lp is None or gate_lp.shape != (len(P_out), len(cols)):
             continue
 
-        if fam_name in ("frontier_and_fable", "kimi_gpt55_qwen"):
+        if fam_name in ("frontier_and_fable", "kimi_gpt55_qwen", "glm_kimi_triad"):
             row_mask = np.isin(P_out.argmax(axis=1), cols)
             if not row_mask.any():
                 continue
@@ -47,8 +47,8 @@ def apply_all_family_confidence_gates(
         else:
             row_mask = np.ones(len(P_out), dtype=bool)
 
-        eff_margin_thr = 0.65 if fam_name == "gemini_37_38_pair" else margin_thr
-        eff_max_strength = max(float(max_strength), 0.32) if fam_name == "gemini_37_38_pair" else float(max_strength)
+        eff_margin_thr = 0.65 if fam_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else margin_thr
+        eff_max_strength = max(float(max_strength), 0.35) if fam_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else float(max_strength)
 
         sub_p = np.clip(P_out[np.ix_(row_mask, cols)], 1e-12, 1.0)
         tot_mass = sub_p.sum(axis=1, keepdims=True)

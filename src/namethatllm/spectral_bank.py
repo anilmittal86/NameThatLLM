@@ -171,7 +171,7 @@ def fit_within_family_spectral_gates(
             clf_c.fit(X_tr_c[mask_tr], sub_y)
             lp_c = clf_c.predict_log_proba(X_te_c)
 
-            w_p, w_c = (0.40, 0.60) if fam_name in ("gemini_37_38_pair", "gemini_flash_triad") else (0.65, 0.35)
+            w_p, w_c = (0.35, 0.65) if fam_name in ("gemini_37_38_pair", "gemini_flash_triad", "glm", "glm_kimi_triad", "gpt_56_triad", "kimi_gpt55_qwen", "frontier_and_fable") else (0.65, 0.35)
             family_gates[fam_name] = log_softmax(w_p * lp_p + w_c * lp_c, axis=1)
     return family_gates
 

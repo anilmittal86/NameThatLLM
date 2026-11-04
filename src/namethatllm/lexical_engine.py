@@ -57,7 +57,8 @@ SPECIALIST_GROUPS = {
     "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
     "gemini_37_38_pair": [7, 8],         # Dedicated 1-vs-1 binary tie-breaker for gemini-3.7-flash vs gemini-3.8-flash!
     "claude": [9, 10, 11, 12, 13],
-    "glm": [15, 16],                     # glm-5.3 vs glm-5.3-flash
+    "glm": [15, 16],                     # Dedicated 1-vs-1 binary tie-breaker for glm-5.3 vs glm-5.3-flash!
+    "glm_kimi_triad": [15, 16, 17],      # Resolves glm-5.3 <-> glm-5.3-flash <-> kimi-k3 confusion!
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
     "kimi_gpt55_qwen": [0, 14, 17],      # resolves kimi-k3 <-> gpt-5.5 <-> qwen3.8-max confusion!
 }
@@ -584,100 +585,88 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     P_lex_comp = 0.40 * P_svc_comp + 0.25 * P_sgd_comp + 0.15 * P_twin_comp + 0.20 * P_distort
     log_p_lex_comp = np.log(np.clip(P_lex_comp, 1e-9, 1.0))
 
-    # 4 Specialist Group Refiners (4 provider families + 3 targeted tie-breaker groups)
+    hw_c_sp = sparse.csr_matrix(hw_core * 0.25)
+    hw_te_sp = sparse.csr_matrix(hw_te * 0.25)
+    hw_u_sp = sparse.csr_matrix(hw_unseen * 0.25) if hw_unseen is not None else None
+
+    # Specialist Group Refiners (provider families + targeted sibling tie-breaker groups)
     for grp_name, grp_cols in SPECIALIST_GROUPS.items():
         grp_mask = np.isin(core_y, grp_cols)
-        if grp_mask.sum() > 50:
+        if grp_mask.sum() > 30 and len(np.unique(core_y[grp_mask])) == len(grp_cols):
             sub_y = core_y[grp_mask]
             sub_lab2i = {c: i for i, c in enumerate(grp_cols)}
-            sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y])
+            sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y], dtype=int)
 
-            is_main_fam = grp_name in FAMILIES
-            beta_grp = 0.25 if is_main_fam else 0.20
+            is_main_fam = grp_name in FAMILIES and grp_name != "glm"
             c_val = 0.40 if is_main_fam else 0.35
 
-            if grp_name == "gemini_37_38_pair":
-                hw_c_sp = sparse.csr_matrix(hw_core * 0.25)
-                hw_te_sp = sparse.csr_matrix(hw_te * 0.25)
-                hw_u_sp = sparse.csr_matrix(hw_unseen * 0.25) if hw_unseen is not None else None
-                X_tr_grp = sparse.hstack([X_core_5v[grp_mask], hw_c_sp[grp_mask]], format="csr")
-                X_te_grp = sparse.hstack([X_te_5v, hw_te_sp], format="csr")
-                X_u_grp = sparse.hstack([X_unseen_5v, hw_u_sp], format="csr") if X_unseen_5v is not None else None
+            X_tr_grp = sparse.hstack([X_core_5v[grp_mask], hw_c_sp[grp_mask]], format="csr")
+            X_te_grp = sparse.hstack([X_te_5v, hw_te_sp], format="csr")
+            X_u_grp = sparse.hstack([X_unseen_5v, hw_u_sp], format="csr") if X_unseen_5v is not None else None
 
-                spec_svc = LinearSVC(C=c_val, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
-                spec_svc.fit(X_tr_grp, sub_y_mapped, sample_weight=comp_core_sw[grp_mask])
-                df_spec = spec_svc.decision_function(X_te_grp)
-                logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
-                P_spec_plain = softmax(logits_spec, axis=1)
+            spec_svc = LinearSVC(C=c_val, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
+            spec_svc.fit(X_tr_grp, sub_y_mapped, sample_weight=comp_core_sw[grp_mask])
+            df_spec = spec_svc.decision_function(X_te_grp)
+            logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
+            P_spec_plain = softmax(logits_spec, axis=1)
 
-                train_mask = grp_mask[:len_tr_raw]
-                clf_centered = None
-                if train_mask.sum() >= 10:
-                    X_tr_pair = sparse.hstack([X_core_5v[:len_tr_raw][train_mask], hw_c_sp[:len_tr_raw][train_mask]], format="csr")
-                    y_tr_raw = core_y[:len_tr_raw][train_mask]
-                    y_tr_pair = np.array([sub_lab2i[y] for y in y_tr_raw], dtype=int)
-                    if len(np.unique(y_tr_pair)) >= 2:
-                        prompts_pair = df_tr["prompt_id"].values[train_mask]
-                        u_p, inv_p = np.unique(prompts_pair, return_inverse=True)
-                        counts_p = np.bincount(inv_p)
-                        vals_p = (1.0 / np.maximum(counts_p[inv_p], 1)).astype(np.float32)
-                        G_p = sparse.csr_matrix((vals_p, (np.arange(len(inv_p)), inv_p)), shape=(len(inv_p), len(u_p)), dtype=np.float32)
-                        X_tr_pair_c = X_tr_pair - G_p @ (G_p.T @ X_tr_pair)
+            train_mask = grp_mask[:len_tr_raw]
+            has_centered_pair = (
+                train_mask.sum() >= 6 * len(grp_cols)
+                and len(np.unique(core_y[:len_tr_raw][train_mask])) == len(grp_cols)
+            )
+            if has_centered_pair:
+                X_tr_pair = sparse.hstack([X_core_5v[:len_tr_raw][train_mask], hw_c_sp[:len_tr_raw][train_mask]], format="csr")
+                y_tr_pair = np.array([sub_lab2i[y] for y in core_y[:len_tr_raw][train_mask]], dtype=int)
+                prompts_pair = df_tr["prompt_id"].values[train_mask]
+                u_p, inv_p = np.unique(prompts_pair, return_inverse=True)
+                counts_p = np.bincount(inv_p)
+                vals_p = (1.0 / np.maximum(counts_p[inv_p], 1)).astype(np.float32)
+                G_p = sparse.csr_matrix((vals_p, (np.arange(len(inv_p)), inv_p)), shape=(len(inv_p), len(u_p)), dtype=np.float32)
+                X_tr_pair_c = X_tr_pair - G_p @ (G_p.T @ X_tr_pair)
 
-                        clf_centered = LogisticRegression(C=0.25, class_weight="balanced", random_state=42, max_iter=1000)
-                        clf_centered.fit(X_tr_pair_c, y_tr_pair)
+                clf_centered = LogisticRegression(C=0.25, class_weight="balanced", random_state=42, max_iter=1000)
+                clf_centered.fit(X_tr_pair_c, y_tr_pair)
 
-                        if twin_rows_085.any():
-                            u_t, inv_t = np.unique(groups_085, return_inverse=True)
-                            counts_t = np.bincount(inv_t)
-                            vals_t = (1.0 / np.maximum(counts_t[inv_t], 1)).astype(np.float32)
-                            G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
-                            X_te_pair_c = X_te_grp - G_t @ (G_t.T @ X_te_grp)
-                        else:
-                            X_te_pair_c = X_te_grp
-                        P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
-                        P_spec = 0.55 * P_spec_plain + 0.45 * P_spec_centered
-                    else:
-                        P_spec = P_spec_plain
+                if twin_rows_085.any():
+                    u_t, inv_t = np.unique(groups_085, return_inverse=True)
+                    counts_t = np.bincount(inv_t)
+                    vals_t = (1.0 / np.maximum(counts_t[inv_t], 1)).astype(np.float32)
+                    G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
+                    X_te_pair_c = X_te_grp - G_t @ (G_t.T @ X_te_grp)
                 else:
-                    P_spec = P_spec_plain
-                beta_grp = 0.30
+                    X_te_pair_c = X_te_grp
+                P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
+                w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
+                P_spec = w_plain_s * P_spec_plain + (1.0 - w_plain_s) * P_spec_centered
             else:
-                spec_svc = LinearSVC(C=c_val, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
-                spec_svc.fit(X_core_5v[grp_mask], sub_y_mapped, sample_weight=comp_core_sw[grp_mask])
-                df_spec = spec_svc.decision_function(X_te_5v)
-                logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
-                P_spec = softmax(logits_spec, axis=1)
+                P_spec = P_spec_plain
 
+            beta_grp = 0.30 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else (0.25 if is_main_fam else 0.20)
             P_prior = P_lex_comp[:, grp_cols]
             P_prior_norm = P_prior / (P_prior.sum(axis=1, keepdims=True) + 1e-12)
             P_refined = (1.0 - beta_grp) * P_prior_norm + beta_grp * P_spec
-
             log_ratio = np.log(np.clip(P_refined, 1e-9, 1.0)) - np.log(np.clip(P_prior_norm, 1e-9, 1.0))
             log_p_lex_comp[:, grp_cols] += log_ratio
 
-            if log_p_unseen_comp is not None:
-                if grp_name == "gemini_37_38_pair" and X_u_grp is not None:
-                    df_spec_u = spec_svc.decision_function(X_u_grp)
-                    logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
-                    P_spec_u_plain = softmax(logits_spec_u, axis=1)
-                    if clf_centered is not None:
-                        if "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_u_grp.shape[0]:
-                            u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
-                            counts_u = np.bincount(inv_u)
-                            vals_u = (1.0 / np.maximum(counts_u[inv_u], 1)).astype(np.float32)
-                            G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u)), inv_u)), shape=(len(inv_u), len(u_u)), dtype=np.float32)
-                            X_u_pair_c = X_u_grp - G_u @ (G_u.T @ X_u_grp)
-                        else:
-                            X_u_pair_c = X_u_grp
-                        P_spec_u_centered = clf_centered.predict_proba(X_u_pair_c)
-                        P_spec_u = 0.55 * P_spec_u_plain + 0.45 * P_spec_u_centered
+            if log_p_unseen_comp is not None and X_u_grp is not None and X_u_grp.shape[0] > 0:
+                df_spec_u = spec_svc.decision_function(X_u_grp)
+                logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
+                P_spec_u_plain = softmax(logits_spec_u, axis=1)
+                if has_centered_pair:
+                    if "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_u_grp.shape[0]:
+                        u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
+                        counts_u = np.bincount(inv_u)
+                        vals_u = (1.0 / np.maximum(counts_u[inv_u], 1)).astype(np.float32)
+                        G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u)), inv_u)), shape=(len(inv_u), len(u_u)), dtype=np.float32)
+                        X_u_pair_c = X_u_grp - G_u @ (G_u.T @ X_u_grp)
                     else:
-                        P_spec_u = P_spec_u_plain
+                        X_u_pair_c = X_u_grp
+                    P_spec_u_centered = clf_centered.predict_proba(X_u_pair_c)
+                    w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
+                    P_spec_u = w_plain_s * P_spec_u_plain + (1.0 - w_plain_s) * P_spec_u_centered
                 else:
-                    df_spec_u = spec_svc.decision_function(X_unseen_5v)
-                    logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
-                    P_spec_u = softmax(logits_spec_u, axis=1)
+                    P_spec_u = P_spec_u_plain
 
                 P_prior_u = P_unseen_comp[:, grp_cols]
                 P_prior_u_norm = P_prior_u / (P_prior_u.sum(axis=1, keepdims=True) + 1e-12)
@@ -692,6 +681,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     os.makedirs(working_dir, exist_ok=True)
     np.save(working_dir / 'hw_train.npy', hw_core[:len_tr_raw])
     np.save(working_dir / 'hw_test.npy', hw_te)
+    if hw_unseen is not None:
+        np.save(working_dir / 'hw_unseen.npy', hw_unseen)
     np.save(working_dir / 'log_p_svc_main.npy', log_p_svc_main)
     np.save(working_dir / 'p_lex_comp.npy', P_lex_comp_final)
     np.save(working_dir / 'D_tfidf.npy', D)
@@ -716,6 +707,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         "unseen_p_lex_comp": unseen_p_lex_comp_final,
         "hw_train": hw_core[:len_tr_raw],
         "hw_test": hw_te,
+        "hw_unseen": hw_unseen,
         "log_p_distort": log_p_distort,
         "unseen_log_p_distort": log_p_unseen_distort,
     }

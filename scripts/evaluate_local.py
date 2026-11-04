@@ -685,6 +685,8 @@ def print_npz_ablation_diagnostics(
     active_weights_map: Dict[str, float],
     show_confusion: bool = False,
     html_report_path: Optional[Path] = None,
+    data: Optional[Dict[str, Any]] = None,
+    post_cfg: Optional[Dict[str, Any]] = None,
 ) -> None:
 
     """
@@ -937,7 +939,7 @@ def print_npz_ablation_diagnostics(
 
 
 
-    print_per_class_accuracy_table(auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report_path)
+    print_per_class_accuracy_table(auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report_path, data=data, post_cfg=post_cfg)
 
 
 
@@ -948,6 +950,8 @@ def print_per_class_accuracy_table(
     active_weights_map: Dict[str, float],
     show_confusion: bool = False,
     html_report_path: Optional[Path] = None,
+    data: Optional[Dict[str, Any]] = None,
+    post_cfg: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """
     Table D: Per-Class Accuracy (Recall) across all 18 classes for every model in the cache
@@ -974,10 +978,53 @@ def print_per_class_accuracy_table(
     clean_models = [m for m in models if "v5" not in m["name"].lower() and float(active_weights_map.get(m["name"], m["weight"])) > 0]
     prod_models = [m for m in models if float(active_weights_map.get(m["name"], m["weight"])) > 0]
 
+    def _apply_full_postprocessing(base_lp: np.ndarray) -> np.ndarray:
+        P = softmax(base_lp, axis=1)
+        if data is not None:
+            if "claude_spec_logits_unseen" in data:
+                claude_spec_u = data["claude_spec_logits_unseen"]
+                claude_classes = list(data["claude_classes"]) if "claude_classes" in data else None
+                P = apply_claude_specialist_gate(
+                    P_mix=P,
+                    R_main=P,
+                    claude_spec_logits=claude_spec_u,
+                    claude_classes=claude_classes,
+                    labels=LABELS,
+                    claude_cols=FAMILIES["claude"],
+                    gate_weight=post_cfg.get("claude_specialist_weight", 0.15) if post_cfg else 0.15,
+                )
+            family_gates_u = {}
+            for k in data.keys():
+                if k.startswith("gate_") and k.endswith("_unseen_lp"):
+                    fam_k = k[len("gate_"):-len("_unseen_lp")]
+                    family_gates_u[fam_k] = data[k]
+            if family_gates_u:
+                P = apply_all_family_confidence_gates(
+                    P_mix=P,
+                    family_gates=family_gates_u,
+                    max_strength=post_cfg.get("family_gate_strength", 0.20) if post_cfg else 0.20,
+                )
+            if "unseen_texts" in data:
+                unseen_texts = list(data["unseen_texts"])
+                P = apply_unified_handwriting_shield(
+                    P_mix=P,
+                    test_texts=unseen_texts,
+                    log_p_handwriting=None,
+                    rule_flags=None,
+                    curly_quote_multiplier=post_cfg.get("curly_quote_multiplier", float(np.exp(-1.0))) if post_cfg else float(np.exp(-1.0)),
+                )
+            if "groups_unseen" in data and len(data["groups_unseen"]) == len(P):
+                P = apply_cluster_uniqueness_repulsion(
+                    P_mix=P,
+                    groups=data["groups_unseen"],
+                    strength=post_cfg.get("cluster_repulsion_strength", 0.35) if post_cfg else 0.35,
+                    iters=3,
+                )
+        return _ablation_sinkhorn(P, iters=60, y_true=y_true)
+
     # Helper function for Sinkhorn balanced accuracy
     def calc_sinkhorn_bacc(lp: np.ndarray) -> float:
-        P = softmax(lp, axis=1)
-        P_s = _ablation_sinkhorn(P, iters=60, y_true=y_true)
+        P_s = _apply_full_postprocessing(lp)
         preds = P_s.argmax(axis=1)
         recs = [(preds[y_true == c] == c).mean() for c in range(K) if (y_true == c).sum() > 0]
         return float(np.mean(recs)) if len(recs) > 0 else 0.0
@@ -987,15 +1034,26 @@ def print_per_class_accuracy_table(
     for m in clean_models:
         w = float(active_weights_map.get(m["name"], m["weight"]))
         clean_lp += w * m["unseen_lp"]
-    P_clean = _ablation_sinkhorn(softmax(clean_lp, axis=1), iters=60, y_true=y_true)
-    clean_preds = P_clean.argmax(axis=1)
 
     # Production Ensemble predictions (all active models including qwen3_14b_v5 with its full weight)
     prod_lp = np.zeros((len(y_true), K), dtype=np.float64)
     for m in prod_models:
         w = float(active_weights_map.get(m["name"], m["weight"]))
         prod_lp += w * m["unseen_lp"]
-    P_prod = _ablation_sinkhorn(softmax(prod_lp, axis=1), iters=60, y_true=y_true)
+
+    if data is not None:
+        num_extra = int(data["num_extra"][0]) if "num_extra" in data else 0
+        for ex_idx in range(num_extra):
+            if f"extra_{ex_idx}_unseen_lp" in data:
+                ex_w = float(data[f"extra_{ex_idx}_weight"][0])
+                ex_u_lp = data[f"extra_{ex_idx}_unseen_lp"]
+                prod_lp += ex_w * ex_u_lp
+                clean_lp += ex_w * ex_u_lp
+
+    P_clean = _apply_full_postprocessing(clean_lp)
+    clean_preds = P_clean.argmax(axis=1)
+
+    P_prod = _apply_full_postprocessing(prod_lp)
     prod_preds = P_prod.argmax(axis=1)
     full_prod_bacc = float(np.mean([(prod_preds[y_true == c] == c).mean() for c in range(K)]))
 
@@ -1813,7 +1871,7 @@ def evaluate_from_cache(
 
         df_report = auditor.print_and_save_report(report_dir, final_test_preds=test_final_preds)
 
-        print_npz_ablation_diagnostics(auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report)
+        print_npz_ablation_diagnostics(auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report, data=data, post_cfg=post_cfg)
 
 
 
