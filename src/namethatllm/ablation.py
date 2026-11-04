@@ -81,9 +81,9 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
 
-    # 2. Mark only pool_v4.parquet and pool_v1.parquet as contaminated
-    # (seen by Part-2 LoRAs, DeBERTa, inhouse)
-    for pat in ["pool_v4.parquet", "pool_v1.parquet"]:
+    # 2. Mark pool_v4.parquet, pool_v1.parquet, and nlm_pool_v5.parquet as contaminated
+    # (seen by Part-2 LoRAs, DeBERTa, inhouse, and qwen3_14b_v5)
+    for pat in ["pool_v4.parquet", "pool_v1.parquet", "*pool_v5*.parquet", "nlm_pool_v5.parquet"]:
         for p in input_dir.rglob(pat):
             try:
                 df_p = pd.read_parquet(p, columns=["text"])
@@ -118,7 +118,6 @@ def build_unseen_holdout_dataset(
 
     candidate_patterns = [
         "nlm_matched_clean.parquet",
-        "nlm_pool_v5.parquet",
         "nlm_pool_v2.parquet",
         "*openrouter*.parquet",
         "*openrouter*.csv",
@@ -130,7 +129,7 @@ def build_unseen_holdout_dataset(
             if p in seen_paths:
                 continue
             p_name = p.name.lower()
-            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1", "pool_v5"]):
                 continue
             seen_paths.add(p)
             df_c = _process_candidate_file(p)
@@ -144,7 +143,7 @@ def build_unseen_holdout_dataset(
                 continue
             p_str = str(p).lower().replace("\\", "/")
             p_name = p.name.lower()
-            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1", "pool_v5"]):
                 continue
             if any(k in p_str for k in ["openrouter", "harvest", "passages", "generations"]):
                 seen_paths.add(p)
@@ -159,7 +158,7 @@ def build_unseen_holdout_dataset(
                 if p in seen_paths:
                     continue
                 p_name = p.name.lower()
-                if any(x in p_name for x in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+                if any(x in p_name for x in ["train", "test", "submission", "pool_v4", "pool_v1", "pool_v5"]):
                     continue
                 seen_paths.add(p)
                 df_c = _process_candidate_file(p)
@@ -172,7 +171,7 @@ def build_unseen_holdout_dataset(
     df_pool_unseen = pd.concat(candidate_dfs, ignore_index=True).drop_duplicates(subset=["_hash"])
 
     v5_hashes: Set[str] = set()
-    for pat in ["nlm_pool_v5.parquet", "nlm_matched_clean.parquet"]:
+    for pat in ["nlm_pool_v5.parquet", "*pool_v5*.parquet"]:
         for p in input_dir.rglob(pat):
             try:
                 df_v5 = pd.read_parquet(p, columns=["text"])
@@ -227,7 +226,7 @@ def build_unseen_holdout_dataset(
     holdout_hashes = set(df_unseen["_hash"].tolist())
     print(
         f"[Unseen Benchmark] Built strictly unseen holdout set: {len(df_unseen)} rows "
-        f"across {df_unseen['model'].nunique()} classes (0% overlap with train.csv & pool_v4.parquet)."
+        f"across {df_unseen['model'].nunique()} classes (0% overlap with train.csv, pool_v4.parquet & pool_v5.parquet)."
     )
     return df_unseen, holdout_hashes
 
