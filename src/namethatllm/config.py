@@ -28,7 +28,8 @@ FAMILIES = {
 }
 
 # The 6 lowest-recall classes from Table D that require extra pool capacity and margin priority
-HARD_CLASS_INDICES = [3, 7, 13, 15, 16, 17]  # gpt-5.6-terra, gemini-3.7-flash, claude-fable-5, glm-5.3, glm-5.3-flash, kimi-k3
+# Include BOTH 7 (gemini-3.7-flash) and 8 (gemini-3.8-flash) so their pool caps are 100% symmetric!
+HARD_CLASS_INDICES = [3, 7, 8, 13, 15, 16, 17]
 
 # Extended specialist groups: includes the 4 provider families PLUS the cross-family
 # Straight-Quote / Chinese Frontier confusion cluster (opus-4-8, fable-5, qwen3.8-max, glm-5.3, glm-5.3-flash, kimi-k3)
@@ -38,6 +39,7 @@ SPECIALIST_GROUPS = {
     "gpt_56_triad": [1, 2, 3],           # gpt-5.6-luna vs gpt-5.6-sol vs gpt-5.6-terra
     "gemini": [5, 6, 7, 8],
     "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
+    "gemini_37_38_pair": [7, 8],         # Dedicated 1-vs-1 binary tie-breaker for gemini-3.7-flash vs gemini-3.8-flash!
     "claude": [9, 10, 11, 12, 13],
     "glm": [15, 16],                     # glm-5.3 vs glm-5.3-flash
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
@@ -68,6 +70,32 @@ def align_cols(arr: np.ndarray, src_labels: list) -> np.ndarray:
         elif arr.shape[1] == len(src_list):
             return arr[:, idx]
     return arr[..., idx]
+
+
+def calibrate_model_lp(lp: np.ndarray, model_name: str = "", max_std: float = 4.2) -> np.ndarray:
+    """
+    1. Caps row-wise log-probability std at `max_std` (preventing uncalibrated
+       checkpoints with LP_std=13.1 from hijacking >50% of the ensemble vote)
+       and clips extreme negative tails at -16.0.
+    2. If a `v5` checkpoint still exhibits severe [7, 8] imbalance (where
+       mean LP on col 7 exceeds col 8 by > 3.0 nats across rows), neutralizes
+       its internal [7, 8] split to their mean so it votes on the Gemini Flash
+       pair {3.7, 3.8} while deferring the 3.7-vs-3.8 tie-breaker to clean models.
+    """
+    if lp is None or len(lp) == 0:
+        return lp
+    out = np.asarray(lp, dtype=np.float64).copy()
+    if "v5" in str(model_name).lower() and out.shape[1] == K:
+        if float(np.mean(out[:, 7] - out[:, 8])) > 3.0:
+            mean_37_38 = 0.5 * (out[:, 7] + out[:, 8])
+            out[:, 7] = mean_37_38
+            out[:, 8] = mean_37_38
+    row_std = float(out.std(axis=1).mean())
+    if row_std > max_std and row_std > 1e-6:
+        out = out * (max_std / row_std)
+    out = log_softmax(out, axis=1)
+    out = np.maximum(out, -16.0)
+    return log_softmax(out, axis=1)
 
 def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     """Numerically stable log-softmax."""

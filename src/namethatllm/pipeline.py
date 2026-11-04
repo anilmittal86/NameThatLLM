@@ -655,9 +655,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     del Z_te_u
 
                                 if f_W_p is not None:
-                                    lp_p_acc += log_softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1) / num_14b_folds
+                                    raw_p_f = align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels)
+                                    std_f = float(np.std(raw_p_f, axis=1).mean())
+                                    temp_f = max(1.0, std_f / 4.2)
+                                    lp_p_acc += log_softmax(raw_p_f / temp_f, axis=1) / num_14b_folds
                                     if N_unseen > 0 and f_Z_u is not None:
-                                        lp_u_p_acc += log_softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1) / num_14b_folds
+                                        raw_u_f = align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels)
+                                        lp_u_p_acc += log_softmax(raw_u_f / temp_f, axis=1) / num_14b_folds
                                 if f_W_c is not None:
                                     has_any_c = True
                                     lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
@@ -713,7 +717,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 )
 
                             if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
-                                lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
+                                raw_u_p = align_cols(Z_unseen @ W_p.T + b_p, ts14_labels)
+                                std_u = float(np.std(raw_u_p, axis=1).mean())
+                                temp_u = max(1.0, std_u / 4.2)
+                                lp_u_p_fit = log_softmax(raw_u_p / temp_u, axis=1)
                                 if W_c is not None:
                                     lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts14_labels)
                                     lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
@@ -731,7 +738,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                         gate_passed = False
 
                             if gate_passed:
-                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
+                                if W_p is not None:
+                                    raw_te = align_cols(Z_te @ W_p.T + b_p, ts14_labels)
+                                    std_te = float(np.std(raw_te, axis=1).mean())
+                                    temp_te = max(1.0, std_te / 4.2)
+                                    lp_p = log_softmax(raw_te / temp_te, axis=1)
+                                else:
+                                    lp_p = None
                                 if W_c is not None:
                                     lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
                                     lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
@@ -1034,9 +1047,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     del Z_te_u
 
                                 if f_W_p is not None:
-                                    lp_p_acc += log_softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1) / num_8b_folds
+                                    raw_p_f = align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels)
+                                    std_f = float(np.std(raw_p_f, axis=1).mean())
+                                    temp_f = max(1.0, std_f / 4.2)
+                                    lp_p_acc += log_softmax(raw_p_f / temp_f, axis=1) / num_8b_folds
                                     if N_unseen > 0 and f_Z_u is not None:
-                                        lp_u_p_acc += log_softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1) / num_8b_folds
+                                        raw_u_f = align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels)
+                                        lp_u_p_acc += log_softmax(raw_u_f / temp_f, axis=1) / num_8b_folds
                                 if f_W_c is not None:
                                     has_any_c = True
                                     lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
@@ -1092,7 +1109,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 )
 
                             if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
-                                lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
+                                raw_u_p = align_cols(Z_unseen @ W_p.T + b_p, ts8_labels)
+                                std_u = float(np.std(raw_u_p, axis=1).mean())
+                                temp_u = max(1.0, std_u / 4.2)
+                                lp_u_p_fit = log_softmax(raw_u_p / temp_u, axis=1)
                                 if W_c is not None:
                                     lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts8_labels)
                                     lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
@@ -1110,7 +1130,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                         gate_passed = False
 
                             if gate_passed:
-                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
+                                if W_p is not None:
+                                    raw_te = align_cols(Z_te @ W_p.T + b_p, ts8_labels)
+                                    std_te = float(np.std(raw_te, axis=1).mean())
+                                    temp_te = max(1.0, std_te / 4.2)
+                                    lp_p = log_softmax(raw_te / temp_te, axis=1)
+                                else:
+                                    lp_p = None
                                 if W_c is not None:
                                     lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
                                     lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
@@ -1469,6 +1495,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     # 4-Family Within-Family Spectral Gates (Vectorized)
     family_gates = {}
     if len(spectral_blocks_tr) > 0 and len(spectral_blocks_te) > 0:
+        hw_tr_gate = lex_out.get("hw_train") if "lex_out" in locals() and isinstance(lex_out, dict) else None
+        hw_te_gate = lex_out.get("hw_test") if "lex_out" in locals() and isinstance(lex_out, dict) else None
+        if hw_tr_gate is None and (working_dir / "hw_train.npy").exists():
+            hw_tr_gate = np.load(working_dir / "hw_train.npy")
+        if hw_te_gate is None and (working_dir / "hw_test.npy").exists():
+            hw_te_gate = np.load(working_dir / "hw_test.npy")
+
         family_gates = fit_within_family_spectral_gates(
             spectral_blocks_tr,
             spectral_blocks_te,
@@ -1479,6 +1512,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             D_neural_weight_total,
             N_test,
             max_cluster_size=max_cl,
+            hw_tr=hw_tr_gate,
+            hw_te=hw_te_gate,
         )
 
     # Claude Specialist Gate (Vectorized)

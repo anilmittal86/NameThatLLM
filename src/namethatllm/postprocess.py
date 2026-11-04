@@ -40,15 +40,22 @@ def apply_all_family_confidence_gates(
             row_mask = np.isin(P_out.argmax(axis=1), cols)
             if not row_mask.any():
                 continue
+        elif fam_name == "gemini_37_38_pair":
+            row_mask = np.isin(P_out.argmax(axis=1), FAMILIES.get("gemini", [5, 6, 7, 8]))
+            if not row_mask.any():
+                continue
         else:
             row_mask = np.ones(len(P_out), dtype=bool)
+
+        eff_margin_thr = 0.65 if fam_name == "gemini_37_38_pair" else margin_thr
+        eff_max_strength = max(float(max_strength), 0.32) if fam_name == "gemini_37_38_pair" else float(max_strength)
 
         sub_p = np.clip(P_out[np.ix_(row_mask, cols)], 1e-12, 1.0)
         tot_mass = sub_p.sum(axis=1, keepdims=True)
         base_rel_p = sub_p / tot_mass
         sp = np.sort(base_rel_p, axis=1)
         margin = sp[:, -1] - sp[:, -2]
-        strength = np.clip((margin_thr - margin) / max(margin_thr, 1e-6), 0.0, 1.0)[:, None] * float(max_strength)
+        strength = np.clip((eff_margin_thr - margin) / max(eff_margin_thr, 1e-6), 0.0, 1.0)[:, None] * eff_max_strength
         base_lp = np.log(np.clip(base_rel_p, 1e-12, 1.0))
         gate_p = softmax(gate_lp[row_mask], axis=1)
         gate_lp_norm = np.log(np.clip(gate_p, 1e-12, 1.0))

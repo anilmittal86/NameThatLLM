@@ -44,7 +44,8 @@ FAMILIES = {
 }
 
 # The 6 lowest-recall classes from Table D that require extra pool capacity and margin priority
-HARD_CLASS_INDICES = [3, 7, 13, 15, 16, 17]  # gpt-5.6-terra, gemini-3.7-flash, claude-fable-5, glm-5.3, glm-5.3-flash, kimi-k3
+# Include BOTH 7 (gemini-3.7-flash) and 8 (gemini-3.8-flash) so their pool caps are 100% symmetric!
+HARD_CLASS_INDICES = [3, 7, 8, 13, 15, 16, 17]
 
 # Extended specialist groups: includes the 4 provider families PLUS the cross-family
 # Straight-Quote / Chinese Frontier confusion cluster (opus-4-8, fable-5, qwen3.8-max, glm-5.3, glm-5.3-flash, kimi-k3)
@@ -54,6 +55,7 @@ SPECIALIST_GROUPS = {
     "gpt_56_triad": [1, 2, 3],           # gpt-5.6-luna vs gpt-5.6-sol vs gpt-5.6-terra
     "gemini": [5, 6, 7, 8],
     "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
+    "gemini_37_38_pair": [7, 8],         # Dedicated 1-vs-1 binary tie-breaker for gemini-3.7-flash vs gemini-3.8-flash!
     "claude": [9, 10, 11, 12, 13],
     "glm": [15, 16],                     # glm-5.3 vs glm-5.3-flash
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
@@ -317,8 +319,11 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 fit_add_t, fit_add_y, fit_add_sw = [], [], []
                 core_add_t, core_add_y, core_add_sw = [], [], []
 
+                pf_filename = Path(pf).name.lower()
                 for t_val, m_val in zip(p_df['text'].values, p_df['model'].values):
                     c_idx = LAB2I[m_val]
+                    if 'pool_v5' in pf_filename and c_idx in (7, 8):
+                        continue
                     max_tot_c = int(1.4 * MAX_TOTAL_POOL_PER_CLASS) if c_idx in HARD_CLASS_INDICES else MAX_TOTAL_POOL_PER_CLASS
                     if total_class_counts[c_idx] >= max_tot_c:
                         continue
@@ -455,11 +460,15 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
     # OUTPUT 3: 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble
     # Continuous Handwriting & Punctuation Density Features + Dedicated Classifier (fit strictly on df_tr train.csv)
-    hw_tr_raw, _ = extract_handwriting_and_orthographic_features(fit_texts[:len_tr_raw])
+    hw_core_raw, _ = extract_handwriting_and_orthographic_features(core_texts)
     hw_te_raw, rule_flags_te = extract_handwriting_and_orthographic_features(test_texts)
+    hw_unseen_raw, _ = extract_handwriting_and_orthographic_features(unseen_texts) if unseen_texts else (None, None)
     scaler = StandardScaler()
-    hw_tr = np.clip(scaler.fit_transform(hw_tr_raw), -5.0, 5.0).astype(np.float32)
+    scaler.fit(hw_core_raw[:len_tr_raw])
+    hw_core = np.clip(scaler.transform(hw_core_raw), -5.0, 5.0).astype(np.float32)
     hw_te = np.clip(scaler.transform(hw_te_raw), -5.0, 5.0).astype(np.float32)
+    hw_unseen = np.clip(scaler.transform(hw_unseen_raw), -5.0, 5.0).astype(np.float32) if hw_unseen_raw is not None else None
+    hw_tr = hw_core[:len_tr_raw]
 
     lp_hw = fit_handwriting_model(hw_tr, fit_y[:len_tr_raw], hw_te, df_tr, groups_085, twin_rows_085, len_tr_raw)
 
@@ -509,7 +518,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         X_unseen_5v = sparse.hstack([X_unseen_4v, unseen_cw], format="csr") if unseen_cw is not None else None
 
     comp_core_sw = core_sw.copy()
-    hard_mask = np.isin(core_y, HARD_CLASS_INDICES)
+    # Boost non-Gemini hard classes, keeping 7 and 8 strictly symmetric
+    hard_mask = np.isin(core_y, [c for c in HARD_CLASS_INDICES if c not in (7, 8)])
     comp_core_sw[hard_mask] *= 1.20
 
     svc_comp = LinearSVC(C=0.35, random_state=42, max_iter=3000, tol=1e-3, class_weight="balanced")
@@ -587,11 +597,53 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
             beta_grp = 0.25 if is_main_fam else 0.20
             c_val = 0.40 if is_main_fam else 0.35
 
-            spec_svc = LinearSVC(C=c_val, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
-            spec_svc.fit(X_core_5v[grp_mask], sub_y_mapped, sample_weight=comp_core_sw[grp_mask])
-            df_spec = spec_svc.decision_function(X_te_5v)
-            logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
-            P_spec = softmax(logits_spec, axis=1)
+            if grp_name == "gemini_37_38_pair":
+                hw_c_sp = sparse.csr_matrix(hw_core * 0.25)
+                hw_te_sp = sparse.csr_matrix(hw_te * 0.25)
+                hw_u_sp = sparse.csr_matrix(hw_unseen * 0.25) if hw_unseen is not None else None
+                X_tr_grp = sparse.hstack([X_core_5v[grp_mask], hw_c_sp[grp_mask]], format="csr")
+                X_te_grp = sparse.hstack([X_te_5v, hw_te_sp], format="csr")
+                X_u_grp = sparse.hstack([X_unseen_5v, hw_u_sp], format="csr") if X_unseen_5v is not None else None
+
+                spec_svc = LinearSVC(C=c_val, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
+                spec_svc.fit(X_tr_grp, sub_y_mapped, sample_weight=comp_core_sw[grp_mask])
+                df_spec = spec_svc.decision_function(X_te_grp)
+                logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
+                P_spec_plain = softmax(logits_spec, axis=1)
+
+                train_mask = grp_mask[:len_tr_raw]
+                if train_mask.sum() >= 10:
+                    X_tr_pair = sparse.hstack([X_core_5v[:len_tr_raw][train_mask], hw_c_sp[:len_tr_raw][train_mask]], format="csr")
+                    y_tr_pair = sub_y_mapped[:len_tr_raw][train_mask]
+                    prompts_pair = df_tr["prompt_id"].values[train_mask]
+                    u_p, inv_p = np.unique(prompts_pair, return_inverse=True)
+                    counts_p = np.bincount(inv_p)
+                    vals_p = (1.0 / np.maximum(counts_p[inv_p], 1)).astype(np.float32)
+                    G_p = sparse.csr_matrix((vals_p, (np.arange(len(inv_p)), inv_p)), shape=(len(inv_p), len(u_p)), dtype=np.float32)
+                    X_tr_pair_c = X_tr_pair - G_p @ (G_p.T @ X_tr_pair)
+
+                    clf_centered = LogisticRegression(C=0.25, class_weight="balanced", random_state=42, max_iter=1000)
+                    clf_centered.fit(X_tr_pair_c, y_tr_pair)
+
+                    if twin_rows_085.any():
+                        u_t, inv_t = np.unique(groups_085, return_inverse=True)
+                        counts_t = np.bincount(inv_t)
+                        vals_t = (1.0 / np.maximum(counts_t[inv_t], 1)).astype(np.float32)
+                        G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
+                        X_te_pair_c = X_te_grp - G_t @ (G_t.T @ X_te_grp)
+                    else:
+                        X_te_pair_c = X_te_grp
+                    P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
+                    P_spec = 0.55 * P_spec_plain + 0.45 * P_spec_centered
+                else:
+                    P_spec = P_spec_plain
+                beta_grp = 0.30
+            else:
+                spec_svc = LinearSVC(C=c_val, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
+                spec_svc.fit(X_core_5v[grp_mask], sub_y_mapped, sample_weight=comp_core_sw[grp_mask])
+                df_spec = spec_svc.decision_function(X_te_5v)
+                logits_spec = np.column_stack([-df_spec, df_spec]) if df_spec.ndim == 1 else df_spec
+                P_spec = softmax(logits_spec, axis=1)
 
             P_prior = P_lex_comp[:, grp_cols]
             P_prior_norm = P_prior / (P_prior.sum(axis=1, keepdims=True) + 1e-12)
@@ -601,9 +653,28 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
             log_p_lex_comp[:, grp_cols] += log_ratio
 
             if log_p_unseen_comp is not None:
-                df_spec_u = spec_svc.decision_function(X_unseen_5v)
-                logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
-                P_spec_u = softmax(logits_spec_u, axis=1)
+                if grp_name == "gemini_37_38_pair" and X_u_grp is not None:
+                    df_spec_u = spec_svc.decision_function(X_u_grp)
+                    logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
+                    P_spec_u_plain = softmax(logits_spec_u, axis=1)
+                    if train_mask.sum() >= 10:
+                        if "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_u_grp.shape[0]:
+                            u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
+                            counts_u = np.bincount(inv_u)
+                            vals_u = (1.0 / np.maximum(counts_u[inv_u], 1)).astype(np.float32)
+                            G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u)), inv_u)), shape=(len(inv_u), len(u_u)), dtype=np.float32)
+                            X_u_pair_c = X_u_grp - G_u @ (G_u.T @ X_u_grp)
+                        else:
+                            X_u_pair_c = X_u_grp
+                        P_spec_u_centered = clf_centered.predict_proba(X_u_pair_c)
+                        P_spec_u = 0.55 * P_spec_u_plain + 0.45 * P_spec_u_centered
+                    else:
+                        P_spec_u = P_spec_u_plain
+                else:
+                    df_spec_u = spec_svc.decision_function(X_unseen_5v)
+                    logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
+                    P_spec_u = softmax(logits_spec_u, axis=1)
+
                 P_prior_u = P_unseen_comp[:, grp_cols]
                 P_prior_u_norm = P_prior_u / (P_prior_u.sum(axis=1, keepdims=True) + 1e-12)
                 P_refined_u = (1.0 - beta_grp) * P_prior_u_norm + beta_grp * P_spec_u
@@ -615,6 +686,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
     # Save to disk
     os.makedirs(working_dir, exist_ok=True)
+    np.save(working_dir / 'hw_train.npy', hw_core[:len_tr_raw])
+    np.save(working_dir / 'hw_test.npy', hw_te)
     np.save(working_dir / 'log_p_svc_main.npy', log_p_svc_main)
     np.save(working_dir / 'p_lex_comp.npy', P_lex_comp_final)
     np.save(working_dir / 'D_tfidf.npy', D)
@@ -637,6 +710,8 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         "rule_flags_test": rule_flags_te,
         "unseen_log_p_svc_main": unseen_log_p_svc_main,
         "unseen_p_lex_comp": unseen_p_lex_comp_final,
+        "hw_train": hw_core[:len_tr_raw],
+        "hw_test": hw_te,
         "log_p_distort": log_p_distort,
         "unseen_log_p_distort": log_p_unseen_distort,
     }

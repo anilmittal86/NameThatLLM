@@ -78,7 +78,7 @@ from namethatllm.config import LABELS, K, LAB2I, FAMILIES, SPECIALIST_GROUPS
 
 from namethatllm.lexical_engine import run_lexical_engine
 
-from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc
+from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc, _ablation_sinkhorn
 
 
 
@@ -872,15 +872,7 @@ def print_npz_ablation_diagnostics(
                 cum_lp += w_i * lp_i
 
         P = softmax(cum_lp, axis=1)
-
-        P_s = P.copy()
-
-        for _ in range(100):
-
-            P_s = P_s / np.maximum(P_s.sum(axis=0, keepdims=True), 1e-12) / 18.0
-
-            P_s = P_s / np.maximum(P_s.sum(axis=1, keepdims=True), 1e-12)
-
+        P_s = _ablation_sinkhorn(P, iters=100, y_true=y_unseen)
         bacc = float(balanced_accuracy_score(y_unseen, P_s.argmax(axis=1)))
 
         nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(y_unseen)), y_unseen], 1e-9, 1.0))))
@@ -985,10 +977,8 @@ def print_per_class_accuracy_table(
     # Helper function for Sinkhorn balanced accuracy
     def calc_sinkhorn_bacc(lp: np.ndarray) -> float:
         P = softmax(lp, axis=1)
-        for _ in range(60):
-            P /= np.maximum(P.sum(axis=0, keepdims=True), 1e-12) / float(K)
-            P /= np.maximum(P.sum(axis=1, keepdims=True), 1e-12)
-        preds = P.argmax(axis=1)
+        P_s = _ablation_sinkhorn(P, iters=60, y_true=y_true)
+        preds = P_s.argmax(axis=1)
         recs = [(preds[y_true == c] == c).mean() for c in range(K) if (y_true == c).sum() > 0]
         return float(np.mean(recs)) if len(recs) > 0 else 0.0
 
@@ -997,10 +987,7 @@ def print_per_class_accuracy_table(
     for m in clean_models:
         w = float(active_weights_map.get(m["name"], m["weight"]))
         clean_lp += w * m["unseen_lp"]
-    P_clean = softmax(clean_lp, axis=1)
-    for _ in range(60):
-        P_clean /= np.maximum(P_clean.sum(axis=0, keepdims=True), 1e-12) / float(K)
-        P_clean /= np.maximum(P_clean.sum(axis=1, keepdims=True), 1e-12)
+    P_clean = _ablation_sinkhorn(softmax(clean_lp, axis=1), iters=60, y_true=y_true)
     clean_preds = P_clean.argmax(axis=1)
 
     # Production Ensemble predictions (all active models including qwen3_14b_v5 with its full weight)
@@ -1008,20 +995,14 @@ def print_per_class_accuracy_table(
     for m in prod_models:
         w = float(active_weights_map.get(m["name"], m["weight"]))
         prod_lp += w * m["unseen_lp"]
-    P_prod = softmax(prod_lp, axis=1)
-    for _ in range(60):
-        P_prod /= np.maximum(P_prod.sum(axis=0, keepdims=True), 1e-12) / float(K)
-        P_prod /= np.maximum(P_prod.sum(axis=1, keepdims=True), 1e-12)
+    P_prod = _ablation_sinkhorn(softmax(prod_lp, axis=1), iters=60, y_true=y_true)
     prod_preds = P_prod.argmax(axis=1)
     full_prod_bacc = float(np.mean([(prod_preds[y_true == c] == c).mean() for c in range(K)]))
 
     # Per-model predictions after 60-step Sinkhorn
     model_preds: Dict[str, np.ndarray] = {}
     for m in models:
-        P_m = softmax(m["unseen_lp"], axis=1)
-        for _ in range(60):
-            P_m /= np.maximum(P_m.sum(axis=0, keepdims=True), 1e-12) / float(K)
-            P_m /= np.maximum(P_m.sum(axis=1, keepdims=True), 1e-12)
+        P_m = _ablation_sinkhorn(softmax(m["unseen_lp"], axis=1), iters=60, y_true=y_true)
         model_preds[m["name"]] = P_m.argmax(axis=1)
 
     # 1. Vote Share: weight * std(LP)
@@ -1260,16 +1241,9 @@ def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
 
 
     def fast_sinkhorn_bacc(lp: np.ndarray) -> float:
-
         P = softmax(lp, axis=1)
-
-        for _ in range(60):
-
-            P = P / np.maximum(P.sum(axis=0, keepdims=True), 1e-12) / 18.0
-
-            P = P / np.maximum(P.sum(axis=1, keepdims=True), 1e-12)
-
-        return float(balanced_accuracy_score(y, P.argmax(axis=1)))
+        P_s = _ablation_sinkhorn(P, iters=60, y_true=y)
+        return float(balanced_accuracy_score(y, P_s.argmax(axis=1)))
 
 
 

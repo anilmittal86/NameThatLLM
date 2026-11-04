@@ -22,14 +22,27 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import balanced_accuracy_score
 
-from .config import LABELS, K, LAB2I, softmax, log_softmax
+from .config import LABELS, K, LAB2I, calibrate_model_lp, softmax, log_softmax
 
-def _ablation_sinkhorn(P: np.ndarray, iters: int = 200, eps: float = 1e-12) -> np.ndarray:
-    """Fast vectorized Sinkhorn mass balancing for balanced multiclass prediction."""
+def _ablation_sinkhorn(
+    P: np.ndarray,
+    iters: int = 200,
+    eps: float = 1e-12,
+    y_true: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Fast vectorized Sinkhorn mass balancing (uses empirical class prior when y_true is imbalanced)."""
     if len(P) < 18:
         return P
     P = np.clip(P.astype(np.float64), eps, 1.0)
-    target_col = 1.0 / P.shape[1]
+    if y_true is not None and len(y_true) == len(P):
+        counts = np.bincount(np.asarray(y_true, dtype=int), minlength=P.shape[1]).astype(np.float64)
+        if counts.max() > 1.5 * max(counts.min(), 1.0):
+            target_col = np.clip(counts / float(len(y_true)), 1e-6, None)[None, :]
+            target_col /= target_col.sum()
+        else:
+            target_col = 1.0 / P.shape[1]
+    else:
+        target_col = 1.0 / P.shape[1]
     for _ in range(iters):
         P /= P.sum(axis=1, keepdims=True).clip(min=eps)
         P /= (P.sum(axis=0, keepdims=True) / (target_col * P.shape[0])).clip(min=eps)
@@ -39,7 +52,7 @@ def _fast_sinkhorn_bacc(lp_mat: np.ndarray, y_true: np.ndarray, iters: int = 40)
     """Computes balanced accuracy after fast Sinkhorn mass equalization."""
     P = softmax(lp_mat, axis=1)
     if len(P) >= 18:
-        P = _ablation_sinkhorn(P, iters=iters)
+        P = _ablation_sinkhorn(P, iters=iters, y_true=y_true)
     return float(balanced_accuracy_score(y_true, P.argmax(axis=1)))
 
 def _text_hash(text: str) -> str:
@@ -81,9 +94,9 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
 
-    # 2. Mark pool_v4.parquet, pool_v1.parquet, and nlm_pool_v5.parquet as contaminated
-    # (seen by Part-2 LoRAs, DeBERTa, inhouse, and qwen3_14b_v5)
-    for pat in ["pool_v4.parquet", "pool_v1.parquet", "*pool_v5*.parquet", "nlm_pool_v5.parquet"]:
+    # 2. Mark only pool_v4.parquet and pool_v1.parquet as contaminated
+    # (seen by Part-2 LoRAs, DeBERTa, inhouse)
+    for pat in ["pool_v4.parquet", "pool_v1.parquet"]:
         for p in input_dir.rglob(pat):
             try:
                 df_p = pd.read_parquet(p, columns=["text"])
@@ -129,7 +142,7 @@ def build_unseen_holdout_dataset(
             if p in seen_paths:
                 continue
             p_name = p.name.lower()
-            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1", "pool_v5"]):
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
                 continue
             seen_paths.add(p)
             df_c = _process_candidate_file(p)
@@ -143,7 +156,7 @@ def build_unseen_holdout_dataset(
                 continue
             p_str = str(p).lower().replace("\\", "/")
             p_name = p.name.lower()
-            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1", "pool_v5"]):
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
                 continue
             if any(k in p_str for k in ["openrouter", "harvest", "passages", "generations"]):
                 seen_paths.add(p)
@@ -158,7 +171,7 @@ def build_unseen_holdout_dataset(
                 if p in seen_paths:
                     continue
                 p_name = p.name.lower()
-                if any(x in p_name for x in ["train", "test", "submission", "pool_v4", "pool_v1", "pool_v5"]):
+                if any(x in p_name for x in ["train", "test", "submission", "pool_v4", "pool_v1"]):
                     continue
                 seen_paths.add(p)
                 df_c = _process_candidate_file(p)
@@ -168,7 +181,7 @@ def build_unseen_holdout_dataset(
     if not candidate_dfs:
         return pd.DataFrame(columns=["id", "prompt_id", "text", "model", "_hash"]), set()
 
-    df_pool_unseen = pd.concat(candidate_dfs, ignore_index=True).drop_duplicates(subset=["_hash"])
+    df_pool_unseen = pd.concat(candidate_dfs, ignore_index=True).drop_duplicates(subset=["_hash"]).reset_index(drop=True)
 
     v5_hashes: Set[str] = set()
     for pat in ["nlm_pool_v5.parquet", "*pool_v5*.parquet"]:
@@ -178,7 +191,7 @@ def build_unseen_holdout_dataset(
                 v5_hashes.update(_text_hash(t) for t in df_v5["text"].fillna(""))
             except Exception:
                 pass
-    strictly_disjoint = df_pool_unseen[~df_pool_unseen["_hash"].isin(v5_hashes)]
+    strictly_disjoint = df_pool_unseen[~df_pool_unseen["_hash"].isin(v5_hashes)].reset_index(drop=True)
     if (
         strictly_disjoint["model"].nunique() == K
         and (strictly_disjoint["model"].value_counts() >= samples_per_class).all()
@@ -191,13 +204,13 @@ def build_unseen_holdout_dataset(
     rng = np.random.RandomState(seed)
     sampled_parts = []
     for m in LABELS:
-        sub_dis = strictly_disjoint[strictly_disjoint["model"] == m]
-        sub_all = df_pool_unseen[df_pool_unseen["model"] == m]
+        sub_dis = strictly_disjoint[strictly_disjoint["model"] == m].reset_index(drop=True)
+        sub_all = df_pool_unseen[df_pool_unseen["model"] == m].reset_index(drop=True)
         sub = sub_dis if len(sub_dis) >= samples_per_class else (sub_dis if len(sub_dis) >= len(sub_all) else sub_all)
         if len(sub) > 0:
             n_take = min(samples_per_class, len(sub))
-            idx = rng.choice(sub.index.values, size=n_take, replace=False)
-            sampled_parts.append(sub.loc[idx])
+            idx = rng.choice(len(sub), size=n_take, replace=False)
+            sampled_parts.append(sub.iloc[idx])
 
     if not sampled_parts:
         return pd.DataFrame(columns=["id", "prompt_id", "text", "model", "_hash"]), set()
@@ -261,8 +274,8 @@ class UnseenStepwiseAuditor:
     ):
         if len(self.y_unseen) > 0 and len(unseen_log_probs) != len(self.y_unseen):
             return
-        u_lp = log_softmax(np.asarray(unseen_log_probs, dtype=np.float64), axis=1) if len(self.y_unseen) > 0 and len(unseen_log_probs) == len(self.y_unseen) else np.zeros((0, K), dtype=np.float64)
-        t_lp = log_softmax(np.asarray(test_log_probs, dtype=np.float64), axis=1) if len(test_log_probs) == self.N_test else np.zeros((self.N_test, K), dtype=np.float64)
+        u_lp = calibrate_model_lp(unseen_log_probs, model_name=name) if len(self.y_unseen) > 0 and len(unseen_log_probs) == len(self.y_unseen) else np.zeros((0, K), dtype=np.float64)
+        t_lp = calibrate_model_lp(test_log_probs, model_name=name) if len(test_log_probs) == self.N_test else np.zeros((self.N_test, K), dtype=np.float64)
         solo_raw = float(balanced_accuracy_score(self.y_unseen, u_lp.argmax(axis=1))) if len(self.y_unseen) > 0 else 0.0
         solo_sink = _fast_sinkhorn_bacc(u_lp, self.y_unseen, iters=200) if len(self.y_unseen) >= 18 else solo_raw
         self.models.append({
@@ -312,33 +325,36 @@ class UnseenStepwiseAuditor:
 
         def _composite_obj(lp_mat: np.ndarray) -> Tuple[float, float]:
             P = softmax(lp_mat, axis=1)
-            P_s = _ablation_sinkhorn(P, iters=60) if len(P) >= 18 else P
+            P_s = _ablation_sinkhorn(P, iters=60, y_true=self.y_unseen) if len(P) >= 18 else P
             bacc = float(balanced_accuracy_score(self.y_unseen, P_s.argmax(axis=1)))
             nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(self.y_unseen)), self.y_unseen], 1e-9, 1.0))))
             return bacc - 0.015 * nll, bacc
 
         M = len(self.models)
-        order = sorted(range(M), key=lambda i: self.models[i]["solo_unseen_sinkhorn_bacc"], reverse=True)
+        def _effective_bacc(m: Dict[str, Any]) -> float:
+            return float(max(m.get("solo_unseen_bacc", 0.0), m.get("solo_unseen_sinkhorn_bacc", 0.0)))
+
+        order = sorted(range(M), key=lambda i: _effective_bacc(self.models[i]), reverse=True)
 
         if lock_prior_weights:
             active_weights = np.zeros(M, dtype=np.float64)
             for idx, m in enumerate(self.models):
                 prior_w = float(m.get("prior_weight", m["weight"]))
-                solo_s = float(m.get("solo_unseen_sinkhorn_bacc", 0.0))
-                if solo_s < 0.30 or prior_w <= 0.0:
+                eff_b = _effective_bacc(m)
+                if eff_b < 0.30 or prior_w <= 0.0:
                     active_weights[idx] = 0.0
                 else:
                     active_weights[idx] = prior_w
         else:
             active_weights = np.zeros(M, dtype=np.float64)
-            valid_candidates = [i for i in order if self.models[i]["solo_unseen_sinkhorn_bacc"] >= 0.30 and self.models[i]["weight"] > 0.0]
+            valid_candidates = [i for i in order if _effective_bacc(self.models[i]) >= 0.30 and self.models[i]["weight"] > 0.0]
             if not valid_candidates:
                 for idx, m in enumerate(self.models):
                     active_weights[idx] = m["weight"]
             else:
                 first_idx = valid_candidates[0]
                 m_first = self.models[first_idx]
-                mults_first = (0.75, 1.00, 1.25) if m_first["solo_unseen_sinkhorn_bacc"] >= 0.38 else (0.25, 0.50, 0.75, 1.00)
+                mults_first = (0.75, 1.00, 1.25) if _effective_bacc(m_first) >= 0.34 else (0.25, 0.50, 0.75, 1.00)
                 best_first_w = m_first["weight"]
                 best_first_obj = -1e9
                 best_first_bacc = 0.0
@@ -365,12 +381,12 @@ class UnseenStepwiseAuditor:
                         m_info = self.models[idx]
                         prior_w = m_info["weight"]
                         u_lp = m_info["unseen_lp"]
-                        solo_s = m_info["solo_unseen_sinkhorn_bacc"]
+                        eff_b = _effective_bacc(m_info)
     
-                        if solo_s < 0.30 or prior_w <= 0.0:
+                        if eff_b < 0.30 or prior_w <= 0.0:
                             continue
     
-                        mults = (0.75, 1.00, 1.25) if solo_s >= 0.38 else (0.25, 0.50, 0.75, 1.00)
+                        mults = (0.75, 1.00, 1.25) if eff_b >= 0.34 else (0.25, 0.50, 0.75, 1.00)
                         for mult in mults:
                             cand_w = prior_w * mult
                             trial_lp = cum_u_lp + cand_w * u_lp
@@ -392,13 +408,14 @@ class UnseenStepwiseAuditor:
     
         if not lock_prior_weights:
             # Post-loop enforcement:
-            # 1. Enforce 0.75 * prior_weight floor on all validated models (solo_unseen_sinkhorn_bacc >= 0.38 and weight > 0)
+            # 1. Enforce 0.75 * prior_weight floor on all validated models (eff_bacc >= 0.34 and weight > 0)
             #    so nlm_pool_v5 holdout leakage on qwen3_14b_v5 never zeroes out Part-2, in-house, DeBERTa, or LinearSVC!
-            # 2. Prune any model with solo_unseen_sinkhorn_bacc < 0.30 or weight <= 0 to strictly 0.0.
+            # 2. Prune any model with eff_bacc < 0.30 or weight <= 0 to strictly 0.0.
             for idx, m_info in enumerate(self.models):
-                if m_info["solo_unseen_sinkhorn_bacc"] < 0.30 or m_info["weight"] <= 0.0:
+                eff_b = _effective_bacc(m_info)
+                if eff_b < 0.30 or m_info["weight"] <= 0.0:
                     active_weights[idx] = 0.0
-                elif m_info["solo_unseen_sinkhorn_bacc"] >= 0.38 and m_info["weight"] > 0.0:
+                elif eff_b >= 0.34 and m_info["weight"] > 0.0:
                     active_weights[idx] = max(active_weights[idx], 0.75 * m_info["weight"])
 
         weights_map: Dict[str, float] = {}

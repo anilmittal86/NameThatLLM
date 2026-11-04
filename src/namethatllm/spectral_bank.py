@@ -113,6 +113,8 @@ def fit_within_family_spectral_gates(
     D_neural_weight_total: float,
     N_test: int,
     max_cluster_size: int = 14,
+    hw_tr: Optional[np.ndarray] = None,
+    hw_te: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Fits plain + prompt-centered LogisticRegression sibling specialist gates
@@ -126,6 +128,12 @@ def fit_within_family_spectral_gates(
         return {}
     X_tr = np.hstack(spectral_tr_blocks)
     X_te = np.hstack(spectral_te_blocks)
+
+    if hw_tr is not None and hw_te is not None and len(hw_tr) == len(X_tr) and len(hw_te) == len(X_te):
+        hw_tr_n = (hw_tr / np.linalg.norm(hw_tr, axis=1, keepdims=True).clip(min=1e-6)) * 0.35
+        hw_te_n = (hw_te / np.linalg.norm(hw_te, axis=1, keepdims=True).clip(min=1e-6)) * 0.35
+        X_tr = np.hstack([X_tr, hw_tr_n])
+        X_te = np.hstack([X_te, hw_te_n])
 
     X_tr_c = X_tr.copy()
     for p in np.unique(prompts_sub):
@@ -163,7 +171,8 @@ def fit_within_family_spectral_gates(
             clf_c.fit(X_tr_c[mask_tr], sub_y)
             lp_c = clf_c.predict_log_proba(X_te_c)
 
-            family_gates[fam_name] = log_softmax(0.65 * lp_p + 0.35 * lp_c, axis=1)
+            w_p, w_c = (0.40, 0.60) if fam_name in ("gemini_37_38_pair", "gemini_flash_triad") else (0.65, 0.35)
+            family_gates[fam_name] = log_softmax(w_p * lp_p + w_c * lp_c, axis=1)
     return family_gates
 
 

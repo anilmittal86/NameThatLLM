@@ -140,7 +140,8 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
 
 @torch.no_grad()
 def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms: nn.ModuleList,
-                           dtype: torch.dtype = torch.float16, drop_first_token: bool = True):
+                           dtype: torch.dtype = torch.float16, drop_first_token: bool = True,
+                           final_norm: Optional[nn.Module] = None):
     """
     Runs forward pass in `dtype` (float16 on T4).
     CRITICAL: If any target layer overflows fp16 (Inf/NaN), recomputes ONLY the overflowed
@@ -167,7 +168,13 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
     good_rows = torch.where(~bad_mask)[0].to(first_norm_dev)
     if len(good_rows) > 0:
         for idx_l, l in enumerate(layers):
-            h_good = hs[l][good_rows.to(hs[l].device)].to(first_norm_dev).float()
+            h_raw = hs[l][good_rows.to(hs[l].device)]
+            if final_norm is not None and idx_l == len(layers) - 1:
+                fn_params = list(final_norm.parameters())
+                fn_dev = fn_params[0].device if fn_params else h_raw.device
+                fn_dtype = fn_params[0].dtype if fn_params else h_raw.dtype
+                h_raw = final_norm(h_raw.to(device=fn_dev, dtype=fn_dtype)).to(h_raw.device)
+            h_good = h_raw.to(first_norm_dev).float()
             pooled_layers[idx_l][good_rows] = (h_good * m[good_rows]).sum(dim=1) / den[good_rows]
 
     # Rescue overflowed rows in bfloat16 (exact exponent range as float32, NEVER overflows!)
@@ -181,7 +188,13 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
         hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
         bad_rows_dev = bad_rows.to(first_norm_dev)
         for idx_l, l in enumerate(layers):
-            h_b = hs_bad[l].to(first_norm_dev).float()
+            h_b = hs_bad[l]
+            if final_norm is not None and idx_l == len(layers) - 1:
+                fn_params = list(final_norm.parameters())
+                fn_dev = fn_params[0].device if fn_params else h_b.device
+                fn_dtype = fn_params[0].dtype if fn_params else h_b.dtype
+                h_b = final_norm(h_b.to(device=fn_dev, dtype=fn_dtype)).to(h_b.device)
+            h_b = h_b.to(first_norm_dev).float()
             h_b = torch.nan_to_num(h_b, nan=0.0, posinf=1e4, neginf=-1e4)
             pooled_layers[idx_l][bad_rows_dev] = (h_b * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
         del hs_bad
@@ -378,12 +391,13 @@ class UniversalLoRATrunkLoader:
         # Preserve original final trunk norm before optionally disabling
         self.orig_final_norm = getattr(self.model, "norm", None) or getattr(getattr(self.model, "model", None), "norm", None)
 
-        # Default: disable final trunk norm for two-stage models
+        # Default: keep HuggingFace model.norm as nn.Identity() at all times
         if hasattr(self.model, "norm"):
             self.model.norm = nn.Identity()
-        elif hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+        if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
             self.model.model.norm = nn.Identity()
 
+        self.final_norm_enabled = False
         self.model.eval()
         self.device_norms = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -398,12 +412,8 @@ class UniversalLoRATrunkLoader:
         self.first_dev = next(self.model.parameters()).device
 
     def set_final_norm(self, enabled: bool):
-        """Restores original trunk norm when enabled=True, disables with nn.Identity() when False."""
-        target = self.orig_final_norm if enabled and self.orig_final_norm is not None else nn.Identity()
-        if hasattr(self.model, "norm"):
-            self.model.norm = target
-        elif hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
-            self.model.model.norm = target
+        """Sets final_norm_enabled flag, keeping HuggingFace model.norm as nn.Identity()."""
+        self.final_norm_enabled = bool(enabled)
 
     def snapshot_weights(self, adapter_path: Path) -> dict:
         """Saves CPU fp16 copies of trunk modules modified by adapter."""
@@ -481,7 +491,11 @@ class UniversalLoRATrunkLoader:
             idx = order[s : s + batch_size]
             enc = self.tok.pad({"input_ids": [id_list[i] for i in idx]}, padding=True, return_tensors="pt")
             enc = {k: v.to(self.first_dev) for k, v in enc.items()}
-            out_np, n_bad = forward_and_pool_batch(self.model, enc, self.layers, self.norms, torch.float16, drop_first_token=True)
+            fn = self.orig_final_norm if getattr(self, "final_norm_enabled", False) else None
+            out_np, n_bad = forward_and_pool_batch(
+                self.model, enc, self.layers, self.norms, torch.float16,
+                drop_first_token=True, final_norm=fn
+            )
             self.total_rescued += n_bad
             Z[idx] = out_np
         return Z
