@@ -218,9 +218,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     N_test = len(test_texts)
     print(f"[Pipeline] Loaded test set: {N_test} rows")
 
-    # Build Zero-Leakage Unseen Holdout Benchmark (N_unseen = 360 rows) if enable_ablation_probe is True
+    # Build Zero-Leakage Unseen Holdout Benchmark if enable_ablation_probe is True
     if enable_ablation_probe and not is_smoke:
-        df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=20)
+        ablation_spc = int(cfg.get("ablation_samples_per_class", 66))
+        df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=ablation_spc)
         unseen_parquet_path = working_dir / "unseen_holdout.parquet"
         df_unseen.to_parquet(unseen_parquet_path, index=False)
         unseen_texts = df_unseen["text"].fillna("").astype(str).tolist() if len(df_unseen) > 0 else []

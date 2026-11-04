@@ -4,6 +4,7 @@
   "description": "Production Two-Tier Stack (85% Main Part-Two Baseline + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank)",
   "probe_gate_min_bacc": 0.40,
   "enable_ablation_probe": true,
+  "ablation_samples_per_class": 66,
   "lock_prior_weights": true,
   "labels": [
     "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
@@ -26,13 +27,12 @@
     ],
     "required_checkpoints": [
       "qwen3_14b_p2",
+      "qwen3_14b_inhouse",
+      "qwen3_14b_v5",
       "deberta_p2",
       "qwen3_8b_claude"
     ],
-    "optional_checkpoints": [
-      "qwen3_14b_v5",
-      "qwen3_14b_inhouse"
-    ]
+    "optional_checkpoints": []
   },
   "model_weights": {
     "qwen3_14b_v5":       { "plain_weight": 0.45, "twin_weight": 0.15 },
