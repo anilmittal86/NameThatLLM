@@ -612,29 +612,34 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 P_spec_plain = softmax(logits_spec, axis=1)
 
                 train_mask = grp_mask[:len_tr_raw]
+                clf_centered = None
                 if train_mask.sum() >= 10:
                     X_tr_pair = sparse.hstack([X_core_5v[:len_tr_raw][train_mask], hw_c_sp[:len_tr_raw][train_mask]], format="csr")
-                    y_tr_pair = sub_y_mapped[:len_tr_raw][train_mask]
-                    prompts_pair = df_tr["prompt_id"].values[train_mask]
-                    u_p, inv_p = np.unique(prompts_pair, return_inverse=True)
-                    counts_p = np.bincount(inv_p)
-                    vals_p = (1.0 / np.maximum(counts_p[inv_p], 1)).astype(np.float32)
-                    G_p = sparse.csr_matrix((vals_p, (np.arange(len(inv_p)), inv_p)), shape=(len(inv_p), len(u_p)), dtype=np.float32)
-                    X_tr_pair_c = X_tr_pair - G_p @ (G_p.T @ X_tr_pair)
+                    y_tr_raw = core_y[:len_tr_raw][train_mask]
+                    y_tr_pair = np.array([sub_lab2i[y] for y in y_tr_raw], dtype=int)
+                    if len(np.unique(y_tr_pair)) >= 2:
+                        prompts_pair = df_tr["prompt_id"].values[train_mask]
+                        u_p, inv_p = np.unique(prompts_pair, return_inverse=True)
+                        counts_p = np.bincount(inv_p)
+                        vals_p = (1.0 / np.maximum(counts_p[inv_p], 1)).astype(np.float32)
+                        G_p = sparse.csr_matrix((vals_p, (np.arange(len(inv_p)), inv_p)), shape=(len(inv_p), len(u_p)), dtype=np.float32)
+                        X_tr_pair_c = X_tr_pair - G_p @ (G_p.T @ X_tr_pair)
 
-                    clf_centered = LogisticRegression(C=0.25, class_weight="balanced", random_state=42, max_iter=1000)
-                    clf_centered.fit(X_tr_pair_c, y_tr_pair)
+                        clf_centered = LogisticRegression(C=0.25, class_weight="balanced", random_state=42, max_iter=1000)
+                        clf_centered.fit(X_tr_pair_c, y_tr_pair)
 
-                    if twin_rows_085.any():
-                        u_t, inv_t = np.unique(groups_085, return_inverse=True)
-                        counts_t = np.bincount(inv_t)
-                        vals_t = (1.0 / np.maximum(counts_t[inv_t], 1)).astype(np.float32)
-                        G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
-                        X_te_pair_c = X_te_grp - G_t @ (G_t.T @ X_te_grp)
+                        if twin_rows_085.any():
+                            u_t, inv_t = np.unique(groups_085, return_inverse=True)
+                            counts_t = np.bincount(inv_t)
+                            vals_t = (1.0 / np.maximum(counts_t[inv_t], 1)).astype(np.float32)
+                            G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
+                            X_te_pair_c = X_te_grp - G_t @ (G_t.T @ X_te_grp)
+                        else:
+                            X_te_pair_c = X_te_grp
+                        P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
+                        P_spec = 0.55 * P_spec_plain + 0.45 * P_spec_centered
                     else:
-                        X_te_pair_c = X_te_grp
-                    P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
-                    P_spec = 0.55 * P_spec_plain + 0.45 * P_spec_centered
+                        P_spec = P_spec_plain
                 else:
                     P_spec = P_spec_plain
                 beta_grp = 0.30
@@ -657,7 +662,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                     df_spec_u = spec_svc.decision_function(X_u_grp)
                     logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
                     P_spec_u_plain = softmax(logits_spec_u, axis=1)
-                    if train_mask.sum() >= 10:
+                    if clf_centered is not None:
                         if "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_u_grp.shape[0]:
                             u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
                             counts_u = np.bincount(inv_u)
