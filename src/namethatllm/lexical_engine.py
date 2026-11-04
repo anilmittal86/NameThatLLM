@@ -628,17 +628,17 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 clf_centered = LogisticRegression(C=0.25, class_weight="balanced", random_state=42, max_iter=1000)
                 clf_centered.fit(X_tr_pair_c, y_tr_pair)
 
+                P_spec = P_spec_plain.copy()
                 if twin_rows_085.any():
-                    u_t, inv_t = np.unique(groups_085, return_inverse=True)
+                    X_te_sub = X_te_grp[twin_rows_085]
+                    u_t, inv_t = np.unique(groups_085[twin_rows_085], return_inverse=True)
                     counts_t = np.bincount(inv_t)
                     vals_t = (1.0 / np.maximum(counts_t[inv_t], 1)).astype(np.float32)
                     G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
-                    X_te_pair_c = X_te_grp - G_t @ (G_t.T @ X_te_grp)
-                else:
-                    X_te_pair_c = X_te_grp
-                P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
-                w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
-                P_spec = w_plain_s * P_spec_plain + (1.0 - w_plain_s) * P_spec_centered
+                    X_te_pair_c = X_te_sub - G_t @ (G_t.T @ X_te_sub)
+                    P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
+                    w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
+                    P_spec[twin_rows_085] = w_plain_s * P_spec_plain[twin_rows_085] + (1.0 - w_plain_s) * P_spec_centered
             else:
                 P_spec = P_spec_plain
 
@@ -653,20 +653,22 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 df_spec_u = spec_svc.decision_function(X_u_grp)
                 logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
                 P_spec_u_plain = softmax(logits_spec_u, axis=1)
-                if has_centered_pair:
-                    if "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_u_grp.shape[0]:
-                        u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
-                        counts_u = np.bincount(inv_u)
-                        vals_u = (1.0 / np.maximum(counts_u[inv_u], 1)).astype(np.float32)
-                        G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u)), inv_u)), shape=(len(inv_u), len(u_u)), dtype=np.float32)
-                        X_u_pair_c = X_u_grp - G_u @ (G_u.T @ X_u_grp)
-                    else:
-                        X_u_pair_c = X_u_grp
-                    P_spec_u_centered = clf_centered.predict_proba(X_u_pair_c)
-                    w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
-                    P_spec_u = w_plain_s * P_spec_u_plain + (1.0 - w_plain_s) * P_spec_u_centered
-                else:
-                    P_spec_u = P_spec_u_plain
+                P_spec_u = P_spec_u_plain.copy()
+                if has_centered_pair and "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_u_grp.shape[0]:
+                    u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
+                    counts_u = np.bincount(inv_u)
+                    sz_u = counts_u[inv_u]
+                    twin_u_mask = (sz_u >= 2) & (sz_u <= 18)
+                    if twin_u_mask.any():
+                        X_u_sub = X_u_grp[twin_u_mask]
+                        u_t, inv_t = np.unique(df_unseen_holdout["prompt_id"].values[twin_u_mask], return_inverse=True)
+                        counts_t = np.bincount(inv_t)
+                        vals_t = (1.0 / np.maximum(counts_t[inv_t], 1)).astype(np.float32)
+                        G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
+                        X_u_pair_c = X_u_sub - G_t @ (G_t.T @ X_u_sub)
+                        P_spec_u_centered = clf_centered.predict_proba(X_u_pair_c)
+                        w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
+                        P_spec_u[twin_u_mask] = w_plain_s * P_spec_u_plain[twin_u_mask] + (1.0 - w_plain_s) * P_spec_u_centered
 
                 P_prior_u = P_unseen_comp[:, grp_cols]
                 P_prior_u_norm = P_prior_u / (P_prior_u.sum(axis=1, keepdims=True) + 1e-12)

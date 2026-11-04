@@ -23,6 +23,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import balanced_accuracy_score
 
 from .config import LABELS, K, LAB2I, calibrate_model_lp, softmax, log_softmax
+from .wpca_gaussian import split_oversized_clusters_dist
 
 def _ablation_sinkhorn(
     P: np.ndarray,
@@ -201,6 +202,13 @@ def build_unseen_holdout_dataset(
     else:
         pool_to_sample = df_pool_unseen
 
+    has_source_prompt = (
+        "prompt_id" in pool_to_sample.columns
+        and pool_to_sample["prompt_id"].notna().sum() >= 36
+    )
+    if has_source_prompt:
+        prompt_richness = pool_to_sample.groupby("prompt_id")["model"].nunique()
+
     # Stratified balanced sampling across all 18 classes from a single consistent pool
     rng = np.random.RandomState(seed)
     sampled_parts = []
@@ -208,8 +216,15 @@ def build_unseen_holdout_dataset(
         sub = pool_to_sample[pool_to_sample["model"] == m].reset_index(drop=True)
         if len(sub) > 0:
             n_take = min(samples_per_class, len(sub))
-            idx = rng.choice(len(sub), size=n_take, replace=False)
-            sampled_parts.append(sub.iloc[idx])
+            if has_source_prompt:
+                sub_prompts = sub["prompt_id"].map(prompt_richness).fillna(1).values
+                jitter = rng.rand(len(sub))
+                sort_keys = np.lexsort((jitter, -(sub_prompts >= 2).astype(int), -sub_prompts))
+                sub_sorted = sub.iloc[sort_keys].reset_index(drop=True)
+                sampled_parts.append(sub_sorted.iloc[:n_take])
+            else:
+                idx = rng.choice(len(sub), size=n_take, replace=False)
+                sampled_parts.append(sub.iloc[idx])
 
     if not sampled_parts:
         return pd.DataFrame(columns=["id", "prompt_id", "text", "model", "_hash"]), set()
@@ -218,15 +233,28 @@ def build_unseen_holdout_dataset(
     if "id" not in df_unseen.columns:
         df_unseen["id"] = [f"unseen_{i}" for i in range(len(df_unseen))]
 
-    # Compute valid stopword TF-IDF average-linkage clusters (t=0.85) so prompt_id is positive integer 1..G
+    # Compute valid prompt clusters
+    clusters = None
     if len(df_unseen) >= 2:
         try:
             tfidf = TfidfVectorizer(stop_words="english", max_features=10000, sublinear_tf=True)
             X_tfidf = tfidf.fit_transform(df_unseen["text"].fillna("").tolist())
             D = 1.0 - (X_tfidf @ X_tfidf.T).toarray().clip(0.0, 1.0)
             np.fill_diagonal(D, 0.0)
-            cond_d = squareform(D, checks=False)
-            clusters = fcluster(linkage(cond_d, method="average"), t=0.85, criterion="distance")
+
+            use_source_prompt = False
+            if "prompt_id" in df_unseen.columns and df_unseen["prompt_id"].notna().sum() == len(df_unseen):
+                codes = pd.factorize(df_unseen["prompt_id"])[0]
+                if len(codes) > 0:
+                    counts = np.bincount(codes)
+                    if (counts[codes] >= 2).mean() >= 0.40:
+                        clusters = split_oversized_clusters_dist(D, codes + 1, max_cluster_size=14)
+                        use_source_prompt = True
+
+            if not use_source_prompt:
+                cond_d = squareform(D, checks=False)
+                raw_clusters = fcluster(linkage(cond_d, method="average"), t=0.90, criterion="distance")
+                clusters = split_oversized_clusters_dist(D, raw_clusters, max_cluster_size=14)
         except Exception:
             clusters = np.arange(1, len(df_unseen) + 1, dtype=int)
     else:

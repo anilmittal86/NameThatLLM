@@ -114,7 +114,7 @@ def transform_lowram(X_f32: np.ndarray, prm: dict, batch_rows: int = 1000) -> np
         U_out[s : s + batch_rows] = chunk.astype(np.float64)
     return U_out
 
-def split_oversized_clusters_dist(D: np.ndarray, groups: np.ndarray, max_cluster_size: int = 14) -> np.ndarray:
+def split_oversized_clusters_dist(D: Optional[np.ndarray], groups: np.ndarray, max_cluster_size: int = 14) -> np.ndarray:
     """Recursively splits clusters with size > max_cluster_size to prevent bitmask DP overflow."""
     if len(groups) < 2:
         return groups.copy()
@@ -126,6 +126,11 @@ def split_oversized_clusters_dist(D: np.ndarray, groups: np.ndarray, max_cluster
             new_groups[rows] = next_id
             next_id += 1
         else:
+            if D is None or D.shape != (len(groups), len(groups)):
+                for start in range(0, len(rows), max_cluster_size):
+                    new_groups[rows[start : start + max_cluster_size]] = next_id
+                    next_id += 1
+                continue
             n_sub = int(np.ceil(len(rows) / max_cluster_size))
             D_sub = D[np.ix_(rows, rows)].copy()
             np.fill_diagonal(D_sub, 0.0)
@@ -213,7 +218,7 @@ class ExactAuthorPosterior:
         result -= logsumexp(result, axis=1, keepdims=True)
         return result
 
-def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: np.ndarray) -> np.ndarray:
+def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: Optional[np.ndarray] = None) -> np.ndarray:
     """Wraps ExactAuthorPosterior with oversized cluster splitting guardrail."""
     N = len(U_test)
     if N == 0:
@@ -222,7 +227,16 @@ def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: n
         solver = ExactAuthorPosterior(prm["m"], prm["lam"])
         return solver.single(U_test[0], temperature=prm.get("T1", 2.40))[None, :]
 
-    safe_groups = split_oversized_clusters_dist(D_dist, groups, max_cluster_size=14)
+    _, inv_g = np.unique(np.asarray(groups, dtype=str), return_inverse=True)
+    safe_input_groups = inv_g + 1
+
+    if D_dist is None or D_dist.shape != (N, N):
+        U_c = U_test - U_test.mean(axis=0, keepdims=True)
+        U_n = U_c / np.linalg.norm(U_c, axis=1, keepdims=True).clip(min=1e-6)
+        D_dist = np.clip(1.0 - (U_n @ U_n.T), 0.0, None)
+        np.fill_diagonal(D_dist, 0.0)
+
+    safe_groups = split_oversized_clusters_dist(D_dist, safe_input_groups, max_cluster_size=14)
     solver = ExactAuthorPosterior(prm["m"], prm["lam"])
     T1 = prm.get("T1", 2.40)
     Tg = prm.get("Tg", 2.35)

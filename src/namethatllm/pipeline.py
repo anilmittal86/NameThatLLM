@@ -219,7 +219,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     print(f"[Pipeline] Loaded test set: {N_test} rows")
 
     # Build Zero-Leakage Unseen Holdout Benchmark if enable_ablation_probe is True
-    if enable_ablation_probe and not is_smoke:
+    if enable_ablation_probe and not is_smoke and not (N_test > 100 and bool(cfg.get("lock_prior_weights", True))):
         ablation_spc = int(cfg.get("ablation_samples_per_class", 20))
         df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=ablation_spc)
         unseen_parquet_path = working_dir / "unseen_holdout.parquet"
@@ -229,7 +229,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         y_unseen = np.array([LAB2I[m] for m in df_unseen["model"].values], dtype=int) if N_unseen > 0 else np.array([], dtype=int)
         groups_unseen = df_unseen["prompt_id"].values if N_unseen > 0 and "prompt_id" in df_unseen.columns else np.ones(N_unseen, dtype=int)
     else:
-        if not enable_ablation_probe:
+        if N_test > 100 and bool(cfg.get("lock_prior_weights", True)):
+            print("[Pipeline] Hidden Leaderboard Rerun (N_test > 100 with locked priors): Skipping unseen holdout extraction to maximize GPU throughput.")
+        elif not enable_ablation_probe:
             print("[Pipeline] Frozen Production Mode (enable_ablation_probe=False): Skipping unseen holdout extraction to save GPU time.")
         df_unseen = pd.DataFrame()
         unseen_texts = []
@@ -653,13 +655,22 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 f_labels = f_meta["labels"]
 
                                 if is_last:
-                                    extract_batch = test_texts + (unseen_texts if N_unseen > 0 else []) + train_sub_texts
-                                    Z_te_u_tr = trunk1.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
-                                    f_Z_te = Z_te_u_tr[:N_test]
-                                    f_Z_u = Z_te_u_tr[N_test : N_test + N_unseen] if N_unseen > 0 else None
-                                    Z_tr = Z_te_u_tr[N_test + N_unseen :]
-                                    Z_te = f_Z_te
-                                    del Z_te_u_tr
+                                    if "Z_unseen" in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen and N_unseen > 0:
+                                        extract_batch = test_texts + train_sub_texts
+                                        Z_te_tr = trunk1.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                        f_Z_te = Z_te_tr[:N_test]
+                                        f_Z_u = Z_unseen
+                                        Z_tr = Z_te_tr[N_test:]
+                                        Z_te = f_Z_te
+                                        del Z_te_tr
+                                    else:
+                                        extract_batch = test_texts + (unseen_texts if N_unseen > 0 else []) + train_sub_texts
+                                        Z_te_u_tr = trunk1.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                        f_Z_te = Z_te_u_tr[:N_test]
+                                        f_Z_u = Z_te_u_tr[N_test : N_test + N_unseen] if N_unseen > 0 else None
+                                        Z_tr = Z_te_u_tr[N_test + N_unseen :]
+                                        Z_te = f_Z_te
+                                        del Z_te_u_tr
                                 else:
                                     extract_batch = test_texts + (unseen_texts if N_unseen > 0 else [])
                                     Z_te_u = trunk1.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
@@ -739,6 +750,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
                                 else:
                                     lp_u_fitted = lp_u_p_fit
+                                lp_u = lp_u_fitted
                                 fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
                                 print(f"[Post-Fit Probe] {opt_14b_key}: unseen BAcc = {fitted_bacc:.4f}")
                                 if fitted_bacc < probe_gate_min_bacc:
@@ -1060,13 +1072,22 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 f_labels = f_meta["labels"]
 
                                 if is_last:
-                                    extract_batch = test_texts + (unseen_texts if N_unseen > 0 else []) + train_sub_texts
-                                    Z_te_u_tr = trunk3.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
-                                    f_Z_te = Z_te_u_tr[:N_test]
-                                    f_Z_u = Z_te_u_tr[N_test : N_test + N_unseen] if N_unseen > 0 else None
-                                    Z_tr = Z_te_u_tr[N_test + N_unseen :]
-                                    Z_te = f_Z_te
-                                    del Z_te_u_tr
+                                    if "Z_unseen" in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen and N_unseen > 0:
+                                        extract_batch = test_texts + train_sub_texts
+                                        Z_te_tr = trunk3.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                        f_Z_te = Z_te_tr[:N_test]
+                                        f_Z_u = Z_unseen
+                                        Z_tr = Z_te_tr[N_test:]
+                                        Z_te = f_Z_te
+                                        del Z_te_tr
+                                    else:
+                                        extract_batch = test_texts + (unseen_texts if N_unseen > 0 else []) + train_sub_texts
+                                        Z_te_u_tr = trunk3.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
+                                        f_Z_te = Z_te_u_tr[:N_test]
+                                        f_Z_u = Z_te_u_tr[N_test : N_test + N_unseen] if N_unseen > 0 else None
+                                        Z_tr = Z_te_u_tr[N_test + N_unseen :]
+                                        Z_te = f_Z_te
+                                        del Z_te_u_tr
                                 else:
                                     extract_batch = test_texts + (unseen_texts if N_unseen > 0 else [])
                                     Z_te_u = trunk3.extract_exact(extract_batch, batch_size=8, end_id=f_meta["end_id"])
@@ -1146,6 +1167,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
                                 else:
                                     lp_u_fitted = lp_u_p_fit
+                                lp_u = lp_u_fitted
                                 fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
                                 print(f"[Post-Fit Probe] {opt_8b_key}: unseen BAcc = {fitted_bacc:.4f}")
                                 if fitted_bacc < probe_gate_min_bacc:
@@ -1511,7 +1533,9 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     plain_C=plain_C,
                     center_C=center_C,
                     center_blend=center_blend,
-                    max_cluster_size=max_cl
+                    max_cluster_size=max_cl,
+                    groups_override=groups_unseen,
+                    compute_oof=False,
                 )
 
     elif is_smoke:
@@ -1608,6 +1632,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 max_cluster_size=max_cl,
                 hw_tr=hw_tr_gate,
                 hw_te=hw_u_gate,
+                groups_override=groups_unseen,
             )
 
     # Claude Specialist Gate (Vectorized)
