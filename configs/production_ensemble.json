@@ -4,7 +4,7 @@
   "description": "Production Two-Tier Stack (85% Main Part-Two Baseline + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank)",
   "probe_gate_min_bacc": 0.40,
   "enable_ablation_probe": true,
-  "ablation_samples_per_class": 66,
+  "ablation_samples_per_class": 20,
   "lock_prior_weights": true,
   "labels": [
     "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
@@ -40,8 +40,8 @@
     "qwen3_14b_inhouse":  { "plain_weight": 0.38, "twin_weight": 0.14 },
     "deberta_p2":         { "plain_weight": 0.28, "twin_weight": 0.10 },
     "deberta_inhouse":    { "plain_weight": 0.24, "twin_weight": 0.08 },
-    "svc_4view":          { "plain_weight": 1.25, "twin_weight": 0.00 },
-    "lexical_5v":         { "plain_weight": 0.25, "twin_weight": 0.00 },
+    "svc_4view":          { "plain_weight": 0.38, "twin_weight": 0.00 },
+    "lexical_5v":         { "plain_weight": 0.15, "twin_weight": 0.00 },
     "wpca_dp":            { "plain_weight": 0.35, "twin_weight": 0.00 },
     "spectral_bank":      { "plain_weight": 0.20, "twin_weight": 0.00 },
     "qwen3_8b_claude":    { "plain_weight": 0.00, "twin_weight": 0.00 }

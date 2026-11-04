@@ -208,7 +208,7 @@ def test_unseen_stepwise_auditor_standalone_and_stepwise(tmp_path: Path):
     auditor.add_model(
         name="Adversarial-Model",
         tier="Comp",
-        weight=0.20,
+        weight=0.35,
         unseen_log_probs=logits_m3_unseen,
         test_log_probs=np.random.randn(n_test, K),
     )

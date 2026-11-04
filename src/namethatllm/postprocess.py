@@ -36,7 +36,7 @@ def apply_all_family_confidence_gates(
         if gate_lp is None or gate_lp.shape != (len(P_out), len(cols)):
             continue
 
-        if fam_name == "frontier_and_fable":
+        if fam_name in ("frontier_and_fable", "kimi_gpt55_qwen"):
             row_mask = np.isin(P_out.argmax(axis=1), cols)
             if not row_mask.any():
                 continue

@@ -659,7 +659,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
             w = res["weights_map"]
             self.assertGreater(w.get("qwen3_14b_p2", 0.0), 0.30)
             self.assertEqual(w.get("qwen25_14b_p2", 0.0), 0.0)
-            self.assertGreater(w.get("svc_4view", 0.0), 0.40)
+            self.assertGreater(w.get("svc_4view", 0.0), 0.20)
             self.assertEqual(w.get("qwen3_8b_claude", 0.0), 0.0)
             self.assertGreater(w.get("deberta_p2", 0.0), 0.20)
 

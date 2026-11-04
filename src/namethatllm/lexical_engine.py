@@ -59,6 +59,7 @@ SPECIALIST_GROUPS = {
     "claude": [9, 10, 11, 12, 13],
     "glm": [15, 16],                     # glm-5.3 vs glm-5.3-flash
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
+    "kimi_gpt55_qwen": [0, 14, 17],      # resolves kimi-k3 <-> gpt-5.5 <-> qwen3.8-max confusion!
 }
 
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -322,8 +323,6 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 pf_filename = Path(pf).name.lower()
                 for t_val, m_val in zip(p_df['text'].values, p_df['model'].values):
                     c_idx = LAB2I[m_val]
-                    if 'pool_v5' in pf_filename and c_idx in (7, 8):
-                        continue
                     max_tot_c = int(1.4 * MAX_TOTAL_POOL_PER_CLASS) if c_idx in HARD_CLASS_INDICES else MAX_TOTAL_POOL_PER_CLASS
                     if total_class_counts[c_idx] >= max_tot_c:
                         continue

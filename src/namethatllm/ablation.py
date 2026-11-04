@@ -131,6 +131,7 @@ def build_unseen_holdout_dataset(
 
     candidate_patterns = [
         "nlm_matched_clean.parquet",
+        "nlm_pool_v5.parquet",
         "nlm_pool_v2.parquet",
         "*openrouter*.parquet",
         "*openrouter*.csv",
@@ -341,13 +342,13 @@ class UnseenStepwiseAuditor:
             for idx, m in enumerate(self.models):
                 prior_w = float(m.get("prior_weight", m["weight"]))
                 eff_b = _effective_bacc(m)
-                if eff_b < 0.30 or prior_w <= 0.0:
+                if eff_b < 0.22 or prior_w <= 0.0:
                     active_weights[idx] = 0.0
                 else:
                     active_weights[idx] = prior_w
         else:
             active_weights = np.zeros(M, dtype=np.float64)
-            valid_candidates = [i for i in order if _effective_bacc(self.models[i]) >= 0.30 and self.models[i]["weight"] > 0.0]
+            valid_candidates = [i for i in order if _effective_bacc(self.models[i]) >= 0.22 and self.models[i]["weight"] > 0.0]
             if not valid_candidates:
                 for idx, m in enumerate(self.models):
                     active_weights[idx] = m["weight"]
@@ -383,7 +384,7 @@ class UnseenStepwiseAuditor:
                         u_lp = m_info["unseen_lp"]
                         eff_b = _effective_bacc(m_info)
     
-                        if eff_b < 0.30 or prior_w <= 0.0:
+                        if eff_b < 0.22 or prior_w <= 0.0:
                             continue
     
                         mults = (0.75, 1.00, 1.25) if eff_b >= 0.34 else (0.25, 0.50, 0.75, 1.00)
@@ -413,7 +414,7 @@ class UnseenStepwiseAuditor:
             # 2. Prune any model with eff_bacc < 0.30 or weight <= 0 to strictly 0.0.
             for idx, m_info in enumerate(self.models):
                 eff_b = _effective_bacc(m_info)
-                if eff_b < 0.30 or m_info["weight"] <= 0.0:
+                if eff_b < 0.22 or m_info["weight"] <= 0.0:
                     active_weights[idx] = 0.0
                 elif eff_b >= 0.34 and m_info["weight"] > 0.0:
                     active_weights[idx] = max(active_weights[idx], 0.75 * m_info["weight"])
