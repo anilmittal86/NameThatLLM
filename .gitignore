@@ -41,8 +41,11 @@ powershell.exe
 *.parquet
 *.joblib
 
-# Allow tracked neural evaluation cache
+# Allow tracked neural evaluation cache and in-house champion checkpoint
 !local_data/local_eval_cache.npz
+!checkpoints/
+!checkpoints/export_champion_qwen3_14b/
+!checkpoints/export_champion_qwen3_14b/**
 
 # Git & OS
 .DS_Store
