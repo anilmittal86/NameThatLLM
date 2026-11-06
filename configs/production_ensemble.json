@@ -27,12 +27,17 @@
     ],
     "required_checkpoints": [
       "qwen3_14b_p2",
-      "qwen3_14b_inhouse",
       "qwen3_14b_v5",
       "deberta_p2",
       "qwen3_8b_claude"
     ],
-    "optional_checkpoints": []
+    "optional_checkpoints": [
+      "qwen3_14b_inhouse",
+      "deberta_inhouse",
+      "qwen3_14b_gpt",
+      "qwen3_14b_gemini",
+      "qwen3_14b_glm"
+    ]
   },
   "model_weights": {
     "qwen3_14b_v5":       { "plain_weight": 0.45, "twin_weight": 0.15 },

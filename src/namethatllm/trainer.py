@@ -11,6 +11,7 @@ import gc
 import json
 import math
 import time
+import shutil
 import importlib.util
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any, Iterator
@@ -177,11 +178,26 @@ def family_margin_cross_entropy(
 ) -> torch.Tensor:
     """
     Computes cross-entropy with intra-family margin penalty.
-    Sister models within FAMILIES receive an additive logit penalty (+delta),
+    Sister models receive an additive logit penalty (+delta),
     forcing the network to establish a decisive decision boundary against sister LLMs.
+    Supports standard 18-class as well as K_fam single-family specialists (Gemini, GPT, GLM).
     """
     if family_margin > 0.0:
-        mask = _build_sister_mask(logits.device)
+        num_cls = logits.shape[1]
+        if num_cls == K:
+            mask = _build_sister_mask(logits.device)
+        else:
+            # Single-family specialist: all classes are sisters of each other
+            mask = 1.0 - torch.eye(num_cls, dtype=torch.float32, device=logits.device)
+            # Extra margin boost on the hardest sibling pairs:
+            if num_cls == 4:  # Gemini: boost 3.7-flash (2) <-> 3.8-flash (3)
+                mask[2, 3] = 1.5
+                mask[3, 2] = 1.5
+            elif num_cls == 5:  # GPT: boost luna (1) <-> sol (2) <-> terra (3)
+                for i in (1, 2, 3):
+                    for j in (1, 2, 3):
+                        if i != j:
+                            mask[i, j] = 1.4
         boost = mask[labels] * family_margin
         logits = logits + boost
     return F.cross_entropy(logits, labels, label_smoothing=label_smoothing)
@@ -557,6 +573,22 @@ def fit_ridge_heads(
 
     return W_p, b_p, W_c, b_c
 
+def _blend_head(head_linear: nn.Linear, W_r: np.ndarray, b_r: np.ndarray, w_neural: float = 0.65, w_ridge: float = 0.35) -> None:
+    """Blends neural head with closed-form ridge head after matching Frobenius norm."""
+    with torch.no_grad():
+        W_n = head_linear.weight.detach().cpu().float().numpy()
+        b_n = head_linear.bias.detach().cpu().float().numpy()
+        norm_n = float(np.linalg.norm(W_n))
+        norm_r = float(np.linalg.norm(W_r))
+        if norm_r > 1e-6 and norm_n > 1e-6:
+            W_r_scaled = W_r * (norm_n / norm_r)
+        else:
+            W_r_scaled = W_r
+        W_blend = w_neural * W_n + w_ridge * W_r_scaled
+        b_blend = w_neural * b_n + w_ridge * b_r
+        head_linear.weight.copy_(torch.from_numpy(W_blend).to(head_linear.weight.device, dtype=head_linear.weight.dtype))
+        head_linear.bias.copy_(torch.from_numpy(b_blend).to(head_linear.bias.device, dtype=head_linear.bias.dtype))
+
 def export_compatible_checkpoint(
     model: MultiLayerLoRAClassifier,
     output_dir: Path,
@@ -567,13 +599,15 @@ def export_compatible_checkpoint(
     backbone_name: Optional[str] = None,
     Z_train: Optional[np.ndarray] = None,
     y_train: Optional[np.ndarray] = None,
-    prompts_train: Optional[np.ndarray] = None
+    prompts_train: Optional[np.ndarray] = None,
+    class_labels: Optional[List[str]] = None,
+    target_family: Optional[str] = None,
 ) -> Path:
     """
     Exports standard checkpoint artifacts strictly compatible with inference loaders:
     1. adapter/ (LoRA adapter weights and config)
     2. heads.safetensors (norms.{i}.weight, norms.{i}.bias, plain.weight, plain.bias, centered.weight, centered.bias)
-    3. meta.json (keep, layers, max_len, end_id, labels, backbone)
+    3. meta.json (keep, layers, max_len, end_id, labels, backbone, classes, target_family)
     4. wPCA_bank.npz (shared Gaussian covariance / whitening basis)
     """
     from safetensors.torch import save_file
@@ -604,21 +638,25 @@ def export_compatible_checkpoint(
     save_file(heads_dict, str(out_p / "heads.safetensors"))
 
     # 3. Meta JSON
+    active_labels = list(class_labels) if class_labels is not None else list(LABELS)
     meta = {
-        "labels": list(LABELS),
+        "labels": active_labels,
+        "classes": active_labels,
+        "target_family": str(target_family or ""),
         "backbone": str(backbone_name) if backbone_name else "",
         "cfg": {
             "keep": int(keep),
             "layers": [int(x) for x in layers],
             "max_len": int(max_len),
             "end_token_id": int(end_id),
-            "backbone": str(backbone_name) if backbone_name else ""
+            "backbone": str(backbone_name) if backbone_name else "",
+            "target_family": str(target_family or ""),
         }
     }
     (out_p / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    # 4. wPCA Bank precomputation
-    if Z_train is not None and y_train is not None and prompts_train is not None:
+    # 4. wPCA Bank precomputation (only when standard 18-class)
+    if len(active_labels) == K and Z_train is not None and y_train is not None and prompts_train is not None:
         d_target = min(256, Z_train.shape[1])
         res = fit_shared_gaussian_lowram(Z_train, y_train, prompts_train, d_target=d_target)
         np.savez_compressed(
@@ -659,6 +697,43 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     is_deberta = "deberta" in backbone_name.lower()
 
     input_dir = Path(train_cfg.get("input_dir", "/kaggle/input"))
+
+    # Preserve existing 18-class in-house champion checkpoint if present in input_dir
+    working_champ = Path("/kaggle/working/export_champion_qwen3_14b")
+    if input_dir.exists() and not working_champ.exists():
+        for cand in input_dir.rglob("export_champion_qwen3_14b"):
+            if cand.is_dir() and (cand / "heads.safetensors").exists():
+                try:
+                    shutil.copytree(str(cand), str(working_champ))
+                    print(f"[Trainer] Preserved existing in-house checkpoint from {cand} to {working_champ}")
+                    break
+                except Exception as e:
+                    print(f"[Trainer] Note on preserving in-house checkpoint: {e}")
+
+    # Sequential execution of specialist jobs if configured
+    if train_cfg.get("specialist_jobs") and isinstance(train_cfg["specialist_jobs"], list):
+        final_out = out_dir
+        for job in train_cfg["specialist_jobs"]:
+            job_cfg = {**train_cfg, **job}
+            job_cfg.pop("specialist_jobs", None)
+            final_out = run_training_pipeline(job_cfg)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return final_out
+
+    target_family = train_cfg.get("target_family")
+    is_specialist = bool(target_family and target_family in FAMILIES)
+    if is_specialist:
+        fam_cols = FAMILIES[target_family]
+        active_labels = [LABELS[i] for i in fam_cols]
+        sub_lab2i = {m: i for i, m in enumerate(active_labels)}
+        num_classes = len(active_labels)
+        print(f"[Trainer] Training {target_family} family specialist with {num_classes} classes: {active_labels}")
+    else:
+        active_labels = list(LABELS)
+        sub_lab2i = dict(LAB2I)
+        num_classes = K
     local_base = None
     if input_dir.exists():
         if is_deberta:
@@ -783,7 +858,7 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         if hasattr(mod, "gradient_checkpointing"):
             setattr(mod, "gradient_checkpointing", True)
 
-    model = MultiLayerLoRAClassifier(base_model, hidden_size=base_cfg.hidden_size, layers=layers, num_classes=K)
+    model = MultiLayerLoRAClassifier(base_model, hidden_size=base_cfg.hidden_size, layers=layers, num_classes=num_classes)
     # If device_map was used, do NOT call model.to() as it overrides device_map onto a single GPU
     if hasattr(base_model, "hf_device_map") and len(getattr(base_model, "hf_device_map", {})) > 1:
         model.plain_head = model.plain_head.to(head_dev)
@@ -820,7 +895,7 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         df_p = df_p.dropna(subset=["text", "model"])
         df_p["text"] = df_p["text"].astype(str)
         df_p = df_p[df_p["text"].str.strip().str.len() >= 40]
-        df_p = df_p[df_p["model"].isin(LABELS)]
+        df_p = df_p[df_p["model"].isin(active_labels)]
 
         df_p["_hash"] = [_text_hash(t) for t in df_p["text"]]
         df_p = df_p.drop_duplicates(subset=["_hash"]).reset_index(drop=True)
@@ -837,9 +912,9 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         except Exception as e:
             print(f"[Trainer] Note on holdout quarantine: {e}")
 
-        max_s = int(stage1_cfg.get("max_samples", 90000))
+        max_s = int(stage1_cfg.get("max_samples", 2000 * num_classes if is_specialist else 90000))
         if len(df_p) > max_s:
-            target_per_c = max_s // K
+            target_per_c = max_s // num_classes
             sampled = []
             remainder = []
             for c, group in df_p.groupby("model"):
@@ -862,7 +937,7 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         lengths = [min(len(t) // 4 + 1, max_len) for t in df_p["text"]]
         bs1 = int(stage1_cfg.get("batch_size", 2))
         accum1 = int(stage1_cfg.get("gradient_accumulation_steps", 8))
-        ds1 = TextSequenceDataset(df_p["text"].tolist(), [LAB2I[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id)
+        ds1 = TextSequenceDataset(df_p["text"].tolist(), [sub_lab2i[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id)
         bucket_sampler = BucketedLengthBatchSampler(lengths, batch_size=bs1, shuffle=True)
         loader1 = DataLoader(ds1, batch_sampler=bucket_sampler, collate_fn=collate_text_batch)
 
@@ -914,7 +989,9 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
                 keep=keep_layers,
                 max_len=max_len,
                 end_id=end_id,
-                backbone_name=backbone_name
+                backbone_name=backbone_name,
+                class_labels=active_labels,
+                target_family=target_family if is_specialist else None,
             )
             print(f"[Trainer] Safe intermediate Stage 1 checkpoint exported to {out_dir}")
         except Exception as e:
@@ -923,9 +1000,11 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
     # Stage 2: Prompt-Grouped Fine-Tuning on train.csv
     stage2_cfg = train_cfg.get("stage2", {})
     df_tr = pd.read_csv(train_path)
-    print(f"[Trainer] Stage 2 Fine-Tuning on {train_path} ({len(df_tr)} samples)...")
+    if is_specialist:
+        df_tr = df_tr[df_tr["model"].isin(active_labels)].reset_index(drop=True)
+    print(f"[Trainer] Stage 2 Fine-Tuning on {train_path} ({len(df_tr)} samples, {num_classes} classes)...")
     bs2 = int(stage2_cfg.get("batch_size", 2))
-    ds2 = TextSequenceDataset(df_tr["text"].tolist(), [LAB2I[m] for m in df_tr["model"]], df_tr["prompt_id"].tolist(), tok, max_len=max_len, end_id=end_id)
+    ds2 = TextSequenceDataset(df_tr["text"].tolist(), [sub_lab2i[m] for m in df_tr["model"]], df_tr["prompt_id"].tolist(), tok, max_len=max_len, end_id=end_id)
     sampler2 = PromptGroupBatchSampler(df_tr["prompt_id"].tolist(), batch_size=bs2, shuffle=True)
     loader2 = DataLoader(ds2, batch_sampler=sampler2, collate_fn=collate_text_batch)
 
@@ -977,8 +1056,15 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
                 z_b = model.forward_features(b_ids[:, :max_l], b_mask[:, :max_l], drop_first_token=not is_deberta)
                 Z_list.append(z_b.cpu().numpy())
     Z_train = np.vstack(Z_list)
-    y_train = np.array([LAB2I[m] for m in df_tr["model"]])
+    y_train = np.array([sub_lab2i[m] for m in df_tr["model"]])
     prompts_train = df_tr["prompt_id"].values
+
+    if is_specialist:
+        W_p_r, b_p_r, W_c_r, b_c_r = fit_ridge_heads(
+            Z_train, y_train, prompts_train, alpha=8.0, label_smoothing=0.05, num_classes=num_classes
+        )
+        _blend_head(model.plain_head, W_p_r, b_p_r, w_neural=0.65, w_ridge=0.35)
+        _blend_head(model.centered_head, W_c_r, b_c_r, w_neural=0.65, w_ridge=0.35)
 
     export_compatible_checkpoint(
         model=model,
@@ -990,7 +1076,9 @@ def run_training_pipeline(train_cfg: Optional[Dict[str, Any]] = None) -> Path:
         backbone_name=backbone_name,
         Z_train=Z_train,
         y_train=y_train,
-        prompts_train=prompts_train
+        prompts_train=prompts_train,
+        class_labels=active_labels,
+        target_family=target_family if is_specialist else None,
     )
     print(f"[Trainer] Checkpoint exported to {out_dir}")
     return out_dir

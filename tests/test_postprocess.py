@@ -12,6 +12,7 @@ import tempfile
 from namethatllm.postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
+    apply_family_specialist_lora_gate,
     apply_all_family_confidence_gates,
     apply_cluster_uniqueness_repulsion,
     apply_unified_handwriting_shield,
@@ -226,6 +227,56 @@ class TestPostprocess(unittest.TestCase):
         P_out = sinkhorn_balancing(P_in, iters=100, sinkhorn_strength=0.65, target_mix=0.35, train_prior=train_prior)
         self.assertEqual(P_out.shape, (N, 18))
         self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0, atol=1e-6))
+
+    def test_family_specialist_lora_gate_mass_preservation_and_sibling_swaps(self):
+        np.random.seed(42)
+        N = 25
+
+        # Test all 3 families: GPT (5 classes), Gemini (4 classes), GLM (2 classes)
+        for fam_name, default_gate_w in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+            fam_cols = FAMILIES[fam_name]
+            K_fam = len(fam_cols)
+            fam_labels = [LABELS[c] for c in fam_cols]
+
+            P_mix = softmax(np.random.randn(N, 18), axis=1)
+            R_main = P_mix.copy()
+
+            # Assign row 0 to be clearly predicted in the family
+            R_main[0, :] = 0.01
+            R_main[0, fam_cols[0]] = 0.80
+
+            # Specialist logits favoring sibling index 1 over index 0
+            spec_logits = np.zeros((N, K_fam), dtype=np.float32)
+            spec_logits[0, 1] = 5.0
+            spec_logits[0, 0] = -5.0
+
+            orig_fam_mass = P_mix[:, fam_cols].sum(axis=1)
+            orig_outer_p = P_mix.copy()
+
+            P_refined = apply_family_specialist_lora_gate(
+                P_mix=P_mix,
+                R_main=R_main,
+                spec_logits=spec_logits,
+                spec_classes=fam_labels,
+                labels=LABELS,
+                family_cols=fam_cols,
+                gate_weight=default_gate_w,
+            )
+
+            # 1. Simplex preservation
+            self.assertTrue(np.allclose(P_refined.sum(axis=1), 1.0, atol=1e-6))
+            self.assertTrue((P_refined >= 0.0).all())
+
+            # 2. Strict family mass preservation
+            new_fam_mass = P_refined[:, fam_cols].sum(axis=1)
+            self.assertTrue(np.allclose(orig_fam_mass, new_fam_mass, atol=1e-6))
+
+            # 3. Outer non-family classes completely unchanged
+            outer_cols = [c for c in range(18) if c not in fam_cols]
+            self.assertTrue(np.allclose(P_mix[:, outer_cols], P_refined[:, outer_cols], atol=1e-6))
+
+            # 4. Sibling swap resolution: row 0 favored index 1 in specialist logits
+            self.assertGreater(P_refined[0, fam_cols[1]], P_refined[0, fam_cols[0]])
 
 if __name__ == "__main__":
     unittest.main()

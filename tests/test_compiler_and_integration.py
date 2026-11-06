@@ -558,6 +558,52 @@ class TestCompilerAndIntegration(unittest.TestCase):
             self.assertIn("llama3_8b_ts", ckpts)
             self.assertEqual(ckpts["llama3_8b_ts"], tmp / "nlm_l24_adapters" / "ts_llama8")
 
+    def test_find_checkpoints_family_specialists_routing_guard(self):
+        """Verify find_checkpoints maps specialists under name-that-llm-lora-peft-training correctly without inhouse collision."""
+        from namethatllm.config import find_checkpoints
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            base_peft = tmp / "name-that-llm-lora-peft-training"
+
+            # 1. Standard 18-class champion inhouse
+            champ_dir = base_peft / "export_champion_qwen3_14b"
+            champ_dir.mkdir(parents=True)
+            (champ_dir / "heads.safetensors").write_bytes(b"mock")
+            (champ_dir / "meta.json").write_text(json.dumps({"target_family": "", "backbone": "Qwen/Qwen3-14B-Base"}), encoding="utf-8")
+
+            # 2. GPT specialist (5-class)
+            gpt_dir = base_peft / "export_gpt_specialist_14b"
+            gpt_dir.mkdir(parents=True)
+            (gpt_dir / "heads.safetensors").write_bytes(b"mock")
+            (gpt_dir / "meta.json").write_text(json.dumps({"target_family": "gpt", "backbone": "Qwen/Qwen3-14B-Base"}), encoding="utf-8")
+
+            # 3. Gemini specialist (4-class)
+            gemini_dir = base_peft / "export_gemini_specialist_14b"
+            gemini_dir.mkdir(parents=True)
+            (gemini_dir / "heads.safetensors").write_bytes(b"mock")
+            (gemini_dir / "meta.json").write_text(json.dumps({"target_family": "gemini", "backbone": "Qwen/Qwen3-14B-Base"}), encoding="utf-8")
+
+            # 4. GLM specialist (2-class)
+            glm_dir = base_peft / "export_glm_specialist_14b"
+            glm_dir.mkdir(parents=True)
+            (glm_dir / "heads.safetensors").write_bytes(b"mock")
+            (glm_dir / "meta.json").write_text(json.dumps({"target_family": "glm", "backbone": "Qwen/Qwen3-14B-Base"}), encoding="utf-8")
+
+            ckpts = find_checkpoints(tmp)
+
+            self.assertIn("qwen3_14b_inhouse", ckpts)
+            self.assertEqual(ckpts["qwen3_14b_inhouse"], champ_dir)
+
+            self.assertIn("qwen3_14b_gpt", ckpts)
+            self.assertEqual(ckpts["qwen3_14b_gpt"], gpt_dir)
+
+            self.assertIn("qwen3_14b_gemini", ckpts)
+            self.assertEqual(ckpts["qwen3_14b_gemini"], gemini_dir)
+
+            self.assertIn("qwen3_14b_glm", ckpts)
+            self.assertEqual(ckpts["qwen3_14b_glm"], glm_dir)
+
     def test_merge_lora_atomic_prevalidation_rejects_llama_mlp_mismatch(self):
         """Verify that if an adapter has matching q_proj shape (32, 32) but mismatched gate_proj shape (64, 32) vs (48, 32), merge_lora returns False and leaves q_proj.weight 100% unchanged."""
         import torch

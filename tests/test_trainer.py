@@ -265,6 +265,85 @@ class TestTrainer(unittest.TestCase):
         loss_with_margin = family_margin_cross_entropy(logits, labels, family_margin=0.35)
         self.assertGreater(loss_with_margin.item(), loss_zero_margin.item())
 
+        # Single-family specialist margin checks:
+        # Gemini specialist (4 classes): 3.7-flash (2) <-> 3.8-flash (3) gets 1.5 boost
+        gem_logits = torch.zeros(2, 4)
+        gem_labels = torch.tensor([2, 0])
+        gem_loss = family_margin_cross_entropy(gem_logits, gem_labels, family_margin=0.35)
+        self.assertGreater(gem_loss.item(), 0.0)
+
+        # GPT specialist (5 classes): luna (1) <-> sol (2) <-> terra (3) gets 1.4 boost
+        gpt_logits = torch.zeros(3, 5)
+        gpt_labels = torch.tensor([1, 2, 3])
+        gpt_loss = family_margin_cross_entropy(gpt_logits, gpt_labels, family_margin=0.40)
+        self.assertGreater(gpt_loss.item(), 0.0)
+
+        # GLM specialist (2 classes)
+        glm_logits = torch.zeros(2, 2)
+        glm_labels = torch.tensor([0, 1])
+        glm_loss = family_margin_cross_entropy(glm_logits, glm_labels, family_margin=0.40)
+        self.assertGreater(glm_loss.item(), 0.0)
+
+    def test_family_specialists_checkpoint_export_and_inference_load(self):
+        """Verify export_compatible_checkpoint and resolve_head_tensors for 5-class, 4-class, and 2-class specialists."""
+        from namethatllm.trainer import MultiLayerLoRAClassifier, export_compatible_checkpoint
+        from namethatllm.neural_extractor import load_head_file, resolve_head_tensors, read_checkpoint_meta
+        from namethatllm.config import FAMILIES, LABELS
+
+        hidden_size = 32
+        layers = [1, 2, 3]
+
+        for fam_name in ("gpt", "gemini", "glm"):
+            fam_cols = FAMILIES[fam_name]
+            K_fam = len(fam_cols)
+            active_labels = [LABELS[c] for c in fam_cols]
+
+            mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=4)
+            model = MultiLayerLoRAClassifier(
+                backbone=mock_backbone,
+                hidden_size=hidden_size,
+                layers=layers,
+                num_classes=K_fam
+            )
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                out_p = Path(tmp_dir) / f"export_{fam_name}"
+                export_compatible_checkpoint(
+                    model=model,
+                    output_dir=out_p,
+                    layers=layers,
+                    keep=3,
+                    max_len=447,
+                    end_id=151643,
+                    class_labels=active_labels,
+                    target_family=fam_name
+                )
+
+                # 1. Assert files exist
+                self.assertTrue((out_p / "heads.safetensors").exists())
+                self.assertTrue((out_p / "meta.json").exists())
+                # wPCA_bank must NOT be written for specialists
+                self.assertFalse((out_p / "wPCA_bank.npz").exists())
+
+                # 2. Check meta.json
+                meta_json = json.loads((out_p / "meta.json").read_text(encoding="utf-8"))
+                self.assertEqual(meta_json["target_family"], fam_name)
+                self.assertEqual(meta_json["labels"], active_labels)
+                self.assertEqual(meta_json["classes"], active_labels)
+
+                # 3. Check heads.safetensors resolution
+                heads_sd = load_head_file(out_p)
+                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd, num_classes=K_fam)
+
+                self.assertIsNotNone(W_p)
+                self.assertEqual(W_p.shape, (K_fam, len(layers) * hidden_size))
+                self.assertIsNotNone(b_p)
+                self.assertEqual(b_p.shape, (K_fam,))
+                self.assertIsNotNone(W_c)
+                self.assertEqual(W_c.shape, (K_fam, len(layers) * hidden_size))
+                self.assertIsNotNone(b_c)
+                self.assertEqual(b_c.shape, (K_fam,))
+
     def test_bucketed_length_batch_sampler(self):
         from namethatllm.trainer import BucketedLengthBatchSampler
         lengths = [10, 500, 15, 480, 20, 510, 12, 490]

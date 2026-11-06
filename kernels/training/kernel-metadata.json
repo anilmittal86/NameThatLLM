@@ -17,7 +17,9 @@
   "competition_sources": [
     "name-that-llm"
   ],
-  "kernel_sources": [],
+  "kernel_sources": [
+    "anilmittal/name-that-llm-lora-peft-training"
+  ],
   "model_sources": [
     "qwen-lm/qwen-3/Transformers/14b-base/1",
     "qwen-lm/qwen2.5/Transformers/14b/1",

@@ -37,6 +37,7 @@ from .neural_extractor import (
     load_head_file,
     resolve_head_tensors,
     compute_centered_logits,
+    compute_family_centered_logits,
     merge_lora,
     read_checkpoint_meta,
     extract_deberta_checkpoint
@@ -51,6 +52,7 @@ from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks, fit_wi
 from .postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
+    apply_family_specialist_lora_gate,
     apply_all_family_confidence_gates,
     apply_cluster_uniqueness_repulsion,
     apply_unified_handwriting_shield,
@@ -172,6 +174,132 @@ def _combine_plain_and_twin_lp(
     ratio = float(w_twin) / max(float(w_plain), 1e-6)
     return log_softmax(lp_plain + ratio * lp_twin, axis=1)
 
+def extract_family_specialist_logits(
+    trunk1: UniversalLoRATrunkLoader,
+    spec_dir: Path,
+    family_name: str,
+    test_texts: List[str],
+    unseen_texts: List[str],
+    LOGIT_MAIN: np.ndarray,
+    auditor: Any,
+    groups_test_multi: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    groups_unseen: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, list]:
+    """
+    Selectively runs inference for a Qwen3-14B family specialist adapter
+    (GPT 5-class, Gemini 4-class, or GLM 2-class) on candidate test and unseen passages.
+    Preserves fast execution by filtering to rows predicted in the family or with >=0.15 family mass.
+    """
+    fam_cols = FAMILIES[family_name]
+    target_labels = [LABELS[i] for i in fam_cols]
+    K_fam = len(target_labels)
+    N_test = len(test_texts)
+    N_unseen = len(unseen_texts)
+
+    spec_logits_te = np.zeros((N_test, K_fam), dtype=np.float32)
+    spec_logits_u = np.zeros((N_unseen, K_fam), dtype=np.float32)
+
+    # 1. Selective Family Masking for Test set
+    if N_test <= 60:
+        te_mask = np.ones(N_test, dtype=bool)
+    else:
+        P_cur = softmax(LOGIT_MAIN, axis=1)
+        te_mask = np.isin(P_cur.argmax(axis=1), fam_cols) | (P_cur[:, fam_cols].sum(axis=1) >= 0.15)
+
+    # 2. Selective Family Masking for Unseen set
+    if N_unseen <= 60:
+        u_mask = np.ones(N_unseen, dtype=bool) if N_unseen > 0 else np.zeros(0, dtype=bool)
+    else:
+        u_mask = np.zeros(N_unseen, dtype=bool)
+        if hasattr(auditor, "models") and auditor.models:
+            for m in auditor.models:
+                u_lp = m.get("unseen_lp")
+                if u_lp is not None and len(u_lp) == N_unseen:
+                    p_u = softmax(u_lp, axis=-1)
+                    u_mask |= np.isin(p_u.argmax(axis=1), fam_cols) | (p_u[:, fam_cols].sum(axis=1) >= 0.15)
+        if not u_mask.any() and N_unseen > 0:
+            u_mask[:] = True
+
+    sel_te_idx = np.flatnonzero(te_mask)
+    sel_u_idx = np.flatnonzero(u_mask)
+    n_sel_te = len(sel_te_idx)
+    n_sel_u = len(sel_u_idx)
+
+    print(f"[Specialist {family_name}] Masked inference: {n_sel_te}/{N_test} test rows, {n_sel_u}/{N_unseen} unseen rows.")
+    if n_sel_te == 0 and n_sel_u == 0:
+        return spec_logits_te, spec_logits_u, target_labels
+
+    meta_spec = read_checkpoint_meta(
+        spec_dir,
+        default_keep=27,
+        default_layers=[2, 4, 6, 9, 13, 17, 22, 27],
+        default_max_len=447
+    )
+    trunk1.set_active_layers(meta_spec["layers"], meta_spec["max_len"])
+    backup_spec = trunk1.snapshot_weights(spec_dir)
+    merged = merge_lora(trunk1.model, spec_dir, sign=+1.0)
+    heads_sd = load_head_file(spec_dir)
+    trunk1.load_norm_weights(heads_sd)
+
+    W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd, num_classes=K_fam)
+    src_labels = meta_spec.get("labels", target_labels)
+    src_list = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
+    perm = None
+    if len(src_list) == K_fam and set(src_list) == set(target_labels):
+        perm = [src_list.index(l) for l in target_labels]
+
+    sel_texts = [test_texts[i] for i in sel_te_idx] + [unseen_texts[j] for j in sel_u_idx]
+    Z_sel = trunk1.extract_exact(sel_texts, batch_size=8, end_id=meta_spec["end_id"])
+
+    Z_sel_te = Z_sel[:n_sel_te]
+    Z_sel_u = Z_sel[n_sel_te:]
+
+    g85, g72, g65 = groups_test_multi
+
+    # Test processing
+    if n_sel_te > 0 and W_p is not None:
+        raw_p_te = Z_sel_te @ W_p.T + b_p
+        if perm is not None:
+            raw_p_te = raw_p_te[:, perm]
+        lp_p_te = log_softmax(raw_p_te, axis=1)
+
+        lp_c_blend_te = None
+        if W_c is not None:
+            g85_sel = g85[sel_te_idx] if len(g85) == N_test else np.ones(n_sel_te, dtype=int)
+            g72_sel = g72[sel_te_idx] if len(g72) == N_test else np.ones(n_sel_te, dtype=int)
+            g65_sel = g65[sel_te_idx] if len(g65) == N_test else np.ones(n_sel_te, dtype=int)
+            lp_c85, v85 = compute_family_centered_logits(Z_sel_te, g85_sel, W_c, b_c, src_labels, target_labels)
+            lp_c72, v72 = compute_family_centered_logits(Z_sel_te, g72_sel, W_c, b_c, src_labels, target_labels)
+            lp_c65, v65 = compute_family_centered_logits(Z_sel_te, g65_sel, W_c, b_c, src_labels, target_labels)
+            lp_c_blend_te = 0.50 * lp_c85 + 0.30 * lp_c72 + 0.20 * lp_c65
+
+        comb_te = lp_p_te + 0.45 * lp_c_blend_te if lp_c_blend_te is not None else lp_p_te
+        spec_logits_te[sel_te_idx] = log_softmax(comb_te, axis=1).astype(np.float32)
+
+    # Unseen processing
+    if n_sel_u > 0 and W_p is not None:
+        raw_p_u = Z_sel_u @ W_p.T + b_p
+        if perm is not None:
+            raw_p_u = raw_p_u[:, perm]
+        lp_p_u = log_softmax(raw_p_u, axis=1)
+
+        lp_c_u = None
+        if W_c is not None:
+            gu_sel = groups_unseen[sel_u_idx] if len(groups_unseen) == N_unseen else np.ones(n_sel_u, dtype=int)
+            lp_c_u, vu = compute_family_centered_logits(Z_sel_u, gu_sel, W_c, b_c, src_labels, target_labels)
+
+        comb_u = lp_p_u + 0.45 * lp_c_u if lp_c_u is not None else lp_p_u
+        spec_logits_u[sel_u_idx] = log_softmax(comb_u, axis=1).astype(np.float32)
+
+    trunk1.restore_weights(backup_spec)
+    trunk1.set_final_norm(False)
+    del backup_spec, heads_sd, Z_sel
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return spec_logits_te, spec_logits_u, target_labels
+
 def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.DataFrame, Path]:
     """
     Executes the complete production or smoke-test submission pipeline.
@@ -251,6 +379,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         "qwen3_14b_p2", "qwen3_14b_v5", "qwen3_14b_inhouse",
         "deberta_p2", "deberta_inhouse",
         "qwen3_8b_claude",
+        "qwen3_14b_gpt", "qwen3_14b_gemini", "qwen3_14b_glm",
     }
     if "required_checkpoints" in req_assets or "optional_checkpoints" in req_assets:
         allowed_ckpts = set(req_assets.get("required_checkpoints", [])) | set(req_assets.get("optional_checkpoints", []))
@@ -276,6 +405,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         )
     else:
         verified_bases = {}
+
+    family_spec_logits_te: Dict[str, np.ndarray] = {}
+    family_spec_logits_unseen: Dict[str, np.ndarray] = {}
+    family_spec_classes: Dict[str, list] = {}
 
     # 2. MODULE 1: Subprocess Dual-Output Lexical Engine
     run_lex_script = working_dir / "run_lexical.py"
@@ -429,12 +562,15 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         dp_posteriors: List[Tuple[float, np.ndarray]] = []
         dp_posteriors_unseen: List[Tuple[float, np.ndarray]] = []
         comp_lora_posteriors: List[Tuple[float, np.ndarray]] = []
+        family_spec_logits_te: Dict[str, np.ndarray] = {}
+        family_spec_logits_unseen: Dict[str, np.ndarray] = {}
+        family_spec_classes: Dict[str, list] = {}
 
         # ==============================================================================
         # TRUNK 1: Qwen3-14B (40 layers, hidden=5120)
         # ==============================================================================
         base_q3_14b = verified_bases.get("qwen3_14b") or find_base_model(input_dir, "qwen3", 5120, 40)
-        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_v5" in ckpts or "qwen3_14b_inhouse" in ckpts):
+        if base_q3_14b and any(k in ckpts for k in ("qwen3_14b_p2", "qwen3_14b_v5", "qwen3_14b_inhouse", "qwen3_14b_gpt", "qwen3_14b_gemini", "qwen3_14b_glm")):
             print(f"[Pipeline] Loading Trunk 1: Qwen3-14B from {base_q3_14b}...")
             trunk1 = UniversalLoRATrunkLoader(base_q3_14b, keep_layers=27, layers=[2, 4, 6, 9, 13, 17, 22, 27], max_len=447)
 
@@ -830,6 +966,31 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+
+            # Execute Family Specialists on Trunk 1 (Qwen3-14B)
+            spec_candidates = [
+                ("qwen3_14b_gpt", "gpt"),
+                ("qwen3_14b_gemini", "gemini"),
+                ("qwen3_14b_glm", "glm"),
+            ]
+            for ckpt_key, fam_name in spec_candidates:
+                if ckpt_key in ckpts:
+                    spec_p = ckpts[ckpt_key]
+                    print(f"[Pipeline] Running Trunk 1 Family Specialist: {ckpt_key} ({fam_name}) from {spec_p}...")
+                    te_l, u_l, cls_l = extract_family_specialist_logits(
+                        trunk1=trunk1,
+                        spec_dir=spec_p,
+                        family_name=fam_name,
+                        test_texts=test_texts,
+                        unseen_texts=unseen_texts if N_unseen > 0 else [],
+                        LOGIT_MAIN=LOGIT_MAIN,
+                        auditor=auditor,
+                        groups_test_multi=(groups_085, groups_072, groups_065),
+                        groups_unseen=groups_unseen,
+                    )
+                    family_spec_logits_te[fam_name] = te_l
+                    family_spec_logits_unseen[fam_name] = u_l
+                    family_spec_classes[fam_name] = cls_l
 
             trunk1.free_memory()
             del trunk1
@@ -1647,6 +1808,22 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         gate_weight=gate_weight
     )
 
+    # Family-Specialist LoRA Gates (GPT, Gemini, GLM)
+    for fam_k, default_w in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+        spec_te_logits = family_spec_logits_te.get(fam_k)
+        if spec_te_logits is not None:
+            spec_cls = family_spec_classes.get(fam_k)
+            w_gate = float(post_cfg.get(f"{fam_k}_specialist_weight", default_w))
+            P_mix = apply_family_specialist_lora_gate(
+                P_mix=P_mix,
+                R_main=R_main,
+                spec_logits=spec_te_logits,
+                spec_classes=spec_cls,
+                labels=LABELS,
+                family_cols=FAMILIES[fam_k],
+                gate_weight=w_gate,
+            )
+
     # 4-Family Confidence Gates
     P_mix = apply_all_family_confidence_gates(
         P_mix=P_mix,
@@ -1766,6 +1943,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         cache_dict["num_extra"] = np.array([len(extra_streams)], dtype=np.int32)
         if "claude_spec_logits_unseen" in locals() and claude_spec_logits_unseen is not None:
             cache_dict["claude_spec_logits_unseen"] = claude_spec_logits_unseen.astype(np.float32)
+        for fam_k in ("gpt", "gemini", "glm"):
+            if "family_spec_logits_te" in locals() and fam_k in family_spec_logits_te and family_spec_logits_te[fam_k] is not None:
+                cache_dict[f"{fam_k}_spec_logits"] = family_spec_logits_te[fam_k].astype(np.float32)
+            if "family_spec_logits_unseen" in locals() and fam_k in family_spec_logits_unseen and family_spec_logits_unseen[fam_k] is not None:
+                cache_dict[f"{fam_k}_spec_logits_unseen"] = family_spec_logits_unseen[fam_k].astype(np.float32)
+            if "family_spec_classes" in locals() and fam_k in family_spec_classes and family_spec_classes[fam_k] is not None:
+                cache_dict[f"{fam_k}_classes"] = np.array(family_spec_classes[fam_k], dtype=object)
         if "family_gates_unseen" in locals() and family_gates_unseen:
             for fam_k, fam_lp in family_gates_unseen.items():
                 cache_dict[f"gate_{fam_k}_unseen_lp"] = fam_lp.astype(np.float32)

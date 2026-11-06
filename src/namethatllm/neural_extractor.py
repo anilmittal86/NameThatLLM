@@ -245,9 +245,11 @@ def load_head_file(path_or_dir: Path) -> dict:
             return load_head_file(cand)
     return {}
 
-def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Resolves plain and centered head weights and biases matching American/British naming and handles transposed weights."""
     W_p, b_p, W_c, b_c = None, None, None, None
+    valid_k = (num_classes,) if num_classes is not None else (K, 5, 4, 2)
+
     for wk, bk in [
         ("plain.weight", "plain.bias"),
         ("plain_coef", "plain_intercept"),
@@ -263,7 +265,12 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
             break
         elif wk in heads_dict and bk not in heads_dict:
             W_p = heads_dict[wk]
-            b_p = np.zeros(K, dtype=np.float32)
+            k_rows = (
+                W_p.shape[0] if (hasattr(W_p, "shape") and len(W_p.shape) > 0 and W_p.shape[0] in valid_k)
+                else (W_p.shape[1] if (hasattr(W_p, "shape") and len(W_p.shape) > 1 and W_p.shape[1] in valid_k)
+                else (num_classes or K))
+            )
+            b_p = np.zeros(k_rows, dtype=np.float32)
             break
 
     for wk, bk in [
@@ -281,7 +288,12 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
             break
         elif wk in heads_dict and bk not in heads_dict:
             W_c = heads_dict[wk]
-            b_c = np.zeros(K, dtype=np.float32)
+            k_rows = (
+                W_c.shape[0] if (hasattr(W_c, "shape") and len(W_c.shape) > 0 and W_c.shape[0] in valid_k)
+                else (W_c.shape[1] if (hasattr(W_c, "shape") and len(W_c.shape) > 1 and W_c.shape[1] in valid_k)
+                else (num_classes or K))
+            )
+            b_c = np.zeros(k_rows, dtype=np.float32)
             break
 
     # Suffix / Keyword Matching fallback if W_p or W_c still None
@@ -289,29 +301,35 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
         for k, v in heads_dict.items():
             k_lower = str(k).lower()
             shape = getattr(v, "shape", None)
-            if shape is not None and len(shape) == 2 and (shape[0] == K or shape[1] == K):
+            if shape is not None and len(shape) == 2 and (shape[0] in valid_k or shape[1] in valid_k):
                 # Check for center / twin
                 if any(tag in k_lower for tag in ("center", "centred", "twin")):
                     if W_c is None:
                         W_c = v
                         base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
                         for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "centered.bias", "b"]:
-                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) == (K,):
-                                b_c = heads_dict[bk]
-                                break
+                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) is not None:
+                                b_cand = heads_dict[bk]
+                                if getattr(b_cand, "shape", ()) in [(k_item,) for k_item in valid_k]:
+                                    b_c = b_cand
+                                    break
                         if b_c is None:
-                            b_c = np.zeros(K, dtype=np.float32)
+                            k_rows = W_c.shape[0] if W_c.shape[0] in valid_k else W_c.shape[1]
+                            b_c = np.zeros(k_rows, dtype=np.float32)
                 # Check for plain / head / clf / classifier
                 elif any(tag in k_lower for tag in ("plain", "head", "clf", "classifier")):
                     if W_p is None:
                         W_p = v
                         base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
                         for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "plain.bias", "b"]:
-                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) == (K,):
-                                b_p = heads_dict[bk]
-                                break
+                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) is not None:
+                                b_cand = heads_dict[bk]
+                                if getattr(b_cand, "shape", ()) in [(k_item,) for k_item in valid_k]:
+                                    b_p = b_cand
+                                    break
                         if b_p is None:
-                            b_p = np.zeros(K, dtype=np.float32)
+                            k_rows = W_p.shape[0] if W_p.shape[0] in valid_k else W_p.shape[1]
+                            b_p = np.zeros(k_rows, dtype=np.float32)
 
     if W_p is not None and hasattr(W_p, "cpu"):
         W_p = W_p.cpu().numpy()
@@ -322,12 +340,12 @@ def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Option
     if b_c is not None and hasattr(b_c, "cpu"):
         b_c = b_c.cpu().numpy()
 
-    # Transpose Guard: if shape is (D, K) where K == 18, transpose to canonical (18, D)
+    # Transpose Guard: if shape is (D, K_cls), transpose to canonical (K_cls, D)
     if W_p is not None and W_p.ndim == 2:
-        if W_p.shape[1] == K and W_p.shape[0] != K:
+        if W_p.shape[1] in valid_k and W_p.shape[0] not in valid_k:
             W_p = W_p.T
     if W_c is not None and W_c.ndim == 2:
-        if W_c.shape[1] == K and W_c.shape[0] != K:
+        if W_c.shape[1] in valid_k and W_c.shape[0] not in valid_k:
             W_c = W_c.T
 
     return W_p, b_p, W_c, b_c
@@ -350,6 +368,38 @@ def compute_centered_logits(Z_test: np.ndarray, groups: np.ndarray, W_c: np.ndar
         Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
     raw_c = Zc[valid] @ W_c.T + b_c
     out_lp[valid] = log_softmax(align_cols(raw_c, src_labels))
+    return out_lp, valid
+
+def compute_family_centered_logits(
+    Z_test: np.ndarray,
+    groups: np.ndarray,
+    W_c: np.ndarray,
+    b_c: np.ndarray,
+    src_labels: list,
+    target_labels: list,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes within-cluster centered twin logits for a K_fam-class family specialist."""
+    N = len(Z_test)
+    K_fam = len(target_labels)
+    out_lp = np.zeros((N, K_fam), dtype=np.float64)
+    if N < 2 or W_c is None:
+        return out_lp, np.zeros(N, dtype=bool)
+    _, inv_g = np.unique(np.asarray(groups, dtype=str), return_inverse=True)
+    safe_g = inv_g + 1
+    sz = np.bincount(safe_g)[safe_g]
+    valid = (sz >= 2) & (sz <= 18)
+    if not valid.any():
+        return out_lp, valid
+    Zc = Z_test.copy()
+    for g in np.unique(safe_g[valid]):
+        mask = (safe_g == g)
+        Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
+    raw_c = Zc[valid] @ W_c.T + b_c
+    src_list = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
+    if len(src_list) == K_fam and set(src_list) == set(target_labels):
+        perm = [src_list.index(l) for l in target_labels]
+        raw_c = raw_c[:, perm]
+    out_lp[valid] = log_softmax(raw_c, axis=1)
     return out_lp, valid
 
 class UniversalLoRATrunkLoader:

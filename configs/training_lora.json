@@ -1,7 +1,7 @@
 {
-  "version": "2.0.0",
-  "name": "champion_two_stage_lora_14b",
-  "description": "Champion Two-Stage Multi-Layer LoRA 14B Trainer (Stage 1 Pool Pre-training on 90k Passages + Stage 2 Contrastive Fine-Tuning with Family Margin Loss)",
+  "version": "2.1.0",
+  "name": "qwen3_14b_family_specialists",
+  "description": "Sequential Family-Specialist LoRA 14B Trainer for GPT (5-class), Gemini (4-class), and GLM (2-class) on Qwen/Qwen3-14B-Base (keep_layers=27)",
   "backbone": "Qwen/Qwen3-14B-Base",
   "keep_layers": 27,
   "layers": [2, 4, 6, 9, 13, 17, 22, 27],
@@ -14,8 +14,8 @@
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj"
   ],
-  "family_margin": 0.35,
-  "supcon_weight": 0.20,
+  "family_margin": 0.40,
+  "supcon_weight": 0.25,
   "stage1": {
     "enabled": true,
     "lr_lora": 1.5e-4,
@@ -23,8 +23,8 @@
     "batch_size": 2,
     "gradient_accumulation_steps": 8,
     "epochs": 1,
-    "max_samples": 90000,
-    "warmup_steps": 100
+    "max_samples": 10000,
+    "warmup_steps": 60
   },
   "stage2": {
     "enabled": true,
@@ -33,9 +33,26 @@
     "batch_size": 2,
     "gradient_accumulation_steps": 4,
     "epochs": 2,
-    "centered_weight": 0.60,
-    "warmup_steps": 50
+    "centered_weight": 0.65,
+    "warmup_steps": 30
   },
   "weight_decay": 0.01,
-  "output_dir": "export_champion_qwen3_14b"
+  "output_dir": "export_gemini_specialist_14b",
+  "specialist_jobs": [
+    {
+      "target_family": "gemini",
+      "output_dir": "export_gemini_specialist_14b",
+      "stage1": { "enabled": true, "lr_lora": 1.5e-4, "lr_head": 8e-4, "batch_size": 2, "gradient_accumulation_steps": 8, "epochs": 1, "max_samples": 8000, "warmup_steps": 50 }
+    },
+    {
+      "target_family": "glm",
+      "output_dir": "export_glm_specialist_14b",
+      "stage1": { "enabled": true, "lr_lora": 1.5e-4, "lr_head": 8e-4, "batch_size": 2, "gradient_accumulation_steps": 8, "epochs": 1, "max_samples": 8000, "warmup_steps": 50 }
+    },
+    {
+      "target_family": "gpt",
+      "output_dir": "export_gpt_specialist_14b",
+      "stage1": { "enabled": true, "lr_lora": 1.5e-4, "lr_head": 8e-4, "batch_size": 2, "gradient_accumulation_steps": 8, "epochs": 1, "max_samples": 10000, "warmup_steps": 60 }
+    }
+  ]
 }

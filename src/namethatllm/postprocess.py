@@ -150,6 +150,49 @@ def apply_claude_specialist_gate(
         P_out[np.ix_(rows, claude_cols)] = blended
     return P_out
 
+def apply_family_specialist_lora_gate(
+    P_mix: np.ndarray,
+    R_main: np.ndarray,
+    spec_logits: Optional[np.ndarray],
+    spec_classes: Optional[list] = None,
+    labels: list = LABELS,
+    family_cols: list = FAMILIES["gemini"],
+    gate_weight: float = 0.65,
+) -> np.ndarray:
+    """
+    Refines passages identified in `family_cols` using a dedicated Qwen3-14B
+    Family-Specialist LoRA's logits while strictly preserving total marginal
+    family probability mass!
+    """
+    if spec_logits is None or len(spec_logits) != len(P_mix):
+        return P_mix
+
+    P_out = P_mix.astype(np.float64).copy()
+    spec_arr = np.asarray(spec_logits, dtype=np.float64)
+    if spec_arr.ndim != 2 or spec_arr.shape[1] != len(family_cols):
+        return P_mix
+
+    P_spec = softmax(spec_arr, axis=-1)
+    if spec_classes is not None and len(spec_classes) == len(family_cols):
+        src_c = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in spec_classes]
+        if all(labels[c] in src_c for c in family_cols):
+            c_idx = [src_c.index(labels[c]) for c in family_cols]
+            P_spec = P_spec[:, c_idx]
+
+    fam_mass = P_out[:, family_cols].sum(axis=1)
+    has_signal = np.ptp(spec_arr, axis=1) > 1e-6
+    fam_mask = (np.isin(R_main.argmax(axis=1), family_cols) | (fam_mass >= 0.35)) & has_signal
+
+    if fam_mask.any():
+        rows = np.flatnonzero(fam_mask)
+        sub_mix = np.clip(P_out[np.ix_(rows, family_cols)], 1e-12, 1.0)
+        tot_mass = sub_mix.sum(axis=1, keepdims=True)
+        base_rel = sub_mix / tot_mass
+        log_rel = (1.0 - float(gate_weight)) * np.log(base_rel) + float(gate_weight) * np.log(np.clip(P_spec[rows], 1e-12, 1.0))
+        blended_rel = softmax(log_rel, axis=1)
+        P_out[np.ix_(rows, family_cols)] = tot_mass * blended_rel
+    return P_out
+
 def build_orthographic_penalty_matrix(
     curly_quote_log_penalty: float = -1.00,      # Rule 1: 0/1049 Claude, 0/300 GLM
     multi_em_dash_log_penalty: float = 0.0,      # Rule 2: >=2 em-dashes (v44 default: 0.0)

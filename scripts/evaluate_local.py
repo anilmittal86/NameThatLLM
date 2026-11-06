@@ -117,9 +117,8 @@ CANONICAL_NAME_MAP: Dict[str, str] = {
 
 
 from namethatllm.postprocess import (
-
     apply_claude_specialist_gate,
-
+    apply_family_specialist_lora_gate,
     apply_all_family_confidence_gates,
 
     apply_cluster_uniqueness_repulsion,
@@ -993,6 +992,18 @@ def print_per_class_accuracy_table(
                     claude_cols=FAMILIES["claude"],
                     gate_weight=post_cfg.get("claude_specialist_weight", 0.15) if post_cfg else 0.15,
                 )
+            for fam_k, weight_default in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+                spec_key = f"{fam_k}_spec_logits_unseen"
+                if spec_key in data:
+                    P = apply_family_specialist_lora_gate(
+                        P_mix=P,
+                        R_main=P,
+                        spec_logits=data[spec_key],
+                        spec_classes=list(data[f"{fam_k}_classes"]) if f"{fam_k}_classes" in data else None,
+                        labels=LABELS,
+                        family_cols=FAMILIES[fam_k],
+                        gate_weight=float(post_cfg.get(f"{fam_k}_specialist_weight", weight_default)) if post_cfg else weight_default,
+                    )
             family_gates_u = {}
             for k in data.keys():
                 if k.startswith("gate_") and k.endswith("_unseen_lp"):
@@ -1678,22 +1689,28 @@ def evaluate_from_cache(
         if claude_spec is not None:
 
             P_mix = apply_claude_specialist_gate(
-
                 P_mix=P_mix,
-
                 R_main=R_main,
-
                 claude_spec_logits=claude_spec,
-
                 claude_classes=claude_classes,
-
                 labels=LABELS,
-
                 claude_cols=FAMILIES["claude"],
-
                 gate_weight=gate_weight,
-
             )
+
+        # 2a. Family-Specialist LoRA Gates (GPT, Gemini, GLM)
+        for fam_k, weight_default in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+            spec_key = f"{fam_k}_spec_logits"
+            if spec_key in data:
+                P_mix = apply_family_specialist_lora_gate(
+                    P_mix=P_mix,
+                    R_main=R_main,
+                    spec_logits=data[spec_key],
+                    spec_classes=list(data[f"{fam_k}_classes"]) if f"{fam_k}_classes" in data else None,
+                    labels=LABELS,
+                    family_cols=FAMILIES[fam_k],
+                    gate_weight=float(post_cfg.get(f"{fam_k}_specialist_weight", weight_default)),
+                )
 
 
 

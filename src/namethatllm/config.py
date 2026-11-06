@@ -217,8 +217,8 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
             with safe_open(str(heads_p), framework="pt", device="cpu") as f:
                 for k in f.keys():
                     shape = f.get_tensor(k).shape
-                    if len(shape) == 2 and (shape[0] == 18 or shape[1] == 18):
-                        dim = int(shape[1] if shape[0] == 18 else shape[0])
+                    if len(shape) == 2 and (shape[0] in (18, 5, 4, 2) or shape[1] in (18, 5, 4, 2)):
+                        dim = int(shape[1] if shape[0] in (18, 5, 4, 2) else shape[0])
                         break
         except Exception:
             pass
@@ -228,8 +228,8 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
             sd = torch.load(ckpt_dir / "heads.pt", map_location="cpu", weights_only=False)
             if isinstance(sd, dict):
                 for k, v in sd.items():
-                    if hasattr(v, "shape") and len(v.shape) == 2 and (v.shape[0] == 18 or v.shape[1] == 18):
-                        dim = int(v.shape[1] if v.shape[0] == 18 else v.shape[0])
+                    if hasattr(v, "shape") and len(v.shape) == 2 and (v.shape[0] in (18, 5, 4, 2) or v.shape[1] in (18, 5, 4, 2)):
+                        dim = int(v.shape[1] if v.shape[0] in (18, 5, 4, 2) else v.shape[0])
                         break
         except Exception:
             pass
@@ -244,6 +244,26 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
     for p in head_candidates:
         p_str = str(p).lower().replace('\\', '/')
         is_fold = ('_f0' in p_str or '_f1' in p_str or '_f2' in p_str or '_f3' in p_str or '_f4' in p_str)
+
+        target_family = ""
+        meta_p = p.parent / "meta.json"
+        if meta_p.exists():
+            try:
+                m_data = json.load(open(meta_p, encoding="utf-8"))
+                target_family = str(m_data.get("target_family", "")).lower()
+            except Exception:
+                pass
+
+        # Critical routing guard: check family specialists before general inhouse / lora-peft-training
+        if target_family == "gpt" or any(t in p_str for t in ("export_gpt", "gpt_specialist", "gpt_spec", "qwen3_14b_gpt")):
+            ckpts["qwen3_14b_gpt"] = p.parent
+            continue
+        elif target_family == "gemini" or any(t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini")):
+            ckpts["qwen3_14b_gemini"] = p.parent
+            continue
+        elif target_family == "glm" or any(t in p_str for t in ("export_glm", "glm_specialist", "glm_spec", "qwen3_14b_glm")):
+            ckpts["qwen3_14b_glm"] = p.parent
+            continue
 
         if 'lora_qwen3_14b' in p_str or 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
             ckpts['qwen3_14b_p2'] = p.parent
