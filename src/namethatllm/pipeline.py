@@ -1754,8 +1754,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         P_mix, R_main = blend_main_and_complementary(LOGIT_MAIN, COMP_LIST, main_ratio=main_ratio, comp_ratio=comp_ratio)
 
     # 4-Family Within-Family Spectral Gates (Vectorized)
+    enable_within_fam = bool(post_cfg.get("enable_within_family_confidence_gates", True)) and float(post_cfg.get("family_gate_strength", 0.20)) > 0.0
     family_gates = {}
-    if len(spectral_blocks_tr) > 0 and len(spectral_blocks_te) > 0:
+    family_gates_unseen = {}
+    if enable_within_fam and len(spectral_blocks_tr) > 0 and len(spectral_blocks_te) > 0:
         hw_tr_gate = lex_out.get("hw_train") if "lex_out" in locals() and isinstance(lex_out, dict) else None
         hw_te_gate = lex_out.get("hw_test") if "lex_out" in locals() and isinstance(lex_out, dict) else None
         if hw_tr_gate is None and (working_dir / "hw_train.npy").exists():

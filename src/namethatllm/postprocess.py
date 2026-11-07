@@ -26,7 +26,7 @@ def apply_all_family_confidence_gates(
     all groups in SPECIALIST_GROUPS (4 families + 3 tie-breaker groups).
     Preserves exact probability mass while resolving low-margin confusions.
     """
-    if not family_gates:
+    if not family_gates or float(max_strength) <= 0.0:
         return P_mix
     P_out = P_mix.astype(np.float64).copy()
     for fam_name, gate_lp in family_gates.items():

@@ -111,6 +111,8 @@
     "comp_ratio": 0.15
   },
   "postprocess": {
+    "enable_within_family_confidence_gates": false,
+    "family_gate_strength": 0.0,
     "claude_specialist_weight": 0.15,
     "curly_quote_multiplier": 0.36787944117144233,
     "multi_em_dash_log_penalty": 0.0,
