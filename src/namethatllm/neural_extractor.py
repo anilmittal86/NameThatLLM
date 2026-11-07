@@ -350,8 +350,15 @@ def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) ->
 
     return W_p, b_p, W_c, b_c
 
-def compute_centered_logits(Z_test: np.ndarray, groups: np.ndarray, W_c: np.ndarray, b_c: np.ndarray, src_labels: list) -> Tuple[np.ndarray, np.ndarray]:
-    """Computes prompt-topic centered twin logits for valid multi-sample clusters."""
+def compute_centered_logits(
+    Z_test: np.ndarray,
+    groups: np.ndarray,
+    W_c: np.ndarray,
+    b_c: np.ndarray,
+    src_labels: list,
+    max_std: float = 4.2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes prompt-topic centered twin logits with temperature normalization matching plain heads."""
     N = len(Z_test)
     out_lp = np.zeros((N, K), dtype=np.float64)
     if N < 2 or W_c is None:
@@ -366,8 +373,10 @@ def compute_centered_logits(Z_test: np.ndarray, groups: np.ndarray, W_c: np.ndar
     for g in np.unique(safe_g[valid]):
         mask = (safe_g == g)
         Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
-    raw_c = Zc[valid] @ W_c.T + b_c
-    out_lp[valid] = log_softmax(align_cols(raw_c, src_labels))
+    raw_c = align_cols(Zc[valid] @ W_c.T + b_c, src_labels)
+    std_c = float(np.std(raw_c, axis=1).mean()) if len(raw_c) > 0 else 1.0
+    temp_c = max(1.0, std_c / max_std)
+    out_lp[valid] = log_softmax(raw_c / temp_c, axis=1)
     return out_lp, valid
 
 def compute_family_centered_logits(
@@ -414,6 +423,7 @@ class UniversalLoRATrunkLoader:
         self.max_len = max_len
         self.total_rescued = 0
         self.tok = AutoTokenizer.from_pretrained(str(base_dir), trust_remote_code=True)
+        self.tok.padding_side = "right"
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token or "<|endoftext|>"
 
@@ -573,11 +583,16 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
     """Reads keep, layers, max_len, end_id, and labels dynamically from meta.json or infers from adapter weights."""
     ckpt_dir = Path(ckpt_dir)
     meta_p = ckpt_dir / "meta.json"
-    labels = list(LABELS)
-    keep = default_keep
-    layers = list(default_layers)
-    max_len = default_max_len
-    end_id = 151643
+    dir_str = str(ckpt_dir).lower().replace("\\", "/")
+    is_dhruv = any(x in dir_str for x in ("q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x"))
+
+    labels = sorted(LABELS) if is_dhruv else list(LABELS)
+    keep = 24 if is_dhruv else default_keep
+    layers = [2, 4, 6, 8, 12, 16, 20, 24] if is_dhruv else list(default_layers)
+    max_len = 384 if is_dhruv else default_max_len
+    end_id = None if is_dhruv else 151643
+    no_final_norm = False if is_dhruv else True
+
     if meta_p.exists():
         try:
             m = json.load(open(meta_p))
@@ -586,14 +601,15 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
             keep = int(cfg.get("keep", keep))
             layers = list(cfg.get("layers", layers))
             max_len = int(cfg.get("max_len", max_len))
+            if "no_final_norm" in cfg:
+                no_final_norm = bool(cfg["no_final_norm"])
             for ek in ("end_token_id", "eos_id", "eos_token_id", "end_token"):
-                if ek in cfg and isinstance(cfg[ek], int):
-                    end_id = int(cfg[ek])
+                if ek in cfg:
+                    end_id = int(cfg[ek]) if isinstance(cfg[ek], int) else None
                     break
         except Exception:
             pass
     else:
-        # Infer exact layer depth from adapter weights (e.g. l24 vs l27)
         max_l = infer_adapter_max_layer(ckpt_dir)
         if max_l == 24:
             keep = 24
@@ -606,19 +622,6 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
             layers = [3, 5, 8, 11, 16, 21, 27, 32]
         elif max_l is not None:
             keep = max_l
-        else:
-            dir_str = str(ckpt_dir).lower().replace("\\", "/")
-            if any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x")):
-                keep = 24
-                layers = [2, 4, 6, 8, 12, 16, 20, 24]
-
-    dir_str = str(ckpt_dir).lower().replace("\\", "/")
-    is_dhruv = any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x"))
-    no_final_norm = False if is_dhruv else True
-    if is_dhruv:
-        max_len = 384
-        end_id = None
-        labels = sorted(LABELS)
 
     return {"keep": keep, "layers": layers, "max_len": max_len, "end_id": end_id, "no_final_norm": no_final_norm, "labels": labels}
 

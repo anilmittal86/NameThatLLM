@@ -593,23 +593,22 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         log_p_unseen_comp = None
 
     P_lex_comp = 0.40 * P_svc_comp + 0.25 * P_sgd_comp + 0.15 * P_twin_comp + 0.20 * P_distort
-    log_p_lex_comp = np.log(np.clip(P_lex_comp, 1e-9, 1.0))
+    P_lex_comp_final = P_lex_comp.copy()
+    unseen_p_lex_comp_final = P_unseen_comp.copy() if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else np.zeros((0, K), dtype=np.float32)
 
     hw_c_sp = sparse.csr_matrix(hw_core * 0.25)
     hw_te_sp = sparse.csr_matrix(hw_te * 0.25)
     hw_u_sp = sparse.csr_matrix(hw_unseen * 0.25) if hw_unseen is not None else None
 
-    # Specialist Group Refiners (provider families + targeted sibling tie-breaker groups)
-    for grp_name, grp_cols in SPECIALIST_GROUPS.items():
+    # Disjoint Mass-Conserving Provider Family Refiners (prevents overlapping triple-counting)
+    for grp_name, grp_cols in FAMILIES.items():
         grp_mask = np.isin(core_y, grp_cols)
         if grp_mask.sum() > 30 and len(np.unique(core_y[grp_mask])) == len(grp_cols):
             sub_y = core_y[grp_mask]
             sub_lab2i = {c: i for i, c in enumerate(grp_cols)}
             sub_y_mapped = np.array([sub_lab2i[y] for y in sub_y], dtype=int)
 
-            is_main_fam = grp_name in FAMILIES and grp_name != "glm"
-            c_val = 0.40 if is_main_fam else 0.35
-
+            c_val = 0.35 if grp_name == "glm" else 0.40
             X_tr_grp = sparse.hstack([X_core_5v[grp_mask], hw_c_sp[grp_mask]], format="csr")
             X_te_grp = sparse.hstack([X_te_5v, hw_te_sp], format="csr")
             X_u_grp = sparse.hstack([X_unseen_5v, hw_u_sp], format="csr") if X_unseen_5v is not None else None
@@ -647,19 +646,19 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                     G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
                     X_te_pair_c = X_te_sub - G_t @ (G_t.T @ X_te_sub)
                     P_spec_centered = clf_centered.predict_proba(X_te_pair_c)
-                    w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
+                    w_plain_s = 0.50 if grp_name == "glm" else 0.65
                     P_spec[twin_rows_085] = w_plain_s * P_spec_plain[twin_rows_085] + (1.0 - w_plain_s) * P_spec_centered
             else:
                 P_spec = P_spec_plain
 
-            beta_grp = 0.30 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else (0.25 if is_main_fam else 0.20)
-            P_prior = P_lex_comp[:, grp_cols]
-            P_prior_norm = P_prior / (P_prior.sum(axis=1, keepdims=True) + 1e-12)
+            beta_grp = 0.25
+            P_prior = P_lex_comp_final[:, grp_cols]
+            fam_mass = P_prior.sum(axis=1, keepdims=True)
+            P_prior_norm = P_prior / (fam_mass + 1e-12)
             P_refined = (1.0 - beta_grp) * P_prior_norm + beta_grp * P_spec
-            log_ratio = np.log(np.clip(P_refined, 1e-9, 1.0)) - np.log(np.clip(P_prior_norm, 1e-9, 1.0))
-            log_p_lex_comp[:, grp_cols] += log_ratio
+            P_lex_comp_final[:, grp_cols] = fam_mass * P_refined
 
-            if log_p_unseen_comp is not None and X_u_grp is not None and X_u_grp.shape[0] > 0:
+            if len(unseen_p_lex_comp_final) > 0 and X_u_grp is not None and X_u_grp.shape[0] > 0:
                 df_spec_u = spec_svc.decision_function(X_u_grp)
                 logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
                 P_spec_u_plain = softmax(logits_spec_u, axis=1)
@@ -677,17 +676,18 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                         G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
                         X_u_pair_c = X_u_sub - G_t @ (G_t.T @ X_u_sub)
                         P_spec_u_centered = clf_centered.predict_proba(X_u_pair_c)
-                        w_plain_s = 0.50 if grp_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else 0.65
+                        w_plain_s = 0.50 if grp_name == "glm" else 0.65
                         P_spec_u[twin_u_mask] = w_plain_s * P_spec_u_plain[twin_u_mask] + (1.0 - w_plain_s) * P_spec_u_centered
 
-                P_prior_u = P_unseen_comp[:, grp_cols]
-                P_prior_u_norm = P_prior_u / (P_prior_u.sum(axis=1, keepdims=True) + 1e-12)
+                P_prior_u = unseen_p_lex_comp_final[:, grp_cols]
+                fam_mass_u = P_prior_u.sum(axis=1, keepdims=True)
+                P_prior_u_norm = P_prior_u / (fam_mass_u + 1e-12)
                 P_refined_u = (1.0 - beta_grp) * P_prior_u_norm + beta_grp * P_spec_u
-                log_ratio_u = np.log(np.clip(P_refined_u, 1e-9, 1.0)) - np.log(np.clip(P_prior_u_norm, 1e-9, 1.0))
-                log_p_unseen_comp[:, grp_cols] += log_ratio_u
+                unseen_p_lex_comp_final[:, grp_cols] = fam_mass_u * P_refined_u
 
-    P_lex_comp_final = softmax(log_p_lex_comp, axis=1)
-    unseen_p_lex_comp_final = softmax(log_p_unseen_comp, axis=1) if log_p_unseen_comp is not None else np.zeros((0, K), dtype=np.float32)
+    P_lex_comp_final /= P_lex_comp_final.sum(axis=1, keepdims=True).clip(min=1e-12)
+    if len(unseen_p_lex_comp_final) > 0:
+        unseen_p_lex_comp_final /= unseen_p_lex_comp_final.sum(axis=1, keepdims=True).clip(min=1e-12)
 
     # Save to disk
     os.makedirs(working_dir, exist_ok=True)

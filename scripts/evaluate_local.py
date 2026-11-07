@@ -992,7 +992,7 @@ def print_per_class_accuracy_table(
                     claude_cols=FAMILIES["claude"],
                     gate_weight=post_cfg.get("claude_specialist_weight", 0.15) if post_cfg else 0.15,
                 )
-            for fam_k, weight_default in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+            for fam_k, weight_default in [("gpt", 0.20), ("gemini", 0.25), ("glm", 0.25)]:
                 spec_key = f"{fam_k}_spec_logits_unseen"
                 if spec_key in data:
                     P = apply_family_specialist_lora_gate(
@@ -1052,14 +1052,17 @@ def print_per_class_accuracy_table(
         w = float(active_weights_map.get(m["name"], m["weight"]))
         prod_lp += w * m["unseen_lp"]
 
+    extra_unseen_lp = np.zeros((len(y_true), K), dtype=np.float64)
     if data is not None:
         num_extra = int(data["num_extra"][0]) if "num_extra" in data else 0
         for ex_idx in range(num_extra):
             if f"extra_{ex_idx}_unseen_lp" in data:
                 ex_w = float(data[f"extra_{ex_idx}_weight"][0])
-                ex_u_lp = data[f"extra_{ex_idx}_unseen_lp"]
-                prod_lp += ex_w * ex_u_lp
-                clean_lp += ex_w * ex_u_lp
+                ex_u_lp = log_softmax(np.asarray(data[f"extra_{ex_idx}_unseen_lp"], dtype=np.float64), axis=1)
+                extra_unseen_lp += ex_w * ex_u_lp
+
+    prod_lp += extra_unseen_lp
+    clean_lp += extra_unseen_lp
 
     P_clean = _apply_full_postprocessing(clean_lp)
     clean_preds = P_clean.argmax(axis=1)
@@ -1083,11 +1086,11 @@ def print_per_class_accuracy_table(
     tot_power = sum(eff_powers) if sum(eff_powers) > 0 else 1.0
     vote_shares = {m["name"]: (p / tot_power) * 100 for m, p in zip(models, eff_powers)}
 
-    # 2. Leave-One-Out (LOO) Drop
+    # 2. Leave-One-Out (LOO) Drop (preserving extra_unseen_lp so LOO isolates model i)
     loo_drops = {}
     for i, m in enumerate(models):
         sub_models = [sm for sm in models if sm["name"] != m["name"]]
-        sub_lp = np.zeros((len(y_true), K), dtype=np.float64)
+        sub_lp = extra_unseen_lp.copy()
         for sm in sub_models:
             w_sm = float(active_weights_map.get(sm["name"], sm["weight"]))
             sub_lp += w_sm * sm["unseen_lp"]
@@ -1100,9 +1103,9 @@ def print_per_class_accuracy_table(
     for k in range(M + 1):
         for subset in itertools.combinations(range(M), k):
             if len(subset) == 0:
-                v_coalition[subset] = 1.0 / float(K)
+                v_coalition[subset] = calc_sinkhorn_bacc(extra_unseen_lp) if np.any(extra_unseen_lp != 0) else (1.0 / float(K))
             else:
-                c_lp = np.zeros((len(y_true), K), dtype=np.float64)
+                c_lp = extra_unseen_lp.copy()
                 for idx in subset:
                     c_lp += float(active_weights_map.get(models[idx]["name"], models[idx]["weight"])) * models[idx]["unseen_lp"]
                 v_coalition[subset] = calc_sinkhorn_bacc(c_lp)
@@ -1699,7 +1702,7 @@ def evaluate_from_cache(
             )
 
         # 2a. Family-Specialist LoRA Gates (GPT, Gemini, GLM)
-        for fam_k, weight_default in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+        for fam_k, weight_default in [("gpt", 0.20), ("gemini", 0.25), ("glm", 0.25)]:
             spec_key = f"{fam_k}_spec_logits"
             if spec_key in data:
                 P_mix = apply_family_specialist_lora_gate(
@@ -1820,67 +1823,37 @@ def evaluate_from_cache(
 
 
 
-        # 4. Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
+        # 4. TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing (runs BEFORE Sinkhorn)
+        if post_cfg.get("enable_typobayes", True) and "test_texts" in data and len(train_texts_list) > 0:
+            P_mix = apply_typobayes_postprocess(
+                P_mix,
+                train_texts=train_texts_list,
+                y_train=y_train_arr if len(y_train_arr) == len(train_texts_list) else y_unseen,
+                test_texts=test_texts,
+                labels=LABELS,
+                kappa=float(post_cfg.get("typobayes_kappa", 24.0)),
+                evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
+                evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
+            )
 
+        # 5. Sinkhorn Mass Balancing (Final Step)
         sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
-
-        sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
-
-        sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
-
+        sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 1.0))
+        sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 1.0))
         if len(y_train_arr) > 0:
-
             train_prior = np.bincount(y_train_arr, minlength=18).astype(np.float64) + 1.0
-
         elif len(y_unseen) > 0:
-
             train_prior = np.bincount(y_unseen, minlength=18).astype(np.float64) + 1.0
-
         else:
-
             train_prior = None
 
-
-
         P_final = sinkhorn_balancing(
-
             P_mix,
-
             iters=sinkhorn_iters,
-
             sinkhorn_strength=sinkhorn_strength,
-
             target_mix=sinkhorn_target_mix,
-
             train_prior=train_prior
-
         )
-
-
-
-        # 5. TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
-
-        if post_cfg.get("enable_typobayes", True) and "test_texts" in data and len(train_texts_list) > 0:
-
-            P_final = apply_typobayes_postprocess(
-
-                P_final,
-
-                train_texts=train_texts_list,
-
-                y_train=y_train_arr if len(y_train_arr) == len(train_texts_list) else y_unseen,
-
-                test_texts=test_texts,
-
-                labels=LABELS,
-
-                kappa=float(post_cfg.get("typobayes_kappa", 24.0)),
-
-                evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
-
-                evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
-
-            )
 
 
 

@@ -281,71 +281,41 @@ def apply_claude_specialist_gate(
     claude_cols: list = FAMILIES["claude"],
     gate_weight: float = 0.15,
     weight: Optional[float] = None,
+    margin_thr: float = 0.50,
 ) -> np.ndarray:
     """
-    Refines passages predicted in the Claude family using a specialist head.
-
-    Concept:
-    --------
-    Claude family models (Sonnet 4, Sonnet 4.5, Sonnet 5, Haiku 3.5, Opus 5) share
-    subtle architectural patterns. A dedicated Claude specialist head trained on
-    Model 3 representations provides fine-grained discriminative power among them.
-
-    Mass-Preserving Guarantee:
-    --------------------------
-    The total probability allocated to all Claude models combined is conserved:
-        tot_mass = sum_{c in claude_cols} P_mix[i, c]
-    Only the relative proportions among the 5 Claude variants are adjusted.
-    External classes (GPT, Gemini, Qwen, etc.) remain 100% unchanged.
-
-    Parameters:
-    -----------
-    P_mix : np.ndarray of shape (N, 18)
-        Current blended prediction probabilities.
-    R_main : np.ndarray of shape (N, 18)
-        Main stack probabilities used to detect if Claude is top-predicted.
-    claude_spec_logits : np.ndarray of shape (N, 5), optional
-        Logits from the dedicated Claude specialist head.
-    claude_classes : list, optional
-        Class names corresponding to columns of claude_spec_logits.
-    labels : list of 18 class strings
-        Global canonical class list.
-    claude_cols : list of ints
-        Column indices for Claude models in canonical 18-class order.
-    gate_weight : float
-        Interpolation weight for specialist head (default 0.15).
-    weight : float, optional
-        Alias override for gate_weight.
-
-    Returns:
-    --------
-    P_out : np.ndarray of shape (N, 18)
-        Probabilities with Claude family distribution refined.
+    Refines passages predicted in the Claude family using a specialist head,
+    gated by within-family top-1 vs top-2 margin so confident predictions are preserved.
     """
     if claude_spec_logits is None:
         return P_mix
     if weight is not None:
         gate_weight = weight
+    if float(gate_weight) <= 0.0:
+        return P_mix
 
     P_out = P_mix.copy()
     P_claude_head = softmax(claude_spec_logits, axis=-1)
 
-    # Reorder columns of specialist head to match canonical order if necessary
     if claude_classes is not None:
         src_c = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in claude_classes]
-        c_idx = [src_c.index(labels[c]) for c in claude_cols]
-        P_claude_head = P_claude_head[:, c_idx]
+        if all(labels[c] in src_c for c in claude_cols):
+            c_idx = [src_c.index(labels[c]) for c in claude_cols]
+            P_claude_head = P_claude_head[:, c_idx]
 
-    # Only trigger for samples where Main Stack predicted a Claude model as top-1
     claude_mask = np.isin(R_main.argmax(axis=1), claude_cols)
     if claude_mask.any():
         rows = np.flatnonzero(claude_mask)
-        sub_mix = P_out[np.ix_(rows, claude_cols)]
+        sub_mix = np.clip(P_out[np.ix_(rows, claude_cols)], 1e-12, 1.0)
         tot_mass = sub_mix.sum(axis=1, keepdims=True)
+        base_rel = sub_mix / tot_mass
 
-        # Blend existing distribution with specialist head while conserving total mass
-        blended = (1.0 - gate_weight) * sub_mix + gate_weight * (tot_mass * P_claude_head[rows])
-        P_out[np.ix_(rows, claude_cols)] = blended
+        sp = np.sort(base_rel, axis=1)
+        margin = sp[:, -1] - sp[:, -2]
+        eff_w = np.clip((margin_thr - margin) / max(margin_thr, 1e-6), 0.0, 1.0)[:, None] * float(gate_weight)
+
+        blended_rel = (1.0 - eff_w) * base_rel + eff_w * P_claude_head[rows]
+        P_out[np.ix_(rows, claude_cols)] = tot_mass * blended_rel
 
     return P_out
 
@@ -357,57 +327,14 @@ def apply_family_specialist_lora_gate(
     spec_classes: Optional[list] = None,
     labels: list = LABELS,
     family_cols: list = FAMILIES["gemini"],
-    gate_weight: float = 0.65,
+    gate_weight: float = 0.25,
+    margin_thr: float = 0.50,
 ) -> np.ndarray:
     """
-    Refines intra-family predictions using fine-tuned Qwen3-14B Family-Specialist LoRAs.
-
-    Concept:
-    --------
-    For tightly coupled families (Gemini with 4 sisters, GLM with 2 sisters, GPT with 5 sisters),
-    general 18-class models frequently confuse adjacent versions (e.g. Gemini 3.7 vs 3.8).
-    A fine-tuned Qwen3-14B single-family specialist LoRA is trained specifically on that
-    family's sister-class boundaries with sibling margin penalties.
-
-    Mass-Preserving Guarantee:
-    --------------------------
-    Like the Claude gate, this operation strictly preserves the total marginal probability
-    mass of the family:
-        tot_mass = sum_{c in family_cols} P_mix[i, c]
-    The specialist only reallocates relative probabilities *within* the family:
-        blended_rel = softmax((1 - w) * log(base_rel) + w * log(spec_p))
-        P_out[i, family_cols] = tot_mass * blended_rel
-
-    Activation Criteria:
-    --------------------
-    A sample is refined if:
-    1. Main Stack top-1 prediction belongs to this family, OR
-    2. Total family cumulative probability mass >= 0.35, AND
-    3. The specialist produces non-trivial discriminative signal (peak-to-peak > 1e-6).
-
-    Parameters:
-    -----------
-    P_mix : np.ndarray of shape (N, 18)
-        Current blended prediction probabilities.
-    R_main : np.ndarray of shape (N, 18)
-        Main stack probabilities used for routing.
-    spec_logits : np.ndarray of shape (N, K_family), optional
-        Logits from the Qwen3-14B family specialist adapter.
-    spec_classes : list, optional
-        Class names corresponding to columns of spec_logits.
-    labels : list of 18 class strings
-        Global canonical class list.
-    family_cols : list of ints
-        Column indices for this family in canonical 18-class order.
-    gate_weight : float
-        Interpolation weight for the neural specialist (e.g. 0.65 for Gemini, 0.70 for GLM).
-
-    Returns:
-    --------
-    P_out : np.ndarray of shape (N, 18)
-        Probabilities with intra-family predictions refined by the specialist.
+    Refines intra-family predictions using fine-tuned Qwen3-14B Family-Specialist LoRAs,
+    dynamically gated by within-family margin (< margin_thr).
     """
-    if spec_logits is None or len(spec_logits) != len(P_mix):
+    if spec_logits is None or len(spec_logits) != len(P_mix) or float(gate_weight) <= 0.0:
         return P_mix
 
     P_out = P_mix.astype(np.float64).copy()
@@ -417,31 +344,28 @@ def apply_family_specialist_lora_gate(
 
     P_spec = softmax(spec_arr, axis=-1)
 
-    # Reorder columns to align with canonical 18-class ordering
     if spec_classes is not None and len(spec_classes) == len(family_cols):
         src_c = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in spec_classes]
         if all(labels[c] in src_c for c in family_cols):
             c_idx = [src_c.index(labels[c]) for c in family_cols]
             P_spec = P_spec[:, c_idx]
 
-    # Evaluate activation criteria
     fam_mass = P_out[:, family_cols].sum(axis=1)
-    has_signal = np.ptp(spec_arr, axis=1) > 1e-6  # ptp = max - min
+    has_signal = np.ptp(spec_arr, axis=1) > 1e-6
     fam_mask = (np.isin(R_main.argmax(axis=1), family_cols) | (fam_mass >= 0.35)) & has_signal
 
     if fam_mask.any():
         rows = np.flatnonzero(fam_mask)
         sub_mix = np.clip(P_out[np.ix_(rows, family_cols)], 1e-12, 1.0)
         tot_mass = sub_mix.sum(axis=1, keepdims=True)
-
-        # Base relative distribution within the family
         base_rel = sub_mix / tot_mass
 
-        # Log-space interpolation between base relative and specialist relative
-        log_rel = (1.0 - float(gate_weight)) * np.log(base_rel) + float(gate_weight) * np.log(np.clip(P_spec[rows], 1e-12, 1.0))
-        blended_rel = softmax(log_rel, axis=1)
+        sp = np.sort(base_rel, axis=1)
+        margin = sp[:, -1] - sp[:, -2]
+        eff_w = np.clip((margin_thr - margin) / max(margin_thr, 1e-6), 0.0, 1.0)[:, None] * float(gate_weight)
 
-        # Scale back by original family mass
+        log_rel = (1.0 - eff_w) * np.log(base_rel) + eff_w * np.log(np.clip(P_spec[rows], 1e-12, 1.0))
+        blended_rel = softmax(log_rel, axis=1)
         P_out[np.ix_(rows, family_cols)] = tot_mass * blended_rel
 
     return P_out

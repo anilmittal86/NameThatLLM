@@ -329,40 +329,36 @@ def extract_family_specialist_logits(
 
     g85, g72, g65 = groups_test_multi
 
-    # Step 5: Compute plain + centered twin logits for candidate test passages
+    # Step 5: Compute temperature-scaled plain logits for candidate test passages
+    # (Do NOT prompt-center across family-masked subsets, as full-cluster mean is unavailable on masked rows)
     if n_sel_te > 0 and W_p is not None:
         raw_p_te = Z_sel_te @ W_p.T + b_p
         if perm is not None:
             raw_p_te = raw_p_te[:, perm]
-        lp_p_te = log_softmax(raw_p_te, axis=1)
+        std_te = float(np.std(raw_p_te, axis=1).mean()) if len(raw_p_te) > 0 else 1.0
+        temp_te = max(1.0, std_te / 4.2)
+        spec_logits_te[sel_te_idx] = log_softmax(raw_p_te / temp_te, axis=1).astype(np.float32)
 
-        lp_c_blend_te = None
-        if W_c is not None:
-            g85_sel = g85[sel_te_idx] if len(g85) == N_test else np.ones(n_sel_te, dtype=int)
-            g72_sel = g72[sel_te_idx] if len(g72) == N_test else np.ones(n_sel_te, dtype=int)
-            g65_sel = g65[sel_te_idx] if len(g65) == N_test else np.ones(n_sel_te, dtype=int)
-            lp_c85, v85 = compute_family_centered_logits(Z_sel_te, g85_sel, W_c, b_c, src_labels, target_labels)
-            lp_c72, v72 = compute_family_centered_logits(Z_sel_te, g72_sel, W_c, b_c, src_labels, target_labels)
-            lp_c65, v65 = compute_family_centered_logits(Z_sel_te, g65_sel, W_c, b_c, src_labels, target_labels)
-            lp_c_blend_te = 0.50 * lp_c85 + 0.30 * lp_c72 + 0.20 * lp_c65
-
-        comb_te = lp_p_te + 0.45 * lp_c_blend_te if lp_c_blend_te is not None else lp_p_te
-        spec_logits_te[sel_te_idx] = log_softmax(comb_te, axis=1).astype(np.float32)
-
-    # Step 6: Compute plain + centered twin logits for candidate unseen holdout passages
+    # Step 6: Compute plain logits for candidate unseen holdout passages & validate within-family BAcc
     if n_sel_u > 0 and W_p is not None:
         raw_p_u = Z_sel_u @ W_p.T + b_p
         if perm is not None:
             raw_p_u = raw_p_u[:, perm]
-        lp_p_u = log_softmax(raw_p_u, axis=1)
+        std_u = float(np.std(raw_p_u, axis=1).mean()) if len(raw_p_u) > 0 else 1.0
+        temp_u = max(1.0, std_u / 4.2)
+        spec_logits_u[sel_u_idx] = log_softmax(raw_p_u / temp_u, axis=1).astype(np.float32)
 
-        lp_c_u = None
-        if W_c is not None:
-            gu_sel = groups_unseen[sel_u_idx] if len(groups_unseen) == N_unseen else np.ones(n_sel_u, dtype=int)
-            lp_c_u, vu = compute_family_centered_logits(Z_sel_u, gu_sel, W_c, b_c, src_labels, target_labels)
-
-        comb_u = lp_p_u + 0.45 * lp_c_u if lp_c_u is not None else lp_p_u
-        spec_logits_u[sel_u_idx] = log_softmax(comb_u, axis=1).astype(np.float32)
+        if hasattr(auditor, "y_unseen") and len(auditor.y_unseen) == N_unseen:
+            fam_true_mask = np.isin(auditor.y_unseen, fam_cols) & u_mask
+            if fam_true_mask.sum() >= len(fam_cols) * 2:
+                y_fam_true = np.array([fam_cols.index(int(y)) for y in auditor.y_unseen[fam_true_mask]])
+                fam_preds = spec_logits_u[fam_true_mask].argmax(axis=1)
+                fam_bacc = float(balanced_accuracy_score(y_fam_true, fam_preds))
+                print(f"[Specialist {family_name}] Unseen within-family BAcc = {fam_bacc:.4f}")
+                if fam_bacc < (1.0 / len(fam_cols)) + 0.10:
+                    print(f"[Specialist {family_name}] REJECTED (within-family BAcc {fam_bacc:.4f} too low); zeroing specialist logits.")
+                    spec_logits_te.fill(0.0)
+                    spec_logits_u.fill(0.0)
 
     # Step 7: Cleanly restore original base weights and free temporary tensors
     trunk1.restore_weights(backup_spec)
@@ -1889,10 +1885,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     # -------------------------------------------------------------------------
     # STAGE 3B: Deep Neural Family-Specialist LoRA Gates (GPT, Gemini, GLM)
-    # 14B Qwen3 LoRAs trained specifically on intra-family boundaries with sibling penalties
-    # Preserves 100% of marginal family mass while resolving low-margin confusions
     # -------------------------------------------------------------------------
-    for fam_k, default_w in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+    for fam_k, default_w in [("gpt", 0.20), ("gemini", 0.25), ("glm", 0.25)]:
         spec_te_logits = family_spec_logits_te.get(fam_k)
         if spec_te_logits is not None:
             spec_cls = family_spec_classes.get(fam_k)
@@ -1952,25 +1946,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     )
 
     # -------------------------------------------------------------------------
-    # STAGE 6: Multiplicative Sinkhorn Column Mass Balancing
-    # Equalizes class frequencies across test set to match expected uniform distribution
+    # STAGE 6: TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
+    # Must execute BEFORE Sinkhorn balancing so final column marginals are preserved!
     # -------------------------------------------------------------------------
-    sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
-    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
-    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
-    train_prior = np.bincount(y_sub, minlength=18).astype(np.float64) + 1.0 if len(y_sub) > 0 else None
-    P_final = sinkhorn_balancing(
-        P_mix,
-        iters=sinkhorn_iters,
-        sinkhorn_strength=sinkhorn_strength,
-        target_mix=sinkhorn_target_mix,
-        train_prior=train_prior
-    )
-
-    # TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
     if post_cfg.get("enable_typobayes", True):
-        P_final = apply_typobayes_postprocess(
-            P_final,
+        P_mix = apply_typobayes_postprocess(
+            P_mix,
             train_texts=df_train["text"].fillna("").astype(str).tolist(),
             y_train=np.array([LAB2I[m] for m in df_train["model"].values], dtype=int),
             test_texts=test_texts,
@@ -1979,6 +1960,22 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
             evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
         )
+
+    # -------------------------------------------------------------------------
+    # STAGE 7: Multiplicative Sinkhorn Column Mass Balancing (Final Step)
+    # Equalizes class frequencies across test set to match expected distribution
+    # -------------------------------------------------------------------------
+    sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
+    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 1.0))
+    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 1.0))
+    train_prior = np.bincount(y_sub, minlength=18).astype(np.float64) + 1.0 if len(y_sub) > 0 else None
+    P_final = sinkhorn_balancing(
+        P_mix,
+        iters=sinkhorn_iters,
+        sinkhorn_strength=sinkhorn_strength,
+        target_mix=sinkhorn_target_mix,
+        train_prior=train_prior
+    )
 
     # Auditing and forward stepwise ablation report
     test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
