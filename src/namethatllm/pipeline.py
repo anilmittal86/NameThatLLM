@@ -446,7 +446,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     req_assets = cfg.get("required_assets", {})
     cfg_model_weights = cfg.get("model_weights", {})
     DEFAULT_ALLOWED_CKPTS = {
-        "qwen3_14b_p2", "qwen3_14b_v5", "qwen3_14b_inhouse",
+        "qwen3_14b_p2", "qwen3_14b_inhouse",
         "deberta_p2", "deberta_inhouse",
         "qwen3_8b_claude",
         "qwen3_14b_gpt", "qwen3_14b_gemini", "qwen3_14b_glm",
@@ -723,7 +723,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     torch.cuda.empty_cache()
 
             # Checkpoint 1B / Optional Whitelisted Checkpoints on Trunk 1
-            for opt_14b_key in ("qwen3_14b_v5", "qwen3_14b_inhouse"):
+            for opt_14b_key in ("qwen3_14b_inhouse",):
                 if opt_14b_key in ckpts:
                     primary_ts14_dir = ckpts[opt_14b_key]
                     prefix_14b = "q14v5" if "v5" in opt_14b_key else "ts_q3b14" if "ts" in opt_14b_key else opt_14b_key
@@ -803,8 +803,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
                             print(f"[Fast Probe] {opt_14b_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
 
-                            if solo_bacc < probe_gate_min_bacc:
-                                if opt_14b_key in ("qwen3_14b_ts", "qwen3_14b_v5", "qwen3_14b_p1"):
+                            is_required = opt_14b_key in req_assets.get("required_checkpoints", [])
+                            lock_priors = bool(cfg.get("lock_prior_weights", True))
+                            if solo_bacc < probe_gate_min_bacc and not is_required:
+                                if opt_14b_key in ("qwen3_14b_ts", "qwen3_14b_p1"):
                                     print(f"[Fast Probe] {opt_14b_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> deferring to auto_align_and_verify_head on Z_tr...")
                                     W_p = None
                                     W_c = None
@@ -817,7 +819,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     if torch.cuda.is_available():
                                         torch.cuda.empty_cache()
                                     continue
-                            elif len(auditor.models) > 0:
+                            elif len(auditor.models) > 0 and not is_required and not lock_priors:
                                 lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u, weight=w_comp_tot)
                                 if lift < -0.002:
                                     print(f"[Fast Probe Pruning] {opt_14b_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING 5,620-row test/train extraction!")
@@ -829,6 +831,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                         torch.cuda.empty_cache()
                                     continue
                                 print(f"[Fast Probe] {opt_14b_key}: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
+                            else:
+                                print(f"[Fast Probe] {opt_14b_key}: passed probe (solo={solo_bacc:.4f}) -> extracting test/train...")
 
                         # Stage B: Extract test and train (with multi-fold averaging if multiple folds discovered)
                         num_14b_folds = len(fold_dirs_14b)
