@@ -81,28 +81,43 @@ def calibrate_model_lp(
     max_std: float = 4.2,
 ) -> np.ndarray:
     """
-    Idempotent row-wise log-probability calibration:
-    1. Removes systematic column-mean offset between gemini-3.7-flash (7) and gemini-3.8-flash (8) on v5 checkpoints.
-    2. Clips extreme negative tail at -16.0 BEFORE scaling so post-clip LP_std is exact and idempotent on cache replay.
+    1. Normalizes row-wise log-probability std into `[min_std, max_std]` so neither
+       over-confident neural heads (LP_std=13.1) nor flat lexical heads (LP_std=0.40)
+       distort ensemble vote shares or collapse under Sinkhorn balancing.
+    2. For `v5` checkpoints with a constant prior offset between cols 7 and 8
+       (mean(LP_7 - LP_8) > 3.0 across all rows), centers the column-mean offset
+       between cols 7 and 8 while preserving 100% of per-row relative differences!
+    3. Idempotency guard: if `lp` was already calibrated and clipped (e.g. loaded from
+       local_eval_cache.npz), returns it without double-scaling.
     """
     if lp is None or len(lp) == 0:
         return lp
-    out = log_softmax(np.asarray(lp, dtype=np.float64), axis=1)
+    out = np.asarray(lp, dtype=np.float64).copy()
+
+    # Check if `out` is already a calibrated log-softmax matrix from cache
+    row_max = np.max(out, axis=1)
+    row_min = float(np.min(out))
+    row_std = float(out.std(axis=1).mean())
+    bias_78 = float(np.mean(out[:, 7] - out[:, 8])) if (out.shape[1] == K and len(out) >= 18) else 0.0
+    if (
+        np.all(row_max <= 1e-4)
+        and row_min >= -16.5
+        and (1.4 <= row_std <= max_std + 0.1)
+        and (not ("v5" in str(model_name).lower() and abs(bias_78) > 3.0))
+    ):
+        return log_softmax(out, axis=1)
+
     if "v5" in str(model_name).lower() and out.shape[1] == K and len(out) >= 18:
-        bias_78 = float(np.mean(out[:, 7] - out[:, 8]))
-        if abs(bias_78) > 0.5:
+        if abs(bias_78) > 3.0:
             out[:, 7] -= 0.5 * bias_78
             out[:, 8] += 0.5 * bias_78
-            out = log_softmax(out, axis=1)
-
-    # Clip tail relative to row max first so subsequent std scaling is idempotent
-    out = np.maximum(out, -16.0)
-    out -= out.mean(axis=1, keepdims=True)
     row_std = float(out.std(axis=1).mean())
     if row_std > max_std and row_std > 1e-6:
         out = out * (max_std / row_std)
     elif row_std < min_std and row_std > 1e-6:
         out = out * (min_std / row_std)
+    out = log_softmax(out, axis=1)
+    out = np.maximum(out, -16.0)
     return log_softmax(out, axis=1)
 
 def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:

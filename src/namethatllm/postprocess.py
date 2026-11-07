@@ -281,11 +281,10 @@ def apply_claude_specialist_gate(
     claude_cols: list = FAMILIES["claude"],
     gate_weight: float = 0.15,
     weight: Optional[float] = None,
-    margin_thr: float = 0.50,
 ) -> np.ndarray:
     """
-    Refines passages predicted in the Claude family using a specialist head,
-    gated by within-family top-1 vs top-2 margin so confident predictions are preserved.
+    Refines passages predicted in the Claude family using a specialist head
+    while strictly conserving total Claude family probability mass.
     """
     if claude_spec_logits is None:
         return P_mix
@@ -306,16 +305,10 @@ def apply_claude_specialist_gate(
     claude_mask = np.isin(R_main.argmax(axis=1), claude_cols)
     if claude_mask.any():
         rows = np.flatnonzero(claude_mask)
-        sub_mix = np.clip(P_out[np.ix_(rows, claude_cols)], 1e-12, 1.0)
+        sub_mix = P_out[np.ix_(rows, claude_cols)]
         tot_mass = sub_mix.sum(axis=1, keepdims=True)
-        base_rel = sub_mix / tot_mass
-
-        sp = np.sort(base_rel, axis=1)
-        margin = sp[:, -1] - sp[:, -2]
-        eff_w = np.clip((margin_thr - margin) / max(margin_thr, 1e-6), 0.0, 1.0)[:, None] * float(gate_weight)
-
-        blended_rel = (1.0 - eff_w) * base_rel + eff_w * P_claude_head[rows]
-        P_out[np.ix_(rows, claude_cols)] = tot_mass * blended_rel
+        blended = (1.0 - gate_weight) * sub_mix + gate_weight * (tot_mass * P_claude_head[rows])
+        P_out[np.ix_(rows, claude_cols)] = blended
 
     return P_out
 
@@ -327,12 +320,11 @@ def apply_family_specialist_lora_gate(
     spec_classes: Optional[list] = None,
     labels: list = LABELS,
     family_cols: list = FAMILIES["gemini"],
-    gate_weight: float = 0.25,
-    margin_thr: float = 0.50,
+    gate_weight: float = 0.65,
 ) -> np.ndarray:
     """
-    Refines intra-family predictions using fine-tuned Qwen3-14B Family-Specialist LoRAs,
-    dynamically gated by within-family margin (< margin_thr).
+    Refines intra-family predictions using fine-tuned Qwen3-14B Family-Specialist LoRAs
+    while strictly preserving 100% of total marginal family probability mass.
     """
     if spec_logits is None or len(spec_logits) != len(P_mix) or float(gate_weight) <= 0.0:
         return P_mix
@@ -360,11 +352,7 @@ def apply_family_specialist_lora_gate(
         tot_mass = sub_mix.sum(axis=1, keepdims=True)
         base_rel = sub_mix / tot_mass
 
-        sp = np.sort(base_rel, axis=1)
-        margin = sp[:, -1] - sp[:, -2]
-        eff_w = np.clip((margin_thr - margin) / max(margin_thr, 1e-6), 0.0, 1.0)[:, None] * float(gate_weight)
-
-        log_rel = (1.0 - eff_w) * np.log(base_rel) + eff_w * np.log(np.clip(P_spec[rows], 1e-12, 1.0))
+        log_rel = (1.0 - float(gate_weight)) * np.log(base_rel) + float(gate_weight) * np.log(np.clip(P_spec[rows], 1e-12, 1.0))
         blended_rel = softmax(log_rel, axis=1)
         P_out[np.ix_(rows, family_cols)] = tot_mass * blended_rel
 
