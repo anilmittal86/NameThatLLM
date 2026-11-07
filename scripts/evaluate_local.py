@@ -1046,9 +1046,12 @@ def print_per_class_accuracy_table(
         num_extra = int(data["num_extra"][0]) if "num_extra" in data else 0
         for ex_idx in range(num_extra):
             if f"extra_{ex_idx}_unseen_lp" in data:
-                ex_w = float(data[f"extra_{ex_idx}_weight"][0])
-                ex_u_lp = np.asarray(data[f"extra_{ex_idx}_unseen_lp"], dtype=np.float64)
-                extra_unseen_lp += ex_w * ex_u_lp
+                ex_raw = data.get(f"extra_{ex_idx}_name", f"extra_{ex_idx}")
+                ex_name = str(ex_raw[0]) if hasattr(ex_raw, "__len__") and len(ex_raw) > 0 else str(ex_raw)
+                ex_w = float(active_weights_map.get(ex_name, 0.0))
+                if ex_w > 0.0:
+                    ex_u_lp = np.asarray(data[f"extra_{ex_idx}_unseen_lp"], dtype=np.float64)
+                    extra_unseen_lp += ex_w * ex_u_lp
 
     prod_lp += extra_unseen_lp
     clean_lp += extra_unseen_lp
@@ -1655,16 +1658,20 @@ def evaluate_from_cache(
 
 
         for raw_name in model_names:
-
             c_name = CANONICAL_NAME_MAP.get(raw_name, raw_name)
-
             if c_name not in active_weights_map:
-
                 active_weights_map[c_name] = 0.0
-
             if raw_name not in active_weights_map:
-
                 active_weights_map[raw_name] = 0.0
+
+        for ex_idx in range(num_extra):
+            raw_ex = data.get(f"extra_{ex_idx}_name", f"extra_{ex_idx}")
+            raw_ex_name = str(raw_ex[0]) if hasattr(raw_ex, "__len__") and len(raw_ex) > 0 else str(raw_ex)
+            c_ex_name = CANONICAL_NAME_MAP.get(raw_ex_name, raw_ex_name)
+            if c_ex_name not in active_weights_map:
+                active_weights_map[c_ex_name] = 0.0
+            if raw_ex_name not in active_weights_map:
+                active_weights_map[raw_ex_name] = 0.0
 
         R_main = P_mix.copy()
 

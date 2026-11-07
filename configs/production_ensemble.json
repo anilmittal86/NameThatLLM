@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
   "name": "production_ensemble",
-  "description": "Production Two-Tier Stack (85% Main Part-Two Baseline + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank)",
+  "description": "Production Ensemble: Pure 2-Model [qwen3_14b_v5 + svc_4view] + Normalized Weights + Pure Sinkhorn Balancing",
   "probe_gate_min_bacc": 0.40,
   "enable_ablation_probe": true,
   "ablation_samples_per_class": 20,
@@ -22,59 +22,49 @@
   "required_assets": {
     "require_pool_parquet": true,
     "required_base_models": [
-      { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 },
-      { "name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36 },
-      { "name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24 }
+      { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 }
     ],
     "required_checkpoints": [
-      "qwen3_14b_p2",
-      "qwen3_14b_v5",
-      "deberta_p2",
-      "qwen3_8b_claude"
+      "qwen3_14b_v5"
     ],
-    "optional_checkpoints": [
-      "qwen3_14b_inhouse",
-      "qwen3_14b_gpt",
-      "qwen3_14b_gemini",
-      "qwen3_14b_glm"
-    ]
+    "optional_checkpoints": []
   },
   "model_weights": {
-    "qwen3_14b_v5":       { "plain_weight": 0.45, "twin_weight": 0.15 },
-    "qwen3_14b_p2":       { "plain_weight": 0.38, "twin_weight": 0.14 },
-    "qwen3_14b_inhouse":  { "plain_weight": 0.38, "twin_weight": 0.14 },
-    "deberta_p2":         { "plain_weight": 0.28, "twin_weight": 0.10 },
-    "svc_4view":          { "plain_weight": 0.38, "twin_weight": 0.00 },
-    "lexical_5v":         { "plain_weight": 0.15, "twin_weight": 0.00 },
-    "wpca_dp":            { "plain_weight": 0.35, "twin_weight": 0.00 },
-    "spectral_bank":      { "plain_weight": 0.20, "twin_weight": 0.00 },
+    "qwen3_14b_v5":       { "plain_weight": 0.46, "twin_weight": 0.15 },
+    "svc_4view":          { "plain_weight": 0.39, "twin_weight": 0.00 },
+    "qwen3_14b_p2":       { "plain_weight": 0.00, "twin_weight": 0.00 },
+    "qwen3_14b_inhouse":  { "plain_weight": 0.00, "twin_weight": 0.00 },
+    "deberta_p2":         { "plain_weight": 0.00, "twin_weight": 0.00 },
+    "lexical_5v":         { "plain_weight": 0.00, "twin_weight": 0.00 },
+    "wpca_dp":            { "plain_weight": 0.00, "twin_weight": 0.00 },
+    "spectral_bank":      { "plain_weight": 0.00, "twin_weight": 0.00 },
     "qwen3_8b_claude":    { "plain_weight": 0.00, "twin_weight": 0.00 }
   },
   "main_stack": {
-    "linear_svc_weight": 1.00,
+    "linear_svc_weight": 0.39,
     "members": {
       "lora_qwen3_14b": {
-        "plain_weight": 0.40,
-        "twin_weight": 0.10,
+        "plain_weight": 0.00,
+        "twin_weight": 0.00,
         "twin_clustering": "groups_085"
       },
       "deberta_v3_large": {
-        "plain_weight": 0.25,
+        "plain_weight": 0.00,
         "twin_weight": 0.00
       }
     }
   },
   "complementary_stack": {
     "stream_weights": {
-      "lora_and_twins": 0.35,
-      "lexical": 0.20,
-      "dp_posteriors": 0.30,
-      "spectral_bank": 0.15
+      "lora_and_twins": 0.61,
+      "lexical": 0.00,
+      "dp_posteriors": 0.00,
+      "spectral_bank": 0.00
     },
     "lora_members": {
-      "lora_qwen3_14b": { "plain_weight": 0.30, "twin_weight": 0.10 },
-      "ntl_claude_head": { "plain_weight": 0.14, "twin_weight": 0.05 },
-      "deberta_v3_large": { "plain_weight": 0.18, "twin_weight": 0.06 }
+      "lora_qwen3_14b": { "plain_weight": 0.00, "twin_weight": 0.00 },
+      "ntl_claude_head": { "plain_weight": 0.00, "twin_weight": 0.00 },
+      "deberta_v3_large": { "plain_weight": 0.00, "twin_weight": 0.00 }
     },
     "twin_resolutions": {
       "t85": 0.50,
@@ -82,10 +72,10 @@
       "t60": 0.20
     },
     "dp_weights": {
-      "q3_14b": 0.38,
-      "q25_14b": 0.24,
-      "deberta": 0.20,
-      "claude_8b": 0.04
+      "q3_14b": 0.00,
+      "q25_14b": 0.00,
+      "deberta": 0.00,
+      "claude_8b": 0.00
     },
     "se_floors": {
       "qwen3_14b_p2": 0.10,
@@ -94,10 +84,10 @@
       "qwen3_8b_claude": 0.35
     },
     "prior_scales": {
-      "qwen3_14b_p2": 1.00,
-      "qwen25_14b_p2": 0.85,
-      "deberta_p2": 0.80,
-      "qwen3_8b_claude": 0.30
+      "qwen3_14b_p2": 0.00,
+      "qwen25_14b_p2": 0.00,
+      "deberta_p2": 0.00,
+      "qwen3_8b_claude": 0.00
     },
     "spectral_bank": {
       "plain_C": 0.04,
@@ -106,26 +96,26 @@
     }
   },
   "fusion": {
-    "main_ratio": 0.85,
-    "comp_ratio": 0.15
+    "main_ratio": 0.39,
+    "comp_ratio": 0.61
   },
   "postprocess": {
     "enable_within_family_confidence_gates": false,
     "family_gate_strength": 0.0,
-    "claude_specialist_weight": 0.15,
-    "gpt_specialist_weight": 0.55,
-    "gemini_specialist_weight": 0.65,
-    "glm_specialist_weight": 0.70,
-    "curly_quote_multiplier": 0.36787944117144233,
+    "claude_specialist_weight": 0.0,
+    "gpt_specialist_weight": 0.0,
+    "gemini_specialist_weight": 0.0,
+    "glm_specialist_weight": 0.0,
+    "curly_quote_multiplier": 1.0,
     "multi_em_dash_log_penalty": 0.0,
     "straight_contr_log_penalty": 0.0,
     "curly_contr_log_penalty": 0.0,
     "continuous_hw_weight": 0.0,
-    "cluster_repulsion_strength": 0.35,
-    "sinkhorn_iterations": 100,
-    "sinkhorn_strength": 0.65,
-    "sinkhorn_target_mix": 0.35,
-    "enable_typobayes": true,
+    "cluster_repulsion_strength": 0.0,
+    "sinkhorn_iterations": 60,
+    "sinkhorn_strength": 1.0,
+    "sinkhorn_target_mix": 1.0,
+    "enable_typobayes": false,
     "typobayes_kappa": 24.0,
     "typobayes_evidence_scale": 1.2,
     "typobayes_evidence_cap": 0.30,
