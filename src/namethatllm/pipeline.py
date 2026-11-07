@@ -1,11 +1,69 @@
-"""
+r"""
 Top-Level Pipeline Orchestrator
 ===============================
-Coordinates the complete end-to-end execution flow:
-- Module 1: Dual-Output Lexical Engine (subprocess isolated or in-process)
-- Module 2: Neural Trunk Extraction Loop (All 4 trunks and 6 checkpoints)
-- Module 3: wPCA DP Posterior (ExactAuthorPosterior) + 384-Dim Spectral Bank
-- Module 4: Two-Tier Simplex Blend + Vectorized Claude Gate + Sinkhorn Balancing
+This module orchestrates the complete end-to-end inference and evaluation pipeline:
+
+Architectural Dataflow:
+-----------------------
+  [ Frozen Neural Readers ]              [ Fit Live in Pipeline ]
+  • Qwen3-14B Part 2                     • Style SVC (4 views)
+  • Qwen3-14B Part 1                     • Lexical Model (5 views)
+  • Qwen2.5-14B Part 2                   • Exact Prompt Group Search (TF-IDF linkage)
+  • DeBERTa-v3-Large                     • Spectral Bank (joint multi-view features)
+  • 8B Patches (Claude, In-Style, LoRA24)• wPCA-DP Posterior (shared Gaussian DP)
+                    \                           /
+                     \                         /
+                      ▼                       ▼
+            ┌───────────────────────────────────────────────┐
+            │ Stage 1: Quick Probe and Gate                 │
+            │ Evaluates solo balanced accuracy on strictly   │
+            │ unseen 360-row holdout set. Drops any reader  │
+            │ scoring below min threshold (0.40 BAcc).      │
+            └───────────────────────┬───────────────────────┘
+                                    │
+                                    ▼
+            ┌───────────────────────────────────────────────┐
+            │ Stage 2: Flat Ensemble / Greedy Stepwise      │
+            │ Computes optimal combination weights using    │
+            │ Leave-One-Out (LOO) attribution. Non-helpers  │
+            │ receive weight 0.0 (pruned).                  │
+            └───────────────────────┬───────────────────────┘
+                                    │
+                                    ▼
+            ┌───────────────────────────────────────────────┐
+            │ Stage 3: Neural Specialist Gates Layer        │
+            │ Mass-preserving neural gating inside families: │
+            │ • Claude Head     (Model 3 head, weight 0.15) │
+            │ • Gemini LoRA     (Qwen3-14B, weight 0.65)    │
+            │ • GLM LoRA        (Qwen3-14B, weight 0.70)    │
+            │ • GPT LoRA        (Qwen3-14B, weight 0.55)    │
+            └───────────────────────┬───────────────────────┘
+                                    │
+                                    ▼
+            ┌───────────────────────────────────────────────┐
+            │ Stage 4: Orthographic Punctuation Shield      │
+            │ Bayesian tokenization penalties: curly quotes │
+            │ get -1.0 log penalty for Claude and GLM.      │
+            └───────────────────────┬───────────────────────┘
+                                    │
+                                    ▼
+            ┌───────────────────────────────────────────────┐
+            │ Stage 5: Cluster Uniqueness Repulsion         │
+            │ Cavity mean-field repulsion: at-most-one text │
+            │ per model within identical test prompt group. │
+            └───────────────────────┬───────────────────────┘
+                                    │
+                                    ▼
+            ┌───────────────────────────────────────────────┐
+            │ Stage 6: Multiplicative Sinkhorn Balancing    │
+            │ 300 alternating row/column normalization steps│
+            │ matching uniform 1/18 global class priors.    │
+            └───────────────────────┬───────────────────────┘
+                                    │
+                                    ▼
+            ┌───────────────────────────────────────────────┐
+            │ Output: submission.parquet & submission.csv   │
+            └───────────────────────────────────────────────┘
 """
 
 import os
@@ -188,7 +246,17 @@ def extract_family_specialist_logits(
     """
     Selectively runs inference for a Qwen3-14B family specialist adapter
     (GPT 5-class, Gemini 4-class, or GLM 2-class) on candidate test and unseen passages.
-    Preserves fast execution by filtering to rows predicted in the family or with >=0.15 family mass.
+
+    Performance & Resource Optimization:
+    ------------------------------------
+    Rather than running the massive 14B model over ALL test samples, this function
+    applies selective family masking:
+    1. Only passages where the ensemble indicates membership in this family
+       (either top-1 prediction is in family OR cumulative family probability >= 0.15)
+       are selected for specialist inference.
+    2. Dynamically hot-swaps LoRA adapter weights on the already loaded Qwen3-14B trunk
+       without re-loading the base model from disk (saving ~2 minutes per specialist).
+    3. Restores original trunk weights immediately upon completion.
     """
     fam_cols = FAMILIES[family_name]
     target_labels = [LABELS[i] for i in fam_cols]
@@ -199,14 +267,14 @@ def extract_family_specialist_logits(
     spec_logits_te = np.zeros((N_test, K_fam), dtype=np.float32)
     spec_logits_u = np.zeros((N_unseen, K_fam), dtype=np.float32)
 
-    # 1. Selective Family Masking for Test set
+    # 1. Selective Family Masking for Test set: filter to candidate rows
     if N_test <= 60:
         te_mask = np.ones(N_test, dtype=bool)
     else:
         P_cur = softmax(LOGIT_MAIN, axis=1)
         te_mask = np.isin(P_cur.argmax(axis=1), fam_cols) | (P_cur[:, fam_cols].sum(axis=1) >= 0.15)
 
-    # 2. Selective Family Masking for Unseen set
+    # 2. Selective Family Masking for Unseen holdout set
     if N_unseen <= 60:
         u_mask = np.ones(N_unseen, dtype=bool) if N_unseen > 0 else np.zeros(0, dtype=bool)
     else:
@@ -235,12 +303,16 @@ def extract_family_specialist_logits(
         default_layers=[2, 4, 6, 9, 13, 17, 22, 27],
         default_max_len=447
     )
+    # Step 1: Configure active layers and take a snapshot of base model weights
     trunk1.set_active_layers(meta_spec["layers"], meta_spec["max_len"])
     backup_spec = trunk1.snapshot_weights(spec_dir)
+
+    # Step 2: Merge specialist LoRA weights directly into Qwen3-14B attention and MLP matrices
     merged = merge_lora(trunk1.model, spec_dir, sign=+1.0)
     heads_sd = load_head_file(spec_dir)
     trunk1.load_norm_weights(heads_sd)
 
+    # Step 3: Resolve linear heads (plain head W_p, b_p and centered twin head W_c, b_c)
     W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd, num_classes=K_fam)
     src_labels = meta_spec.get("labels", target_labels)
     src_list = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
@@ -248,6 +320,7 @@ def extract_family_specialist_logits(
     if len(src_list) == K_fam and set(src_list) == set(target_labels):
         perm = [src_list.index(l) for l in target_labels]
 
+    # Step 4: Extract multi-layer representations for selected test & holdout passages
     sel_texts = [test_texts[i] for i in sel_te_idx] + [unseen_texts[j] for j in sel_u_idx]
     Z_sel = trunk1.extract_exact(sel_texts, batch_size=8, end_id=meta_spec["end_id"])
 
@@ -256,7 +329,7 @@ def extract_family_specialist_logits(
 
     g85, g72, g65 = groups_test_multi
 
-    # Test processing
+    # Step 5: Compute plain + centered twin logits for candidate test passages
     if n_sel_te > 0 and W_p is not None:
         raw_p_te = Z_sel_te @ W_p.T + b_p
         if perm is not None:
@@ -276,7 +349,7 @@ def extract_family_specialist_logits(
         comb_te = lp_p_te + 0.45 * lp_c_blend_te if lp_c_blend_te is not None else lp_p_te
         spec_logits_te[sel_te_idx] = log_softmax(comb_te, axis=1).astype(np.float32)
 
-    # Unseen processing
+    # Step 6: Compute plain + centered twin logits for candidate unseen holdout passages
     if n_sel_u > 0 and W_p is not None:
         raw_p_u = Z_sel_u @ W_p.T + b_p
         if perm is not None:
@@ -291,6 +364,7 @@ def extract_family_specialist_logits(
         comb_u = lp_p_u + 0.45 * lp_c_u if lp_c_u is not None else lp_p_u
         spec_logits_u[sel_u_idx] = log_softmax(comb_u, axis=1).astype(np.float32)
 
+    # Step 7: Cleanly restore original base weights and free temporary tensors
     trunk1.restore_weights(backup_spec)
     trunk1.set_final_norm(False)
     del backup_spec, heads_sd, Z_sel
@@ -1798,7 +1872,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 groups_override=groups_unseen,
             )
 
-    # Claude Specialist Gate (Vectorized)
+    # -------------------------------------------------------------------------
+    # STAGE 3A: Claude Specialist Gate (Vectorized Head)
+    # Refines Claude variants (Sonnet 4/4.5/5, Haiku 3.5, Opus 5) using Model 3 head
+    # -------------------------------------------------------------------------
     gate_weight = post_cfg.get("claude_specialist_weight", 0.15)
     P_mix = apply_claude_specialist_gate(
         P_mix=P_mix,
@@ -1810,7 +1887,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         gate_weight=gate_weight
     )
 
-    # Family-Specialist LoRA Gates (GPT, Gemini, GLM)
+    # -------------------------------------------------------------------------
+    # STAGE 3B: Deep Neural Family-Specialist LoRA Gates (GPT, Gemini, GLM)
+    # 14B Qwen3 LoRAs trained specifically on intra-family boundaries with sibling penalties
+    # Preserves 100% of marginal family mass while resolving low-margin confusions
+    # -------------------------------------------------------------------------
     for fam_k, default_w in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
         spec_te_logits = family_spec_logits_te.get(fam_k)
         if spec_te_logits is not None:
@@ -1826,14 +1907,20 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 gate_weight=w_gate,
             )
 
-    # 4-Family Confidence Gates
+    # -------------------------------------------------------------------------
+    # STAGE 3C: Auxiliary Within-Family Confidence Gates (Shallow Tie-Breakers)
+    # Automatically bypassed when enable_within_family_confidence_gates is false
+    # -------------------------------------------------------------------------
     P_mix = apply_all_family_confidence_gates(
         P_mix=P_mix,
         family_gates=family_gates,
         max_strength=post_cfg.get("family_gate_strength", 0.20),
     )
 
-    # Unified Handwriting & Orthographic Shield (discrete Bayesian rules + continuous handwriting density)
+    # -------------------------------------------------------------------------
+    # STAGE 4: Unified Handwriting & Orthographic Shield
+    # Subtracts log penalties for tokenization artifacts (e.g. curly quotes: -1.0 for Claude & GLM)
+    # -------------------------------------------------------------------------
     default_curly_multiplier = float(np.exp(-1.0))
     multiplier = post_cfg.get("curly_quote_multiplier", default_curly_multiplier)
     multi_em_dash_log_pen = post_cfg.get("multi_em_dash_log_penalty", 0.0)
@@ -1853,7 +1940,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         continuous_hw_weight=continuous_hw_weight,
     )
 
-    # Cavity Cluster Uniqueness Repulsion (Soft at-most-once within prompt cluster)
+    # -------------------------------------------------------------------------
+    # STAGE 5: Cavity Cluster Uniqueness Repulsion
+    # Enforces soft at-most-once constraint on completions from identical test prompt groups
+    # -------------------------------------------------------------------------
     P_mix = apply_cluster_uniqueness_repulsion(
         P_mix=P_mix,
         groups=groups_065,
@@ -1861,7 +1951,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         iters=3
     )
 
-    # Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
+    # -------------------------------------------------------------------------
+    # STAGE 6: Multiplicative Sinkhorn Column Mass Balancing
+    # Equalizes class frequencies across test set to match expected uniform distribution
+    # -------------------------------------------------------------------------
     sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
     sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
     sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))

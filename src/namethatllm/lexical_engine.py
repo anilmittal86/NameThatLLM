@@ -99,11 +99,21 @@ FUNCTION_WORDS = set(
 STOP_WORDS = FUNCTION_WORDS
 
 def shape_text(t: str) -> str:
-    """Replaces alphabetic character blocks with X (uppercase) and x (lowercase)."""
+    """
+    Transforms text into structural casing patterns (shape view).
+    Replaces capitalized words with 'X' and lowercase words with 'x'.
+    Captures formatting capitalization rhythm independent of lexical vocabulary.
+    """
     return re.sub(r"[^\W\d_]+", lambda m: "X" if m.group(0)[0].isupper() else "x", str(t))
 
 def function_text(t: str) -> str:
-    """Masks non-stopwords and non-punctuation to CONTENT, preserving function and punctuation syntax."""
+    """
+    Transforms text into a pure function-word and syntactic skeleton (function view).
+    Masks open-class content words (nouns, main verbs, adjectives) to 'CONTENT' while
+    preserving closed-class function words (prepositions, conjunctions, pronouns, auxiliaries)
+    and punctuation. Stylometric research demonstrates that function-word transition rates
+    form one of the strongest, topic-invariant signatures of LLM generator identity.
+    """
     tokens = re.findall(r"(?u)\b\w+\b|[^\w\s]", str(t))
     return " ".join([w.lower() if (w.lower() in STOP_WORDS or not w.isalnum()) else "CONTENT" for w in tokens])
 

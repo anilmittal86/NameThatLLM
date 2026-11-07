@@ -45,6 +45,17 @@ except Exception:
     pass
 
 def _disable_final_norm(mod: nn.Module) -> None:
+    """
+    Replaces the model's final LayerNorm / RMSNorm with nn.Identity().
+
+    Why This Is Done:
+    -----------------
+    In standard autoregressive language models (Qwen, Llama), the final normalization
+    layer immediately precedes the vocabulary lm_head and is tuned specifically for
+    next-token token prediction. For sequence classification using intermediate hidden states
+    from earlier layers (e.g. layers 9, 13, 17, 21, 25), the final norm is either bypassed
+    or distorts the pooled representation. Replacing it with Identity avoids unintended side-effects.
+    """
     for path in ["norm", "model.norm", "base_model.norm", "base_model.model.norm", "base_model.model.model.norm"]:
         curr = mod
         parts = path.split(".")
@@ -57,9 +68,26 @@ def _disable_final_norm(mod: nn.Module) -> None:
 
 class MultiLayerLoRAClassifier(nn.Module):
     """
-    Universal Multi-Layer LoRA sequence classifier with dedicated per-layer
-    LayerNorm heads, causal attention-sink masking (m[:, 0] = 0.0), and
-    5-branch Multi-Sample Dropout.
+    Universal Multi-Layer LoRA Sequence Classifier.
+
+    Key Architectural Components:
+    ------------------------------
+    1. Intermediate Layer Extraction:
+       Instead of relying only on the final transformer layer, hidden states are pulled
+       from multiple intermediate layers (e.g., 8 evenly spaced layers). Intermediate layers
+       capture rich lexical, syntactic, and stylistic patterns before they get compressed
+       into next-token representations.
+    2. Per-Layer LayerNorm:
+       Each selected layer has a dedicated nn.LayerNorm to normalize feature scales
+       prior to concatenation into a single (num_layers * hidden_size) feature vector Z.
+    3. Dual Classification Heads:
+       - plain_head: Standard linear projection from Z -> num_classes.
+       - centered_head: Linear projection trained on prompt-centered features (Z - Z_prompt_mean)
+         to decouple pure LLM writing style from the prompt's topical content.
+    4. 5-Branch Multi-Sample Dropout (MSD):
+       During training, Z is passed through 5 distinct dropout masks (p = 0.1, 0.2, 0.3, 0.4, 0.5),
+       and the outputs are averaged. This accelerates training convergence and acts as an
+       implicit ensemble of regularized classifiers.
     """
     def __init__(
         self,
@@ -77,17 +105,21 @@ class MultiLayerLoRAClassifier(nn.Module):
         self.hidden_size = hidden_size
         self.total_dim = len(layers) * hidden_size
 
-        # Dedicated LayerNorm for each intermediate layer
+        # Dedicated LayerNorm for each extracted intermediate layer
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in layers])
 
         # Dual classification heads (Plain + Prompt-Centered Twin)
         self.plain_head = nn.Linear(self.total_dim, num_classes)
         self.centered_head = nn.Linear(self.total_dim, num_classes)
 
-        # 5-branch Multi-Sample Dropout for superior regularization
+        # 5-branch Multi-Sample Dropout for superior regularization and gradient stability
         self.dropouts = nn.ModuleList([nn.Dropout(p) for p in (0.1, 0.2, 0.3, 0.4, 0.5)])
 
     def predict_plain(self, Z: torch.Tensor) -> torch.Tensor:
+        """
+        Projects concatenated feature vector Z to logits via the plain head.
+        Averages across 5 Multi-Sample Dropout branches during training.
+        """
         first_dev = Z.device
         if next(self.plain_head.parameters()).device != first_dev:
             self.plain_head = self.plain_head.to(first_dev)
@@ -96,6 +128,10 @@ class MultiLayerLoRAClassifier(nn.Module):
         return self.plain_head(Z)
 
     def predict_centered(self, Z: torch.Tensor) -> torch.Tensor:
+        """
+        Projects prompt-centered feature vector Z to logits via the centered twin head.
+        Averages across 5 Multi-Sample Dropout branches during training.
+        """
         first_dev = Z.device
         if next(self.centered_head.parameters()).device != first_dev:
             self.centered_head = self.centered_head.to(first_dev)
@@ -109,10 +145,20 @@ class MultiLayerLoRAClassifier(nn.Module):
         attention_mask: torch.Tensor,
         drop_first_token: bool = True
     ) -> torch.Tensor:
-        """Forward pass with causal attention sink masking and multi-layer LayerNorm pooling."""
+        """
+        Extracts pooled multi-layer representations with causal attention-sink masking.
+
+        Why Attention-Sink Masking (drop_first_token) Matters:
+        ------------------------------------------------------
+        In causal LLMs (Qwen, Llama), the first token (token index 0, e.g. BOS or leading word)
+        acts as an 'attention sink' where the softmax mechanism dumps massive attention logits
+        regardless of whether token 0 carries semantic meaning. If token 0 is included in
+        mean pooling across the sequence length, it injects noise that masks subtle stylistic
+        differences. Setting m[:, 0] = 0.0 cleans the representation.
+        """
         m = attention_mask.clone().float()
         if drop_first_token and m.shape[1] > 1:
-            m[:, 0] = 0.0
+            m[:, 0] = 0.0  # Zero out attention sink token
         den = m.sum(dim=1, keepdim=True).clamp(min=1e-5)
         first_device = input_ids.device
 
@@ -161,7 +207,11 @@ class MultiLayerLoRAClassifier(nn.Module):
         return Z, logits_plain, logits_centered
 
 def _build_sister_mask(device: torch.device) -> torch.Tensor:
-    """Builds an (18, 18) binary mask of sister models within the same model family."""
+    """
+    Builds an (18, 18) binary indicator matrix M where M[i, j] = 1.0 if class i and
+    class j belong to the same LLM provider family (sisters), and 0.0 otherwise.
+    Used by family_margin_cross_entropy to identify competing sibling classes.
+    """
     M = torch.zeros((K, K), dtype=torch.float32, device=device)
     for fam_name, members in FAMILIES.items():
         for m1 in members:
@@ -177,10 +227,27 @@ def family_margin_cross_entropy(
     label_smoothing: float = 0.0
 ) -> torch.Tensor:
     """
-    Computes cross-entropy with intra-family margin penalty.
-    Sister models receive an additive logit penalty (+delta),
-    forcing the network to establish a decisive decision boundary against sister LLMs.
-    Supports standard 18-class as well as K_fam single-family specialists (Gemini, GPT, GLM).
+    Computes Cross-Entropy with Sibling Margin Penalty (Additive Margin on Sister Classes).
+
+    Concept & Mathematical Intuition:
+    ---------------------------------
+    In LLM author identification, confusing a Gemini model with a Claude model is a rare
+    mistake; the overwhelming source of error is confusing sister variants (e.g., Gemini 3.7
+    vs Gemini 3.8, or GLM-5.3 vs GLM-5.3-flash). Standard cross-entropy treats all negative
+    classes symmetrically.
+
+    By adding a positive margin penalty (+family_margin) to the logits of sibling classes:
+        logits[i, sister_j] += margin_boost
+    the softmax denominator is artificially inflated by the sister's logits. This penalizes
+    the network whenever it produces ambiguous or overlapping predictions between sisters,
+    forcing the gradients to carve out a sharp, decisive separation boundary.
+
+    Specialist Sibling Boost:
+    -------------------------
+    - For single-family specialists (e.g. Gemini 4-class), all classes are sisters.
+    - We apply an extra 1.5x multiplier to the most difficult sibling pair:
+      Gemini 3.7-flash <-> Gemini 3.8-flash, which prevents stylistic collapse.
+    - For GPT 5-class specialist: 1.4x boost among the triad (Luna, Sol, Terra).
     """
     if family_margin > 0.0:
         num_cls = logits.shape[1]

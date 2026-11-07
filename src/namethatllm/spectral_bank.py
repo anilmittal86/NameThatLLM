@@ -18,7 +18,13 @@ from .wpca_gaussian import split_oversized_clusters_dist
 
 def make_spectral_blocks(Z_tr: np.ndarray, Z_te: np.ndarray, res: dict, prior_scale: float) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Projects train and test features onto V_top64 and scales by out-of-sample prior scale.
+    Constructs unit-normalized spectral feature blocks projected onto unsupervised principal components.
+
+    Why This Works (Zero Label Leakage):
+    -----------------------------------
+    V_top64 is computed purely via within-prompt covariance decomposition (no model labels are used).
+    Projecting representations onto V_top64 isolates the 64 highest-variance directions of stylistic
+    variation across prompts, regularized by the reader's out-of-sample prior scale.
     """
     mx, sx, V64 = res["mx"], res["sx"], res["V_top64"]
     S_tr = (((Z_tr - mx) / sx) @ V64).astype(np.float32)
@@ -35,6 +41,11 @@ def _resolve_spectral_groups(
     max_cluster_size: int = 14,
     groups_override: Optional[np.ndarray] = None,
 ) -> np.ndarray:
+    """
+    Identifies test prompt clusters by blending lexical and neural cosine distances:
+        D_hybrid = 0.55 * D_tfidf + 0.45 * D_neural
+    Clusters at average-linkage distance threshold 0.65, splitting clusters > 14.
+    """
     N_te = len(X_te)
     if N_te < 2:
         return np.ones(N_te, dtype=int)

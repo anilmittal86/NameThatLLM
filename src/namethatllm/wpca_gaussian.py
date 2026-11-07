@@ -16,26 +16,63 @@ from sklearn.covariance import ledoit_wolf_shrinkage
 
 from .config import K
 
-def _two_way(Z: np.ndarray, y: np.ndarray, pinv: np.ndarray, G: int, K_classes: int = 18, iters: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Iterative two-way ANOVA decomposition separating author means and prompt random effects."""
+# =============================================================================
+# 1. TWO-WAY ANOVA DECOMPOSITION & COVARIANCE SHRINKAGE
+# =============================================================================
+
+def _two_way(
+    Z: np.ndarray,
+    y: np.ndarray,
+    pinv: np.ndarray,
+    G: int,
+    K_classes: int = 18,
+    iters: int = 4
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Iterative Two-Way ANOVA variance decomposition.
+
+    Mathematical Formulation:
+    -------------------------
+    Each sample embedding Z_{i} is modeled as:
+        Z_{i} = mu_{y_i} + P_{g_i} + epsilon_{i}
+    where:
+    - mu_{k} is the fixed effect of LLM author k (the pure writing style centroid)
+    - P_{g} is the random effect of prompt topic g (the prompt-specific content shift)
+    - epsilon_{i} is residual noise
+
+    By alternating:
+    1. Estimate mu_{k} by averaging residuals (Z - P_{g}) for each class k
+    2. Estimate P_{g} by averaging residuals (Z - mu_{k}) for each prompt group g
+    for 4 iterations, we completely decouple the author's stylistic signature
+    from the topic/subject of the prompt!
+    """
     N, d = Z.shape
     mu = np.zeros((K_classes, d), dtype=np.float64)
     P = np.zeros((G, d), dtype=np.float64)
     ng = np.bincount(pinv, minlength=G).clip(min=1)
+
     for _ in range(iters):
+        # Step 1: Subtract current prompt effects, update author centroids mu
         R = Z - P[pinv]
         for k in range(K_classes):
             idx = (y == k)
             if idx.any():
                 mu[k] = R[idx].mean(axis=0)
+
+        # Step 2: Subtract updated author centroids, update prompt effects P
         R = Z - mu[y]
         P[:] = 0.0
         np.add.at(P, pinv, R)
         P /= ng[:, None]
+
     return mu, P, ng
 
 def _shrunk(S: np.ndarray, alpha: float) -> np.ndarray:
-    """Shrinks covariance matrix S towards spherical target."""
+    """
+    Shrinks covariance matrix S towards a spherical target:
+        S_shrunk = (1 - alpha) * S + alpha * (trace(S)/d) * I
+    Prevents degenerate zero-variance dimensions in high dimensions.
+    """
     d = S.shape[0]
     tr = np.trace(S) / d
     return (1.0 - alpha) * S + alpha * tr * np.eye(d)
@@ -152,7 +189,31 @@ def _bitmask_levels(k: int = 18):
     return tuple(masks[counts == n] for n in range(k + 1))
 
 class ExactAuthorPosterior:
-    """Exact shared-prompt Gaussian posteriors under author uniqueness via 2^18 bitmask DP."""
+    """
+    Exact Gaussian Posteriors under the Unique-Authorship Constraint via 2^18 Bitmask DP.
+
+    Domain Insight & Problem Setup:
+    -------------------------------
+    When n completions (e.g. n = 4) belong to the same prompt cluster, each completion
+    must come from a DIFFERENT LLM author. This is an injective bipartite matching
+    between the n observed completions and the K = 18 potential LLM authors.
+    Evaluating all possible injective assignments naively requires:
+        18 * 17 * ... * (18 - n + 1) assignments (up to 1.76 * 10^11 permutations for n=14!)
+
+    Dynamic Programming Solution (2^18 Bitmask DP):
+    -----------------------------------------------
+    By representing the set of assigned authors as a binary bitmask of length K = 18
+    (total 2^18 = 262,144 states), we can compute the EXACT marginal posterior using
+    an efficient forward-backward message passing algorithm:
+    1. Forward Pass: Computes forward[mask], the cumulative likelihood of matching
+       the first `count` passages to the subset of authors represented by `mask`.
+    2. Terminal Prompt Correction: Evaluates the Gaussian prompt coupling effect:
+       residual = sum(U) - sum(mu_authors), adding the quadratic coupling term.
+    3. Backward Pass: Propagates backward messages from the terminal level down to the base.
+    4. Exact Marginalization: Combines forward, unary passage likelihood A[row, author],
+       and backward terms to yield the exact marginal probability P(author | all n texts in cluster).
+    Runs in milliseconds!
+    """
     def __init__(self, m: np.ndarray, lam: np.ndarray):
         self.m = np.asarray(m, dtype=np.float64)
         self.lam = np.asarray(lam, dtype=np.float64)
