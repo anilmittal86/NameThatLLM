@@ -491,40 +491,35 @@ def apply_curly_quote_shield(
 
 def sinkhorn_balancing(
     P: np.ndarray,
-    iters: int = 300,
-    sinkhorn_strength: float = 1.0,
-    target_mix: float = 1.0,
+    iters: int = 100,
+    sinkhorn_strength: float = 0.65,
+    target_mix: float = 0.35,
     train_prior: Optional[np.ndarray] = None,
+    allow_pure: bool = False,
 ) -> np.ndarray:
     """
-    Sinkhorn-Knopp column mass balancing.
-
-    Concept:
-    --------
-    In Kaggle classification competitions where test sets are constructed with
-    balanced class distributions, each model class generates approximately 1/K
-    of all test samples. Without balancing, uncalibrated ensemble probabilities
-    can systematically over-predict popular classes and under-predict rare ones.
-
-    Sinkhorn-Knopp alternates:
-    1. Row normalization: Each test sample's probabilities sum to 1.0.
-    2. Column scaling: Total predicted mass for class k matches target_col[k].
-    Converges to an exact doubly-stochastic scaling in ~300 iterations.
+    Soft Multiplicative Sinkhorn-Knopp Column Marginal Balancing.
+    =============================================================
+    Equalizes global class marginals using Soft Sinkhorn shrinkage.
+    Pure Sinkhorn (1.0 / 1.0) is disallowed by default as it destroys test performance
+    by hard-forcing uniform marginals on batches with natural class variance.
 
     Parameters:
     -----------
     P : np.ndarray of shape (N, 18)
         Probability matrix to balance.
     iters : int
-        Number of alternating row/column scaling steps (default 300).
+        Number of alternating row/column scaling steps (default 100).
     sinkhorn_strength : float
-        Interpolation between original P and fully balanced Q:
-        1.0 = full exact Sinkhorn, < 1.0 = soft shrinkage.
+        Soft shrinkage interpolation between original P and balanced Q (default 0.65).
+        Capped at 0.75 unless allow_pure=True.
     target_mix : float
-        1.0 = strictly uniform 1/18 target marginals;
-        < 1.0 = convex blend between predicted marginals and empirical prior.
+        Convex blend between predicted marginals and prior (default 0.35).
+        Capped at 0.50 unless allow_pure=True.
     train_prior : np.ndarray of shape (18,), optional
         Empirical training class frequencies (used when target_mix < 1.0).
+    allow_pure : bool, optional
+        Whether to allow 100% hard pure Sinkhorn (default False).
 
     Returns:
     --------
@@ -543,10 +538,11 @@ def sinkhorn_balancing(
     else:
         p_train = np.full(K_cols, 1.0 / K_cols, dtype=np.float64)
 
-    if target_mix < 1.0:
+    eff_mix = target_mix if allow_pure else min(target_mix, 0.50)
+    if eff_mix < 1.0:
         pred_marg = np.clip(P_work.mean(axis=0), 1e-6, None)
         pred_marg /= pred_marg.sum()
-        rho = float(np.clip(target_mix, 0.0, 1.0))
+        rho = float(np.clip(eff_mix, 0.0, 1.0))
         target_col = (1.0 - rho) * pred_marg + rho * p_train
         target_col = np.clip(target_col, 1e-6, None)
         target_col /= target_col.sum()
@@ -564,11 +560,15 @@ def sinkhorn_balancing(
     # Final row normalization
     Q /= Q.sum(axis=1, keepdims=True).clip(min=1e-12)
 
-    if sinkhorn_strength >= 1.0:
+    if allow_pure and sinkhorn_strength >= 1.0:
         return Q
 
-    # Soft logarithmic mixture between original P and balanced Q
-    log_P = (1.0 - sinkhorn_strength) * np.log(np.clip(P_work, 1e-12, None)) + sinkhorn_strength * np.log(np.clip(Q, 1e-12, None))
+    # Soft logarithmic mixture between original P and balanced Q (pure Sinkhorn disallowed)
+    eff_strength = float(np.clip(sinkhorn_strength, 0.0, 0.75 if not allow_pure else 1.0))
+    if eff_strength <= 0.0:
+        return P_work
+
+    log_P = (1.0 - eff_strength) * np.log(np.clip(P_work, 1e-12, None)) + eff_strength * np.log(np.clip(Q, 1e-12, None))
     return softmax(log_P, axis=1)
 
 

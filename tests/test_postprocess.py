@@ -141,7 +141,7 @@ class TestPostprocess(unittest.TestCase):
         np.random.seed(42)
         N = 180
         P = softmax(np.random.randn(N, 18), axis=1)
-        P_sink = sinkhorn_balancing(P, iters=300)
+        P_sink = sinkhorn_balancing(P, iters=300, sinkhorn_strength=1.0, target_mix=1.0, allow_pure=True)
 
         self.assertTrue(np.allclose(P_sink.sum(axis=1), 1.0))
         target_col = N / 18.0

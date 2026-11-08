@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
   "name": "production_ensemble",
-  "description": "Clean Optimal 4-Stream Ensemble [qwen3_14b_p2 (0.52) + qwen3_14b_inhouse (0.33) + svc_4view (0.30) + spectral_bank (0.15)] + Gemini Specialist LoRA (0.35) + Pure Sinkhorn",
+  "description": "In-House Champion 14B LoRA [qwen3_14b_inhouse (0.70 plain + 0.30 twin)] + All Family Specialist Gates (Claude, Gemini, GPT, GLM) + Soft Sinkhorn (0.65/0.35)",
   "probe_gate_min_bacc": 0.35,
   "enable_ablation_probe": true,
   "ablation_samples_per_class": 20,
@@ -22,32 +22,35 @@
   "required_assets": {
     "require_pool_parquet": true,
     "required_base_models": [
-      { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 }
+      { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 },
+      { "name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36 }
     ],
     "required_checkpoints": [
-      "qwen3_14b_p2",
-      "qwen3_14b_inhouse"
+      "qwen3_14b_inhouse",
+      "qwen3_8b_claude"
     ],
     "optional_checkpoints": [
-      "qwen3_14b_gemini"
+      "qwen3_14b_gemini",
+      "qwen3_14b_gpt",
+      "qwen3_14b_glm"
     ]
   },
   "model_weights": {
-    "qwen3_14b_p2":       { "plain_weight": 0.40, "twin_weight": 0.12 },
-    "qwen3_14b_inhouse":  { "plain_weight": 0.25, "twin_weight": 0.08 },
-    "svc_4view":          { "plain_weight": 0.30, "twin_weight": 0.00 },
-    "spectral_bank":      { "plain_weight": 0.15, "twin_weight": 0.00 },
+    "qwen3_14b_inhouse":  { "plain_weight": 0.70, "twin_weight": 0.30 },
+    "qwen3_14b_p2":       { "plain_weight": 0.00, "twin_weight": 0.00 },
+    "svc_4view":          { "plain_weight": 0.00, "twin_weight": 0.00 },
+    "spectral_bank":      { "plain_weight": 0.00, "twin_weight": 0.00 },
     "deberta_p2":         { "plain_weight": 0.00, "twin_weight": 0.00 },
     "lexical_5v":         { "plain_weight": 0.00, "twin_weight": 0.00 },
     "wpca_dp":            { "plain_weight": 0.00, "twin_weight": 0.00 },
     "qwen3_8b_claude":    { "plain_weight": 0.00, "twin_weight": 0.00 }
   },
   "main_stack": {
-    "linear_svc_weight": 0.30,
+    "linear_svc_weight": 0.00,
     "members": {
       "lora_qwen3_14b": {
-        "plain_weight": 0.40,
-        "twin_weight": 0.12,
+        "plain_weight": 0.00,
+        "twin_weight": 0.00,
         "twin_clustering": "groups_085"
       },
       "deberta_v3_large": {
@@ -58,13 +61,14 @@
   },
   "complementary_stack": {
     "stream_weights": {
-      "lora_and_twins": 0.33,
+      "lora_and_twins": 1.00,
       "lexical": 0.00,
       "dp_posteriors": 0.00,
-      "spectral_bank": 0.15
+      "spectral_bank": 0.00
     },
     "lora_members": {
-      "lora_qwen3_14b": { "plain_weight": 0.40, "twin_weight": 0.12 },
+      "qwen3_14b_inhouse": { "plain_weight": 0.70, "twin_weight": 0.30 },
+      "lora_qwen3_14b": { "plain_weight": 0.00, "twin_weight": 0.00 },
       "ntl_claude_head": { "plain_weight": 0.00, "twin_weight": 0.00 },
       "deberta_v3_large": { "plain_weight": 0.00, "twin_weight": 0.00 }
     },
@@ -86,6 +90,7 @@
       "qwen3_8b_claude": 0.35
     },
     "prior_scales": {
+      "qwen3_14b_inhouse": 1.00,
       "qwen3_14b_p2": 1.00,
       "qwen25_14b_p2": 0.85,
       "deberta_p2": 0.80,
@@ -98,25 +103,25 @@
     }
   },
   "fusion": {
-    "main_ratio": 0.65,
-    "comp_ratio": 0.35
+    "main_ratio": 0.00,
+    "comp_ratio": 1.00
   },
   "postprocess": {
     "enable_within_family_confidence_gates": false,
     "family_gate_strength": 0.0,
-    "claude_specialist_weight": 0.0,
-    "gpt_specialist_weight": 0.0,
+    "claude_specialist_weight": 0.15,
+    "gpt_specialist_weight": 0.30,
     "gemini_specialist_weight": 0.35,
-    "glm_specialist_weight": 0.0,
+    "glm_specialist_weight": 0.30,
     "curly_quote_multiplier": 1.0,
     "multi_em_dash_log_penalty": 0.0,
     "straight_contr_log_penalty": 0.0,
     "curly_contr_log_penalty": 0.0,
     "continuous_hw_weight": 0.0,
     "cluster_repulsion_strength": 0.0,
-    "sinkhorn_iterations": 60,
-    "sinkhorn_strength": 1.0,
-    "sinkhorn_target_mix": 1.0,
+    "sinkhorn_iterations": 100,
+    "sinkhorn_strength": 0.65,
+    "sinkhorn_target_mix": 0.35,
     "enable_typobayes": false,
     "typobayes_kappa": 24.0,
     "typobayes_evidence_scale": 1.2,

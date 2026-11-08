@@ -34,46 +34,57 @@ def _ablation_sinkhorn(
     iters: int = 200,
     eps: float = 1e-12,
     y_true: Optional[np.ndarray] = None,
+    allow_pure: bool = False,
 ) -> np.ndarray:
     """
     Fast vectorized Sinkhorn-Knopp column mass balancing for evaluation.
-
-    Why This Is Needed During Ablation:
-    ----------------------------------
-    When measuring balanced accuracy across 18 classes, a model that systematically
-    favors frequent classes at the expense of rare ones will suffer. Sinkhorn balancing
-    scales columns so the total predicted mass for each class matches its expected
-    target prior (uniform 1/18 if balanced, or empirical sample frequencies if imbalanced).
-    This reveals the true discriminative power of the model independent of calibration bias.
+    Uses Soft Sinkhorn by default; pure Sinkhorn (1.0/1.0) is only enabled when allow_pure=True.
 
     Algorithm:
     ----------
     Repeatedly projects the probability matrix:
     1. Row normalization: P[i, :] / sum(P[i, :])  -> sums to 1.0 per sample
     2. Column scaling: P[:, k] / sum(P[:, k]) * (target[k] * N) -> matches target prior
+    3. Soft shrinkage mixture with original probabilities (pure Sinkhorn disallowed by default).
     """
     if len(P) < 18:
         return P
-    P = np.clip(P.astype(np.float64), eps, 1.0)
+    P_work = np.clip(P.astype(np.float64), eps, 1.0)
+    P_orig = P_work / P_work.sum(axis=1, keepdims=True).clip(min=eps)
 
-    # Determine target column marginals
+    # Determine target column marginals with empirical prior mixing
     if y_true is not None and len(y_true) == len(P):
         counts = np.bincount(np.asarray(y_true, dtype=int), minlength=P.shape[1]).astype(np.float64)
-        # If ground-truth labels are substantially non-uniform (>1.5x ratio), match empirical distribution
-        if counts.max() > 1.5 * max(counts.min(), 1.0):
-            target_col = np.clip(counts / float(len(y_true)), 1e-6, None)[None, :]
-            target_col /= target_col.sum()
-        else:
-            target_col = 1.0 / P.shape[1]
+        p_train = np.clip(counts / float(len(y_true)), 1e-6, None)
+        p_train /= p_train.sum()
     else:
-        target_col = 1.0 / P.shape[1]
+        p_train = np.full(P.shape[1], 1.0 / P.shape[1], dtype=np.float64)
+
+    # Soft target mix (0.35 prior, 0.65 predicted marginals) if not allow_pure
+    if not allow_pure:
+        pred_marg = np.clip(P_orig.mean(axis=0), 1e-6, None)
+        pred_marg /= pred_marg.sum()
+        target_col = 0.65 * pred_marg + 0.35 * p_train
+        target_col = np.clip(target_col, 1e-6, None)
+        target_col /= target_col.sum()
+    else:
+        target_col = p_train
 
     # Alternating row and column normalization
+    Q = P_orig.copy()
     for _ in range(iters):
-        P /= P.sum(axis=1, keepdims=True).clip(min=eps)
-        P /= (P.sum(axis=0, keepdims=True) / (target_col * P.shape[0])).clip(min=eps)
+        Q /= Q.sum(axis=1, keepdims=True).clip(min=eps)
+        Q *= (len(Q) * target_col[None, :]) / Q.sum(axis=0, keepdims=True).clip(min=eps)
 
-    return P / P.sum(axis=1, keepdims=True).clip(min=eps)
+    Q /= Q.sum(axis=1, keepdims=True).clip(min=eps)
+
+    if allow_pure:
+        return Q
+
+    # Soft logarithmic shrinkage (strength = 0.65)
+    soft_strength = 0.65
+    log_P = (1.0 - soft_strength) * np.log(np.clip(P_orig, eps, None)) + soft_strength * np.log(np.clip(Q, eps, None))
+    return softmax(log_P, axis=1)
 
 
 def _fast_sinkhorn_bacc(lp_mat: np.ndarray, y_true: np.ndarray, iters: int = 40) -> float:

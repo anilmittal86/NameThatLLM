@@ -715,7 +715,10 @@ class TestCompilerAndIntegration(unittest.TestCase):
         if cache_path.exists():
             res = evaluate_from_cache(cache_path)
             w = res["weights_map"]
-            self.assertGreater(w.get("svc_4view", 0.0), 0.20)
+            if "qwen3_14b_inhouse" in w and w.get("qwen3_14b_inhouse", 0.0) > 0.0:
+                self.assertGreater(w.get("qwen3_14b_inhouse", 0.0), 0.50)
+            else:
+                self.assertGreater(w.get("svc_4view", 0.0), 0.20)
             self.assertEqual(w.get("qwen3_14b_v5", 0.0), 0.0)
             self.assertEqual(w.get("qwen25_14b_p2", 0.0), 0.0)
             self.assertEqual(w.get("qwen3_8b_claude", 0.0), 0.0)

@@ -645,7 +645,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             trunk1 = UniversalLoRATrunkLoader(base_q3_14b, keep_layers=27, layers=[2, 4, 6, 9, 13, 17, 22, 27], max_len=447)
 
             # Checkpoint 1A: Part 2 (lora_qwen3_14b)
-            if "qwen3_14b_p2" in ckpts:
+            w_main_p = model_weights.get("qwen3_14b_p2", {}).get("plain_weight", main_members.get("lora_qwen3_14b", {}).get("plain_weight", 0.42))
+            w_main_c = model_weights.get("qwen3_14b_p2", {}).get("twin_weight", main_members.get("lora_qwen3_14b", {}).get("twin_weight", 0.12))
+            is_p2_req = "qwen3_14b_p2" in req_assets.get("required_checkpoints", [])
+            if "qwen3_14b_p2" in ckpts and ((w_main_p + w_main_c) <= 0.0 and not is_p2_req):
+                print("[Pipeline] qwen3_14b_p2 weight is 0.0 and not required; skipping extraction.")
+            elif "qwen3_14b_p2" in ckpts:
                 p2_dir = ckpts["qwen3_14b_p2"]
                 meta_p2 = read_checkpoint_meta(p2_dir, default_keep=27, default_layers=[2, 4, 6, 9, 13, 17, 22, 27], default_max_len=447)
                 trunk1.set_active_layers(meta_p2["layers"], meta_p2["max_len"])

@@ -1922,7 +1922,7 @@ def evaluate_matrix(cache_path: Path):
         ('Full Clean (p2+inh+deb+svc+sb+lex)', ['p2', 'inh', 'deb', 'svc', 'sb', 'lex']),
     ]
 
-    def sinkhorn_func(log_probs, iters=60, strength=1.0, mix=1.0):
+    def sinkhorn_func(log_probs, iters=60, strength=0.65, mix=0.35):
         P = softmax(log_probs, axis=1)
         N, K = P.shape
         u = np.ones(N)
@@ -1932,20 +1932,20 @@ def evaluate_matrix(cache_path: Path):
             u = 1.0 / np.maximum(P @ v, 1e-12)
         P_bal = P * np.outer(u, v)
         P_bal = P_bal / P_bal.sum(axis=1, keepdims=True)
-        if strength < 1.0 or mix < 1.0:
-            return (1.0 - mix) * P + mix * ((1.0 - strength) * P + strength * P_bal)
-        return P_bal
+        eff_strength = min(strength, 0.75)
+        eff_mix = min(mix, 0.50)
+        return (1.0 - eff_mix) * P + eff_mix * ((1.0 - eff_strength) * P + eff_strength * P_bal)
 
     headers = [
-        "Model Combination", "Raw", "SoftSK", "PureSK", "+Claude", "+Gemini", "+GPT", "+GLM", "+AllSpec", "FullPipe"
+        "Model Combination", "Raw", "SoftSK", "+Claude", "+Gemini", "+GPT", "+GLM", "+AllSpec", "FullPipe"
     ]
-    col_w = [36, 7, 7, 7, 8, 8, 7, 7, 9, 9]
+    col_w = [36, 7, 7, 8, 8, 7, 7, 9, 9]
 
     header_str = " | ".join(h.ljust(w) for h, w in zip(headers, col_w))
     sep_str = "-+-".join("-" * w for w in col_w)
 
     print("=" * len(header_str))
-    print("FACTORIAL ABLATION MATRIX: CLEAN MODEL COMBINATIONS x POST-PROCESSING STEPS")
+    print("FACTORIAL ABLATION MATRIX: CLEAN MODEL COMBINATIONS x POST-PROCESSING STEPS (SOFT SINKHORN)")
     print("=" * len(header_str))
     print(header_str)
     print(sep_str)
@@ -1961,19 +1961,17 @@ def evaluate_matrix(cache_path: Path):
         acc_raw = balanced_accuracy_score(y_true, p_raw.argmax(axis=1)) * 100
         p_soft_sk = sinkhorn_func(lp_mix, iters=60, strength=0.65, mix=0.35)
         acc_soft_sk = balanced_accuracy_score(y_true, p_soft_sk.argmax(axis=1)) * 100
-        p_pure_sk = sinkhorn_func(lp_mix, iters=60, strength=1.0, mix=1.0)
-        acc_pure_sk = balanced_accuracy_score(y_true, p_pure_sk.argmax(axis=1)) * 100
         
-        p_cl = apply_claude_specialist_gate(p_pure_sk, lp_mix, cl_logits, gate_weight=0.15) if cl_logits is not None else p_pure_sk
+        p_cl = apply_claude_specialist_gate(p_soft_sk, lp_mix, cl_logits, gate_weight=0.15) if cl_logits is not None else p_soft_sk
         acc_cl = balanced_accuracy_score(y_true, p_cl.argmax(axis=1)) * 100
-        p_gem = apply_family_specialist_lora_gate(p_pure_sk, lp_mix, gem_logits, family_cols=FAMILIES['gemini'], gate_weight=0.35) if gem_logits is not None else p_pure_sk
+        p_gem = apply_family_specialist_lora_gate(p_soft_sk, lp_mix, gem_logits, family_cols=FAMILIES['gemini'], gate_weight=0.35) if gem_logits is not None else p_soft_sk
         acc_gem = balanced_accuracy_score(y_true, p_gem.argmax(axis=1)) * 100
-        p_gpt = apply_family_specialist_lora_gate(p_pure_sk, lp_mix, gpt_logits, family_cols=FAMILIES['gpt'], gate_weight=0.30) if gpt_logits is not None else p_pure_sk
+        p_gpt = apply_family_specialist_lora_gate(p_soft_sk, lp_mix, gpt_logits, family_cols=FAMILIES['gpt'], gate_weight=0.30) if gpt_logits is not None else p_soft_sk
         acc_gpt = balanced_accuracy_score(y_true, p_gpt.argmax(axis=1)) * 100
-        p_glm = apply_family_specialist_lora_gate(p_pure_sk, lp_mix, glm_logits, family_cols=FAMILIES['glm'], gate_weight=0.30) if glm_logits is not None else p_pure_sk
+        p_glm = apply_family_specialist_lora_gate(p_soft_sk, lp_mix, glm_logits, family_cols=FAMILIES['glm'], gate_weight=0.30) if glm_logits is not None else p_soft_sk
         acc_glm = balanced_accuracy_score(y_true, p_glm.argmax(axis=1)) * 100
         
-        p_all_spec = p_pure_sk.copy()
+        p_all_spec = p_soft_sk.copy()
         if cl_logits is not None:
             p_all_spec = apply_claude_specialist_gate(p_all_spec, lp_mix, cl_logits, gate_weight=0.15)
         if gem_logits is not None:
@@ -1991,19 +1989,19 @@ def evaluate_matrix(cache_path: Path):
         acc_full = balanced_accuracy_score(y_true, p_full.argmax(axis=1)) * 100
 
         row_vals = [
-            name, f"{acc_raw:5.2f}%", f"{acc_soft_sk:5.2f}%", f"{acc_pure_sk:5.2f}%",
+            name, f"{acc_raw:5.2f}%", f"{acc_soft_sk:5.2f}%",
             f"{acc_cl:5.2f}%", f"{acc_gem:5.2f}%", f"{acc_gpt:5.2f}%", f"{acc_glm:5.2f}%",
             f"{acc_all_spec:5.2f}%", f"{acc_full:5.2f}%",
         ]
         row_str = " | ".join(v.ljust(w) for v, w in zip(row_vals, col_w))
         print(row_str)
-        results.append((name, acc_raw, acc_pure_sk, acc_all_spec, acc_full))
+        results.append((name, acc_raw, acc_soft_sk, acc_all_spec, acc_full))
 
     print("=" * len(header_str))
     if results:
-        best_pure = max(results, key=lambda x: x[2])
+        best_sk = max(results, key=lambda x: x[2])
         best_full = max(results, key=lambda x: x[4])
-        print(f"\nTOP PERFORMER (Pure Sinkhorn):    {best_pure[0]} -> {best_pure[2]:.2f}%")
+        print(f"\nTOP PERFORMER (Soft Sinkhorn):    {best_sk[0]} -> {best_sk[2]:.2f}%")
         print(f"TOP PERFORMER (Full Pipeline):     {best_full[0]} -> {best_full[4]:.2f}%")
 
 

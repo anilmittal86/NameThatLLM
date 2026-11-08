@@ -491,7 +491,7 @@ def test_ablation_sinkhorn_and_prior_weight_preservation(tmp_path: Path):
 
     # Test _ablation_sinkhorn
     P_rand = np.random.rand(36, 18)
-    P_sink = _ablation_sinkhorn(P_rand, iters=100)
+    P_sink = _ablation_sinkhorn(P_rand, iters=100, allow_pure=True)
     assert P_sink.shape == (36, 18)
     np.testing.assert_allclose(P_sink.sum(axis=1), 1.0, atol=1e-6)
     np.testing.assert_allclose(P_sink.sum(axis=0), 36.0 / 18.0, atol=1e-3)
