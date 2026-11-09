@@ -538,6 +538,19 @@ In Stage 2, samples are grouped into 18-row prompt batches via `PromptGroupBatch
 2. **Recursive Final Norm Removal (`_disable_final_norm`)**: When wrapping models with PEFT, `norm` is nested under `base_model.model.norm`. `_disable_final_norm` recursively replaces all final RMSNorm modules with `nn.Identity()`, ensuring hidden states extracted at layer 24 during training match the un-normalized representations extracted during inference.
 3. **Closed-Form Dual Ridge Regression Head Calibration (`fit_ridge_heads`)**: Before Stage 2 and immediately prior to exporting artifacts, closed-form $N \times N$ dual Ridge regression ($L_2$-regularized, $\lambda = 1.0$) with label smoothing $0.10$ solves optimal classification weights $W_p$ and $W_c$ directly on extracted training features, preventing overfitting to prompt topics.
 
+### 5. Training Regime Comparison: In-House 14B vs. Dhruv's `v5`
+
+The table below contrasts the training regime, dataset coverage, and computational budget of our in-house champion backbone (`qwen3_14b_inhouse`) against Dhruv Tibarewal's external benchmark adapter (`qwen3_14b_v5`):
+
+| Training Stage / Attribute | Our In-House 14B (`qwen3_14b_inhouse`) | Dhruv's `v5` (`qwen3_14b_v5`) |
+| :--- | :--- | :--- |
+| **Stage 1 Passages** | 25,022 passages | 119,899 passages |
+| **Stage 1 Epochs** | 0.28 epochs (partial pass) | 2.0 full epochs |
+| **Total Stage 1 Forward Passes** | 25,022 passes | 239,798 passes (~10x more!) |
+| **Stage 1 Compute Hardware** | Kaggle Dual T4 (2x 15GB) | External NVIDIA A100 (80GB) |
+| **Stage 1 Wall-Clock Time** | 4.5 hours (stopped by timeout) | 10.0 hours |
+| **Stage 2 Epochs** | 2 epochs (1 full fit) | 2 epochs (across 5 folds + full fit) |
+
 ---
 
 ## 11. Single-Source-of-Truth Compilation & Verification
