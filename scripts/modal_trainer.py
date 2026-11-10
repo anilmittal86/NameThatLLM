@@ -324,11 +324,18 @@ if __name__ == "__main__":
     parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync"], help="Command (run, smoke, test, sync)")
     parser.add_argument("--config", default="configs/training_lora.json", help="Path to training config json")
     parser.add_argument("--backbone", default="Qwen/Qwen2.5-0.5B", help="Backbone model for smoke test")
+    parser.add_argument("--spawn", action="store_true", help="Spawn asynchronously on deployed app and exit immediately")
     args = parser.parse_args()
 
     if modal is None:
         print("Error: modal package not installed. Run 'pip install modal' and 'modal setup'.")
         sys.exit(1)
+
+    if args.spawn:
+        f = modal.Function.from_name("ntl-inhouse-trainer", "train_cloud_worker")
+        call = f.spawn(config_path=args.config)
+        print(f"[Modal] Spawned detached training task on A100 GPU! Call ID: {call.object_id}")
+        sys.exit(0)
 
     with modal.enable_output(), app.run():
         if args.cmd == "test":
