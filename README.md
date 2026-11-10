@@ -268,8 +268,10 @@ python -m modal run scripts/modal_trainer.py --mode sync
 # 2. Run fast 2-minute end-to-end smoke test on A100 GPU
 python -m modal run scripts/modal_trainer.py --mode smoke
 
-# 3. Launch full 18-class champion training in detached mode (immune to local network drops)
-python -m modal run --detach scripts/modal_trainer.py --mode run --config configs/training_lora.json
+# 3. Launch full 18-class champion training in 100% detached mode (laptop shutdown & sleep proof):
+python scripts/launch_cloud_training.py --config configs/training_lora.json
+# Or using modal CLI directly:
+# python -m modal run --detach scripts/modal_trainer.py --mode run --config configs/training_lora.json
 
 # 4. Check active cloud apps and live logs
 python -m modal app list

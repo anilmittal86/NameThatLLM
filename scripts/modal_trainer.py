@@ -279,7 +279,15 @@ if modal is not None:
         cfg["stage1"].setdefault("epochs", 2)
         cfg["stage1"].setdefault("max_samples", 150000)
 
-        out_path = run_training_pipeline(cfg)
+        def _on_checkpoint(event: str, step: Any):
+            if event == "checkpoint_saved":
+                try:
+                    checkpoints_volume.commit()
+                    print(f"[Modal Cloud Worker] Permanently committed intermediate checkpoint ({step}) to ntl-checkpoints volume!")
+                except Exception as e:
+                    print(f"[Modal Cloud Worker] Checkpoint volume commit note: {e}")
+
+        out_path = run_training_pipeline(cfg, step_callback=_on_checkpoint)
         checkpoints_volume.commit()
         print(f"[Modal Worker] Training successfully completed. Checkpoints committed to: {out_path}")
         return str(out_path)

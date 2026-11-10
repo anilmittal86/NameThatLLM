@@ -1005,7 +1005,10 @@ def _get_loraplus_param_groups(
     return groups
 
 
-def run_training_pipeline(train_cfg: dict[str, Any] | None = None) -> Path:
+def run_training_pipeline(
+    train_cfg: dict[str, Any] | None = None,
+    step_callback: Any | None = None,
+) -> Path:
     """
     Executes complete Two-Stage Multi-Layer LoRA training pipeline:
     Stage 1: Multi-corpus pretraining on up to 90k passages with family margin loss.
@@ -1054,7 +1057,7 @@ def run_training_pipeline(train_cfg: dict[str, Any] | None = None) -> Path:
         for job in train_cfg["specialist_jobs"]:
             job_cfg = {**train_cfg, **job}
             job_cfg.pop("specialist_jobs", None)
-            final_out = run_training_pipeline(job_cfg)
+            final_out = run_training_pipeline(job_cfg, step_callback=step_callback)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1450,6 +1453,27 @@ def run_training_pipeline(train_cfg: dict[str, Any] | None = None) -> Path:
                     print(
                         f"[Trainer Stage 1] Epoch {ep + 1}/{epochs1} Step {step_idx + 1}/{len(loader1)} (Global {global_step1}/{total_steps1}) | Loss: {loss.item() * accum1:.4f} | Elapsed: {elapsed_m:.1f}m"
                     )
+
+                save_steps = int(stage1_cfg.get("save_steps", 500))
+                if global_step1 % save_steps == 0:
+                    try:
+                        export_compatible_checkpoint(
+                            model=model,
+                            output_dir=out_dir,
+                            layers=layers,
+                            keep=keep_layers,
+                            max_len=max_len,
+                            end_id=end_id,
+                            backbone_name=backbone_name,
+                            class_labels=active_labels,
+                            target_family=target_family if is_specialist else None,
+                        )
+                        print(f"[Trainer Stage 1] Intermediate checkpoint auto-saved at step {global_step1} to {out_dir}")
+                        if step_callback is not None:
+                            step_callback("checkpoint_saved", global_step1)
+                    except Exception as e:
+                        print(f"[Trainer Stage 1 Warning] Auto-save failed at step {global_step1}: {e}")
+
                 if (time.time() - s1_start) >= max_s1_sec:
                     print(
                         f"[Trainer Stage 1] Reached {stage1_cfg.get('max_hours', 12.0)}h time budget at global step {global_step1}; advancing to Stage 2."
@@ -1476,6 +1500,8 @@ def run_training_pipeline(train_cfg: dict[str, Any] | None = None) -> Path:
                 target_family=target_family if is_specialist else None,
             )
             print(f"[Trainer] Safe intermediate Stage 1 checkpoint exported to {out_dir}")
+            if step_callback is not None:
+                step_callback("checkpoint_saved", "stage1_finished")
         except Exception as e:
             print(f"[Trainer] Warning: could not export Stage 1 intermediate checkpoint: {e}")
 
@@ -1625,5 +1651,10 @@ def run_training_pipeline(train_cfg: dict[str, Any] | None = None) -> Path:
         class_labels=active_labels,
         target_family=target_family if is_specialist else None,
     )
+    if step_callback is not None:
+        try:
+            step_callback("checkpoint_saved", "training_complete")
+        except Exception as e:
+            print(f"[Trainer Callback Warning] {e}")
     print(f"[Trainer] Checkpoint exported to {out_dir}")
     return out_dir
