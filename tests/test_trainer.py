@@ -3,32 +3,37 @@ Unit and Integration Tests for namethatllm.trainer
 ==================================================
 """
 
-import unittest
-import math
 import json
-from pathlib import Path
+import math
+import os
 import tempfile
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
 from namethatllm.config import LABELS, K
+from namethatllm.neural_extractor import (
+    load_head_file,
+    read_checkpoint_meta,
+    resolve_head_tensors,
+)
 from namethatllm.trainer import (
     MultiLayerLoRAClassifier,
-    compute_two_stage_loss,
     PromptGroupBatchSampler,
-    export_compatible_checkpoint
+    compute_two_stage_loss,
+    evaluate_stage2_oof_cv,
+    export_compatible_checkpoint,
 )
-from namethatllm.neural_extractor import (
-    read_checkpoint_meta,
-    load_head_file,
-    resolve_head_tensors
-)
+
 
 class MockHiddenStatesModel(nn.Module):
     """Tiny mock causal model that outputs 4 hidden states of dimension hidden_size=32."""
+
     def __init__(self, hidden_size: int = 32, num_layers: int = 4):
         super().__init__()
         self.hidden_size = hidden_size
@@ -44,18 +49,14 @@ class MockHiddenStatesModel(nn.Module):
             hs.append(h)
         return SimpleNamespace(hidden_states=hs)
 
+
 class TestTrainer(unittest.TestCase):
     def test_multi_layer_lora_classifier_forward_and_two_stage_loss(self):
         torch.manual_seed(42)
         hidden_size = 32
         layers = [1, 2, 3]
         mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=4)
-        model = MultiLayerLoRAClassifier(
-            backbone=mock_backbone,
-            hidden_size=hidden_size,
-            layers=layers,
-            num_classes=K
-        )
+        model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K)
 
         batch_size = 6
         seq_len = 10
@@ -71,9 +72,7 @@ class TestTrainer(unittest.TestCase):
         labels = torch.randint(0, K, (batch_size,))
         prompt_ids = ["p1", "p1", "p1", "p2", "p2", "p3"]
 
-        tot_loss, l_plain, l_centered = compute_two_stage_loss(
-            model, Z, labels, prompt_ids=prompt_ids, centered_weight=0.5
-        )
+        tot_loss, l_plain, l_centered = compute_two_stage_loss(model, Z, labels, prompt_ids=prompt_ids, centered_weight=0.5)
         self.assertTrue(torch.isfinite(tot_loss))
         self.assertTrue(torch.isfinite(l_plain))
         self.assertTrue(torch.isfinite(l_centered))
@@ -98,12 +97,7 @@ class TestTrainer(unittest.TestCase):
         hidden_size = 32
         layers = [1, 2, 3]
         mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=4)
-        model = MultiLayerLoRAClassifier(
-            backbone=mock_backbone,
-            hidden_size=hidden_size,
-            layers=layers,
-            num_classes=K
-        )
+        model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             out_p = Path(tmp_dir) / "export_test"
@@ -121,7 +115,7 @@ class TestTrainer(unittest.TestCase):
                 end_id=151643,
                 Z_train=Z_train,
                 y_train=y_train,
-                prompts_train=prompts_train
+                prompts_train=prompts_train,
             )
 
             # 1. Assert files exist
@@ -153,6 +147,7 @@ class TestTrainer(unittest.TestCase):
 
     def test_collate_text_batch_preserves_token_zero(self):
         from namethatllm.trainer import collate_text_batch
+
         b1 = {
             "input_ids": torch.tensor([0, 42, 99], dtype=torch.long),
             "attention_mask": torch.ones(3, dtype=torch.long),
@@ -177,10 +172,12 @@ class TestTrainer(unittest.TestCase):
 
     def test_peft_wrapped_model_disables_final_norm(self):
         from namethatllm.trainer import _disable_final_norm
+
         class MockNorm(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.weight = nn.Parameter(torch.ones(16))
+
             def forward(self, x):
                 return x * self.weight
 
@@ -206,16 +203,12 @@ class TestTrainer(unittest.TestCase):
 
     def test_train_prompt_group_step_microbatched(self):
         from namethatllm.trainer import train_prompt_group_step
+
         torch.manual_seed(42)
         hidden_size = 32
         layers = [1, 2, 3]
         mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=4)
-        model = MultiLayerLoRAClassifier(
-            backbone=mock_backbone,
-            hidden_size=hidden_size,
-            layers=layers,
-            num_classes=K
-        )
+        model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K)
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
         input_ids = torch.randint(0, 100, (6, 12))
         attention_mask = torch.ones(6, 12, dtype=torch.long)
@@ -231,7 +224,7 @@ class TestTrainer(unittest.TestCase):
             labels=labels,
             micro_batch_size=2,
             centered_weight=0.5,
-            label_smoothing=0.10
+            label_smoothing=0.10,
         )
         self.assertTrue(math.isfinite(tot_loss))
         self.assertTrue(math.isfinite(l_plain))
@@ -244,8 +237,9 @@ class TestTrainer(unittest.TestCase):
         self.assertGreater(model.centered_head.weight.grad.abs().sum().item(), 0.0)
 
     def test_family_margin_cross_entropy_penalizes_sister_classes(self):
-        from namethatllm.trainer import family_margin_cross_entropy, _build_sister_mask
         from namethatllm.config import FAMILIES
+        from namethatllm.trainer import _build_sister_mask, family_margin_cross_entropy
+
         mask = _build_sister_mask(torch.device("cpu"))
         self.assertEqual(mask.shape, (K, K))
 
@@ -284,11 +278,24 @@ class TestTrainer(unittest.TestCase):
         glm_loss = family_margin_cross_entropy(glm_logits, glm_labels, family_margin=0.40)
         self.assertGreater(glm_loss.item(), 0.0)
 
+        # Boosted 18-class sister mask checks:
+        boosted_mask = _build_sister_mask(torch.device("cpu"), boosted=True)
+        self.assertAlmostEqual(boosted_mask[7, 8].item(), 1.5, places=5)
+        self.assertAlmostEqual(boosted_mask[8, 7].item(), 1.5, places=5)
+        self.assertAlmostEqual(boosted_mask[2, 3].item(), 1.4, places=5)
+        self.assertAlmostEqual(boosted_mask[15, 16].item(), 1.4, places=5)
+
     def test_family_specialists_checkpoint_export_and_inference_load(self):
         """Verify export_compatible_checkpoint and resolve_head_tensors for 5-class, 4-class, and 2-class specialists."""
-        from namethatllm.trainer import MultiLayerLoRAClassifier, export_compatible_checkpoint
-        from namethatllm.neural_extractor import load_head_file, resolve_head_tensors, read_checkpoint_meta
         from namethatllm.config import FAMILIES, LABELS
+        from namethatllm.neural_extractor import (
+            load_head_file,
+            resolve_head_tensors,
+        )
+        from namethatllm.trainer import (
+            MultiLayerLoRAClassifier,
+            export_compatible_checkpoint,
+        )
 
         hidden_size = 32
         layers = [1, 2, 3]
@@ -299,12 +306,7 @@ class TestTrainer(unittest.TestCase):
             active_labels = [LABELS[c] for c in fam_cols]
 
             mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=4)
-            model = MultiLayerLoRAClassifier(
-                backbone=mock_backbone,
-                hidden_size=hidden_size,
-                layers=layers,
-                num_classes=K_fam
-            )
+            model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K_fam)
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 out_p = Path(tmp_dir) / f"export_{fam_name}"
@@ -316,7 +318,7 @@ class TestTrainer(unittest.TestCase):
                     max_len=447,
                     end_id=151643,
                     class_labels=active_labels,
-                    target_family=fam_name
+                    target_family=fam_name,
                 )
 
                 # 1. Assert files exist
@@ -346,6 +348,7 @@ class TestTrainer(unittest.TestCase):
 
     def test_bucketed_length_batch_sampler(self):
         from namethatllm.trainer import BucketedLengthBatchSampler
+
         lengths = [10, 500, 15, 480, 20, 510, 12, 490]
         sampler = BucketedLengthBatchSampler(lengths, batch_size=2, bucket_size_multiplier=2, shuffle=False)
         batches = list(iter(sampler))
@@ -357,26 +360,14 @@ class TestTrainer(unittest.TestCase):
         hidden_size = 16
         layers = [1, 2]
         mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=3)
-        model = MultiLayerLoRAClassifier(
-            backbone=mock_backbone,
-            hidden_size=hidden_size,
-            layers=layers,
-            num_classes=K
-        )
+        model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K)
         # Custom head values
         model.plain_head.weight.data.fill_(0.42)
         model.plain_head.bias.data.fill_(0.15)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             out_p = Path(tmp_dir) / "ckpt_export"
-            export_compatible_checkpoint(
-                model=model,
-                output_dir=out_p,
-                layers=layers,
-                keep=2,
-                max_len=128,
-                end_id=151643
-            )
+            export_compatible_checkpoint(model=model, output_dir=out_p, layers=layers, keep=2, max_len=128, end_id=151643)
             heads_sd = load_head_file(out_p)
             W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
             self.assertIsNotNone(W_p)
@@ -386,6 +377,7 @@ class TestTrainer(unittest.TestCase):
 
     def test_compute_supcon_loss_unique_labels_no_nan(self):
         from namethatllm.trainer import compute_supcon_loss
+
         torch.manual_seed(42)
 
         # 1. Verification of 2-arg signature on distinct-class positive cosine vectors
@@ -405,13 +397,7 @@ class TestTrainer(unittest.TestCase):
         centered_head_weight = torch.randn(K, 64, requires_grad=True)
         Z_group_centered = torch.randn(18, 64)
 
-        loss = compute_supcon_loss(
-            Z_c_mb,
-            labels_mb,
-            temperature=0.10,
-            prototypes=centered_head_weight,
-            Z_group_centered=Z_group_centered
-        )
+        loss = compute_supcon_loss(Z_c_mb, labels_mb, temperature=0.10, prototypes=centered_head_weight, Z_group_centered=Z_group_centered)
         self.assertTrue(torch.isfinite(loss))
         self.assertGreater(loss.item(), 0.0)
 
@@ -422,18 +408,18 @@ class TestTrainer(unittest.TestCase):
         self.assertGreater(centered_head_weight.grad.abs().sum().item(), 0.0)
 
     def test_stage1_time_budget_guard_and_metadata_backbone(self):
-        from namethatllm.config import _inspect_checkpoint_dim_and_keep, find_checkpoints
         from safetensors.torch import save_file
+
+        from namethatllm.config import (
+            _inspect_checkpoint_dim_and_keep,
+            find_checkpoints,
+        )
+
         torch.manual_seed(42)
         hidden_size = 16
         layers = [1, 2]
         mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=3)
-        model = MultiLayerLoRAClassifier(
-            backbone=mock_backbone,
-            hidden_size=hidden_size,
-            layers=layers,
-            num_classes=K
-        )
+        model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -441,13 +427,7 @@ class TestTrainer(unittest.TestCase):
             # Export Qwen3-14B inhouse
             q3_p = tmp_path / "export_champion_qwen3_14b"
             export_compatible_checkpoint(
-                model=model,
-                output_dir=q3_p,
-                layers=layers,
-                keep=27,
-                max_len=128,
-                end_id=151643,
-                backbone_name="Qwen/Qwen3-14B-Base"
+                model=model, output_dir=q3_p, layers=layers, keep=27, max_len=128, end_id=151643, backbone_name="Qwen/Qwen3-14B-Base"
             )
             # Create a 14B heads file containing 1D norms.0.weight (5120) and 2D plain.weight (18, 40960)
             mock_14b_heads = {
@@ -455,7 +435,7 @@ class TestTrainer(unittest.TestCase):
                 "plain.weight": torch.randn(18, 40960),
                 "plain.bias": torch.zeros(18),
                 "centered.weight": torch.randn(18, 40960),
-                "centered.bias": torch.zeros(18)
+                "centered.bias": torch.zeros(18),
             }
             save_file(mock_14b_heads, str(q3_p / "heads.safetensors"))
 
@@ -467,13 +447,7 @@ class TestTrainer(unittest.TestCase):
             # Export Qwen2.5-14B inhouse
             q25_p = tmp_path / "export_champion_qwen25_14b"
             export_compatible_checkpoint(
-                model=model,
-                output_dir=q25_p,
-                layers=layers,
-                keep=32,
-                max_len=128,
-                end_id=151643,
-                backbone_name="Qwen/Qwen2.5-14B"
+                model=model, output_dir=q25_p, layers=layers, keep=32, max_len=128, end_id=151643, backbone_name="Qwen/Qwen2.5-14B"
             )
             dim25, keep25, bb25 = _inspect_checkpoint_dim_and_keep(q25_p)
             self.assertIn("qwen2.5", bb25)
@@ -497,37 +471,48 @@ class TestTrainer(unittest.TestCase):
         self.assertLessEqual(len(lines), 150, f"compile_notebook.py is {len(lines)} lines; must be <= 150")
 
         # Compile both notebooks
-        from scripts.compile_notebook import compile_submission_notebook, compile_training_notebook
+        from scripts.compile_notebook import (
+            compile_submission_notebook,
+            compile_training_notebook,
+        )
+
         sub_out = compile_submission_notebook(
-            repo_root / "configs" / "production_ensemble.json",
-            repo_root / "kernels" / "submission" / "kaggle_submission.ipynb"
+            repo_root / "configs" / "production_ensemble.json", repo_root / "kernels" / "submission" / "kaggle_submission.ipynb"
         )
         self.assertTrue(sub_out.exists())
 
         trn_out = compile_training_notebook(
-            repo_root / "configs" / "training_lora.json",
-            repo_root / "kernels" / "training" / "lora_training.ipynb"
+            repo_root / "configs" / "training_lora.json", repo_root / "kernels" / "training" / "lora_training.ipynb"
         )
         self.assertTrue(trn_out.exists())
 
     def test_merge_lora_atomic_rejection_on_mlp_shape_mismatch(self):
         """Verify merge_lora atomically rejects mismatched adapter (e.g. Llama vs Qwen) without partial mutation."""
-        from namethatllm.neural_extractor import merge_lora
         from safetensors.torch import save_file
+
+        from namethatllm.neural_extractor import merge_lora
 
         class DummyTrunk(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList([
-                    nn.ModuleDict({
-                        "self_attn": nn.ModuleDict({
-                            "q_proj": nn.Linear(64, 64, bias=False),
-                        }),
-                        "mlp": nn.ModuleDict({
-                            "up_proj": nn.Linear(64, 128, bias=False),  # Qwen shape: out=128, in=64
-                        })
-                    })
-                ])
+                self.layers = nn.ModuleList(
+                    [
+                        nn.ModuleDict(
+                            {
+                                "self_attn": nn.ModuleDict(
+                                    {
+                                        "q_proj": nn.Linear(64, 64, bias=False),
+                                    }
+                                ),
+                                "mlp": nn.ModuleDict(
+                                    {
+                                        "up_proj": nn.Linear(64, 128, bias=False),  # Qwen shape: out=128, in=64
+                                    }
+                                ),
+                            }
+                        )
+                    ]
+                )
 
         trunk = DummyTrunk()
         orig_q = trunk.layers[0]["self_attn"]["q_proj"].weight.clone()
@@ -558,22 +543,12 @@ class TestTrainer(unittest.TestCase):
         from transformers import AutoConfig, AutoModel
 
         cfg = AutoConfig.for_model(
-            "qwen2",
-            hidden_size=64,
-            num_hidden_layers=4,
-            num_attention_heads=2,
-            num_key_value_heads=2,
-            intermediate_size=128
+            "qwen2", hidden_size=64, num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=2, intermediate_size=128
         )
         base = AutoModel.from_config(cfg)
         base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        clf = MultiLayerLoRAClassifier(
-            backbone=base,
-            hidden_size=64,
-            layers=[1, 3],
-            num_classes=18
-        )
+        clf = MultiLayerLoRAClassifier(backbone=base, hidden_size=64, layers=[1, 3], num_classes=18)
 
         input_ids = torch.randint(0, 100, (2, 16))
         attention_mask = torch.ones((2, 16), dtype=torch.long)
@@ -588,8 +563,9 @@ class TestTrainer(unittest.TestCase):
 
     def test_inspect_checkpoint_dim_and_keep_ignores_1d_norms(self):
         """Verify _inspect_checkpoint_dim_and_keep ignores 1D norms.0.weight and returns 2D plain.weight dimension."""
-        from namethatllm.config import _inspect_checkpoint_dim_and_keep
         from safetensors.torch import save_file
+
+        from namethatllm.config import _inspect_checkpoint_dim_and_keep
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
@@ -609,6 +585,182 @@ class TestTrainer(unittest.TestCase):
             self.assertEqual(keep, 27)
             self.assertEqual(backbone, "qwen3-14b")
 
+    def test_setup_training_env_alias_and_execution(self):
+        """Verify _setup_training_env and _configure_training_environment alias configure environment without side-effects."""
+        from namethatllm.trainer import _configure_training_environment, _setup_training_env
+
+        self.assertIs(_setup_training_env, _configure_training_environment)
+        _setup_training_env()
+        self.assertEqual(os.environ.get("PYTORCH_CUDA_ALLOC_CONF"), "expandable_segments:True")
+
+    def test_modal_trainer_launcher_thin_design(self):
+        """Verify scripts/modal_trainer.py is a thin launcher delegating to namethatllm.trainer."""
+        modal_script = Path(__file__).resolve().parents[1] / "scripts" / "modal_trainer.py"
+        self.assertTrue(modal_script.exists())
+        code = modal_script.read_text(encoding="utf-8")
+
+        # Must NOT contain legacy duplicated model / training loops
+        self.assertNotIn("def build_model_and_tokenizer", code)
+        self.assertNotIn("class PassageDataset", code)
+        self.assertNotIn("def collate_fn", code)
+
+        # Must delegate to namethatllm.trainer
+        self.assertIn("from namethatllm.trainer import run_training_pipeline", code)
+        self.assertIn("train_cloud_worker", code)
+
+    def test_evaluate_stage2_oof_cv_overfitting_gap(self):
+        """Verify 5-stage GroupKFold CV partitions by prompt_id, quantifies overfitting gap, and exports report + predictions."""
+        np.random.seed(42)
+        n_prompts = 10
+        samples_per_prompt = K
+        n_samples = n_prompts * samples_per_prompt
+        dim = 64
+
+        y = np.tile(np.arange(K), n_prompts)
+        prompts = np.repeat([f"prompt_{p}" for p in range(n_prompts)], samples_per_prompt)
+        author_prototypes = np.random.randn(K, dim)
+        prompt_effects = np.random.randn(n_prompts, dim)
+
+        Z = np.zeros((n_samples, dim), dtype=np.float32)
+        for i in range(n_samples):
+            p_idx = int(prompts[i].split("_")[1])
+            Z[i] = author_prototypes[y[i]] + 0.3 * prompt_effects[p_idx] + 0.1 * np.random.randn(dim)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_p = Path(tmp_dir)
+            report = evaluate_stage2_oof_cv(
+                Z=Z,
+                y=y,
+                prompts=prompts,
+                n_splits=5,
+                alpha=5.0,
+                label_smoothing=0.05,
+                num_classes=K,
+                class_labels=list(LABELS),
+                output_dir=out_p,
+            )
+
+            self.assertEqual(report["n_splits"], 5)
+            self.assertEqual(report["n_samples"], 180)
+            self.assertEqual(report["n_prompts"], 10)
+            self.assertEqual(len(report["folds"]), 5)
+            self.assertIn("mean_train_bacc", report)
+            self.assertIn("oof_sink_bacc", report)
+            self.assertIn("overfit_gap", report)
+            self.assertIsInstance(report["overfit_gap"], float)
+            self.assertIn(report["verdict"].split()[0], {"LOW", "MODERATE", "HIGH"})
+
+            json_file = out_p / "stage2_cv_report.json"
+            self.assertTrue(json_file.exists())
+            saved_report = json.loads(json_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved_report["n_splits"], 5)
+            self.assertEqual(len(saved_report["folds"]), 5)
+
+            npz_file = out_p / "stage2_oof_predictions.npz"
+            self.assertTrue(npz_file.exists())
+            with np.load(npz_file) as npz_data:
+                self.assertEqual(npz_data["oof_plain_lp"].shape, (180, K))
+                self.assertEqual(npz_data["oof_centered_lp"].shape, (180, K))
+                self.assertEqual(npz_data["oof_blend_lp"].shape, (180, K))
+                self.assertEqual(npz_data["oof_sink_probs"].shape, (180, K))
+                np.testing.assert_array_equal(npz_data["y_true"], y)
+                np.testing.assert_array_equal(npz_data["prompts"], prompts)
+
+            single_prompt = np.array(["p1"] * 20)
+            empty_report = evaluate_stage2_oof_cv(
+                Z=Z[:20],
+                y=y[:20],
+                prompts=single_prompt,
+                n_splits=5,
+                num_classes=K,
+            )
+            self.assertEqual(empty_report, {})
+
+    def test_loraplus_param_groups_asymmetric_learning_rates(self):
+        """Verify LoRA+ splits lora_A and lora_B parameters with asymmetric multiplier."""
+        from namethatllm.trainer import _get_loraplus_param_groups
+
+        hidden_size = 16
+        layers = [1, 2]
+        mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=3)
+        # Mock lora_A and lora_B named parameters in backbone
+        mock_backbone.lora_A = nn.Linear(hidden_size, 4, bias=False)
+        mock_backbone.lora_B = nn.Linear(4, hidden_size, bias=False)
+
+        model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K)
+
+        lr_lora = 1e-4
+        lr_head = 5e-4
+        ratio = 2.5
+        groups = _get_loraplus_param_groups(model, lr_lora=lr_lora, lr_head=lr_head, lora_plus_ratio=ratio, include_centered_head=True)
+
+        lrs = [g["lr"] for g in groups]
+        self.assertIn(lr_lora, lrs)
+        self.assertIn(lr_lora * ratio, lrs)
+        self.assertIn(lr_head, lrs)
+
+    def test_family_margin_cross_entropy_hard_class_weights(self):
+        """Verify family_margin_cross_entropy accepts class weights and increases penalty on hard classes."""
+        from namethatllm.trainer import family_margin_cross_entropy
+
+        # Sample 0 has high confidence for class 0 (low loss ~0.01), sample 1 has low confidence for class 3 (high loss ~2.89)
+        logits = torch.zeros(2, K)
+        logits[0, 0] = 5.0
+        labels = torch.tensor([0, 3])  # 3 is in HARD_CLASS_INDICES
+        weights = torch.ones(K)
+        weights[3] = 2.0  # Upweight the high-loss hard class
+
+        unweighted_loss = family_margin_cross_entropy(logits, labels, family_margin=0.0)
+        weighted_loss = family_margin_cross_entropy(logits, labels, family_margin=0.0, weight=weights)
+
+        self.assertTrue(torch.isfinite(weighted_loss))
+        self.assertGreater(weighted_loss.item(), unweighted_loss.item())
+
+    def test_variable_size_sub_cluster_centering_step(self):
+        """Verify train_prompt_group_step executes with N >= 8 variable sub-cluster centering."""
+        from namethatllm.trainer import train_prompt_group_step
+
+        torch.manual_seed(42)
+        hidden_size = 16
+        layers = [1, 2]
+        mock_backbone = MockHiddenStatesModel(hidden_size=hidden_size, num_layers=3)
+        model = MultiLayerLoRAClassifier(backbone=mock_backbone, hidden_size=hidden_size, layers=layers, num_classes=K)
+
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        N = 10  # >= 8 to trigger variable sub-cluster logic
+        seq_len = 12
+        input_ids = torch.randint(0, 100, (N, seq_len))
+        attention_mask = torch.ones((N, seq_len), dtype=torch.long)
+        labels = torch.arange(N) % K
+
+        tot_loss, p_loss, c_loss = train_prompt_group_step(
+            model=model,
+            opt=opt,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            micro_batch_size=4,
+            centered_weight=0.60,
+            family_margin=0.35,
+            supcon_weight=0.20,
+            compute_dtype=torch.float32,
+        )
+        self.assertTrue(math.isfinite(tot_loss))
+        self.assertTrue(math.isfinite(p_loss))
+        self.assertTrue(math.isfinite(c_loss))
+
+    def test_resolve_all_pool_files_includes_pool_120k(self):
+        """Verify resolve_all_pool_files discovers pool_120k.parquet."""
+        from namethatllm.config import resolve_all_pool_files
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_p = Path(tmp_dir)
+            p120 = tmp_p / "pool_120k.parquet"
+            p120.touch()
+
+            discovered = resolve_all_pool_files(tmp_p)
+            self.assertIn(p120, discovered)
+
+
 if __name__ == "__main__":
     unittest.main()
-

@@ -14,21 +14,21 @@ This module handles all post-ensemble refinement stages:
 
 import re
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+
 import numpy as np
 import pandas as pd
 
-from .config import LABELS, K, LAB2I, FAMILIES, SPECIALIST_GROUPS, softmax, log_softmax
+from .config import FAMILIES, LAB2I, LABELS, SPECIALIST_GROUPS, K, softmax
 from .lexical_engine import extract_handwriting_and_orthographic_features
-
 
 # =============================================================================
 # 1. WITHIN-FAMILY CONFIDENCE GATES (SPECTRAL / TIE-BREAKER HEURISTICS)
 # =============================================================================
 
+
 def apply_all_family_confidence_gates(
     P_mix: np.ndarray,
-    family_gates: Optional[Dict[str, np.ndarray]],
+    family_gates: dict[str, np.ndarray] | None,
     max_strength: float = 0.20,
     margin_thr: float = 0.45,
 ) -> np.ndarray:
@@ -100,7 +100,9 @@ def apply_all_family_confidence_gates(
 
         # Hard-sister groups (e.g. Gemini 3.7 vs 3.8, GLM) use wider margin threshold
         eff_margin_thr = 0.65 if fam_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else margin_thr
-        eff_max_strength = max(float(max_strength), 0.35) if fam_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else float(max_strength)
+        eff_max_strength = (
+            max(float(max_strength), 0.35) if fam_name in ("gemini_37_38_pair", "glm", "glm_kimi_triad") else float(max_strength)
+        )
 
         # Step 1: Extract sub-probabilities and preserve total marginal mass
         sub_p = np.clip(P_out[np.ix_(row_mask, cols)], 1e-12, 1.0)
@@ -131,9 +133,10 @@ def apply_all_family_confidence_gates(
 # 2. PROMPT-CLUSTER UNIQUENESS REPULSION (CAVITY MEAN-FIELD)
 # =============================================================================
 
+
 def apply_cluster_uniqueness_repulsion(
     P_mix: np.ndarray,
-    groups: Optional[np.ndarray],
+    groups: np.ndarray | None,
     strength: float = 0.35,
     iters: int = 3,
 ) -> np.ndarray:
@@ -196,7 +199,7 @@ def apply_cluster_uniqueness_repulsion(
     for _ in range(iters):
         L = log_P0.copy()
         for g in valid_g:
-            m = (safe_g == g)
+            m = safe_g == g
             q_g = q[m]  # Shape: (cluster_size, 18)
 
             # lo[j, k] = log(1 - q_{j, k}): log-probability that sample j did NOT pick class k
@@ -217,12 +220,10 @@ def apply_cluster_uniqueness_repulsion(
 # 3. TWO-TIER CONVEX ENSEMBLE BLENDING
 # =============================================================================
 
+
 def blend_main_and_complementary(
-    LOGIT_MAIN: np.ndarray,
-    COMP_LIST: List[Tuple[float, np.ndarray]],
-    main_ratio: float = 0.85,
-    comp_ratio: float = 0.15
-) -> Tuple[np.ndarray, np.ndarray]:
+    LOGIT_MAIN: np.ndarray, COMP_LIST: list[tuple[float, np.ndarray]], main_ratio: float = 0.85, comp_ratio: float = 0.15
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Blends the Main Stack and Complementary Stack in probability space.
 
@@ -272,15 +273,16 @@ def blend_main_and_complementary(
 # 4. NEURAL SPECIALIST GATES (CLAUDE HEAD & FAMILY LORAS)
 # =============================================================================
 
+
 def apply_claude_specialist_gate(
     P_mix: np.ndarray,
     R_main: np.ndarray,
-    claude_spec_logits: Optional[np.ndarray],
-    claude_classes: Optional[list] = None,
+    claude_spec_logits: np.ndarray | None,
+    claude_classes: list | None = None,
     labels: list = LABELS,
     claude_cols: list = FAMILIES["claude"],
     gate_weight: float = 0.15,
-    weight: Optional[float] = None,
+    weight: float | None = None,
 ) -> np.ndarray:
     """
     Refines passages predicted in the Claude family using a specialist head
@@ -316,8 +318,8 @@ def apply_claude_specialist_gate(
 def apply_family_specialist_lora_gate(
     P_mix: np.ndarray,
     R_main: np.ndarray,
-    spec_logits: Optional[np.ndarray],
-    spec_classes: Optional[list] = None,
+    spec_logits: np.ndarray | None,
+    spec_classes: list | None = None,
     labels: list = LABELS,
     family_cols: list = FAMILIES["gemini"],
     gate_weight: float = 0.65,
@@ -363,11 +365,12 @@ def apply_family_specialist_lora_gate(
 # 5. ORTHOGRAPHIC RULES & HANDWRITING SHIELD
 # =============================================================================
 
+
 def build_orthographic_penalty_matrix(
-    curly_quote_log_penalty: float = -1.00,      # Rule 1: Claude & GLM never emit curly quotes
-    multi_em_dash_log_penalty: float = 0.0,      # Rule 2: Multiple prose em-dashes (rare in Gemini)
-    straight_contr_log_penalty: float = 0.0,     # Rule 3: Straight contractions
-    curly_contr_log_penalty: float = 0.0,        # Rule 4: Curly contractions
+    curly_quote_log_penalty: float = -1.00,  # Rule 1: Claude & GLM never emit curly quotes
+    multi_em_dash_log_penalty: float = 0.0,  # Rule 2: Multiple prose em-dashes (rare in Gemini)
+    straight_contr_log_penalty: float = 0.0,  # Rule 3: Straight contractions
+    curly_contr_log_penalty: float = 0.0,  # Rule 4: Curly contractions
 ) -> np.ndarray:
     """
     Builds the (4, 18) log-penalty matrix W_pen mapping discrete orthographic
@@ -401,7 +404,7 @@ def build_orthographic_penalty_matrix(
     return W_pen
 
 
-def _extract_rules_fallback(texts: List[str]) -> np.ndarray:
+def _extract_rules_fallback(texts: list[str]) -> np.ndarray:
     """
     Fallback discrete rules extractor using regex when lexical_engine is unavailable.
     Detects curly quotes, em-dashes, and straight/curly prose contractions.
@@ -425,9 +428,9 @@ def _extract_rules_fallback(texts: List[str]) -> np.ndarray:
 
 def apply_unified_handwriting_shield(
     P_mix: np.ndarray,
-    test_texts: List[str],
-    log_p_handwriting: Optional[np.ndarray] = None,
-    rule_flags: Optional[np.ndarray] = None,
+    test_texts: list[str],
+    log_p_handwriting: np.ndarray | None = None,
+    rule_flags: np.ndarray | None = None,
     curly_quote_multiplier: float = 0.36787944117144233,  # exp(-1.0)
     multi_em_dash_log_penalty: float = 0.0,
     straight_contr_log_penalty: float = 0.0,
@@ -466,11 +469,7 @@ def apply_unified_handwriting_shield(
     return softmax(log_P, axis=1)
 
 
-def apply_curly_quote_shield(
-    P_mix: np.ndarray,
-    test_texts: List[str],
-    multiplier: float = 0.36787944117144233
-) -> np.ndarray:
+def apply_curly_quote_shield(P_mix: np.ndarray, test_texts: list[str], multiplier: float = 0.36787944117144233) -> np.ndarray:
     """Backward-compatible wrapper invoking the unified handwriting shield."""
     return apply_unified_handwriting_shield(
         P_mix=P_mix,
@@ -489,12 +488,13 @@ def apply_curly_quote_shield(
 # 6. SINKHORN-KNOPP COLUMN MASS BALANCING
 # =============================================================================
 
+
 def sinkhorn_balancing(
     P: np.ndarray,
     iters: int = 100,
     sinkhorn_strength: float = 0.65,
     target_mix: float = 0.35,
-    train_prior: Optional[np.ndarray] = None,
+    train_prior: np.ndarray | None = None,
     allow_pure: bool = False,
 ) -> np.ndarray:
     """
@@ -576,11 +576,12 @@ def sinkhorn_balancing(
 # 7. TYPOBAYES POSTPROCESSOR (HIERARCHICAL BETA-BERNOULLI SHRINKAGE)
 # =============================================================================
 
+
 def apply_typobayes_postprocess(
     P_or_logP: np.ndarray,
-    train_texts: List[str],
+    train_texts: list[str],
     y_train: np.ndarray,
-    test_texts: List[str],
+    test_texts: list[str],
     labels: list = LABELS,
     kappa: float = 24.0,
     evidence_scale: float = 1.2,
@@ -602,13 +603,80 @@ def apply_typobayes_postprocess(
 
     y_tr = np.array([LAB2I[y] if isinstance(y, str) else int(y) for y in y_train], dtype=int)
     marks = [
-        ' — ', '—', '–', '’', '‘', '“', '”', '«', '»', '"', ';', ':', '(', ')', '[', ']',
-        '**', '`', '…', '•', '\n', '\n\n', 'e.g.', 'i.e.', 'However,', 'Overall,',
-        'In conclusion', 'Therefore,', 'Moreover,', '\t', ' - ', ' = ', '\n- ', '\n1.', '###', '```', '> '
+        " — ",
+        "—",
+        "–",
+        "’",
+        "‘",
+        "“",
+        "”",
+        "«",
+        "»",
+        '"',
+        ";",
+        ":",
+        "(",
+        ")",
+        "[",
+        "]",
+        "**",
+        "`",
+        "…",
+        "•",
+        "\n",
+        "\n\n",
+        "e.g.",
+        "i.e.",
+        "However,",
+        "Overall,",
+        "In conclusion",
+        "Therefore,",
+        "Moreover,",
+        "\t",
+        " - ",
+        " = ",
+        "\n- ",
+        "\n1.",
+        "###",
+        "```",
+        "> ",
     ]
     K_cls = len(labels)
-    Xtr = np.array([[float(m in t) for m in marks] for t in train_texts], dtype=np.float32)
-    Xte = np.array([[float(m in t) for m in marks] for t in test_texts], dtype=np.float32)
+
+    def _extract_marker_row(t: str) -> list[float]:
+        # Mutually exclusive decoupling for overlapping substrings:
+        # 1. ' — ' vs unspaced '—'
+        has_spaced_em = " — " in t
+        t_no_spaced = t.replace(" — ", "")
+        has_unspaced_em = "—" in t_no_spaced
+
+        # 2. '\n\n', '\n- ', '\n1.' vs standalone '\n'
+        has_double_nl = "\n\n" in t
+        has_bullet = "\n- " in t
+        has_num_list = "\n1." in t
+        t_no_compound_nl = t.replace("\n\n", "").replace("\n- ", "").replace("\n1.", "")
+        has_single_nl = "\n" in t_no_compound_nl
+
+        row = []
+        for m in marks:
+            if m == " — ":
+                row.append(float(has_spaced_em))
+            elif m == "—":
+                row.append(float(has_unspaced_em))
+            elif m == "\n\n":
+                row.append(float(has_double_nl))
+            elif m == "\n- ":
+                row.append(float(has_bullet))
+            elif m == "\n1.":
+                row.append(float(has_num_list))
+            elif m == "\n":
+                row.append(float(has_single_nl))
+            else:
+                row.append(float(m in t))
+        return row
+
+    Xtr = np.array([_extract_marker_row(t) for t in train_texts], dtype=np.float32)
+    Xte = np.array([_extract_marker_row(t) for t in test_texts], dtype=np.float32)
     freq = np.bincount(y_tr, minlength=K_cls).astype(np.float64)
     hits = np.stack([Xtr[y_tr == k].sum(axis=0) for k in range(K_cls)], axis=0).astype(np.float64)
 
@@ -647,7 +715,7 @@ def apply_typobayes_postprocess(
     sorted_p = np.sort(probs, axis=1)
     margin = sorted_p[:, -1] - sorted_p[:, -2]
     confidence_gate = np.clip((0.60 - margin) / 0.60, 0.0, 1.0)
-    word_count = np.array([len(re.findall(r'\b\w+\b', str(t))) for t in test_texts], dtype=np.float32)
+    word_count = np.array([len(re.findall(r"\b\w+\b", str(t))) for t in test_texts], dtype=np.float32)
     length_gate = np.clip(np.sqrt(np.maximum(word_count, 1.0) / 80.0), 0.40, 1.0)
     active_markers = Xte.sum(axis=1)
     coverage_gate = np.clip(np.sqrt((active_markers + 1.0) / 4.0), 0.45, 1.0)
@@ -661,11 +729,8 @@ def apply_typobayes_postprocess(
 # 8. FINAL SUBMISSION EXPORT
 # =============================================================================
 
-def generate_submission(
-    P_final: np.ndarray,
-    test_ids: pd.Series,
-    working_dir: Path
-) -> Tuple[pd.DataFrame, Path, Path]:
+
+def generate_submission(P_final: np.ndarray, test_ids: pd.Series, working_dir: Path) -> tuple[pd.DataFrame, Path, Path]:
     """
     Generates submission.parquet and submission.csv with exact Kaggle competition schema:
     - id: test sample identifier string

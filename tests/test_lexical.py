@@ -5,12 +5,18 @@ Unit and Integration Tests for namethatllm.lexical_engine
 
 import unittest
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from scipy import sparse
 
-from namethatllm.lexical_engine import shape_text, function_text, STOP_WORDS, run_lexical_engine
 from namethatllm.config import LABELS, K
+from namethatllm.lexical_engine import (
+    STOP_WORDS,
+    function_text,
+    run_lexical_engine,
+    shape_text,
+)
+
 
 class TestLexicalEngine(unittest.TestCase):
     def test_shape_text_patterns(self):
@@ -45,6 +51,7 @@ class TestLexicalEngine(unittest.TestCase):
 
     def test_run_lexical_engine_mock(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
 
@@ -86,7 +93,8 @@ class TestLexicalEngine(unittest.TestCase):
 
     def test_shape_and_function_vectorizers_preserve_case_and_punctuation(self):
         from sklearn.feature_extraction.text import TfidfVectorizer
-        from namethatllm.lexical_engine import shape_text, function_text
+
+        from namethatllm.lexical_engine import function_text, shape_text
 
         text = "Hello World! It's — great; test."
         sh = shape_text(text)
@@ -102,12 +110,12 @@ class TestLexicalEngine(unittest.TestCase):
         self.assertIn("it", vocab)
 
     def test_extract_handwriting_features_shape_and_contractions(self):
-        from namethatllm.lexical_engine import extract_handwriting_features, extract_handwriting_and_orthographic_features
+        from namethatllm.lexical_engine import (
+            extract_handwriting_and_orthographic_features,
+            extract_handwriting_features,
+        )
 
-        samples = [
-            "It's a straight contraction — test with em-dash.",
-            "It\u2019s a curly contraction; test without em-dash."
-        ]
+        samples = ["It's a straight contraction — test with em-dash.", "It\u2019s a curly contraction; test without em-dash."]
         feats = extract_handwriting_features(samples)
         self.assertEqual(feats.shape, (2, 26))
         # Feature 14 is straight contractions, Feature 15 is curly contractions
@@ -125,6 +133,7 @@ class TestLexicalEngine(unittest.TestCase):
 
     def test_pool_source_weight_filename_check_and_core_prefix(self):
         import tempfile
+
         from namethatllm.config import LABELS, K
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -137,42 +146,46 @@ class TestLexicalEngine(unittest.TestCase):
             # File 2: nlm_matched_clean.parquet
             p_matched = tmp / "nlm_matched_clean.parquet"
 
-            df_pool = pd.DataFrame({
-                "text": [f"Pool passage {i} with sufficient competition passage length for verification." for i in range(18)],
-                "model": [LABELS[i % K] for i in range(18)]
-            })
+            df_pool = pd.DataFrame(
+                {
+                    "text": [f"Pool passage {i} with sufficient competition passage length for verification." for i in range(18)],
+                    "model": [LABELS[i % K] for i in range(18)],
+                }
+            )
             df_pool.to_parquet(p_v5)
             df_pool.to_parquet(p_matched)
 
             # Check filename logic: nlm_pool_v5 in matched-clean dir must get 0.35, while matched_clean gets 0.50
             fn_v5 = p_v5.name.lower()
-            is_matched_v5 = ("matched" in fn_v5 or "clean" in fn_v5)
+            is_matched_v5 = "matched" in fn_v5 or "clean" in fn_v5
             src_w_v5 = 0.50 if is_matched_v5 else 0.35
             self.assertEqual(src_w_v5, 0.35, "nlm_pool_v5.parquet must receive 0.35 even inside nlm-matched-clean folder")
 
             fn_matched = p_matched.name.lower()
-            is_matched_clean = ("matched" in fn_matched or "clean" in fn_matched)
+            is_matched_clean = "matched" in fn_matched or "clean" in fn_matched
             src_w_matched = 0.50 if is_matched_clean else 0.35
             self.assertEqual(src_w_matched, 0.50, "nlm_matched_clean.parquet must receive 0.50")
 
             # Check run_lexical_engine execution with pools and verify output shapes
             tr_file = tmp / "train.csv"
-            pd.DataFrame({
-                "id": list(range(18)),
-                "prompt_id": [0] * 18,
-                "text": [f"Train passage {i} with good length." for i in range(18)],
-                "model": [LABELS[i % K] for i in range(18)]
-            }).to_csv(tr_file, index=False)
+            pd.DataFrame(
+                {
+                    "id": list(range(18)),
+                    "prompt_id": [0] * 18,
+                    "text": [f"Train passage {i} with good length." for i in range(18)],
+                    "model": [LABELS[i % K] for i in range(18)],
+                }
+            ).to_csv(tr_file, index=False)
 
             te_file = tmp / "test.csv"
-            pd.DataFrame({
-                "id": [100, 101],
-                "text": ["Test passage 1 with good length.", "Test passage 2 with good length."]
-            }).to_csv(te_file, index=False)
+            pd.DataFrame({"id": [100, 101], "text": ["Test passage 1 with good length.", "Test passage 2 with good length."]}).to_csv(
+                te_file, index=False
+            )
 
             res = run_lexical_engine(tr_file, te_file, pool_file=[p_matched, p_v5], qwen_tok_dir="", working_dir=tmp / "out")
             self.assertEqual(res["log_p_svc_main"].shape, (2, 18))
             self.assertEqual(res["p_lex_comp"].shape, (2, 18))
+
 
 if __name__ == "__main__":
     unittest.main()

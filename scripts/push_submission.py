@@ -6,8 +6,8 @@ Automated Test -> Compile -> Kaggle Push CLI Runner
 3. Pushes kernel to Kaggle via Kaggle CLI.
 """
 
-import sys
 import subprocess
+import sys
 from pathlib import Path
 
 scripts_dir = Path(__file__).resolve().parent
@@ -15,6 +15,7 @@ if str(scripts_dir) not in sys.path:
     sys.path.insert(0, str(scripts_dir))
 
 from compile_notebook import compile_notebook
+
 
 def main():
     root_dir = Path(__file__).resolve().parent.parent
@@ -32,6 +33,7 @@ def main():
     subprocess.run([sys.executable, "-m", "kaggle", "kernels", "push", "-p", str(kernel_dir)], cwd=root_dir, check=True)
 
     print("\n[SUCCESS] Kernel successfully pushed to Kaggle!")
+
 
 if __name__ == "__main__":
     main()

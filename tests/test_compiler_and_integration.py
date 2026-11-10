@@ -6,18 +6,20 @@ Compiler Parity & End-to-End Integration Test Suite
 3. Tests end-to-end pipeline execution in smoke mode on synthetic competition data.
 """
 
-import os
 import ast
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
-import tempfile
-import pandas as pd
-import numpy as np
 
-from namethatllm.config import LABELS, K
+import numpy as np
+import pandas as pd
+
+from namethatllm.config import LABELS
 from namethatllm.pipeline import run_submission_pipeline
 from scripts.compile_notebook import compile_notebook
+
 
 class TestCompilerAndIntegration(unittest.TestCase):
     def setUp(self):
@@ -28,18 +30,12 @@ class TestCompilerAndIntegration(unittest.TestCase):
         self.assertTrue(compiler_path.exists(), "scripts/compile_notebook.py must exist")
 
         lines = compiler_path.read_text(encoding="utf-8").splitlines()
-        self.assertLessEqual(
-            len(lines), 150,
-            f"Compiler must be a thin bundler <= 150 lines, but found {len(lines)} lines"
-        )
+        self.assertLessEqual(len(lines), 150, f"Compiler must be a thin bundler <= 150 lines, but found {len(lines)} lines")
 
         content = compiler_path.read_text(encoding="utf-8")
         forbidden_ml_strings = ["LOGIT_MAIN", "sinkhorn", "ExactAuthorPosterior", "softmax("]
         for s in forbidden_ml_strings:
-            self.assertNotIn(
-                s, content,
-                f"Compiler must not contain hardcoded ML string '{s}'"
-            )
+            self.assertNotIn(s, content, f"Compiler must not contain hardcoded ML string '{s}'")
 
     def test_ast_parity_between_src_and_compiled_notebook(self):
         cfg_path = self.repo_root / "configs" / "production_ensemble.json"
@@ -74,10 +70,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
                         nb_defs.add(node.name)
 
         missing_in_notebook = src_defs - nb_defs
-        self.assertEqual(
-            len(missing_in_notebook), 0,
-            f"Functions/classes in src/ missing in compiled notebook: {missing_in_notebook}"
-        )
+        self.assertEqual(len(missing_in_notebook), 0, f"Functions/classes in src/ missing in compiled notebook: {missing_in_notebook}")
         self.assertGreater(len(src_defs), 15, "Expected at least 15 definitions in src/namethatllm")
 
     def test_end_to_end_smoke_pipeline(self):
@@ -90,12 +83,14 @@ class TestCompilerAndIntegration(unittest.TestCase):
             row_id = 0
             for p in prompts:
                 for m in LABELS:
-                    train_rows.append({
-                        "id": row_id,
-                        "prompt_id": p,
-                        "model": m,
-                        "text": f"This is an analytical essay about prompt {p} authored by {m}. Furthermore, punctuation is stylized; 'quotes' and numbers 1234 are used."
-                    })
+                    train_rows.append(
+                        {
+                            "id": row_id,
+                            "prompt_id": p,
+                            "model": m,
+                            "text": f"This is an analytical essay about prompt {p} authored by {m}. Furthermore, punctuation is stylized; 'quotes' and numbers 1234 are used.",
+                        }
+                    )
                     row_id += 1
             df_train = pd.DataFrame(train_rows)
             train_csv = tmp_path / "train.csv"
@@ -107,11 +102,13 @@ class TestCompilerAndIntegration(unittest.TestCase):
             t_id = 1000
             for p in test_prompts:
                 for i in range(18):
-                    test_rows.append({
-                        "id": t_id,
-                        "prompt_id": p,
-                        "text": f"Test mystery response passage {i} for prompt {p}. Includes standard words and content."
-                    })
+                    test_rows.append(
+                        {
+                            "id": t_id,
+                            "prompt_id": p,
+                            "text": f"Test mystery response passage {i} for prompt {p}. Includes standard words and content.",
+                        }
+                    )
                     t_id += 1
             df_test = pd.DataFrame(test_rows)
             test_csv = tmp_path / "test.csv"
@@ -144,7 +141,9 @@ class TestCompilerAndIntegration(unittest.TestCase):
 
     def test_neural_extractor_layernorm_specs(self):
         import inspect
+
         from namethatllm.neural_extractor import UniversalLoRATrunkLoader
+
         src = inspect.getsource(UniversalLoRATrunkLoader.__init__)
         self.assertIn("nn.LayerNorm", src, "Norms must be initialized with nn.LayerNorm to accept bias")
         self.assertNotIn("nn.RMSNorm", src, "nn.RMSNorm lacks bias parameters present in heads.safetensors")
@@ -156,9 +155,11 @@ class TestCompilerAndIntegration(unittest.TestCase):
         dynamic meta parsing, multi-res twins, exact DP, joint spectral bank, Claude specialist gate,
         and Sinkhorn mass balancing) without requiring multi-gigabyte pretrained model downloads.
         """
-        import torch
         from unittest.mock import patch
+
+        import torch
         from safetensors.torch import save_file
+
         from namethatllm.config import FAMILIES
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -174,12 +175,14 @@ class TestCompilerAndIntegration(unittest.TestCase):
             row_id = 0
             for p in prompts:
                 for m in LABELS:
-                    train_rows.append({
-                        "id": row_id,
-                        "prompt_id": p,
-                        "model": m,
-                        "text": f"Prompt {p} discourse sample authored by {m} with diverse features and stylistic punctuation."
-                    })
+                    train_rows.append(
+                        {
+                            "id": row_id,
+                            "prompt_id": p,
+                            "model": m,
+                            "text": f"Prompt {p} discourse sample authored by {m} with diverse features and stylistic punctuation.",
+                        }
+                    )
                     row_id += 1
             df_train = pd.DataFrame(train_rows)
             train_csv = tmp_path / "train.csv"
@@ -189,11 +192,13 @@ class TestCompilerAndIntegration(unittest.TestCase):
             test_rows = []
             for p in [201, 202]:
                 for i in range(18):
-                    test_rows.append({
-                        "id": 1000 + len(test_rows),
-                        "prompt_id": p,
-                        "text": f"Mystery test passage {i} for prompt {p} with curly ‘quotes’ and words."
-                    })
+                    test_rows.append(
+                        {
+                            "id": 1000 + len(test_rows),
+                            "prompt_id": p,
+                            "text": f"Mystery test passage {i} for prompt {p} with curly ‘quotes’ and words.",
+                        }
+                    )
             df_test = pd.DataFrame(test_rows)
             test_csv = tmp_path / "test.csv"
             df_test.to_csv(test_csv, index=False)
@@ -205,12 +210,14 @@ class TestCompilerAndIntegration(unittest.TestCase):
             unseen_rows = []
             for m in LABELS:
                 for idx_m in range(2):
-                    unseen_rows.append({
-                        "id": f"clean_{m}_{idx_m}",
-                        "prompt_id": 301 + idx_m,
-                        "model": m,
-                        "text": f"Disjoint unseen holdout text sample {idx_m} generated by {m} with distinct stylistic lexicon.",
-                    })
+                    unseen_rows.append(
+                        {
+                            "id": f"clean_{m}_{idx_m}",
+                            "prompt_id": 301 + idx_m,
+                            "model": m,
+                            "text": f"Disjoint unseen holdout text sample {idx_m} generated by {m} with distinct stylistic lexicon.",
+                        }
+                    )
             pd.DataFrame(unseen_rows).to_parquet(input_dir / "nlm_matched_clean.parquet")
 
             # 3. Create mock base model directories with config.json
@@ -248,32 +255,55 @@ class TestCompilerAndIntegration(unittest.TestCase):
             # 4A. qwen3_14b_p2
             p2_dir = input_dir / "lora_qwen3_14b"
             p2_dir.mkdir(parents=True, exist_ok=True)
-            (p2_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [2, 4, 6, 9, 13, 17, 22, 27], "keep": 27, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            (p2_dir / "meta.json").write_text(
+                json.dumps(
+                    {"cfg": {"layers": [2, 4, 6, 9, 13, 17, 22, 27], "keep": 27, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}
+                )
+            )
             save_file(make_18class_head(), str(p2_dir / "heads.safetensors"))
 
             # 4B. qwen3_14b_p1
             p1_dir = input_dir / "lora14b_v1"
             p1_dir.mkdir(parents=True, exist_ok=True)
-            (p1_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [2, 4, 6, 9, 13, 17, 21, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            (p1_dir / "meta.json").write_text(
+                json.dumps(
+                    {"cfg": {"layers": [2, 4, 6, 9, 13, 17, 21, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}
+                )
+            )
             save_file(make_18class_head(), str(p1_dir / "heads.safetensors"))
 
             # 4C. qwen25_14b_p2
             q25_dir = input_dir / "lora_qwen25_14b"
             q25_dir.mkdir(parents=True, exist_ok=True)
-            (q25_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [3, 5, 8, 11, 16, 21, 27, 32], "keep": 32, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            (q25_dir / "meta.json").write_text(
+                json.dumps(
+                    {"cfg": {"layers": [3, 5, 8, 11, 16, 21, 27, 32], "keep": 32, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}
+                )
+            )
             save_file(make_18class_head(), str(q25_dir / "heads.safetensors"))
 
             # 4D. instyle (adapter only, no classification head)
             ins_dir = input_dir / "instyle"
             ins_dir.mkdir(parents=True, exist_ok=True)
-            (ins_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [2, 4, 6, 8, 12, 16, 20, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}))
+            (ins_dir / "meta.json").write_text(
+                json.dumps(
+                    {"cfg": {"layers": [2, 4, 6, 8, 12, 16, 20, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}, "labels": LABELS}
+                )
+            )
             save_file({}, str(ins_dir / "heads.safetensors"))
 
             # 4E. qwen3_8b_claude (5-class specialist + 18-class readouts.npz)
             claude_dir = input_dir / "qwen3_8b_claude"
             claude_dir.mkdir(parents=True, exist_ok=True)
             claude_classes = [LABELS[i] for i in FAMILIES["claude"]]
-            (claude_dir / "meta.json").write_text(json.dumps({"classes": claude_classes, "cfg": {"layers": [2, 4, 6, 8, 12, 16, 20, 24], "keep": 24, "max_len": 447, "end_token_id": 151643}}))
+            (claude_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "classes": claude_classes,
+                        "cfg": {"layers": [2, 4, 6, 8, 12, 16, 20, 24], "keep": 24, "max_len": 447, "end_token_id": 151643},
+                    }
+                )
+            )
             save_file({"norms.0.weight": torch.ones(64), "norms.0.bias": torch.zeros(64)}, str(claude_dir / "heads.safetensors"))
             np.savez(
                 str(claude_dir / "readouts.npz"),
@@ -290,7 +320,9 @@ class TestCompilerAndIntegration(unittest.TestCase):
             # 4F. deberta_p2
             deb_dir = input_dir / "deberta_p2"
             deb_dir.mkdir(parents=True, exist_ok=True)
-            (deb_dir / "meta.json").write_text(json.dumps({"cfg": {"layers": [3, 6, 9, 12, 15, 18, 21, 24], "keep": 24, "max_len": 447}, "labels": LABELS}))
+            (deb_dir / "meta.json").write_text(
+                json.dumps({"cfg": {"layers": [3, 6, 9, 12, 15, 18, 21, 24], "keep": 24, "max_len": 447}, "labels": LABELS})
+            )
             save_file({"plain.weight": torch.randn(18, 512), "plain.bias": torch.zeros(18)}, str(deb_dir / "head.safetensors"))
 
             # 5. Define MockTrunkLoader and Mock DeBERTa
@@ -299,21 +331,28 @@ class TestCompilerAndIntegration(unittest.TestCase):
                     self.layers = layers
                     self.max_len = max_len
                     self.model = torch.nn.Linear(10, 10)
+
                 def snapshot_weights(self, adapter_path):
                     return {}
+
                 def restore_weights(self, backup):
                     pass
+
                 def set_active_layers(self, layers, max_len=None):
                     self.layers = layers
                     if max_len is not None:
                         self.max_len = max_len
+
                 def set_final_norm(self, enabled):
                     pass
+
                 def load_norm_weights(self, heads_sd):
                     pass
+
                 def extract_exact(self, texts, batch_size=8, end_id=151643):
                     rng = np.random.RandomState(42)
                     return rng.randn(len(texts), 512).astype(np.float32) * 0.1
+
                 def free_memory(self):
                     pass
 
@@ -337,9 +376,11 @@ class TestCompilerAndIntegration(unittest.TestCase):
                     "input_dir": str(input_dir),
                 }
 
-                with patch("namethatllm.pipeline.UniversalLoRATrunkLoader", MockTrunkLoader), \
-                     patch("namethatllm.pipeline.extract_deberta_checkpoint", mock_extract_deberta), \
-                     patch("namethatllm.pipeline.merge_lora", return_value=True):
+                with (
+                    patch("namethatllm.pipeline.UniversalLoRATrunkLoader", MockTrunkLoader),
+                    patch("namethatllm.pipeline.extract_deberta_checkpoint", mock_extract_deberta),
+                    patch("namethatllm.pipeline.merge_lora", return_value=True),
+                ):
                     df_sub, parquet_path = run_submission_pipeline(cfg)
 
                 self.assertTrue(parquet_path.exists(), "submission.parquet must exist")
@@ -359,8 +400,9 @@ class TestCompilerAndIntegration(unittest.TestCase):
         """Tests unified loading of heads.safetensors and heads.pt, and multi-pool discovery."""
         import torch
         from safetensors.torch import save_file
+
+        from namethatllm.config import find_checkpoints, resolve_all_pool_files
         from namethatllm.neural_extractor import load_head_file, resolve_head_tensors
-        from namethatllm.config import resolve_all_pool_files, find_checkpoints
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
@@ -467,6 +509,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
     def test_preflight_validation_passes_when_all_required_assets_present(self):
         """Pre-flight asset validation succeeds when all required base trunks, checkpoints, and pools exist."""
         from namethatllm.config import validate_production_assets
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
             train_p = tmp / "train.csv"
@@ -511,16 +554,18 @@ class TestCompilerAndIntegration(unittest.TestCase):
                 test_path=test_p,
                 pool_files=[pool_p],
                 ckpts=ckpts,
-                cfg={"required_assets": {
-                    "require_pool_parquet": True,
-                    "required_base_models": [
-                        {"name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40},
-                        {"name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48},
-                        {"name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36},
-                        {"name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24},
-                    ],
-                    "required_checkpoints": list(ckpts.keys()),
-                }}
+                cfg={
+                    "required_assets": {
+                        "require_pool_parquet": True,
+                        "required_base_models": [
+                            {"name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40},
+                            {"name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48},
+                            {"name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36},
+                            {"name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24},
+                        ],
+                        "required_checkpoints": list(ckpts.keys()),
+                    }
+                },
             )
             self.assertEqual(len(verified_bases), 4)
             self.assertIn("qwen3_14b", verified_bases)
@@ -582,7 +627,9 @@ class TestCompilerAndIntegration(unittest.TestCase):
             gemini_dir = base_peft / "export_gemini_specialist_14b"
             gemini_dir.mkdir(parents=True)
             (gemini_dir / "heads.safetensors").write_bytes(b"mock")
-            (gemini_dir / "meta.json").write_text(json.dumps({"target_family": "gemini", "backbone": "Qwen/Qwen3-14B-Base"}), encoding="utf-8")
+            (gemini_dir / "meta.json").write_text(
+                json.dumps({"target_family": "gemini", "backbone": "Qwen/Qwen3-14B-Base"}), encoding="utf-8"
+            )
 
             # 4. GLM specialist (2-class)
             glm_dir = base_peft / "export_glm_specialist_14b"
@@ -607,23 +654,28 @@ class TestCompilerAndIntegration(unittest.TestCase):
     def test_merge_lora_atomic_prevalidation_rejects_llama_mlp_mismatch(self):
         """Verify that if an adapter has matching q_proj shape (32, 32) but mismatched gate_proj shape (64, 32) vs (48, 32), merge_lora returns False and leaves q_proj.weight 100% unchanged."""
         import torch
-        import torch.nn as nn
         from safetensors.torch import save_file
+        from torch import nn
+
         from namethatllm.neural_extractor import merge_lora
 
         class ToyModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList([
-                    nn.ModuleDict({
-                        "self_attn": nn.ModuleDict({
-                            "q_proj": nn.Linear(32, 32, bias=False)
-                        }),
-                        "mlp": nn.ModuleDict({
-                            "gate_proj": nn.Linear(32, 48, bias=False)  # Qwen shape: (48, 32)
-                        })
-                    })
-                ])
+                self.layers = nn.ModuleList(
+                    [
+                        nn.ModuleDict(
+                            {
+                                "self_attn": nn.ModuleDict({"q_proj": nn.Linear(32, 32, bias=False)}),
+                                "mlp": nn.ModuleDict(
+                                    {
+                                        "gate_proj": nn.Linear(32, 48, bias=False)  # Qwen shape: (48, 32)
+                                    }
+                                ),
+                            }
+                        )
+                    ]
+                )
 
         model = ToyModel()
         orig_q = model.layers[0]["self_attn"]["q_proj"].weight.clone()
@@ -653,9 +705,12 @@ class TestCompilerAndIntegration(unittest.TestCase):
         import torch
         import torch.nn.functional as F
         from transformers import AutoConfig, AutoModel
+
         from namethatllm.trainer import MultiLayerLoRAClassifier
 
-        cfg = AutoConfig.for_model("qwen2", hidden_size=64, num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=2, intermediate_size=128)
+        cfg = AutoConfig.for_model(
+            "qwen2", hidden_size=64, num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=2, intermediate_size=128
+        )
         base = AutoModel.from_config(cfg)
         base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -674,6 +729,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
     def test_ablation_does_not_define_sinkhorn_balancing(self):
         """Verify ablation.py does NOT define sinkhorn_balancing at module scope so postprocess.sinkhorn_balancing is never overwritten."""
         import namethatllm.ablation as abl
+
         self.assertNotIn("sinkhorn_balancing", dir(abl), "ablation.py must NOT export sinkhorn_balancing")
 
     def test_pipeline_whitelist_filtering_strips_pruned_checkpoints(self):
@@ -691,7 +747,14 @@ class TestCompilerAndIntegration(unittest.TestCase):
         cfg = {
             "required_assets": {
                 "required_checkpoints": ["qwen3_14b_p2", "qwen25_14b_p2", "deberta_p2", "qwen3_8b_claude"],
-                "optional_checkpoints": ["qwen3_14b_v5", "qwen3_14b_inhouse", "qwen25_14b_inhouse", "deberta_inhouse", "qwen3_8b_v5", "llama3_8b_v5"],
+                "optional_checkpoints": [
+                    "qwen3_14b_v5",
+                    "qwen3_14b_inhouse",
+                    "qwen25_14b_inhouse",
+                    "deberta_inhouse",
+                    "qwen3_8b_v5",
+                    "llama3_8b_v5",
+                ],
             }
         }
         req_assets = cfg.get("required_assets", {})
@@ -711,6 +774,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
     def test_evaluate_from_cache_preserves_validated_models_and_prunes_broken(self):
         """Verify offline cache evaluator retains >= 0.75 * prior_weight on validated models and 0.0 on broken/pruned models."""
         from scripts.evaluate_local import evaluate_from_cache
+
         cache_path = Path("local_data/local_eval_cache.npz")
         if cache_path.exists():
             res = evaluate_from_cache(cache_path)
@@ -723,6 +787,6 @@ class TestCompilerAndIntegration(unittest.TestCase):
             self.assertEqual(w.get("qwen25_14b_p2", 0.0), 0.0)
             self.assertEqual(w.get("qwen3_8b_claude", 0.0), 0.0)
 
+
 if __name__ == "__main__":
     unittest.main()
-

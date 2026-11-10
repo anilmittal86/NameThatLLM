@@ -5,19 +5,20 @@ Tests zero-leakage prompt-grouped holdout evaluation,
 synthetic cache generation, and sub-second offline cache replay.
 """
 
-import unittest
 import tempfile
 import time
+import unittest
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-from namethatllm.config import LABELS, K, FAMILIES
+from namethatllm.config import LABELS, K
 from scripts.evaluate_local import (
     compute_top_confused_pairs,
-    generate_synthetic_cache,
     evaluate_from_cache,
     evaluate_prompt_split,
+    generate_synthetic_cache,
 )
 
 
@@ -65,10 +66,18 @@ class TestLocalEvalHarness(unittest.TestCase):
             npz.close()
 
             required_keys = {
-                "N_test", "N_unseen", "y_unseen", "groups_unseen",
-                "model_names", "model_tiers", "model_prior_weights",
-                "m_0_unseen_lp", "m_0_test_lp", "rule_flags_test",
-                "log_p_handwriting", "num_extra",
+                "N_test",
+                "N_unseen",
+                "y_unseen",
+                "groups_unseen",
+                "model_names",
+                "model_tiers",
+                "model_prior_weights",
+                "m_0_unseen_lp",
+                "m_0_test_lp",
+                "rule_flags_test",
+                "log_p_handwriting",
+                "num_extra",
             }
             for k in required_keys:
                 self.assertIn(k, keys)
@@ -115,12 +124,14 @@ class TestLocalEvalHarness(unittest.TestCase):
                 for model_idx, model_name in enumerate(LABELS):
                     # Distinct text cues per model to ensure classifier can learn
                     text = f"This is prompt {prompt_idx} response from model {model_name} with unique style markers {model_name}."
-                    rows.append({
-                        "id": f"{prompt_idx}_{model_idx}",
-                        "prompt_id": p_id,
-                        "text": text,
-                        "model": model_name,
-                    })
+                    rows.append(
+                        {
+                            "id": f"{prompt_idx}_{model_idx}",
+                            "prompt_id": p_id,
+                            "text": text,
+                            "model": model_name,
+                        }
+                    )
 
             df_synth = pd.DataFrame(rows)
             df_synth.to_csv(train_csv, index=False)

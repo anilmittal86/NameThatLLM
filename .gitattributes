@@ -1,3 +1,5 @@
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
 checkpoints/export_champion_qwen3_14b/adapter/adapter_model.safetensors filter=lfs diff=lfs merge=lfs -text
 checkpoints/export_champion_qwen3_14b/wPCA_bank.npz filter=lfs diff=lfs merge=lfs -text
 checkpoints/export_champion_qwen3_14b/heads.safetensors filter=lfs diff=lfs merge=lfs -text

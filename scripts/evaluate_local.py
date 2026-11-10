@@ -34,37 +34,19 @@ Provides sub-second local tuning and evaluation across two benchmarks:
 
 """
 
-
-
-import os
-
-import sys
-
-import json
-
-import time
-
 import argparse
-
+import json
+import sys
 import tempfile
-
+import time
 from pathlib import Path
-
-from typing import Dict, List, Tuple, Optional, Any
-
-
+from typing import Any
 
 import numpy as np
-
 import pandas as pd
-
-from scipy.special import softmax, log_softmax
-
+from scipy.special import log_softmax, softmax
 from sklearn.metrics import balanced_accuracy_score
-
 from sklearn.model_selection import GroupKFold
-
-
 
 # Ensure workspace root is in sys.path
 
@@ -73,172 +55,106 @@ WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKSPACE_DIR / "src"))
 
 
-
-from namethatllm.config import LABELS, K, LAB2I, FAMILIES, SPECIALIST_GROUPS
-
+from namethatllm.ablation import UnseenStepwiseAuditor, _ablation_sinkhorn
+from namethatllm.config import FAMILIES, LAB2I, LABELS, K
 from namethatllm.lexical_engine import run_lexical_engine
 
-from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc, _ablation_sinkhorn
-
-
-
-CANONICAL_NAME_MAP: Dict[str, str] = {
-
+CANONICAL_NAME_MAP: dict[str, str] = {
     "LinearSVC (4-View)": "svc_4view",
-
     "Lexical Comp (5-View)": "lexical_5v",
-
     "Qwen3-14B Part-2": "qwen3_14b_p2",
-
     "Qwen3-14B In-House": "qwen3_14b_inhouse",
-
     "DeBERTa-v3-Large": "deberta_p2",
-
     "DeBERTa-InHouse": "deberta_inhouse",
-
     "Qwen3-8B Claude Head": "qwen3_8b_claude",
-
     "Qwen2.5-14B Part-2": "qwen25_14b_p2",
-
     "Qwen3-8B In-Style": "instyle",
-
     "Qwen3-8B In-House": "qwen3_8b_inhouse",
-
     "qwen3_8b_v5": "qwen3_8b_v5",
-
     "qwen3_14b_v5": "qwen3_14b_v5",
-
     "wpca_dp": "wpca_dp",
-
     "spectral_bank": "spectral_bank",
-
 }
-
 
 
 from namethatllm.postprocess import (
     apply_claude_specialist_gate,
-    apply_family_specialist_lora_gate,
-    apply_all_family_confidence_gates,
-
     apply_cluster_uniqueness_repulsion,
-
-    apply_unified_handwriting_shield,
-
-    sinkhorn_balancing,
-
+    apply_family_specialist_lora_gate,
     apply_typobayes_postprocess,
-
+    apply_unified_handwriting_shield,
+    sinkhorn_balancing,
 )
 
 
-
-
-
-def load_config(config_path: Optional[Path] = None) -> dict:
+def load_config(config_path: Path | None = None) -> dict:
 
     if config_path and Path(config_path).exists():
-
         with open(config_path, "r", encoding="utf-8") as f:
-
             return json.load(f)
 
     default_cfg = WORKSPACE_DIR / "configs" / "production_ensemble.json"
 
     if default_cfg.exists():
-
         with open(default_cfg, "r", encoding="utf-8") as f:
-
             return json.load(f)
 
     return {}
 
 
-
-
-
 def compute_top_confused_pairs(
-
     y_true: np.ndarray,
-
     y_pred: np.ndarray,
-
-    labels: List[str],
-
+    labels: list[str],
     top_n: int = 5,
-
-) -> List[Dict[str, Any]]:
-
+) -> list[dict[str, Any]]:
     """Identifies the most frequent misclassification pairs, highlighting sister models."""
 
-    model_to_fam: Dict[int, str] = {}
+    model_to_fam: dict[int, str] = {}
 
     for fam, indices in FAMILIES.items():
-
         for idx in indices:
-
             model_to_fam[idx] = fam
 
-
-
-    pair_counts: Dict[Tuple[int, int], int] = {}
+    pair_counts: dict[tuple[int, int], int] = {}
 
     for yt, yp in zip(y_true, y_pred):
-
         if yt != yp:
-
             p = (min(yt, yp), max(yt, yp))
 
             pair_counts[p] = pair_counts.get(p, 0) + 1
-
-
 
     sorted_pairs = sorted(pair_counts.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
     results = []
 
     for (i, j), count in sorted_pairs:
-
         fam_i = model_to_fam.get(i)
 
         fam_j = model_to_fam.get(j)
 
-        is_sister = (fam_i == fam_j and fam_i is not None)
+        is_sister = fam_i == fam_j and fam_i is not None
 
-        results.append({
-
-            "model_a": labels[i],
-
-            "model_b": labels[j],
-
-            "count": count,
-
-            "family": fam_i if is_sister else "Cross-Family",
-
-            "is_sister": is_sister,
-
-        })
+        results.append(
+            {
+                "model_a": labels[i],
+                "model_b": labels[j],
+                "count": count,
+                "family": fam_i if is_sister else "Cross-Family",
+                "is_sister": is_sister,
+            }
+        )
 
     return results
 
 
-
-
-
 def evaluate_prompt_split(
-
     train_path: Path,
-
     n_splits: int = 5,
-
     fast: bool = True,
-
-    config_path: Optional[Path] = None,
-
-    working_dir: Optional[Path] = None,
-
-) -> Dict[str, Any]:
-
+    config_path: Path | None = None,
+    working_dir: Path | None = None,
+) -> dict[str, Any]:
     """
 
     Benchmark A: Zero-leakage prompt-grouped holdout evaluation.
@@ -250,10 +166,7 @@ def evaluate_prompt_split(
     train_path = Path(train_path)
 
     if not train_path.exists():
-
         raise FileNotFoundError(f"Training data not found at: {train_path}")
-
-
 
     df_tr = pd.read_csv(train_path)
 
@@ -263,13 +176,8 @@ def evaluate_prompt_split(
 
     t0 = time.time()
 
-
-
     if "prompt_id" not in df_tr.columns:
-
         raise ValueError(f"train.csv must contain 'prompt_id' for grouped evaluation. Found columns: {list(df_tr.columns)}")
-
-
 
     gkf = GroupKFold(n_splits=n_splits)
 
@@ -277,13 +185,9 @@ def evaluate_prompt_split(
 
     y_all = np.array([LAB2I[m] for m in df_tr["model"].values], dtype=int)
 
-
-
     splits = list(gkf.split(df_tr, y_all, groups=groups))
 
     eval_splits = splits[:1] if fast else splits
-
-
 
     print("\n" + "=" * 90)
 
@@ -293,37 +197,25 @@ def evaluate_prompt_split(
 
     print("=" * 90)
 
+    fold_metrics: list[dict[str, float]] = []
 
+    all_val_true: list[np.ndarray] = []
 
-    fold_metrics: List[Dict[str, float]] = []
-
-    all_val_true: List[np.ndarray] = []
-
-    all_val_preds: List[np.ndarray] = []
-
-
+    all_val_preds: list[np.ndarray] = []
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
-
         base_tmp = Path(tmp_dir) if working_dir is None else Path(working_dir)
 
-
-
         for fold_idx, (tr_i, val_i) in enumerate(eval_splits):
-
             fold_t0 = time.time()
 
             df_fold_tr = df_tr.iloc[tr_i]
 
             df_fold_val = df_tr.iloc[val_i]
 
-
-
             f_dir = base_tmp / f"fold_{fold_idx}"
 
             f_dir.mkdir(parents=True, exist_ok=True)
-
-
 
             f_tr_csv = f_dir / "train_fold.csv"
 
@@ -333,31 +225,19 @@ def evaluate_prompt_split(
 
             df_fold_val.to_csv(f_val_csv, index=False)
 
-
-
             val_texts = df_fold_val["text"].fillna("").astype(str).tolist()
 
             y_val = y_all[val_i]
 
-
-
             # Execute lexical engine in-process
 
             lex_out = run_lexical_engine(
-
                 train_path=f_tr_csv,
-
                 test_path=f_val_csv,
-
                 pool_file=None,
-
                 qwen_tok_dir="",
-
                 working_dir=f_dir,
-
             )
-
-
 
             lp_svc = lex_out["log_p_svc_main"]
 
@@ -367,23 +247,17 @@ def evaluate_prompt_split(
 
             rule_flags = lex_out.get("rule_flags_test")
 
-
-
             # Stage 1: 4-View LinearSVC Raw
 
             preds_svc = lp_svc.argmax(axis=1)
 
             bacc_svc = float(balanced_accuracy_score(y_val, preds_svc))
 
-
-
             # Stage 2: 5-View BPE + SGD + Twin + Family Specialists Raw
 
             preds_lex = p_lex.argmax(axis=1)
 
             bacc_lex = float(balanced_accuracy_score(y_val, preds_lex))
-
-
 
             # Stage 3: Combined Lexical Blend (0.85 SVC + 0.15 Lexical Comp)
 
@@ -395,39 +269,25 @@ def evaluate_prompt_split(
 
             bacc_blend = float(balanced_accuracy_score(y_val, preds_blend))
 
-
-
             # Stage 4: + Unified Handwriting & Orthographic Shield
 
             multiplier = post_cfg.get("curly_quote_multiplier", float(np.exp(-1.0)))
 
             p_shield = apply_unified_handwriting_shield(
-
                 P_mix=p_blend.copy(),
-
                 test_texts=val_texts,
-
                 log_p_handwriting=lp_hw,
-
                 rule_flags=rule_flags,
-
                 curly_quote_multiplier=multiplier,
-
                 multi_em_dash_log_penalty=post_cfg.get("multi_em_dash_log_penalty", 0.0),
-
                 straight_contr_log_penalty=post_cfg.get("straight_contr_log_penalty", 0.0),
-
                 curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", 0.0),
-
                 continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.0),
-
             )
 
             preds_shield = p_shield.argmax(axis=1)
 
             bacc_shield = float(balanced_accuracy_score(y_val, preds_shield))
-
-
 
             # Stage 5: + 300-Step Sinkhorn Balancing
 
@@ -439,30 +299,18 @@ def evaluate_prompt_split(
 
             bacc_final = float(balanced_accuracy_score(y_val, preds_final))
 
-
-
             fold_time = time.time() - fold_t0
 
             metrics = {
-
                 "fold": fold_idx,
-
                 "n_val": len(df_fold_val),
-
                 "n_prompts_val": df_fold_val["prompt_id"].nunique(),
-
                 "svc_raw_bacc": bacc_svc,
-
                 "lex_raw_bacc": bacc_lex,
-
                 "lex_blend_bacc": bacc_blend,
-
                 "shield_bacc": bacc_shield,
-
                 "sinkhorn_bacc": bacc_final,
-
                 "seconds": fold_time,
-
             }
 
             fold_metrics.append(metrics)
@@ -471,21 +319,23 @@ def evaluate_prompt_split(
 
             all_val_preds.append(preds_final)
 
-
-
             print(f" Fold {fold_idx}: {len(df_fold_val)} val texts ({df_fold_val['prompt_id'].nunique()} prompts) in {fold_time:.2f}s")
 
             print(f"   - Step 1: 4-View LinearSVC (Raw)                                    : BAcc = {bacc_svc:.4f}")
 
             print(f"   - Step 2: 5-View BPE + SGD + Twin + Family Specialists (Raw)        : BAcc = {bacc_lex:.4f}")
 
-            print(f"   - Step 3: Combined Lexical Blend (0.85 * SVC + 0.15 * LexComp)      : BAcc = {bacc_blend:.4f} (Delta={bacc_blend - bacc_svc:+.4f})")
+            print(
+                f"   - Step 3: Combined Lexical Blend (0.85 * SVC + 0.15 * LexComp)      : BAcc = {bacc_blend:.4f} (Delta={bacc_blend - bacc_svc:+.4f})"
+            )
 
-            print(f"   - Step 4: + Unified Handwriting & Orthographic Shield               : BAcc = {bacc_shield:.4f} (Delta={bacc_shield - bacc_blend:+.4f})")
+            print(
+                f"   - Step 4: + Unified Handwriting & Orthographic Shield               : BAcc = {bacc_shield:.4f} (Delta={bacc_shield - bacc_blend:+.4f})"
+            )
 
-            print(f"   - Step 5: + 300-Step Multiplicative Sinkhorn Mass Balancing         : BAcc = {bacc_final:.4f} (Delta={bacc_final - bacc_shield:+.4f})")
-
-
+            print(
+                f"   - Step 5: + 300-Step Multiplicative Sinkhorn Mass Balancing         : BAcc = {bacc_final:.4f} (Delta={bacc_final - bacc_shield:+.4f})"
+            )
 
     y_cat_true = np.concatenate(all_val_true)
 
@@ -493,17 +343,12 @@ def evaluate_prompt_split(
 
     top_confused = compute_top_confused_pairs(y_cat_true, y_cat_pred, LABELS, top_n=5)
 
-
-
     print("\n Top-5 Most Confused Sister-Model Pairs (Held-Out Prompts):")
 
     for rank, cp in enumerate(top_confused, 1):
-
         sister_tag = f"[{cp['family']} Sister Pair]" if cp["is_sister"] else "[Cross-Family]"
 
         print(f"   {rank}. {cp['model_a']:<22} <---> {cp['model_b']:<22} : {cp['count']} errors {sister_tag}")
-
-
 
     avg_bacc = float(np.mean([m["sinkhorn_bacc"] for m in fold_metrics]))
 
@@ -513,36 +358,20 @@ def evaluate_prompt_split(
 
     print("=" * 90)
 
-
-
     return {
-
         "mean_bacc": avg_bacc,
-
         "fold_metrics": fold_metrics,
-
         "top_confused": top_confused,
-
         "total_seconds": total_time,
-
     }
 
 
-
-
-
 def generate_synthetic_cache(
-
     output_path: Path,
-
     N_unseen: int = 360,
-
     N_test: int = 500,
-
     seed: int = 42,
-
 ) -> Path:
-
     """Generates a realistic multi-backbone simulation cache for instant offline evaluation."""
 
     np.random.seed(seed)
@@ -551,108 +380,64 @@ def generate_synthetic_cache(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-
-
     y_unseen = np.tile(np.arange(K), N_unseen // K).astype(np.int32)
 
     groups_unseen = ((np.arange(N_unseen) // 3) + 1).astype(np.int32)
 
-
-
     # 10 Simulated models with realistic accuracies and characteristics
 
     models_spec = [
-
         ("Qwen3-14B Part-2", "Main", 0.50, 0.88, 3.2),
-
         ("Qwen2.5-14B Part-2", "Main", 0.35, 0.78, 2.4),
-
         ("DeBERTa-v3-Large", "Main", 0.30, 0.74, 2.2),
-
         ("Qwen3-8B Claude Head", "Comp", 0.16, 0.70, 2.0),
-
         ("Qwen3-8B In-Style", "Comp", 0.20, 0.68, 1.9),
-
         ("Qwen3-14B In-House", "Comp", 0.45, 0.76, 2.3),
-
         ("LinearSVC (4-View)", "Main", 0.85, 0.65, 1.7),
-
         ("Lexical Comp (5-View)", "Comp", 0.15, 0.60, 1.5),
-
         ("Poison-Adversarial", "Comp", 0.20, 0.05, -3.0),
-
     ]
 
-
-
-    cache_dict: Dict[str, Any] = {
-
+    cache_dict: dict[str, Any] = {
         "N_test": np.array([N_test], dtype=np.int32),
-
         "N_unseen": np.array([N_unseen], dtype=np.int32),
-
         "y_unseen": y_unseen,
-
         "groups_unseen": groups_unseen,
-
         "D_tfidf": np.zeros((N_test, N_test), dtype=np.float32),
-
         "D_hybrid": np.zeros((N_test, N_test), dtype=np.float32),
-
         "groups_085": np.ones(N_test, dtype=np.int32),
-
         "model_names": np.array([m[0] for m in models_spec], dtype=object),
-
         "model_tiers": np.array([m[1] for m in models_spec], dtype=object),
-
         "model_prior_weights": np.array([m[2] for m in models_spec], dtype=np.float64),
-
         "model_learned_weights": np.array([m[2] for m in models_spec], dtype=np.float64),
-
         "test_texts": np.array([f"Synthetic test text passage {i} for benchmarking." for i in range(N_test)], dtype=object),
-
     }
 
-
-
     for idx, (m_name, m_tier, m_prior, m_acc, m_signal) in enumerate(models_spec):
-
         lp_u = np.random.randn(N_unseen, K) * 0.6
 
         for i, y in enumerate(y_unseen):
-
             if m_signal > 0:
-
                 if (i + idx) % 5 != 0:
-
                     lp_u[i, y] += m_signal
 
             else:
-
                 lp_u[i, (y + 1) % K] += 3.5
 
         cache_dict[f"m_{idx}_unseen_lp"] = log_softmax(lp_u, axis=1).astype(np.float32)
-
-
 
         lp_te = np.random.randn(N_test, K) * 0.6
 
         cache_dict[f"m_{idx}_test_lp"] = log_softmax(lp_te, axis=1).astype(np.float32)
 
-
-
     # Extra streams (wPCA DP & Spectral Bank)
 
     extra_streams = [
-
         ("wpca_dp", 0.22, log_softmax(np.random.randn(N_test, K) * 0.5, axis=1).astype(np.float32)),
-
         ("spectral_bank", 0.12, log_softmax(np.random.randn(N_test, K) * 0.5, axis=1).astype(np.float32)),
-
     ]
 
     for ex_idx, (ex_name, ex_w, ex_lp) in enumerate(extra_streams):
-
         cache_dict[f"extra_{ex_idx}_name"] = np.array([ex_name], dtype=object)
 
         cache_dict[f"extra_{ex_idx}_weight"] = np.array([ex_w], dtype=np.float64)
@@ -661,33 +446,23 @@ def generate_synthetic_cache(
 
     cache_dict["num_extra"] = np.array([len(extra_streams)], dtype=np.int32)
 
-
-
     cache_dict["rule_flags_test"] = np.zeros((N_test, 4), dtype=np.float32)
 
     cache_dict["log_p_handwriting"] = log_softmax(np.random.randn(N_test, K), axis=1).astype(np.float32)
-
-
 
     np.savez_compressed(output_path, **cache_dict)
 
     return output_path
 
 
-
-
-
-
-
 def print_npz_ablation_diagnostics(
     auditor: UnseenStepwiseAuditor,
-    active_weights_map: Dict[str, float],
+    active_weights_map: dict[str, float],
     show_confusion: bool = False,
-    html_report_path: Optional[Path] = None,
-    data: Optional[Dict[str, Any]] = None,
-    post_cfg: Optional[Dict[str, Any]] = None,
+    html_report_path: Path | None = None,
+    data: dict[str, Any] | None = None,
+    post_cfg: dict[str, Any] | None = None,
 ) -> None:
-
     """
 
     Comprehensive .npz Ablation Diagnostics:
@@ -705,10 +480,7 @@ def print_npz_ablation_diagnostics(
     models = auditor.models
 
     if len(y_unseen) < 18 or len(models) == 0:
-
         return
-
-
 
     print("\n" + "=" * 115)
 
@@ -716,16 +488,15 @@ def print_npz_ablation_diagnostics(
 
     print("=" * 115)
 
-    print(f"{'Model / Checkpoint':<25} | {'Nominal Wt':<10} | {'LP_std':<8} | {'Gap (1-2)':<9} | {'Effective Share':<15} | {'Learned Wt':<10} | {'Solo BAcc':<9} | {'Sink BAcc':<9}")
+    print(
+        f"{'Model / Checkpoint':<25} | {'Nominal Wt':<10} | {'LP_std':<8} | {'Gap (1-2)':<9} | {'Effective Share':<15} | {'Learned Wt':<10} | {'Solo BAcc':<9} | {'Sink BAcc':<9}"
+    )
 
     print("-" * 115)
-
-
 
     eff_powers = []
 
     for m in models:
-
         u_lp = m["unseen_lp"]
 
         w = float(m.get("prior_weight", m["weight"]))
@@ -736,10 +507,7 @@ def print_npz_ablation_diagnostics(
 
     total_eff_power = sum(eff_powers)
 
-
-
     for idx, m in enumerate(models):
-
         name = m["name"]
 
         w_nom = float(m.get("prior_weight", m["weight"]))
@@ -760,13 +528,11 @@ def print_npz_ablation_diagnostics(
 
         solo_sink = float(m.get("solo_unseen_sinkhorn_bacc", 0.0))
 
-
-
-        print(f"{name:<25} | {w_nom:<10.2f} | {lp_std:<8.3f} | {gap:<9.3f} | {eff_share:<14.1f}% | {w_learned:<10.2f} | {solo_raw:<9.4f} | {solo_sink:<9.4f}")
+        print(
+            f"{name:<25} | {w_nom:<10.2f} | {lp_std:<8.3f} | {gap:<9.3f} | {eff_share:<14.1f}% | {w_learned:<10.2f} | {solo_raw:<9.4f} | {solo_sink:<9.4f}"
+        )
 
     print("=" * 115)
-
-
 
     print("\n" + "=" * 115)
 
@@ -777,20 +543,15 @@ def print_npz_ablation_diagnostics(
     anchor_idx = None
 
     for i, m in enumerate(models):
-
         if "14B Part-2" in m["name"] or "qwen3_14b_p2" in m["name"]:
-
             anchor_idx = i
 
             break
 
     if anchor_idx is None:
-
         cand_14b = [i for i, m in enumerate(models) if "14b" in m["name"].lower()]
 
         anchor_idx = max(cand_14b, key=lambda i: models[i]["weight"]) if cand_14b else 0
-
-
 
     anchor_m = models[anchor_idx]
 
@@ -798,24 +559,23 @@ def print_npz_ablation_diagnostics(
 
     anchor_preds = anchor_m["unseen_lp"].argmax(axis=1)
 
-    anchor_wrong = (anchor_preds != y_unseen)
+    anchor_wrong = anchor_preds != y_unseen
 
     n_anchor_err = int(anchor_wrong.sum())
 
-
-
-    print(f"Primary Anchor: {anchor_name} | Total Unseen Errors: {n_anchor_err}/{len(y_unseen)} ({n_anchor_err/len(y_unseen)*100.0:.1f}%)")
-
-    print("-" * 115)
-
-    print(f"{'Model / Checkpoint':<25} | {'Tier':<6} | {'Solo BAcc':<9} | {'Agreement w/ Anchor':<21} | {'Errors Rescued':<16} | {'Rescue Rate':<11}")
+    print(
+        f"Primary Anchor: {anchor_name} | Total Unseen Errors: {n_anchor_err}/{len(y_unseen)} ({n_anchor_err / len(y_unseen) * 100.0:.1f}%)"
+    )
 
     print("-" * 115)
 
+    print(
+        f"{'Model / Checkpoint':<25} | {'Tier':<6} | {'Solo BAcc':<9} | {'Agreement w/ Anchor':<21} | {'Errors Rescued':<16} | {'Rescue Rate':<11}"
+    )
 
+    print("-" * 115)
 
     for m in models:
-
         name = m["name"]
 
         tier = m["tier"]
@@ -832,15 +592,13 @@ def print_npz_ablation_diagnostics(
 
         rescue_rate = (rescued / max(1, n_anchor_err)) * 100.0
 
-
-
         is_anchor_mark = " (Anchor)" if name == anchor_name else ""
 
-        print(f"{name + is_anchor_mark:<25} | {tier:<6} | {solo_bacc:<9.4f} | {agree_pct:<20.1f}% | {rescued:>3d} / {n_anchor_err:<8d} | {rescue_rate:<10.1f}%")
+        print(
+            f"{name + is_anchor_mark:<25} | {tier:<6} | {solo_bacc:<9.4f} | {agree_pct:<20.1f}% | {rescued:>3d} / {n_anchor_err:<8d} | {rescue_rate:<10.1f}%"
+        )
 
     print("=" * 115)
-
-
 
     print("\n" + "=" * 115)
 
@@ -848,28 +606,21 @@ def print_npz_ablation_diagnostics(
 
     print("=" * 115)
 
-
-
     clean_models = [m for m in models if "v5" not in m["name"].lower()]
 
     print(f"Clean Disjoint Subset: {len(clean_models)} models ([{', '.join(m['name'] for m in clean_models)}])")
 
     print("-" * 115)
 
-
-
     def _eval_subset_lp(subset_lps, weights):
 
         if not subset_lps:
-
             return 0.0, 99.0
 
         cum_lp = np.zeros_like(subset_lps[0], dtype=np.float64)
 
         for lp_i, w_i in zip(subset_lps, weights):
-
             if w_i > 0:
-
                 cum_lp += w_i * lp_i
 
         P = softmax(cum_lp, axis=1)
@@ -880,13 +631,9 @@ def print_npz_ablation_diagnostics(
 
         return bacc, nll
 
-
-
     clean_lps = [m["unseen_lp"] for m in clean_models]
 
     clean_ws = [float(active_weights_map.get(m["name"], m["weight"])) for m in clean_models]
-
-
 
     base_clean_bacc, base_clean_nll = _eval_subset_lp(clean_lps, clean_ws)
 
@@ -894,25 +641,21 @@ def print_npz_ablation_diagnostics(
 
     print("-" * 115)
 
-    print(f"{'Excluded Model':<25} | {'Active Wt':<10} | {'LOO BAcc':<9} | {'Delta BAcc (Drop)':<18} | {'LOO NLL':<8} | {'Delta NLL':<10} | {'Verdict':<15}")
+    print(
+        f"{'Excluded Model':<25} | {'Active Wt':<10} | {'LOO BAcc':<9} | {'Delta BAcc (Drop)':<18} | {'LOO NLL':<8} | {'Delta NLL':<10} | {'Verdict':<15}"
+    )
 
     print("-" * 115)
 
-
-
     for i, m in enumerate(clean_models):
-
         name = m["name"]
 
         w = clean_ws[i]
 
         if w <= 0.0:
-
             print(f"{name:<25} | {w:<10.2f} | {'N/A':<9} | {'N/A':<18} | {'N/A':<8} | {'N/A':<10} | {'Already Pruned':<15}")
 
             continue
-
-
 
         loo_lps = [lp for j, lp in enumerate(clean_lps) if j != i]
 
@@ -924,8 +667,6 @@ def print_npz_ablation_diagnostics(
 
         delta_nll = loo_nll - base_clean_nll
 
-
-
         verdict = "Essential (+)" if delta_bacc > 0.005 else "Beneficial (+)" if delta_bacc >= 0.000 else "Neutral/Hurts (-)"
 
         sign_bacc = f"+{delta_bacc:.4f}" if delta_bacc >= 0 else f"{delta_bacc:.4f}"
@@ -936,29 +677,27 @@ def print_npz_ablation_diagnostics(
 
     print("=" * 115)
 
-
-
-    print_per_class_accuracy_table(auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report_path, data=data, post_cfg=post_cfg)
-
-
-
+    print_per_class_accuracy_table(
+        auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report_path, data=data, post_cfg=post_cfg
+    )
 
 
 def print_per_class_accuracy_table(
     auditor: UnseenStepwiseAuditor,
-    active_weights_map: Dict[str, float],
+    active_weights_map: dict[str, float],
     show_confusion: bool = False,
-    html_report_path: Optional[Path] = None,
-    data: Optional[Dict[str, Any]] = None,
-    post_cfg: Optional[Dict[str, Any]] = None,
+    html_report_path: Path | None = None,
+    data: dict[str, Any] | None = None,
+    post_cfg: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """
     Table D: Per-Class Accuracy (Recall) across all 18 classes for every model in the cache
     plus the calibrated ensemble, alongside the Top Confused Sister/Cross-Family class per author.
     Includes full attribution summary: Vote Share, Shapley Accuracy Lift, LOO Drop, and Run Time.
     """
-    import math
     import itertools
+    import math
+
     from sklearn.metrics import confusion_matrix
 
     y_true = auditor.y_unseen
@@ -968,9 +707,11 @@ def print_per_class_accuracy_table(
 
     # Reorder models to canonical order: svc_4view, lexical_5v, qwen3_14b_p2, qwen3_14b_inhouse, deberta_p2, qwen3_14b_v5
     canonical_order = ["svc_4view", "lexical_5v", "qwen3_14b_p2", "qwen3_14b_inhouse", "deberta_p2", "qwen3_14b_v5"]
+
     def model_sort_key(m):
         n = m["name"]
         return canonical_order.index(n) if n in canonical_order else 99
+
     models = sorted(models, key=model_sort_key)
 
     # Compute Clean Ensemble (excluding v5) and Full Production Ensemble (all models including v5 with its full weight)
@@ -1064,7 +805,7 @@ def print_per_class_accuracy_table(
     full_prod_bacc = float(np.mean([(prod_preds[y_true == c] == c).mean() for c in range(K)]))
 
     # Per-model predictions after 60-step Sinkhorn
-    model_preds: Dict[str, np.ndarray] = {}
+    model_preds: dict[str, np.ndarray] = {}
     for m in models:
         P_m = _ablation_sinkhorn(softmax(m["unseen_lp"], axis=1), iters=60, y_true=y_true)
         model_preds[m["name"]] = P_m.argmax(axis=1)
@@ -1091,26 +832,32 @@ def print_per_class_accuracy_table(
 
     # 3. Shapley Value Attribution (Accuracy Lift across all 2^M coalitions)
     M = len(models)
-    v_coalition = {}
-    for k in range(M + 1):
-        for subset in itertools.combinations(range(M), k):
-            if len(subset) == 0:
-                v_coalition[subset] = 1.0 / float(K)
-            else:
-                c_lp = extra_unseen_lp.copy()
-                for idx in subset:
-                    c_lp += float(active_weights_map.get(models[idx]["name"], models[idx]["weight"])) * models[idx]["unseen_lp"]
-                v_coalition[subset] = calc_sinkhorn_bacc(c_lp)
-
     shapley_lifts = {}
-    for i in range(M):
-        sh = 0.0
-        for subset in v_coalition:
-            if i not in subset:
-                w_coeff = math.factorial(len(subset)) * math.factorial(M - len(subset) - 1) / math.factorial(M)
-                with_i = tuple(sorted(subset + (i,)))
-                sh += w_coeff * (v_coalition[with_i] - v_coalition[subset])
-        shapley_lifts[models[i]["name"]] = sh
+    if M <= 12:
+        v_coalition = {}
+        for k in range(M + 1):
+            for subset in itertools.combinations(range(M), k):
+                if len(subset) == 0:
+                    v_coalition[subset] = 1.0 / float(K)
+                else:
+                    c_lp = extra_unseen_lp.copy()
+                    for idx in subset:
+                        c_lp += float(active_weights_map.get(models[idx]["name"], models[idx]["weight"])) * models[idx]["unseen_lp"]
+                    v_coalition[subset] = calc_sinkhorn_bacc(c_lp)
+
+        for i in range(M):
+            sh = 0.0
+            for subset in v_coalition:
+                if i not in subset:
+                    w_coeff = math.factorial(len(subset)) * math.factorial(M - len(subset) - 1) / math.factorial(M)
+                    with_i = tuple(sorted(subset + (i,)))
+                    sh += w_coeff * (v_coalition[with_i] - v_coalition[subset])
+            shapley_lifts[models[i]["name"]] = sh
+    else:
+        # Fallback to Leave-One-Out lift when M > 12 to avoid 2^M combinatorial explosion
+        for m in models:
+            shapley_lifts[m["name"]] = max(0.0, float(loo_drops.get(m["name"], 0.0)) / 100.0)
+
     tot_lift = sum(shapley_lifts.values()) if sum(shapley_lifts.values()) > 0 else 1.0
     lift_pcts = {m["name"]: (shapley_lifts[m["name"]] / tot_lift) * 100 for m in models}
 
@@ -1134,12 +881,14 @@ def print_per_class_accuracy_table(
     m_names = [m["name"] for m in models]
     short_hdrs = [n[:12] for n in m_names]
     hdr_str = " | ".join(f"{h:<12}" for h in short_hdrs)
-    print(f"{'Class / Author Label':<24} | {'N':<3} | {hdr_str} | {'Clean Ens (5-M)':<15} | {'Prod Ens (6-M)':<14} | {'Most Confused With (Prod Ens)'}")
+    print(
+        f"{'Class / Author Label':<24} | {'N':<3} | {hdr_str} | {'Clean Ens (5-M)':<15} | {'Prod Ens (6-M)':<14} | {'Most Confused With (Prod Ens)'}"
+    )
     print("-" * 155)
 
     rows_out = []
     for c_idx, label in enumerate(LABELS):
-        mask_c = (y_true == c_idx)
+        mask_c = y_true == c_idx
         n_c = int(mask_c.sum())
         rec_clean = float((clean_preds[mask_c] == c_idx).mean()) if n_c > 0 else 0.0
         rec_prod = float((prod_preds[mask_c] == c_idx).mean()) if n_c > 0 else 0.0
@@ -1173,11 +922,11 @@ def print_per_class_accuracy_table(
         rows_out.append(row_dict)
 
     print("-" * 155)
-    mean_m_strs = [f"{f'{float(np.mean([r[m_name] for r in rows_out]))*100:.2f}%':<12}" for m_name in m_names]
+    mean_m_strs = [f"{f'{float(np.mean([r[m_name] for r in rows_out])) * 100:.2f}%':<12}" for m_name in m_names]
     mean_clean = float(np.mean([r["clean_ens_bacc"] for r in rows_out]))
     mean_prod = float(np.mean([r["prod_ens_bacc"] for r in rows_out]))
-    clean_mean_str = f"{f'{mean_clean*100:.2f}%':<15}"
-    prod_mean_str = f"{f'{mean_prod*100:.2f}%':<14}"
+    clean_mean_str = f"{f'{mean_clean * 100:.2f}%':<15}"
+    prod_mean_str = f"{f'{mean_prod * 100:.2f}%':<14}"
     print(f"{'MEAN BALANCED ACCURACY':<24} | {len(y_true):<3d} | {' | '.join(mean_m_strs)} | {clean_mean_str} | {prod_mean_str} |")
 
     # 4 Attribution Footer Rows
@@ -1206,7 +955,10 @@ def print_per_class_accuracy_table(
         try:
             hp = Path(html_report_path)
             hp.parent.mkdir(parents=True, exist_ok=True)
-            col_hdrs = "".join(f"<th class='py-2 px-1 text-center text-[10px] font-semibold text-slate-400 uppercase tracking-tighter' title='{lbl}'>{lbl[:4]}</th>" for lbl in LABELS)
+            col_hdrs = "".join(
+                f"<th class='py-2 px-1 text-center text-[10px] font-semibold text-slate-400 uppercase tracking-tighter' title='{lbl}'>{lbl[:4]}</th>"
+                for lbl in LABELS
+            )
             cm_table_html = ""
             for i, true_label in enumerate(LABELS):
                 n_true = (y_true == i).sum()
@@ -1223,11 +975,15 @@ def print_per_class_accuracy_table(
                         tc = "#ffffff" if (cnt / n_true) > 0.3 else "#fca5a5"
                         fw = "font-semibold"
                     else:
-                        bg = "transparent"; tc = "#475569"; fw = "font-normal"
-                    row_cells += f"<td class='py-2 px-1 text-center text-xs font-mono {fw}' style='background-color: {bg}; color: {tc};'>{cnt}</td>"
+                        bg = "transparent"
+                        tc = "#475569"
+                        fw = "font-normal"
+                    row_cells += (
+                        f"<td class='py-2 px-1 text-center text-xs font-mono {fw}' style='background-color: {bg}; color: {tc};'>{cnt}</td>"
+                    )
                 cm_table_html += f"<tr>{row_cells}</tr>"
 
-            full_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Confusion Matrix</title><script src="https://cdn.tailwindcss.com"></script><style>body {{ background-color: #0b0f19; color: #f1f5f9; }}</style></head><body class="p-6 font-sans"><div class="max-w-7xl mx-auto space-y-6"><div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl"><h1 class="text-2xl font-bold text-white">18-Class Confusion Matrix Heatmap (N={len(y_true)})</h1><p class="text-sm text-slate-400 mt-1">Clean Ens: {mean_clean*100:.2f}% | Prod Ens: {mean_prod*100:.2f}%</p></div><div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl"><table class="w-full border-collapse"><thead><tr class="border-b border-slate-800"><th class="py-2 px-3 text-left text-xs text-slate-400">True \\ Pred</th><th class="py-2 px-2 text-center text-xs text-slate-400">N</th>{col_hdrs}</tr></thead><tbody>{cm_table_html}</tbody></table></div></div></body></html>"""
+            full_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Confusion Matrix</title><script src="https://cdn.tailwindcss.com"></script><style>body {{ background-color: #0b0f19; color: #f1f5f9; }}</style></head><body class="p-6 font-sans"><div class="max-w-7xl mx-auto space-y-6"><div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl"><h1 class="text-2xl font-bold text-white">18-Class Confusion Matrix Heatmap (N={len(y_true)})</h1><p class="text-sm text-slate-400 mt-1">Clean Ens: {mean_clean * 100:.2f}% | Prod Ens: {mean_prod * 100:.2f}%</p></div><div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl"><table class="w-full border-collapse"><thead><tr class="border-b border-slate-800"><th class="py-2 px-3 text-left text-xs text-slate-400">True \\ Pred</th><th class="py-2 px-2 text-center text-xs text-slate-400">N</th>{col_hdrs}</tr></thead><tbody>{cm_table_html}</tbody></table></div></div></body></html>"""
             hp.write_text(full_html, encoding="utf-8")
             print(f"[HTML Report] Successfully exported confusion matrix to: {hp}")
         except Exception as e:
@@ -1235,13 +991,7 @@ def print_per_class_accuracy_table(
     return pd.DataFrame(rows_out)
 
 
-
-
-
-
-
-def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
-
+def print_stepwise_greedy_table(data: dict[str, Any]) -> None:
     """
 
     Stepwise forward greedy analysis on zero-leakage models:
@@ -1253,37 +1003,28 @@ def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
     """
 
     if "y_unseen" not in data or len(data["y_unseen"]) < 18:
-
         print("[Stepwise] Cannot run stepwise analysis: unseen holdout is missing or too small.")
 
         return
-
-
 
     y = data["y_unseen"].astype(int)
 
     model_names = [str(x) for x in data["model_names"]]
 
-
-
     # Collect zero-leakage models
 
-    candidates: Dict[str, np.ndarray] = {}
+    candidates: dict[str, np.ndarray] = {}
 
     sorted_labels = sorted(LABELS)
 
     perm = [sorted_labels.index(lbl) for lbl in LABELS]
 
-
-
     for idx, name in enumerate(model_names):
-
         c_name = CANONICAL_NAME_MAP.get(name, name)
 
         # Skip v5 models contaminated with nlm_pool_v5 holdout leakage
 
         if "v5" in c_name.lower():
-
             continue
 
         u_lp = data[f"m_{idx}_unseen_lp"].copy()
@@ -1291,29 +1032,19 @@ def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
         # Fix label alignment for claude head if applicable
 
         if c_name == "qwen3_8b_claude":
-
             u_lp = u_lp[:, perm]
 
         candidates[c_name] = u_lp
 
-
-
     if not candidates:
-
         return
-
-
 
     def fast_sinkhorn_bacc(lp: np.ndarray) -> float:
         P = softmax(lp, axis=1)
         P_s = _ablation_sinkhorn(P, iters=60, y_true=y)
         return float(balanced_accuracy_score(y, P_s.argmax(axis=1)))
 
-
-
     weight_grid = [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00]
-
-
 
     solo_scores = {k: fast_sinkhorn_bacc(v) for k, v in candidates.items()}
 
@@ -1323,38 +1054,32 @@ def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
 
     top3_base = ", ".join([f"{k} ({s:.4f})" for k, s in sorted_solo[:3]])
 
-
-
     print("\n" + "=" * 125)
 
     print(" ZERO-LEAKAGE STEPWISE GREEDY MODEL & WEIGHT SELECTION (With Sinkhorn Balancing)")
 
     print("=" * 125)
 
-    print(f"{'Step':<16} | {'Selected Model':<20} | {'Selected Weight':<15} | {'Ensemble BAcc':<14} | {'Marginal Lift':<14} | {'Top 3 Contenders Evaluated at this Step'}")
+    print(
+        f"{'Step':<16} | {'Selected Model':<20} | {'Selected Weight':<15} | {'Ensemble BAcc':<14} | {'Marginal Lift':<14} | {'Top 3 Contenders Evaluated at this Step'}"
+    )
 
     print("-" * 125)
 
     print(f"{'Base model -Step':<16} | {base_model:<20} | {'1.00 (Anchor)':<15} | {base_bacc:<14.4f} | {'Baseline':<14} | {top3_base}")
 
-
-
     ensemble_lp = candidates[base_model].copy()
 
     cur_bacc = base_bacc
 
-    remaining = [k for k in candidates.keys() if k != base_model]
-
-
+    remaining = [k for k in candidates if k != base_model]
 
     step_num = 1
 
     while remaining:
-
         cand_evals = []
 
         for cand in remaining:
-
             cand_lp = candidates[cand]
 
             best_w = 0.0
@@ -1362,20 +1087,16 @@ def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
             best_bacc = 0.0
 
             for w in weight_grid:
-
                 trial = ensemble_lp + w * cand_lp
 
                 bacc = fast_sinkhorn_bacc(trial)
 
                 if bacc > best_bacc:
-
                     best_bacc = bacc
 
                     best_w = w
 
             cand_evals.append((cand, best_w, best_bacc, best_bacc - cur_bacc))
-
-
 
         cand_evals.sort(key=lambda x: x[2], reverse=True)
 
@@ -1383,13 +1104,9 @@ def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
 
         top3_str = ", ".join([f"{c} (w={w:.2f}, {b:.4f}, {l:+.4f})" for c, w, b, l in cand_evals[:3]])
 
-
-
         step_label = f"Model {step_num} - Step"
 
         print(f"{step_label:<16} | {best_cand:<20} | {best_w:<15.2f} | {best_bacc:<14.4f} | {best_lift:<+14.4f} | {top3_str}")
-
-
 
         ensemble_lp = ensemble_lp + best_w * candidates[best_cand]
 
@@ -1399,22 +1116,18 @@ def print_stepwise_greedy_table(data: Dict[str, Any]) -> None:
 
         step_num += 1
 
-
-
     print("=" * 125 + "\n")
-
 
 
 def evaluate_from_cache(
     cache_path: Path,
-    config_path: Optional[Path] = None,
-    working_dir: Optional[Path] = None,
+    config_path: Path | None = None,
+    working_dir: Path | None = None,
     strict_config: bool = True,
     run_stepwise: bool = False,
     show_confusion: bool = False,
-    html_report: Optional[Path] = None,
-) -> Dict[str, Any]:
-
+    html_report: Path | None = None,
+) -> dict[str, Any]:
     """
 
     Benchmark B: Sub-second offline replay of cached neural representations.
@@ -1426,10 +1139,7 @@ def evaluate_from_cache(
     cache_path = Path(cache_path)
 
     if not cache_path.exists():
-
         raise FileNotFoundError(f"Cache file not found at: {cache_path}")
-
-
 
     t0 = time.time()
 
@@ -1439,8 +1149,6 @@ def evaluate_from_cache(
 
     raw_npz.close()
 
-
-
     cfg = load_config(config_path)
 
     post_cfg = cfg.get("postprocess", cfg.get("postprocessing", {}))
@@ -1448,8 +1156,6 @@ def evaluate_from_cache(
     cfg_weights = cfg.get("model_weights", {})
 
     lock_priors = bool(cfg.get("lock_prior_weights", True))
-
-
 
     N_test = int(data["N_test"][0])
 
@@ -1465,11 +1171,7 @@ def evaluate_from_cache(
 
     model_prior_weights = data["model_prior_weights"].astype(float)
 
-
-
     auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=groups_unseen, N_test=N_test)
-
-
 
     active_models_summary = []
 
@@ -1477,28 +1179,20 @@ def evaluate_from_cache(
 
     added_names = set()
 
-
-
     for idx, (raw_name, tier, prior_w) in enumerate(zip(model_names, model_tiers, model_prior_weights)):
-
         canon_name = CANONICAL_NAME_MAP.get(raw_name, raw_name)
 
         u_lp = data[f"m_{idx}_unseen_lp"]
 
         t_lp = data[f"m_{idx}_test_lp"]
 
-
-
         if strict_config and cfg_weights:
-
             if canon_name in cfg_weights:
-
                 mw = cfg_weights[canon_name]
 
                 cfg_w = float(mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0))
 
                 if cfg_w > 0.0:
-
                     auditor.add_model(name=canon_name, tier=tier, weight=cfg_w, unseen_log_probs=u_lp, test_log_probs=t_lp)
 
                     active_models_summary.append((canon_name, cfg_w, tier))
@@ -1506,33 +1200,27 @@ def evaluate_from_cache(
                     added_names.add(canon_name)
 
                 else:
-
                     pruned_models_summary.append((f"{raw_name} ({canon_name})", f"Weight is {cfg_w:.2f} (Specialist Gate Only / Pruned)"))
 
             else:
-
                 pruned_models_summary.append((f"{raw_name} ({canon_name})", "Not in active ensemble config"))
 
         else:
-
             auditor.add_model(name=canon_name, tier=tier, weight=prior_w, unseen_log_probs=u_lp, test_log_probs=t_lp)
 
             active_models_summary.append((canon_name, prior_w, tier))
 
             added_names.add(canon_name)
 
-
-
     # Reconstruct extra streams
 
-    extra_streams: List[Tuple[str, float, np.ndarray]] = []
+    extra_streams: list[tuple[str, float, np.ndarray]] = []
 
     active_extras_summary = []
 
     num_extra = int(data["num_extra"][0]) if "num_extra" in data else 0
 
     for ex_idx in range(num_extra):
-
         raw_ex_name = str(data[f"extra_{ex_idx}_name"][0])
 
         canon_ex_name = CANONICAL_NAME_MAP.get(raw_ex_name, raw_ex_name)
@@ -1541,16 +1229,11 @@ def evaluate_from_cache(
 
         ex_lp = data[f"extra_{ex_idx}_lp"]
 
-
-
         if strict_config and cfg_weights:
-
             if canon_ex_name in cfg_weights:
-
                 cfg_ex_w = float(cfg_weights[canon_ex_name].get("plain_weight", ex_w))
 
                 if cfg_ex_w > 0.0:
-
                     extra_streams.append((canon_ex_name, cfg_ex_w, ex_lp))
 
                     active_extras_summary.append((canon_ex_name, cfg_ex_w))
@@ -1558,36 +1241,26 @@ def evaluate_from_cache(
                     added_names.add(canon_ex_name)
 
                 else:
-
                     pruned_models_summary.append((f"{raw_ex_name} ({canon_ex_name})", f"Weight is {cfg_ex_w:.2f}"))
 
             else:
-
                 pruned_models_summary.append((f"{raw_ex_name} ({canon_ex_name})", "Not in active ensemble config"))
 
         else:
-
             extra_streams.append((canon_ex_name, ex_w, ex_lp))
 
             active_extras_summary.append((canon_ex_name, ex_w))
 
             added_names.add(canon_ex_name)
 
-
-
     missing_models_summary = []
 
     if strict_config and cfg_weights:
-
         for k, mw in cfg_weights.items():
-
             tot_w = float(mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0))
 
             if tot_w > 0.0 and k not in added_names:
-
                 missing_models_summary.append((k, tot_w))
-
-
 
     print("\n" + "=" * 90)
 
@@ -1598,64 +1271,43 @@ def evaluate_from_cache(
     print(f" Active Models in Ensemble ({len(active_models_summary)}):")
 
     for name, w, tier in active_models_summary:
-
         print(f"   - {name:<22}: weight = {w:<5.2f} ({tier})")
 
     print(f" Active Extra Streams ({len(active_extras_summary)}):")
 
     for name, w in active_extras_summary:
-
         print(f"   - {name:<22}: weight = {w:<5.2f}")
 
     if pruned_models_summary:
-
         print(f" Pruned / Excluded Models ({len(pruned_models_summary)}):")
 
         for name, reason in pruned_models_summary:
-
             print(f"   - {name:<22}: {reason}")
 
     if missing_models_summary:
-
         print(f" Configured Models Missing in Cache ({len(missing_models_summary)}):")
 
         for name, w in missing_models_summary:
-
             print(f"   - {name:<22}: Config weight = {w:<5.2f} (To be extracted / mounted)")
 
     print("=" * 90)
 
-
-
     if run_stepwise:
-
         print_stepwise_greedy_table(data)
 
-
-
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
-
         report_dir = Path(tmp_dir) if working_dir is None else Path(working_dir)
 
-        optimize_on_unseen = (N_unseen >= 36)
-
-
+        optimize_on_unseen = N_unseen >= 36
 
         # 1. Caruana Greedy Stepwise Selection with Smooth NLL Tie-Breaking
 
         P_mix, active_weights_map, df_ablation = auditor.optimize_weights_and_blend(
-
             working_dir=report_dir,
-
             extra_test_log_probs=extra_streams,
-
             optimize_on_unseen=optimize_on_unseen,
-
             lock_prior_weights=lock_priors,
-
         )
-
-
 
         for raw_name in model_names:
             c_name = CANONICAL_NAME_MAP.get(raw_name, raw_name)
@@ -1675,8 +1327,6 @@ def evaluate_from_cache(
 
         R_main = P_mix.copy()
 
-
-
         # 2. Claude Specialist Gate
 
         gate_weight = post_cfg.get("claude_specialist_weight", 0.15)
@@ -1686,7 +1336,6 @@ def evaluate_from_cache(
         claude_classes = list(data["claude_classes"]) if "claude_classes" in data else None
 
         if claude_spec is not None:
-
             P_mix = apply_claude_specialist_gate(
                 P_mix=P_mix,
                 R_main=R_main,
@@ -1711,8 +1360,6 @@ def evaluate_from_cache(
                     gate_weight=float(post_cfg.get(f"{fam_k}_specialist_weight", weight_default)),
                 )
 
-
-
         # 3. Unified Handwriting & Orthographic Shield
 
         test_texts = list(data["test_texts"]) if "test_texts" in data else [""] * N_test
@@ -1723,51 +1370,29 @@ def evaluate_from_cache(
 
         multiplier = post_cfg.get("curly_quote_multiplier", float(np.exp(-1.0)))
 
-
-
         P_mix = apply_unified_handwriting_shield(
-
             P_mix=P_mix,
-
             test_texts=test_texts,
-
             log_p_handwriting=log_p_hw,
-
             rule_flags=rule_flags,
-
             curly_quote_multiplier=multiplier,
-
             multi_em_dash_log_penalty=post_cfg.get("multi_em_dash_log_penalty", 0.0),
-
             straight_contr_log_penalty=post_cfg.get("straight_contr_log_penalty", 0.0),
-
             curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", 0.0),
-
             continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.0),
-
         )
-
-
 
         # 3b. Cavity Cluster Uniqueness Repulsion
 
         groups_065 = data.get("groups_065", data.get("groups_085", None))
 
         if groups_065 is not None:
-
             P_mix = apply_cluster_uniqueness_repulsion(
-
                 P_mix=P_mix,
-
                 groups=groups_065,
-
                 strength=post_cfg.get("cluster_repulsion_strength", 0.35),
-
                 iters=3,
-
             )
-
-
 
         # Load train_texts and y_train if available in data or fallback to local_data/train.csv
 
@@ -1778,22 +1403,16 @@ def evaluate_from_cache(
         default_train_csv = WORKSPACE_DIR / "local_data" / "train.csv"
 
         if len(train_texts_list) == 0 and default_train_csv.exists():
-
             try:
-
                 df_tr_local = pd.read_csv(default_train_csv)
 
                 if "text" in df_tr_local.columns and "model" in df_tr_local.columns:
-
                     train_texts_list = df_tr_local["text"].fillna("").astype(str).tolist()
 
                     y_train_arr = np.array([LAB2I[m] for m in df_tr_local["model"].values if m in LAB2I], dtype=int)
 
             except Exception:
-
                 pass
-
-
 
         # 4. Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
         sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
@@ -1807,11 +1426,7 @@ def evaluate_from_cache(
             train_prior = None
 
         P_final = sinkhorn_balancing(
-            P_mix,
-            iters=sinkhorn_iters,
-            sinkhorn_strength=sinkhorn_strength,
-            target_mix=sinkhorn_target_mix,
-            train_prior=train_prior
+            P_mix, iters=sinkhorn_iters, sinkhorn_strength=sinkhorn_strength, target_mix=sinkhorn_target_mix, train_prior=train_prior
         )
 
         # 5. TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
@@ -1827,15 +1442,13 @@ def evaluate_from_cache(
                 evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
             )
 
-
-
         test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
 
         df_report = auditor.print_and_save_report(report_dir, final_test_preds=test_final_preds)
 
-        print_npz_ablation_diagnostics(auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report, data=data, post_cfg=post_cfg)
-
-
+        print_npz_ablation_diagnostics(
+            auditor, active_weights_map, show_confusion=show_confusion, html_report_path=html_report, data=data, post_cfg=post_cfg
+        )
 
     replay_time = time.time() - t0
 
@@ -1844,19 +1457,11 @@ def evaluate_from_cache(
     print(f"[Cache Evaluator] Active Weights Map: {active_weights_map}")
 
     return {
-
         "P_final": P_final,
-
         "weights_map": active_weights_map,
-
         "df_report": df_report,
-
         "replay_time": replay_time,
-
     }
-
-
-
 
 
 def evaluate_matrix(cache_path: Path):
@@ -1865,13 +1470,15 @@ def evaluate_matrix(cache_path: Path):
     Evaluates all model subset combinations crossed with every downstream post-processing operator.
     """
     import numpy as np
-    from sklearn.metrics import balanced_accuracy_score
     from scipy.special import softmax
-    from namethatllm.config import LABELS, FAMILIES, calibrate_model_lp
+    from sklearn.metrics import balanced_accuracy_score
+
+    from namethatllm.config import FAMILIES, calibrate_model_lp
     from namethatllm.postprocess import (
         apply_claude_specialist_gate,
         apply_family_specialist_lora_gate,
         apply_unified_handwriting_shield,
+        sinkhorn_balancing,
     )
 
     if not cache_path.exists() or "v68" not in str(cache_path):
@@ -1880,65 +1487,49 @@ def evaluate_matrix(cache_path: Path):
             cache_path = alt
 
     d = np.load(str(cache_path), allow_pickle=True)
-    y_true = d['y_unseen']
-    texts = list(d['unseen_texts']) if 'unseen_texts' in d else []
+    y_true = d["y_unseen"]
+    texts = list(d["unseen_texts"]) if "unseen_texts" in d else []
 
     models = {}
     model_keys = [
-        ('p2', 'qwen3_14b_p2', 'm_2_unseen_lp', 0.52),
-        ('inh', 'qwen3_14b_inhouse', 'm_4_unseen_lp', 0.33),
-        ('deb', 'deberta_p2', 'm_5_unseen_lp', 0.33),
-        ('svc', 'svc_4view', 'm_0_unseen_lp', 0.30),
-        ('sb', 'spectral_bank', 'extra_1_unseen_lp', 0.15),
-        ('lex', 'lexical_5v', 'm_1_unseen_lp', 0.10),
+        ("p2", "qwen3_14b_p2", "m_2_unseen_lp", 0.52),
+        ("inh", "qwen3_14b_inhouse", "m_4_unseen_lp", 0.33),
+        ("deb", "deberta_p2", "m_5_unseen_lp", 0.33),
+        ("svc", "svc_4view", "m_0_unseen_lp", 0.30),
+        ("sb", "spectral_bank", "extra_1_unseen_lp", 0.15),
+        ("lex", "lexical_5v", "m_1_unseen_lp", 0.10),
     ]
     for short_k, full_name, arr_k, w in model_keys:
         if arr_k in d:
             models[short_k] = (calibrate_model_lp(d[arr_k], full_name), w)
 
-    cl_logits = d.get('claude_spec_logits_unseen', None)
-    gpt_logits = d.get('gpt_spec_logits_unseen', None)
-    gem_logits = d.get('gemini_spec_logits_unseen', None)
-    glm_logits = d.get('glm_spec_logits_unseen', None)
+    cl_logits = d.get("claude_spec_logits_unseen", None)
+    gpt_logits = d.get("gpt_spec_logits_unseen", None)
+    gem_logits = d.get("gemini_spec_logits_unseen", None)
+    glm_logits = d.get("glm_spec_logits_unseen", None)
 
     combos = [
-        ('qwen3_14b_p2 (Solo)', ['p2']),
-        ('qwen3_14b_inhouse (Solo)', ['inh']),
-        ('deberta_p2 (Solo)', ['deb']),
-        ('svc_4view (Solo)', ['svc']),
-        ('spectral_bank (Solo)', ['sb']),
-        ('lexical_5v (Solo)', ['lex']),
-        ('p2 + svc_4view', ['p2', 'svc']),
-        ('p2 + qwen3_14b_inhouse', ['p2', 'inh']),
-        ('p2 + deberta_p2', ['p2', 'deb']),
-        ('inh + svc_4view', ['inh', 'svc']),
-        ('deb + svc_4view', ['deb', 'svc']),
-        ('p2 + inh + svc', ['p2', 'inh', 'svc']),
-        ('p2 + deb + svc', ['p2', 'deb', 'svc']),
-        ('p2 + inh + deb', ['p2', 'inh', 'deb']),
-        ('p2 + inh + deb + svc', ['p2', 'inh', 'deb', 'svc']),
-        ('p2 + inh + svc + sb', ['p2', 'inh', 'svc', 'sb']),
-        ('p2 + inh + deb + svc + sb', ['p2', 'inh', 'deb', 'svc', 'sb']),
-        ('Full Clean (p2+inh+deb+svc+sb+lex)', ['p2', 'inh', 'deb', 'svc', 'sb', 'lex']),
+        ("qwen3_14b_p2 (Solo)", ["p2"]),
+        ("qwen3_14b_inhouse (Solo)", ["inh"]),
+        ("deberta_p2 (Solo)", ["deb"]),
+        ("svc_4view (Solo)", ["svc"]),
+        ("spectral_bank (Solo)", ["sb"]),
+        ("lexical_5v (Solo)", ["lex"]),
+        ("p2 + svc_4view", ["p2", "svc"]),
+        ("p2 + qwen3_14b_inhouse", ["p2", "inh"]),
+        ("p2 + deberta_p2", ["p2", "deb"]),
+        ("inh + svc_4view", ["inh", "svc"]),
+        ("deb + svc_4view", ["deb", "svc"]),
+        ("p2 + inh + svc", ["p2", "inh", "svc"]),
+        ("p2 + deb + svc", ["p2", "deb", "svc"]),
+        ("p2 + inh + deb", ["p2", "inh", "deb"]),
+        ("p2 + inh + deb + svc", ["p2", "inh", "deb", "svc"]),
+        ("p2 + inh + svc + sb", ["p2", "inh", "svc", "sb"]),
+        ("p2 + inh + deb + svc + sb", ["p2", "inh", "deb", "svc", "sb"]),
+        ("Full Clean (p2+inh+deb+svc+sb+lex)", ["p2", "inh", "deb", "svc", "sb", "lex"]),
     ]
 
-    def sinkhorn_func(log_probs, iters=60, strength=0.65, mix=0.35):
-        P = softmax(log_probs, axis=1)
-        N, K = P.shape
-        u = np.ones(N)
-        v = np.ones(K)
-        for _ in range(iters):
-            v = (N / K) / np.maximum(P.T @ u, 1e-12)
-            u = 1.0 / np.maximum(P @ v, 1e-12)
-        P_bal = P * np.outer(u, v)
-        P_bal = P_bal / P_bal.sum(axis=1, keepdims=True)
-        eff_strength = min(strength, 0.75)
-        eff_mix = min(mix, 0.50)
-        return (1.0 - eff_mix) * P + eff_mix * ((1.0 - eff_strength) * P + eff_strength * P_bal)
-
-    headers = [
-        "Model Combination", "Raw", "SoftSK", "+Claude", "+Gemini", "+GPT", "+GLM", "+AllSpec", "FullPipe"
-    ]
+    headers = ["Model Combination", "Raw", "SoftSK", "+Claude", "+Gemini", "+GPT", "+GLM", "+AllSpec", "FullPipe"]
     col_w = [36, 7, 7, 8, 8, 7, 7, 9, 9]
 
     header_str = " | ".join(h.ljust(w) for h, w in zip(headers, col_w))
@@ -1956,42 +1547,65 @@ def evaluate_matrix(cache_path: Path):
             continue
         tot_w = sum(models[k][1] for k in keys)
         lp_mix = sum((models[k][1] / tot_w) * models[k][0] for k in keys)
-        
+
         p_raw = softmax(lp_mix, axis=1)
         acc_raw = balanced_accuracy_score(y_true, p_raw.argmax(axis=1)) * 100
-        p_soft_sk = sinkhorn_func(lp_mix, iters=60, strength=0.65, mix=0.35)
+        p_soft_sk = sinkhorn_balancing(p_raw, iters=60, sinkhorn_strength=0.65, target_mix=0.35)
         acc_soft_sk = balanced_accuracy_score(y_true, p_soft_sk.argmax(axis=1)) * 100
-        
-        p_cl = apply_claude_specialist_gate(p_soft_sk, lp_mix, cl_logits, gate_weight=0.15) if cl_logits is not None else p_soft_sk
+
+        # Post-processing execution order matching pipeline.py: R_main = p_raw
+        p_cl = apply_claude_specialist_gate(p_raw, p_raw, cl_logits, gate_weight=0.15) if cl_logits is not None else p_raw
         acc_cl = balanced_accuracy_score(y_true, p_cl.argmax(axis=1)) * 100
-        p_gem = apply_family_specialist_lora_gate(p_soft_sk, lp_mix, gem_logits, family_cols=FAMILIES['gemini'], gate_weight=0.35) if gem_logits is not None else p_soft_sk
+        p_gem = (
+            apply_family_specialist_lora_gate(p_raw, p_raw, gem_logits, family_cols=FAMILIES["gemini"], gate_weight=0.35)
+            if gem_logits is not None
+            else p_raw
+        )
         acc_gem = balanced_accuracy_score(y_true, p_gem.argmax(axis=1)) * 100
-        p_gpt = apply_family_specialist_lora_gate(p_soft_sk, lp_mix, gpt_logits, family_cols=FAMILIES['gpt'], gate_weight=0.30) if gpt_logits is not None else p_soft_sk
+        p_gpt = (
+            apply_family_specialist_lora_gate(p_raw, p_raw, gpt_logits, family_cols=FAMILIES["gpt"], gate_weight=0.30)
+            if gpt_logits is not None
+            else p_raw
+        )
         acc_gpt = balanced_accuracy_score(y_true, p_gpt.argmax(axis=1)) * 100
-        p_glm = apply_family_specialist_lora_gate(p_soft_sk, lp_mix, glm_logits, family_cols=FAMILIES['glm'], gate_weight=0.30) if glm_logits is not None else p_soft_sk
+        p_glm = (
+            apply_family_specialist_lora_gate(p_raw, p_raw, glm_logits, family_cols=FAMILIES["glm"], gate_weight=0.30)
+            if glm_logits is not None
+            else p_raw
+        )
         acc_glm = balanced_accuracy_score(y_true, p_glm.argmax(axis=1)) * 100
-        
-        p_all_spec = p_soft_sk.copy()
+
+        # All specialists combined on p_raw
+        p_all_spec = p_raw.copy()
         if cl_logits is not None:
-            p_all_spec = apply_claude_specialist_gate(p_all_spec, lp_mix, cl_logits, gate_weight=0.15)
+            p_all_spec = apply_claude_specialist_gate(p_all_spec, p_raw, cl_logits, gate_weight=0.15)
         if gem_logits is not None:
-            p_all_spec = apply_family_specialist_lora_gate(p_all_spec, lp_mix, gem_logits, family_cols=FAMILIES['gemini'], gate_weight=0.35)
+            p_all_spec = apply_family_specialist_lora_gate(p_all_spec, p_raw, gem_logits, family_cols=FAMILIES["gemini"], gate_weight=0.35)
         if gpt_logits is not None:
-            p_all_spec = apply_family_specialist_lora_gate(p_all_spec, lp_mix, gpt_logits, family_cols=FAMILIES['gpt'], gate_weight=0.30)
+            p_all_spec = apply_family_specialist_lora_gate(p_all_spec, p_raw, gpt_logits, family_cols=FAMILIES["gpt"], gate_weight=0.30)
         if glm_logits is not None:
-            p_all_spec = apply_family_specialist_lora_gate(p_all_spec, lp_mix, glm_logits, family_cols=FAMILIES['glm'], gate_weight=0.30)
+            p_all_spec = apply_family_specialist_lora_gate(p_all_spec, p_raw, glm_logits, family_cols=FAMILIES["glm"], gate_weight=0.30)
         acc_all_spec = balanced_accuracy_score(y_true, p_all_spec.argmax(axis=1)) * 100
-        
-        if texts:
-            p_full = apply_unified_handwriting_shield(p_all_spec, texts, curly_quote_multiplier=0.368, continuous_hw_weight=0.04)
-        else:
-            p_full = p_all_spec
+
+        # Full Pipeline: Specialist Gates -> Handwriting Shield -> Soft Sinkhorn
+        p_shield = (
+            apply_unified_handwriting_shield(p_all_spec, texts, curly_quote_multiplier=0.368, continuous_hw_weight=0.04)
+            if texts
+            else p_all_spec
+        )
+        p_full = sinkhorn_balancing(p_shield, iters=60, sinkhorn_strength=0.65, target_mix=0.35)
         acc_full = balanced_accuracy_score(y_true, p_full.argmax(axis=1)) * 100
 
         row_vals = [
-            name, f"{acc_raw:5.2f}%", f"{acc_soft_sk:5.2f}%",
-            f"{acc_cl:5.2f}%", f"{acc_gem:5.2f}%", f"{acc_gpt:5.2f}%", f"{acc_glm:5.2f}%",
-            f"{acc_all_spec:5.2f}%", f"{acc_full:5.2f}%",
+            name,
+            f"{acc_raw:5.2f}%",
+            f"{acc_soft_sk:5.2f}%",
+            f"{acc_cl:5.2f}%",
+            f"{acc_gem:5.2f}%",
+            f"{acc_gpt:5.2f}%",
+            f"{acc_glm:5.2f}%",
+            f"{acc_all_spec:5.2f}%",
+            f"{acc_full:5.2f}%",
         ]
         row_str = " | ".join(v.ljust(w) for v, w in zip(row_vals, col_w))
         print(row_str)
@@ -2007,69 +1621,52 @@ def evaluate_matrix(cache_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="NameThatLLM - Fail-Fast Local Evaluation & Ablation Harness")
-    parser.add_argument("--mode", choices=["split", "cache", "simulate", "stepwise", "matrix"], default="split",
-                        help="Evaluation mode: 'split' (prompt-grouped holdout), 'cache' (replay local_eval_cache.npz), 'simulate' (synthetic cache), 'stepwise' (zero-leakage stepwise analysis), or 'matrix' (full factorial ablation matrix).")
+    parser.add_argument(
+        "--mode",
+        choices=["split", "cache", "simulate", "stepwise", "matrix"],
+        default="split",
+        help="Evaluation mode: 'split' (prompt-grouped holdout), 'cache' (replay local_eval_cache.npz), 'simulate' (synthetic cache), 'stepwise' (zero-leakage stepwise analysis), or 'matrix' (full factorial ablation matrix).",
+    )
 
-    parser.add_argument("--strict-config", action=argparse.BooleanOptionalAction, default=True,
-
-                        help="Strictly filter cache models against configs/production_ensemble.json (default: True).")
+    parser.add_argument(
+        "--strict-config",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Strictly filter cache models against configs/production_ensemble.json (default: True).",
+    )
 
     parser.add_argument("--show-confusion", action="store_true", help="Print full 18x18 numeric confusion matrix grid in console.")
     parser.add_argument("--html-report", type=str, default=None, help="Path to export an interactive HTML confusion matrix report.")
-    parser.add_argument("--stepwise", action="store_true",
+    parser.add_argument("--stepwise", action="store_true", help="Run zero-leakage stepwise forward greedy selection analysis.")
 
-                        help="Run zero-leakage stepwise forward greedy selection analysis.")
+    parser.add_argument("--train-path", type=str, default="local_data/train.csv", help="Path to train.csv for --mode split.")
 
-    parser.add_argument("--train-path", type=str, default="local_data/train.csv",
+    parser.add_argument(
+        "--cache-file", type=str, default="local_data/local_eval_cache.npz", help="Path to local_eval_cache.npz for --mode cache."
+    )
 
-                        help="Path to train.csv for --mode split.")
+    parser.add_argument("--config", type=str, default="configs/production_ensemble.json", help="Path to ensemble JSON configuration.")
 
-    parser.add_argument("--cache-file", type=str, default="local_data/local_eval_cache.npz",
+    parser.add_argument("--folds", type=int, default=5, help="Number of GroupKFold splits for --mode split.")
 
-                        help="Path to local_eval_cache.npz for --mode cache.")
+    parser.add_argument("--fast", action="store_true", default=True, help="Evaluate fold 0 only for ~4s execution.")
 
-    parser.add_argument("--config", type=str, default="configs/production_ensemble.json",
-
-                        help="Path to ensemble JSON configuration.")
-
-    parser.add_argument("--folds", type=int, default=5,
-
-                        help="Number of GroupKFold splits for --mode split.")
-
-    parser.add_argument("--fast", action="store_true", default=True,
-
-                        help="Evaluate fold 0 only for ~4s execution.")
-
-    parser.add_argument("--all-folds", action="store_true",
-
-                        help="Evaluate all 5 folds.")
-
-
+    parser.add_argument("--all-folds", action="store_true", help="Evaluate all 5 folds.")
 
     args = parser.parse_args()
 
-
-
     if args.mode == "split":
-
         fast = False if args.all_folds else args.fast
 
         evaluate_prompt_split(
-
             train_path=Path(args.train_path),
-
             n_splits=args.folds,
-
             fast=fast,
-
             config_path=Path(args.config) if args.config else None,
-
         )
 
     elif args.mode == "simulate":
-
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
-
             sim_cache = Path(tmp_dir) / "sim_eval_cache.npz"
 
             print(f"[Simulate] Synthesizing realistic 10-model multi-trunk cache at {sim_cache}...")
@@ -2082,35 +1679,26 @@ def main():
         evaluate_matrix(Path(args.cache_file))
 
     elif args.mode in ("cache", "stepwise"):
-
-        run_stepwise = (args.mode == "stepwise" or args.stepwise)
+        run_stepwise = args.mode == "stepwise" or args.stepwise
 
         c_path = Path(args.cache_file)
 
         if not c_path.exists():
-
             print(f"[Warning] Cache file {c_path} not found; falling back to --mode simulate...")
 
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
-
                 sim_cache = Path(tmp_dir) / "sim_eval_cache.npz"
 
                 generate_synthetic_cache(sim_cache)
 
                 evaluate_from_cache(
-
                     sim_cache,
-
                     config_path=Path(args.config) if args.config else None,
-
                     strict_config=args.strict_config,
-
                     run_stepwise=run_stepwise,
-
                 )
 
         else:
-
             evaluate_from_cache(
                 c_path,
                 config_path=Path(args.config) if args.config else None,
@@ -2121,10 +1709,5 @@ def main():
             )
 
 
-
-
-
 if __name__ == "__main__":
-
     main()
-

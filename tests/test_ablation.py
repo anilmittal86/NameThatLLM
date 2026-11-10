@@ -3,18 +3,18 @@ Unit Tests for Zero-Leakage Unseen Holdout Benchmark & Forward Stepwise Ablation
 """
 
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import pytest
 
-from namethatllm.config import LABELS, K, align_cols
-from namethatllm.neural_extractor import compute_centered_logits
-from namethatllm.pipeline import auto_align_and_verify_head
 from namethatllm.ablation import (
+    UnseenStepwiseAuditor,
     _text_hash,
     build_unseen_holdout_dataset,
-    UnseenStepwiseAuditor,
 )
+from namethatllm.config import LABELS, K
+from namethatllm.neural_extractor import compute_centered_logits
+from namethatllm.pipeline import auto_align_and_verify_head
 
 
 def test_text_hash_normalization():
@@ -69,12 +69,14 @@ def test_build_unseen_holdout_dataset_quarantine(tmp_path: Path):
         "Train sentence beta.",
         "Train sentence gamma.",
     ]
-    df_train = pd.DataFrame({
-        "id": [1, 2, 3],
-        "prompt_id": [10, 10, 10],
-        "text": train_texts,
-        "model": [LABELS[0], LABELS[1], LABELS[2]],
-    })
+    df_train = pd.DataFrame(
+        {
+            "id": [1, 2, 3],
+            "prompt_id": [10, 10, 10],
+            "text": train_texts,
+            "model": [LABELS[0], LABELS[1], LABELS[2]],
+        }
+    )
     train_path = input_dir / "train.csv"
     df_train.to_csv(train_path, index=False)
 
@@ -83,10 +85,12 @@ def test_build_unseen_holdout_dataset_quarantine(tmp_path: Path):
         "Pool v4 sentence delta.",
         "Pool v4 sentence epsilon.",
     ]
-    df_p4 = pd.DataFrame({
-        "text": pool_v4_texts,
-        "model": [LABELS[3], LABELS[4]],
-    })
+    df_p4 = pd.DataFrame(
+        {
+            "text": pool_v4_texts,
+            "model": [LABELS[3], LABELS[4]],
+        }
+    )
     p4_dir = input_dir / "pool_v4_ds"
     p4_dir.mkdir()
     df_p4.to_parquet(p4_dir / "pool_v4.parquet")
@@ -95,10 +99,12 @@ def test_build_unseen_holdout_dataset_quarantine(tmp_path: Path):
         "Pool v5 sentence zeta.",
         "Pool v5 sentence eta.",
     ]
-    df_p5 = pd.DataFrame({
-        "text": pool_v5_texts,
-        "model": [LABELS[5], LABELS[6]],
-    })
+    df_p5 = pd.DataFrame(
+        {
+            "text": pool_v5_texts,
+            "model": [LABELS[5], LABELS[6]],
+        }
+    )
     p5_dir = input_dir / "pool_v5_ds"
     p5_dir.mkdir()
     df_p5.to_parquet(p5_dir / "nlm_pool_v5.parquet")
@@ -106,21 +112,20 @@ def test_build_unseen_holdout_dataset_quarantine(tmp_path: Path):
     # 3. Candidate disjoint openrouter corpus with contaminated and strictly unseen texts
     unseen_texts = [f"Unseen topic text {i} for model {LABELS[i % K]} with stylized vocabulary." for i in range(72)]
     candidate_texts = (
-        train_texts    # contaminated (should be excluded)
+        train_texts  # contaminated (should be excluded)
         + pool_v4_texts  # contaminated (should be excluded)
         + pool_v5_texts  # contaminated (should be excluded)
-        + unseen_texts   # genuine unseen candidates
+        + unseen_texts  # genuine unseen candidates
     )
     candidate_models = (
-        [LABELS[0], LABELS[1], LABELS[2]]
-        + [LABELS[3], LABELS[4]]
-        + [LABELS[5], LABELS[6]]
-        + [LABELS[i % K] for i in range(72)]
+        [LABELS[0], LABELS[1], LABELS[2]] + [LABELS[3], LABELS[4]] + [LABELS[5], LABELS[6]] + [LABELS[i % K] for i in range(72)]
     )
-    df_cand = pd.DataFrame({
-        "text": candidate_texts,
-        "model": candidate_models,
-    })
+    df_cand = pd.DataFrame(
+        {
+            "text": candidate_texts,
+            "model": candidate_models,
+        }
+    )
     cand_dir = input_dir / "openrouter_harvest_ds"
     cand_dir.mkdir()
     df_cand.to_parquet(cand_dir / "openrouter_harvest.parquet")
@@ -363,9 +368,13 @@ def test_optimize_weights_and_blend_prunes_bad_model_and_weights_individually(tm
 
 def test_infer_adapter_max_layer_selects_l24_layers_on_14b(tmp_path: Path):
     """Verify that an adapter whose max layer index is 23 (l24) sets keep=24 and [2, 4, 6, 8, 12, 16, 20, 24]."""
-    from safetensors.torch import save_file
     import torch
-    from namethatllm.neural_extractor import infer_adapter_max_layer, read_checkpoint_meta
+    from safetensors.torch import save_file
+
+    from namethatllm.neural_extractor import (
+        infer_adapter_max_layer,
+        read_checkpoint_meta,
+    )
 
     ckpt_dir = tmp_path / "mock_l24_adapter"
     ckpt_dir.mkdir()
@@ -394,7 +403,8 @@ def test_infer_adapter_max_layer_selects_l24_layers_on_14b(tmp_path: Path):
 def test_load_norm_weights_resets_stale_biases():
     """Verify that load_norm_weights resets stale weights/biases to 1.0 and 0.0 before loading new keys."""
     import torch
-    import torch.nn as nn
+    from torch import nn
+
     from namethatllm.neural_extractor import UniversalLoRATrunkLoader
 
     # Create mock loader structure
@@ -458,6 +468,7 @@ def test_enable_ablation_probe_toggle(tmp_path: Path):
 def test_resolve_head_tensors_suffix_matching():
     """Verify resolve_head_tensors resolves non-standard suffix keys for plain and centered heads."""
     import torch
+
     from namethatllm.neural_extractor import resolve_head_tensors
 
     # 1. Non-standard plain classifier key (e.g. module.classifier.weight)
@@ -487,7 +498,7 @@ def test_resolve_head_tensors_suffix_matching():
 
 def test_ablation_sinkhorn_and_prior_weight_preservation(tmp_path: Path):
     """Verify _ablation_sinkhorn normalizes mass and print_and_save_report preserves prior weights."""
-    from namethatllm.ablation import _ablation_sinkhorn, UnseenStepwiseAuditor
+    from namethatllm.ablation import UnseenStepwiseAuditor, _ablation_sinkhorn
 
     # Test _ablation_sinkhorn
     P_rand = np.random.rand(36, 18)
@@ -525,6 +536,7 @@ def test_ablation_sinkhorn_and_prior_weight_preservation(tmp_path: Path):
 def test_combine_plain_and_twin_lp_preserves_singleton_temperature():
     """Verify that singleton rows where lp_twin is 0 preserve logit temperature without compression."""
     from scipy.special import log_softmax, softmax
+
     from namethatllm.pipeline import _combine_plain_and_twin_lp
 
     np.random.seed(42)
@@ -555,6 +567,7 @@ def test_combine_plain_and_twin_lp_preserves_singleton_temperature():
 def test_multi_scale_evaluate_marginal_lift_rescues_high_weight_candidate():
     """Verify multi-scale search rescues a candidate that has negative lift at rigid 1.0*weight but positive lift at smaller multiplier."""
     from scipy.special import log_softmax
+
     from namethatllm.ablation import UnseenStepwiseAuditor, _fast_sinkhorn_bacc
 
     np.random.seed(42)
@@ -591,9 +604,10 @@ def test_multi_scale_evaluate_marginal_lift_rescues_high_weight_candidate():
 
 def test_find_fold_adapters_discovery_and_ordering(tmp_path: Path):
     """Verifies find_fold_adapters discovers all 5 folds + full data adapter for q14v5 and q8v5."""
-    from namethatllm.config import find_fold_adapters
-    from safetensors.torch import save_file
     import torch
+    from safetensors.torch import save_file
+
+    from namethatllm.config import find_fold_adapters
 
     # Create dummy dataset folder structure matching dhruvtibarewal/nlm-l24-adapters-v5
     ds_dir = tmp_path / "nlm-l24-adapters-v5"
@@ -613,4 +627,3 @@ def test_find_fold_adapters_discovery_and_ordering(tmp_path: Path):
     for i in range(5):
         assert f"q14v5_f{i}" in found_names
     assert "unrelated_model" not in found_names
-

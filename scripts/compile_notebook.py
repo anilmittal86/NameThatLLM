@@ -4,12 +4,11 @@ Reads modular Python source files directly from `src/namethatllm/*.py` and
 config JSONs to assemble `kaggle_submission.ipynb` and `lora_training.ipynb`.
 """
 
+import argparse
 import ast
 import json
 import re
-import argparse
 from pathlib import Path
-from typing import List
 
 SUBMISSION_MODULES = [
     "config.py",
@@ -25,9 +24,11 @@ TRAINING_MODULES = [
     "config.py",
     "wpca_gaussian.py",
     "neural_extractor.py",
+    "postprocess.py",
     "ablation.py",
     "trainer.py",
 ]
+
 
 def strip_internal_imports(source: str) -> str:
     """Removes internal `from namethatllm... import ...` or `from .xxx import ...` lines, including multi-line."""
@@ -44,7 +45,8 @@ def strip_internal_imports(source: str) -> str:
         lines.append(line)
     return "\n".join(lines).strip() + "\n"
 
-def _build_notebook(cells_code: List[str], output_path: Path) -> Path:
+
+def _build_notebook(cells_code: list[str], output_path: Path) -> Path:
     nb = {
         "cells": [
             {
@@ -53,7 +55,7 @@ def _build_notebook(cells_code: List[str], output_path: Path) -> Path:
                 "id": f"cell_{idx}",
                 "metadata": {},
                 "outputs": [],
-                "source": [line + "\n" for line in code.splitlines()]
+                "source": [line + "\n" for line in code.splitlines()],
             }
             for idx, code in enumerate(cells_code)
         ],
@@ -68,19 +70,22 @@ def _build_notebook(cells_code: List[str], output_path: Path) -> Path:
     output_path.write_text(json.dumps(nb, indent=2), encoding="utf-8")
     return output_path
 
+
 def compile_submission_notebook(config_path: Path, output_path: Path) -> Path:
     repo_root = Path(__file__).resolve().parents[1]
     pkg_dir = repo_root / "src" / "namethatllm"
     cfg_data = json.loads(config_path.read_text(encoding="utf-8"))
 
+    cfg_src = strip_internal_imports((pkg_dir / "config.py").read_text(encoding="utf-8"))
     lex_src = strip_internal_imports((pkg_dir / "lexical_engine.py").read_text(encoding="utf-8"))
-    ast.parse(lex_src, filename="lexical_engine.py")
-    cells = [f"%%writefile /kaggle/working/run_lexical.py\n{lex_src}"]
+    combined_lex = f"{cfg_src}\n\n{lex_src}"
+    ast.parse(combined_lex, filename="run_lexical.py")
+    cells = [f"%%writefile /kaggle/working/run_lexical.py\n{combined_lex}"]
 
     for mod in SUBMISSION_MODULES:
         raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
         if mod == "config.py":
-            raw = f"ENSEMBLE_CONFIG = {repr(cfg_data)}\n\n" + raw
+            raw = f"ENSEMBLE_CONFIG = {cfg_data!r}\n\n" + raw
         ast.parse(raw, filename=mod)
         cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
 
@@ -89,7 +94,9 @@ def compile_submission_notebook(config_path: Path, output_path: Path) -> Path:
     cells.append(entry)
     return _build_notebook(cells, output_path)
 
+
 compile_notebook = compile_submission_notebook
+
 
 def compile_training_notebook(config_path: Path, output_path: Path) -> Path:
     repo_root = Path(__file__).resolve().parents[1]
@@ -100,7 +107,7 @@ def compile_training_notebook(config_path: Path, output_path: Path) -> Path:
     for mod in TRAINING_MODULES:
         raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
         if mod == "config.py":
-            raw = f"TRAINING_CONFIG = {repr(cfg_data)}\n\n" + raw
+            raw = f"TRAINING_CONFIG = {cfg_data!r}\n\n" + raw
         ast.parse(raw, filename=mod)
         cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
 
@@ -108,6 +115,7 @@ def compile_training_notebook(config_path: Path, output_path: Path) -> Path:
     ast.parse(entry, filename="entrypoint_training")
     cells.append(entry)
     return _build_notebook(cells, output_path)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compile Kaggle notebooks from src/namethatllm")

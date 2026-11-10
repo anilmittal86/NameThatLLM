@@ -5,17 +5,35 @@ Master canonical label ordering, provider families, simplex helpers,
 and Kaggle filesystem asset discovery.
 """
 
+import hashlib
 import json
+import re
+import unicodedata
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Any
+
 import numpy as np
 
 # Canonical 18-Class Labels (Strict order from NTL two-stage LoRA part two)
 LABELS = [
-    "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
-    "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
-    "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
-    "qwen3.8-max", "glm-5.3", "glm-5.3-flash", "kimi-k3"
+    "gpt-5.5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gemini-3.1-pro-preview",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "claude-opus-4-6",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "qwen3.8-max",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "kimi-k3",
 ]
 K = len(LABELS)
 LAB2I = {l: i for i, l in enumerate(LABELS)}
@@ -27,24 +45,34 @@ FAMILIES = {
     "glm": [15, 16],
 }
 
-# The 6 lowest-recall classes from Table D that require extra pool capacity and margin priority
-# Include BOTH 7 (gemini-3.7-flash) and 8 (gemini-3.8-flash) so their pool caps are 100% symmetric!
-HARD_CLASS_INDICES = [3, 7, 8, 13, 15, 16, 17]
+# Master list of highest-error and most confused classes requiring loss upweighting:
+# 1: gpt-5.6-luna (60.0% error, easily confused with astra/sol)
+# 2: gpt-5.6-sol (75.0% error, heavily confused with astra)
+# 3: gpt-5.6-terra (70.0% error, confused with luna/sol)
+# 6: gemini-3.6-flash (45.0% error, confused with 3.1-pro)
+# 7: gemini-3.7-flash (80.0% error, confused with 3.8-flash & 3.6-flash)
+# 8: gemini-3.8-flash (65.0% error, confused with 3.7-flash & 3.6-flash)
+# 13: claude-fable-5 (45.0% error, cross-family confusion)
+# 14: qwen3.8-max (40.0% error, lowest pool count 4,209)
+# 15: glm-5.3 (80.0% error, confused with glm-5.3-flash)
+# 16: glm-5.3-flash (80.0% error, confused with glm-5.3)
+# 17: kimi-k3 (80.0% error, straight-quote & Chinese frontier confusion)
+HARD_CLASS_INDICES = [1, 2, 3, 6, 7, 8, 13, 14, 15, 16, 17]
 
 # Extended specialist groups: includes the 4 provider families PLUS the cross-family
 # Straight-Quote / Chinese Frontier confusion cluster (opus-4-8, fable-5, qwen3.8-max, glm-5.3, glm-5.3-flash, kimi-k3)
 # and high-confusion sibling sub-clusters!
 SPECIALIST_GROUPS = {
     "gpt": [0, 1, 2, 3, 4],
-    "gpt_56_triad": [1, 2, 3],           # gpt-5.6-luna vs gpt-5.6-sol vs gpt-5.6-terra
+    "gpt_56_triad": [1, 2, 3],  # gpt-5.6-luna vs gpt-5.6-sol vs gpt-5.6-terra
     "gemini": [5, 6, 7, 8],
-    "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
-    "gemini_37_38_pair": [7, 8],         # Dedicated 1-vs-1 binary tie-breaker for gemini-3.7-flash vs gemini-3.8-flash!
+    "gemini_flash_triad": [6, 7, 8],  # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
+    "gemini_37_38_pair": [7, 8],  # Dedicated 1-vs-1 binary tie-breaker for gemini-3.7-flash vs gemini-3.8-flash!
     "claude": [9, 10, 11, 12, 13],
-    "glm": [15, 16],                     # Dedicated 1-vs-1 binary tie-breaker for glm-5.3 vs glm-5.3-flash!
-    "glm_kimi_triad": [15, 16, 17],      # Resolves glm-5.3 <-> glm-5.3-flash <-> kimi-k3 confusion!
+    "glm": [15, 16],  # Dedicated 1-vs-1 binary tie-breaker for glm-5.3 vs glm-5.3-flash!
+    "glm_kimi_triad": [15, 16, 17],  # Resolves glm-5.3 <-> glm-5.3-flash <-> kimi-k3 confusion!
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
-    "kimi_gpt55_qwen": [0, 14, 17],      # resolves kimi-k3 <-> gpt-5.5 <-> qwen3.8-max confusion!
+    "kimi_gpt55_qwen": [0, 14, 17],  # resolves kimi-k3 <-> gpt-5.5 <-> qwen3.8-max confusion!
 }
 
 PRIOR_SCALES = {
@@ -60,9 +88,10 @@ PRIOR_SCALES = {
     "qwen3_8b_inhouse": 0.30,
 }
 
+
 def align_cols(arr: np.ndarray, src_labels: list) -> np.ndarray:
     """Aligns columns of array to canonical 18-class order."""
-    src_list = [x.decode('utf-8') if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
+    src_list = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
     idx = [src_list.index(l) for l in LABELS]
     if arr.ndim == 1:
         return arr[idx]
@@ -106,10 +135,32 @@ def calibrate_model_lp(
     out = np.maximum(out, -16.0)
     return log_softmax(out, axis=1)
 
+
+def _text_hash(text: str) -> str:
+    """
+    Computes a canonical SHA-1 hash of normalized text for zero-leakage deduplication.
+
+    Why Strict Normalization Matters:
+    --------------------------------
+    Subtle variations (different Unicode quotes, leading/trailing markdown asterisks,
+    differing whitespace) could cause a training passage to evade exact string matching.
+    We apply:
+    1. Unicode NFKC normalization (replaces typographic quotes, fullwidth chars).
+    2. Stripping enclosing markdown bold (**text** -> text).
+    3. Collapsing all multi-whitespace and newlines into single spaces.
+    This guarantees 0% exact or near-exact leakage between training and holdout!
+    """
+    s = unicodedata.normalize("NFKC", str(text or "")).strip()
+    s = re.sub(r"^\*\*(.*)\*\*$", r"\1", s).strip()
+    norm = " ".join(s.split())
+    return hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
+
+
 def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     """Numerically stable log-softmax."""
     c = np.max(x, axis=axis, keepdims=True)
     return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
+
 
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     """Numerically stable softmax."""
@@ -117,47 +168,59 @@ def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     e = np.exp(x - c)
     return e / (np.sum(e, axis=axis, keepdims=True) + 1e-15)
 
-def resolve_dataset_paths(input_dir: Optional[Path] = None) -> Tuple[Path, Path, Optional[Path]]:
+
+def resolve_dataset_paths(input_dir: Path | None = None) -> tuple[Path, Path, Path | None]:
     """Resolves train.csv, test.csv, and pool_v4.parquet across local and Kaggle environments."""
     if input_dir is None:
-        input_dir = Path('/kaggle/input')
+        input_dir = Path("/kaggle/input")
         if not input_dir.exists():
-            input_dir = Path('.')
+            input_dir = Path(".")
 
     candidates = [
-        input_dir / 'competitions' / 'name-that-llm',
-        input_dir / 'name-that-llm',
-        Path('local_data'),
-        Path('.')
+        input_dir,
+        input_dir / "competitions" / "name-that-llm",
+        input_dir / "name-that-llm",
+        Path("local_data"),
+        Path("."),
     ]
     train_path = None
     test_path = None
     for c in candidates:
-        if (c / 'train.csv').exists() and train_path is None:
-            train_path = c / 'train.csv'
-        if (c / 'test.csv').exists() and test_path is None:
-            test_path = c / 'test.csv'
+        if (c / "train.csv").exists() and train_path is None:
+            train_path = c / "train.csv"
+        if (c / "test.csv").exists() and test_path is None:
+            test_path = c / "test.csv"
 
     if train_path is None:
-        train_path = Path('local_data') / 'train.csv'
+        train_path = Path("local_data") / "train.csv"
     if test_path is None:
-        test_path = Path('local_data') / 'test.csv'
+        test_path = Path("local_data") / "test.csv"
 
     pool_files = resolve_all_pool_files(input_dir)
     pool_file = pool_files[0] if pool_files else None
 
     return train_path, test_path, pool_file
 
-def resolve_all_pool_files(input_dir: Optional[Path] = None) -> List[Path]:
-    """Discovers all pretraining/unlabeled pool parquet files in priority order."""
+
+def resolve_all_pool_files(input_dir: Path | None = None) -> list[Path]:
+    """Discovers all pretraining/unlabeled pool parquet files in priority order.
+
+    If the consolidated pool_120k.parquet exists, returns it directly as it already
+    subsumes all individual pool sources (nlm_matched_clean, pool_v4, nlm_pool_v5, nlm_pool_v2).
+    """
     if input_dir is None:
-        input_dir = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
-    pool_files: List[Path] = []
+        input_dir = Path("/kaggle/input") if Path("/kaggle/input").exists() else Path(".")
+
+    # If the consolidated 120k pool is present, use it directly to eliminate redundant I/O
+    for p in input_dir.rglob("pool_120k.parquet"):
+        return [p]
+
+    pool_files: list[Path] = []
     pool_patterns = [
-        'nlm_matched_clean.parquet',
-        'pool_v4.parquet',
-        'nlm_pool_v5.parquet',
-        'nlm_pool_v2.parquet',
+        "nlm_matched_clean.parquet",
+        "pool_v4.parquet",
+        "nlm_pool_v5.parquet",
+        "nlm_pool_v2.parquet",
     ]
     for pat in pool_patterns:
         for p in input_dir.rglob(pat):
@@ -165,46 +228,33 @@ def resolve_all_pool_files(input_dir: Optional[Path] = None) -> List[Path]:
                 pool_files.append(p)
     return pool_files
 
-def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_layers: int) -> Optional[Path]:
+
+def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_layers: int) -> Path | None:
     """Discovers base model directories from Hugging Face config.json inspection."""
-    for cfg_p in input_dir.rglob('config.json'):
+    for cfg_p in input_dir.rglob("config.json"):
         try:
-            cfg = json.load(open(cfg_p))
-            m_type = str(cfg.get('model_type', '')).lower()
-            h_dim = cfg.get('hidden_size', 0)
-            n_lay = cfg.get('num_hidden_layers', 0)
+            with open(cfg_p, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            m_type = str(cfg.get("model_type", "")).lower()
+            h_dim = cfg.get("hidden_size", 0)
+            n_lay = cfg.get("num_hidden_layers", 0)
             if model_family.lower() in m_type and h_dim == hidden_sz and n_lay == num_layers:
                 return cfg_p.parent
         except Exception:
             continue
     return None
 
-class CheckpointInfo(tuple):
-    """Tuple subclass supporting both 2-element (dim, keep) and 3-element (dim, keep, backbone) unpacking."""
-    def __iter__(self):
-        try:
-            import sys
-            import dis
-            f = sys._getframe(1)
-            for i in dis.get_instructions(f.f_code):
-                if i.offset == f.f_lasti and i.opname.startswith('UNPACK_SEQUENCE'):
-                    if i.argval == 2:
-                        return iter(self[:2])
-                    elif i.argval == 3:
-                        return iter(self[:3])
-        except Exception:
-            pass
-        return super().__iter__()
 
-def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
-    """Returns (head_feature_dim, keep_layers) for checkpoint directory without full model loading."""
+def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> tuple[int, int, str]:
+    """Returns (head_feature_dim, keep_layers, backbone) for checkpoint directory without full model loading."""
     dim = 0
     keep = 0
     backbone = ""
     meta_p = ckpt_dir / "meta.json"
     if meta_p.exists():
         try:
-            m = json.load(open(meta_p))
+            with open(meta_p, "r", encoding="utf-8") as f:
+                m = json.load(f)
             cfg = m.get("cfg", m)
             keep = int(cfg.get("keep", 0))
             backbone = str(m.get("backbone", cfg.get("backbone", ""))).lower()
@@ -215,6 +265,7 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
     if heads_p.exists():
         try:
             from safetensors import safe_open
+
             with safe_open(str(heads_p), framework="pt", device="cpu") as f:
                 for k in f.keys():
                     shape = f.get_tensor(k).shape
@@ -226,6 +277,7 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
     elif (ckpt_dir / "heads.pt").exists():
         try:
             import torch
+
             sd = torch.load(ckpt_dir / "heads.pt", map_location="cpu", weights_only=False)
             if isinstance(sd, dict):
                 for k, v in sd.items():
@@ -234,23 +286,25 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
                         break
         except Exception:
             pass
-    return CheckpointInfo((dim, keep, backbone))
+    return dim, keep, backbone
 
-def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
+
+def find_checkpoints(input_dir: Path) -> dict[str, Path]:
     """Finds all fine-tuned LoRA and head checkpoints across safetensors and PyTorch formats."""
     ckpts = {}
 
     # 1. Check for heads.safetensors and heads.pt files
-    head_candidates = list(input_dir.rglob('heads.safetensors')) + list(input_dir.rglob('heads.pt'))
+    head_candidates = list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt"))
     for p in head_candidates:
-        p_str = str(p).lower().replace('\\', '/')
-        is_fold = ('_f0' in p_str or '_f1' in p_str or '_f2' in p_str or '_f3' in p_str or '_f4' in p_str)
+        p_str = str(p).lower().replace("\\", "/")
+        is_fold = "_f0" in p_str or "_f1" in p_str or "_f2" in p_str or "_f3" in p_str or "_f4" in p_str
 
         target_family = ""
         meta_p = p.parent / "meta.json"
         if meta_p.exists():
             try:
-                m_data = json.load(open(meta_p, encoding="utf-8"))
+                with open(meta_p, "r", encoding="utf-8") as f:
+                    m_data = json.load(f)
                 target_family = str(m_data.get("target_family", "")).lower()
             except Exception:
                 pass
@@ -259,113 +313,122 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
         if target_family == "gpt" or any(t in p_str for t in ("export_gpt", "gpt_specialist", "gpt_spec", "qwen3_14b_gpt")):
             ckpts["qwen3_14b_gpt"] = p.parent
             continue
-        elif target_family == "gemini" or any(t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini")):
+        elif target_family == "gemini" or any(
+            t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini")
+        ):
             ckpts["qwen3_14b_gemini"] = p.parent
             continue
         elif target_family == "glm" or any(t in p_str for t in ("export_glm", "glm_specialist", "glm_spec", "qwen3_14b_glm")):
             ckpts["qwen3_14b_glm"] = p.parent
             continue
 
-        if 'lora_qwen3_14b' in p_str or 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
-            ckpts['qwen3_14b_p2'] = p.parent
-        elif 'lora_qwen25_14b' in p_str or 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
-            ckpts['qwen25_14b_p2'] = p.parent
-        elif 'q14v5' in p_str:
-            if 'qwen3_14b_v5' not in ckpts or (not is_fold):
-                ckpts['qwen3_14b_v5'] = p.parent
-        elif 'ts_q3b14' in p_str:
-            if 'qwen3_14b_ts' not in ckpts or (not is_fold):
-                ckpts['qwen3_14b_ts'] = p.parent
-        elif 'lora14b_v1' in p_str:
-            ckpts['qwen3_14b_p1'] = p.parent
-        elif any(token in p_str for token in ('inhouse', 'ntl-inhouse', 'export_lora24', 'export_champion', 'lora-peft-training', 'peft_training')):
+        if "lora_qwen3_14b" in p_str or "qwen3_14b_part2" in p_str or ("14b" in p_str and "part2" in p_str and "qwen3" in p_str):
+            ckpts["qwen3_14b_p2"] = p.parent
+        elif "lora_qwen25_14b" in p_str or "qwen25_14b_part2" in p_str or ("14b" in p_str and "part2" in p_str and "qwen2" in p_str):
+            ckpts["qwen25_14b_p2"] = p.parent
+        elif "q14v5" in p_str:
+            if "qwen3_14b_v5" not in ckpts or (not is_fold):
+                ckpts["qwen3_14b_v5"] = p.parent
+        elif "ts_q3b14" in p_str:
+            if "qwen3_14b_ts" not in ckpts or (not is_fold):
+                ckpts["qwen3_14b_ts"] = p.parent
+        elif "lora14b_v1" in p_str:
+            ckpts["qwen3_14b_p1"] = p.parent
+        elif any(
+            token in p_str
+            for token in ("inhouse", "ntl-inhouse", "export_lora24", "export_champion", "lora-peft-training", "peft_training")
+        ):
             dim, keep, backbone = _inspect_checkpoint_dim_and_keep(p.parent)
-            if '2.5' in backbone or 'qwen25' in backbone or (dim == 40960 and (keep >= 30 or '25' in p_str or 'qwen25' in p_str)):
-                ckpts['qwen25_14b_inhouse'] = p.parent
-            elif dim == 40960 or '14b' in p_str or '14b' in backbone:
-                ckpts['qwen3_14b_inhouse'] = p.parent
-            elif dim == 8192 or 'deberta' in p_str or 'deberta' in backbone:
-                ckpts['deberta_inhouse'] = p.parent
+            if "2.5" in backbone or "qwen25" in backbone or (dim == 40960 and (keep >= 30 or "25" in p_str or "qwen25" in p_str)):
+                ckpts["qwen25_14b_inhouse"] = p.parent
+            elif dim == 40960 or "14b" in p_str or "14b" in backbone:
+                ckpts["qwen3_14b_inhouse"] = p.parent
+            elif dim == 8192 or "deberta" in p_str or "deberta" in backbone:
+                ckpts["deberta_inhouse"] = p.parent
             else:
-                ckpts['qwen3_8b_inhouse'] = p.parent
-        elif 'q8v5' in p_str:
-            if 'qwen3_8b_v5' not in ckpts or (not is_fold):
-                ckpts['qwen3_8b_v5'] = p.parent
-        elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'l24x_q3b8' in p_str:
-            if 'qwen3_8b_ts' not in ckpts or (not is_fold):
-                ckpts['qwen3_8b_ts'] = p.parent
-        elif 'll8v5' in p_str:
-            if 'llama3_8b_v5' not in ckpts or (not is_fold):
-                ckpts['llama3_8b_v5'] = p.parent
-        elif 'ts_llama8' in p_str:
-            if 'llama3_8b_ts' not in ckpts or (not is_fold):
-                ckpts['llama3_8b_ts'] = p.parent
-        elif 'lora8b_v1' in p_str:
-            ckpts['qwen3_8b_p1'] = p.parent
-        elif 'ts_q25_7b' in p_str or 'l24x_q25_7b' in p_str:
-            if 'qwen25_7b_ts' not in ckpts or (not is_fold):
-                ckpts['qwen25_7b_ts'] = p.parent
-        elif 'instyle' in p_str:
-            ckpts['instyle'] = p.parent
+                ckpts["qwen3_8b_inhouse"] = p.parent
+        elif "q8v5" in p_str:
+            if "qwen3_8b_v5" not in ckpts or (not is_fold):
+                ckpts["qwen3_8b_v5"] = p.parent
+        elif "ts_q3b8" in p_str or "ts8_s7" in p_str or "l24x_q3b8" in p_str:
+            if "qwen3_8b_ts" not in ckpts or (not is_fold):
+                ckpts["qwen3_8b_ts"] = p.parent
+        elif "ll8v5" in p_str:
+            if "llama3_8b_v5" not in ckpts or (not is_fold):
+                ckpts["llama3_8b_v5"] = p.parent
+        elif "ts_llama8" in p_str:
+            if "llama3_8b_ts" not in ckpts or (not is_fold):
+                ckpts["llama3_8b_ts"] = p.parent
+        elif "lora8b_v1" in p_str:
+            ckpts["qwen3_8b_p1"] = p.parent
+        elif "ts_q25_7b" in p_str or "l24x_q25_7b" in p_str:
+            if "qwen25_7b_ts" not in ckpts or (not is_fold):
+                ckpts["qwen25_7b_ts"] = p.parent
+        elif "instyle" in p_str:
+            ckpts["instyle"] = p.parent
 
     # 2. Check for Claude specialist head
-    for p in input_dir.rglob('claude_head.safetensors'):
-        ckpts['qwen3_8b_claude'] = p.parent
+    for p in input_dir.rglob("claude_head.safetensors"):
+        ckpts["qwen3_8b_claude"] = p.parent
         break
-    if 'qwen3_8b_claude' not in ckpts:
-        for p in input_dir.rglob('readouts.npz'):
-            if 'claude' in str(p).lower():
-                ckpts['qwen3_8b_claude'] = p.parent
+    if "qwen3_8b_claude" not in ckpts:
+        for p in input_dir.rglob("readouts.npz"):
+            if "claude" in str(p).lower():
+                ckpts["qwen3_8b_claude"] = p.parent
                 break
 
     # 3. Check for DeBERTa sequence classification head
-    for p in list(input_dir.rglob('head.safetensors')) + list(input_dir.rglob('heads.safetensors')):
-        if 'deberta' in str(p).lower():
-            ckpts['deberta_p2'] = p.parent
+    for p in list(input_dir.rglob("head.safetensors")) + list(input_dir.rglob("heads.safetensors")):
+        if "deberta" in str(p).lower():
+            ckpts["deberta_p2"] = p.parent
             break
 
     # 4. Fallback search for instyle
-    if 'instyle' not in ckpts:
-        for p in input_dir.rglob('*'):
-            p_s = str(p).lower().replace('\\', '/')
-            if 'instyle' in p_s and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists() or (p / 'heads.safetensors').exists() or (p / 'heads.pt').exists()):
-                ckpts['instyle'] = p
+    if "instyle" not in ckpts:
+        for p in input_dir.rglob("*"):
+            p_s = str(p).lower().replace("\\", "/")
+            if "instyle" in p_s and (
+                (p / "adapter_model.safetensors").exists()
+                or (p / "adapter" / "adapter_model.safetensors").exists()
+                or (p / "heads.safetensors").exists()
+                or (p / "heads.pt").exists()
+            ):
+                ckpts["instyle"] = p
                 break
 
     # 5. Fallback search for q14v5 / ts_q3b14 adapter
-    if 'qwen3_14b_ts' not in ckpts:
-        for p in input_dir.rglob('adapter_model.safetensors'):
-            p_s = str(p).lower().replace('\\', '/')
-            if 'q14v5' in p_s or 'ts_q3b14' in p_s:
-                ckpts['qwen3_14b_ts'] = p.parent
+    if "qwen3_14b_ts" not in ckpts:
+        for p in input_dir.rglob("adapter_model.safetensors"):
+            p_s = str(p).lower().replace("\\", "/")
+            if "q14v5" in p_s or "ts_q3b14" in p_s:
+                ckpts["qwen3_14b_ts"] = p.parent
                 break
 
     return ckpts
 
-def find_fold_adapters(input_dir: Optional[Path], prefix: str) -> List[Path]:
+
+def find_fold_adapters(input_dir: Path | None, prefix: str) -> list[Path]:
     """Scans input_dir for all adapter/head directories matching prefix, prefix_f*, prefix_fold*, prefix-f*."""
     if input_dir is None:
-        input_dir = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
+        input_dir = Path("/kaggle/input") if Path("/kaggle/input").exists() else Path(".")
 
-    matches: Set[Path] = set()
+    matches: set[Path] = set()
     prefix_lower = prefix.lower()
 
     candidate_files = (
-        list(input_dir.rglob('heads.safetensors')) +
-        list(input_dir.rglob('heads.pt')) +
-        list(input_dir.rglob('adapter_model.safetensors'))
+        list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")) + list(input_dir.rglob("adapter_model.safetensors"))
     )
     for f in candidate_files:
         p = f.parent
         p_name = p.name.lower()
-        if p_name in ('adapter', 'checkpoint'):
+        if p_name in ("adapter", "checkpoint"):
             p = p.parent
             p_name = p.name.lower()
 
-        p_str = str(p).lower().replace('\\', '/')
+        p_str = str(p).lower().replace("\\", "/")
         if prefix_lower in p_name or prefix_lower in p_str:
             # Check pattern: exact match or prefix followed by _ or - or fold
-            tokens = p_name.replace('-', '_').split('_')
+            tokens = p_name.replace("-", "_").split("_")
             matched = False
             for t in tokens:
                 if t == prefix_lower or t.startswith(prefix_lower):
@@ -379,14 +442,15 @@ def find_fold_adapters(input_dir: Optional[Path], prefix: str) -> List[Path]:
 
     return sorted(list(matches), key=lambda x: str(x).lower())
 
+
 def validate_production_assets(
     input_dir: Path,
     train_path: Path,
     test_path: Path,
-    pool_files: List[Path],
-    ckpts: Dict[str, Path],
-    cfg: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Path]:
+    pool_files: list[Path],
+    ckpts: dict[str, Path],
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Path]:
     """
     Fail-closed pre-flight validation for production inference runs (when NTL_SMOKE != '1').
     Raises FileNotFoundError immediately at startup if any required dataset, pool parquet,
@@ -396,7 +460,7 @@ def validate_production_assets(
     if cfg is None:
         cfg = {}
     req = cfg.get("required_assets", {})
-    missing: List[str] = []
+    missing: list[str] = []
 
     # 1. Verify competition CSVs
     if not train_path or not Path(train_path).exists():
@@ -417,7 +481,7 @@ def validate_production_assets(
         {"name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24},
     ]
     base_specs = req.get("required_base_models", default_bases)
-    verified_bases: Dict[str, Path] = {}
+    verified_bases: dict[str, Path] = {}
     for b_spec in base_specs:
         b_path = find_base_model(
             input_dir,
@@ -434,20 +498,14 @@ def validate_production_assets(
             verified_bases[b_spec["name"]] = b_path
 
     # 4. Verify all required fine-tuned checkpoints
-    default_req_ckpts = [
-        "qwen3_14b_p2",
-        "deberta_p2", "qwen3_8b_claude"
-    ]
+    default_req_ckpts = ["qwen3_14b_p2", "deberta_p2", "qwen3_8b_claude"]
     req_ckpts = req.get("required_checkpoints", default_req_ckpts)
     for ck_name in req_ckpts:
         if ck_name not in ckpts or not Path(ckpts[ck_name]).exists():
             missing.append(f"Required checkpoint '{ck_name}' not found under {input_dir} (discovered: {list(ckpts.keys())})")
 
     if missing:
-        error_msg = (
-            "[PRE-FLIGHT ASSET AUDIT FAILED] Missing required inference assets:\n  - "
-            + "\n  - ".join(missing)
-        )
+        error_msg = "[PRE-FLIGHT ASSET AUDIT FAILED] Missing required inference assets:\n  - " + "\n  - ".join(missing)
         raise FileNotFoundError(error_msg)
 
     print(

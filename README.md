@@ -4,7 +4,7 @@
 [![Codebase Architecture](https://img.shields.io/badge/Architecture-Modular%20PyPA%20Package-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
 [![In-House Checkpoint](https://img.shields.io/badge/In--House%20LoRA24-73.19%25%20Validation%20BAcc-brightgreen)](https://www.kaggle.com/datasets/anilmittal/ntl-inhouse-two-stage-lora24)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-61%20Passed-brightgreen)](#)
+[![Unit Tests](https://img.shields.io/badge/Unit%20Tests-87%20Passed%20(100%25)-brightgreen)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
 A competition-grade, memory-isolated machine learning solution for the **Kaggle "Name That LLM"** competition. The objective is to identify which of 18 specific Large Language Models authored an unattributed response passage.
@@ -141,16 +141,17 @@ The codebase is organized in `src/namethatllm/` as a modular PyPA package with 5
   - Re-normalizes rows to the probability simplex.
 - **300-Step Multiplicative Sinkhorn-Knopp Mass Balancing**: Iteratively rescales row and column marginals, equalizing predicted class mass to $N/18$.
 
-### Module 5: Two-Stage LoRA Training Engine (`trainer.py`)
-- **Memory-Balancing Across 2x T4 GPUs**: Distributes weights with `max_memory={i: "9.0GiB"}` and non-reentrant gradient checkpointing (`use_reentrant=False`), eliminating CUDA out-of-memory crashes.
-- **Stage 1 (Pool Pre-training)**: Trains adapter on 75,000 multi-pool passages (`batch_size=4`, `accum=4`, `lr=2e-4`).
-- **Stage 2 (Prompt-Grouped Fine-Tuning)**: Two-pass micro-batched training via `train_prompt_group_step`:
-  - Pass 1 (`torch.no_grad()`): Computes exact within-prompt mean vector `mu_prompt` in chunks of 4.
-  - Pass 2 (Autograd micro-batches of 2): Dynamically slices sequences to `max_l` and accumulates gradients with `label_smoothing=0.10`, ensuring peak memory never exceeds 2 sequences.
-- **Token-0 Padding Preservation**: Properly preserves token ID 0 (`"!"`) with `attention_mask = 1` while padding with `151643` (`attention_mask = 0`).
-- **Full Norm Deactivation (`_disable_final_norm`)**: Recursively neutralizes `.norm` across all PEFT nesting levels to guarantee inference parity with `UniversalLoRATrunkLoader`.
-- **Closed-Form Dual Ridge Head Calibration (`fit_ridge_heads`)**: Ultra-fast dual formulation $(N \times N)$ Ridge regression with label smoothing (0.10) to pre-calibrate and post-calibrate classification heads.
-- **Inference-Compliant Export**: Produces exact `adapter/`, `heads.safetensors`, `meta.json`, and `wPCA_bank.npz` files for instant plug-and-play mounting.
+### Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `scripts/modal_trainer.py`)
+- **High-Throughput Cloud Training (Modal NVIDIA A100-80GB SXM)**: Trains `Qwen/Qwen3-14B-Base` (truncated to `keep_layers=27`) with native `bfloat16`, precompiled FlashAttention-2, and dynamic length bucketing (`max_len=384`), achieving ~25 steps/min (~800 passages/min).
+- **123k Canonical Pool Pre-Training (`pool_120k.parquet`)**: Ingests 123,298 deduplicated passages across all 18 classes with strict 360-row unseen holdout quarantine.
+- **Hard-Class Loss Upweighting ($1.40\times$)**: Upweights the 11 historically error-prone classes (`gemini-3.7-flash`, `gpt-5.6-sol`, `glm-5.3`, `kimi-k3`, `qwen3.8-max`, etc.) in cross-entropy loss, ensuring strong gradient focus on minority/confused classes without duplicate data distortion.
+- **Empirical Sibling Margin Penalty Boost**:
+  - Gemini Flash Triad (`3.7-flash` $\leftrightarrow$ `3.8-flash`): **$1.5\times$ margin penalty**
+  - GPT-5.6 Triad (`luna` $\leftrightarrow$ `sol` $\leftrightarrow$ `terra`): **$1.4\times$ margin penalty**
+  - GLM Sisters (`glm-5.3` $\leftrightarrow$ `glm-5.3-flash`): **$1.4\times$ margin penalty**
+- **Stage 2 (Prompt-Grouped Fine-Tuning)**: Two-pass micro-batched within-prompt centering via `train_prompt_group_step` with dynamic sequence length slicing, Supervised Contrastive (SupCon) repulsion, and Stochastic Weight Averaging (SWA).
+- **Closed-Form Dual Ridge Head Calibration (`fit_ridge_heads`)**: Ultra-fast dual formulation $(N \times N)$ Ridge regression with label smoothing (0.10) to pre-calibrate and post-calibrate classification heads (`plain` and `centered`).
+- **Inference-Compliant Export**: Produces exact `adapter/`, `heads.safetensors`, `meta.json`, `wPCA_bank.npz`, and 5-fold `stage2_cv_report.json` files for instant plug-and-play inference.
 
 ### Model Lineage & Dataset Provenance Map
 
@@ -231,7 +232,7 @@ pip install -e . --no-deps
 ```
 
 ### 2. Running Unit & Integration Tests
-Run the complete 61-test suite:
+Run the complete 87-test suite:
 ```powershell
 python -m pytest tests -v
 ```
@@ -255,4 +256,25 @@ python -m kaggle kernels push -p kernels/submission
 
 # Push training notebook
 python -m kaggle kernels push -p kernels/training
+```
+
+### 5. Cloud Training on Modal (NVIDIA A100-80GB)
+All heavy model training is dispatched to serverless NVIDIA A100-80GB GPUs on Modal:
+
+```powershell
+# 1. Sync competition data and assemble canonical pool_120k.parquet directly into cloud volume
+python -m modal run scripts/modal_trainer.py --mode sync
+
+# 2. Run fast 2-minute end-to-end smoke test on A100 GPU
+python -m modal run scripts/modal_trainer.py --mode smoke
+
+# 3. Launch full 18-class champion training in detached mode (immune to local network drops)
+python -m modal run --detach scripts/modal_trainer.py --mode run --config configs/training_lora.json
+
+# 4. Check active cloud apps and live logs
+python -m modal app list
+python -m modal app logs <app_id>
+
+# 5. Pull trained champion checkpoint artifacts locally
+python -m modal volume get ntl-checkpoints export_champion_qwen3_14b ./checkpoints/
 ```

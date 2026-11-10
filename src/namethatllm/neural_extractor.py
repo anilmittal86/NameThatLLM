@@ -7,23 +7,24 @@ and bit-exact CPU fp16 snapshot/restore for shared trunks.
 """
 
 import gc
+import json
 import os
 import re
-import json
-import time
 import shutil
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
-from transformers import AutoConfig, AutoModel, AutoTokenizer
 from safetensors.torch import load_file
+from torch import nn
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 from .config import LABELS, K, align_cols, log_softmax
 
-def infer_adapter_max_layer(ckpt_dir: Path) -> Optional[int]:
+
+def infer_adapter_max_layer(ckpt_dir: Path) -> int | None:
     """Returns 1-indexed max transformer layer modified by the LoRA adapter (e.g. 24 or 27)."""
     ckpt_dir = Path(ckpt_dir)
     for rel in (
@@ -54,21 +55,24 @@ def infer_adapter_max_layer(ckpt_dir: Path) -> Optional[int]:
                 continue
     return None
 
+
 def in_place_copy(dst: torch.Tensor, src: torch.Tensor):
     """In-place weight copy."""
     dst.data.copy_(src.to(device=dst.device, dtype=dst.dtype))
 
-def _resolve_module_name(k: str, state_dict: dict) -> Optional[str]:
+
+def _resolve_module_name(k: str, state_dict: dict) -> str | None:
     """Resolves module name across various AutoModel and PEFT naming schemes."""
     raw = k.split(".lora_A")[0]
     candidates = [raw, raw.replace("base_model.model.", "")]
     if "layers." in raw:
-        rel = raw[raw.index("layers."):]
+        rel = raw[raw.index("layers.") :]
         candidates.extend([rel, f"model.{rel}"])
     for c in candidates:
         if c in state_dict and hasattr(state_dict[c], "weight"):
             return c
     return None
+
 
 def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool:
     """
@@ -94,7 +98,8 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
     scale = 1.0
     if cfg_p.exists():
         try:
-            c = json.load(open(cfg_p))
+            with open(cfg_p, "r", encoding="utf-8") as f:
+                c = json.load(f)
             scale = float(c.get("lora_alpha", 16)) / float(c.get("r", 16))
         except Exception:
             scale = 1.0
@@ -138,10 +143,17 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
                 applied += 1
     return applied > 0
 
-@torch.no_grad()
-def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms: nn.ModuleList,
-                           dtype: torch.dtype = torch.float16, drop_first_token: bool = True,
-                           final_norm: Optional[nn.Module] = None):
+
+@torch.inference_mode()
+def forward_and_pool_batch(
+    model: nn.Module,
+    enc: dict,
+    layers: list[int],
+    norms: nn.ModuleList,
+    dtype: torch.dtype = torch.float16,
+    drop_first_token: bool = True,
+    final_norm: nn.Module | None = None,
+):
     """
     Runs forward pass in `dtype` (float16 on T4).
     CRITICAL: If any target layer overflows fp16 (Inf/NaN), recomputes ONLY the overflowed
@@ -184,26 +196,29 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         model.to(torch.bfloat16)
-        enc_bad = {k: v[bad_rows] for k, v in enc.items()}
-        hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
-        bad_rows_dev = bad_rows.to(first_norm_dev)
-        for idx_l, l in enumerate(layers):
-            h_b = hs_bad[l]
-            if final_norm is not None and idx_l == len(layers) - 1:
-                fn_params = list(final_norm.parameters())
-                fn_dev = fn_params[0].device if fn_params else h_b.device
-                fn_dtype = fn_params[0].dtype if fn_params else h_b.dtype
-                h_b = final_norm(h_b.to(device=fn_dev, dtype=fn_dtype)).to(h_b.device)
-            h_b = h_b.to(first_norm_dev).float()
-            h_b = torch.nan_to_num(h_b, nan=0.0, posinf=1e4, neginf=-1e4)
-            pooled_layers[idx_l][bad_rows_dev] = (h_b * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
-        del hs_bad
-        model.to(dtype)
+        try:
+            enc_bad = {k: v[bad_rows] for k, v in enc.items()}
+            hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
+            bad_rows_dev = bad_rows.to(first_norm_dev)
+            for idx_l, l in enumerate(layers):
+                h_b = hs_bad[l]
+                if final_norm is not None and idx_l == len(layers) - 1:
+                    fn_params = list(final_norm.parameters())
+                    fn_dev = fn_params[0].device if fn_params else h_b.device
+                    fn_dtype = fn_params[0].dtype if fn_params else h_b.dtype
+                    h_b = final_norm(h_b.to(device=fn_dev, dtype=fn_dtype)).to(h_b.device)
+                h_b = h_b.to(first_norm_dev).float()
+                h_b = torch.nan_to_num(h_b, nan=0.0, posinf=1e4, neginf=-1e4)
+                pooled_layers[idx_l][bad_rows_dev] = (h_b * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
+            del hs_bad
+        finally:
+            model.to(dtype)
 
     out = torch.cat([nm(pooled_layers[idx_l]) for idx_l, nm in enumerate(norms)], dim=-1)
     return out.cpu().numpy(), n_bad
 
-def _flatten_state_dict(obj: Any, prefix: str = "", out: Optional[dict] = None) -> dict:
+
+def _flatten_state_dict(obj: Any, prefix: str = "", out: dict | None = None) -> dict:
     if out is None:
         out = {}
     if hasattr(obj, "state_dict") and callable(obj.state_dict):
@@ -222,6 +237,7 @@ def _flatten_state_dict(obj: Any, prefix: str = "", out: Optional[dict] = None) 
             new_k = f"{prefix}.{idx}" if prefix else str(idx)
             _flatten_state_dict(item, new_k, out)
     return out
+
 
 def load_head_file(path_or_dir: Path) -> dict:
     """Unified loader for classification head state dicts (.safetensors, .pt, .bin, .npz)."""
@@ -245,7 +261,10 @@ def load_head_file(path_or_dir: Path) -> dict:
             return load_head_file(cand)
     return {}
 
-def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+
+def resolve_head_tensors(
+    heads_dict: dict, num_classes: int | None = None
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Resolves plain and centered head weights and biases matching American/British naming and handles transposed weights."""
     W_p, b_p, W_c, b_c = None, None, None, None
     valid_k = (num_classes,) if num_classes is not None else (K, 5, 4, 2)
@@ -266,9 +285,9 @@ def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) ->
         elif wk in heads_dict and bk not in heads_dict:
             W_p = heads_dict[wk]
             k_rows = (
-                W_p.shape[0] if (hasattr(W_p, "shape") and len(W_p.shape) > 0 and W_p.shape[0] in valid_k)
-                else (W_p.shape[1] if (hasattr(W_p, "shape") and len(W_p.shape) > 1 and W_p.shape[1] in valid_k)
-                else (num_classes or K))
+                W_p.shape[0]
+                if (hasattr(W_p, "shape") and len(W_p.shape) > 0 and W_p.shape[0] in valid_k)
+                else (W_p.shape[1] if (hasattr(W_p, "shape") and len(W_p.shape) > 1 and W_p.shape[1] in valid_k) else (num_classes or K))
             )
             b_p = np.zeros(k_rows, dtype=np.float32)
             break
@@ -289,9 +308,9 @@ def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) ->
         elif wk in heads_dict and bk not in heads_dict:
             W_c = heads_dict[wk]
             k_rows = (
-                W_c.shape[0] if (hasattr(W_c, "shape") and len(W_c.shape) > 0 and W_c.shape[0] in valid_k)
-                else (W_c.shape[1] if (hasattr(W_c, "shape") and len(W_c.shape) > 1 and W_c.shape[1] in valid_k)
-                else (num_classes or K))
+                W_c.shape[0]
+                if (hasattr(W_c, "shape") and len(W_c.shape) > 0 and W_c.shape[0] in valid_k)
+                else (W_c.shape[1] if (hasattr(W_c, "shape") and len(W_c.shape) > 1 and W_c.shape[1] in valid_k) else (num_classes or K))
             )
             b_c = np.zeros(k_rows, dtype=np.float32)
             break
@@ -307,7 +326,15 @@ def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) ->
                     if W_c is None:
                         W_c = v
                         base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
-                        for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "centered.bias", "b"]:
+                        for bk in [
+                            f"{base_prefix}.bias",
+                            f"{base_prefix}_bias",
+                            f"{base_prefix}.intercept",
+                            f"{base_prefix}_intercept",
+                            "bias",
+                            "centered.bias",
+                            "b",
+                        ]:
                             if bk in heads_dict and getattr(heads_dict[bk], "shape", None) is not None:
                                 b_cand = heads_dict[bk]
                                 if getattr(b_cand, "shape", ()) in [(k_item,) for k_item in valid_k]:
@@ -321,7 +348,15 @@ def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) ->
                     if W_p is None:
                         W_p = v
                         base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
-                        for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "plain.bias", "b"]:
+                        for bk in [
+                            f"{base_prefix}.bias",
+                            f"{base_prefix}_bias",
+                            f"{base_prefix}.intercept",
+                            f"{base_prefix}_intercept",
+                            "bias",
+                            "plain.bias",
+                            "b",
+                        ]:
                             if bk in heads_dict and getattr(heads_dict[bk], "shape", None) is not None:
                                 b_cand = heads_dict[bk]
                                 if getattr(b_cand, "shape", ()) in [(k_item,) for k_item in valid_k]:
@@ -350,6 +385,7 @@ def resolve_head_tensors(heads_dict: dict, num_classes: Optional[int] = None) ->
 
     return W_p, b_p, W_c, b_c
 
+
 def compute_centered_logits(
     Z_test: np.ndarray,
     groups: np.ndarray,
@@ -357,7 +393,7 @@ def compute_centered_logits(
     b_c: np.ndarray,
     src_labels: list,
     max_std: float = 4.2,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Computes prompt-topic centered twin logits with temperature normalization matching plain heads."""
     N = len(Z_test)
     out_lp = np.zeros((N, K), dtype=np.float64)
@@ -371,13 +407,14 @@ def compute_centered_logits(
         return out_lp, valid
     Zc = Z_test.copy()
     for g in np.unique(safe_g[valid]):
-        mask = (safe_g == g)
+        mask = safe_g == g
         Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
     raw_c = align_cols(Zc[valid] @ W_c.T + b_c, src_labels)
     std_c = float(np.std(raw_c, axis=1).mean()) if len(raw_c) > 0 else 1.0
     temp_c = max(1.0, std_c / max_std)
     out_lp[valid] = log_softmax(raw_c / temp_c, axis=1)
     return out_lp, valid
+
 
 def compute_family_centered_logits(
     Z_test: np.ndarray,
@@ -386,7 +423,7 @@ def compute_family_centered_logits(
     b_c: np.ndarray,
     src_labels: list,
     target_labels: list,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Computes within-cluster centered twin logits for a K_fam-class family specialist."""
     N = len(Z_test)
     K_fam = len(target_labels)
@@ -401,7 +438,7 @@ def compute_family_centered_logits(
         return out_lp, valid
     Zc = Z_test.copy()
     for g in np.unique(safe_g[valid]):
-        mask = (safe_g == g)
+        mask = safe_g == g
         Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
     raw_c = Zc[valid] @ W_c.T + b_c
     src_list = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
@@ -411,8 +448,9 @@ def compute_family_centered_logits(
     out_lp[valid] = log_softmax(raw_c, axis=1)
     return out_lp, valid
 
+
 class UniversalLoRATrunkLoader:
-    def __init__(self, base_dir: Path, keep_layers: int, layers: List[int], max_len: int = 447):
+    def __init__(self, base_dir: Path, keep_layers: int, layers: list[int], max_len: int = 447):
         if base_dir is not None and not (base_dir / "config.json").exists():
             for sub in base_dir.rglob("config.json"):
                 base_dir = sub.parent
@@ -437,13 +475,17 @@ class UniversalLoRATrunkLoader:
         if n_gpus >= 2:
             max_memory = {0: "13.5GiB", 1: "13.5GiB"}
             self.model = AutoModel.from_pretrained(
-                str(base_dir), config=cfg, device_map="auto", max_memory=max_memory,
-                torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
+                str(base_dir),
+                config=cfg,
+                device_map="auto",
+                max_memory=max_memory,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
             )
         elif n_gpus == 1:
             self.model = AutoModel.from_pretrained(
-                str(base_dir), config=cfg, device_map="auto",
-                torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
+                str(base_dir), config=cfg, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
             )
         else:
             self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32, low_cpu_mem_usage=True)
@@ -463,10 +505,7 @@ class UniversalLoRATrunkLoader:
 
         # nn.LayerNorm with both weight and bias matching heads.safetensors
         hidden_dim = self.model.config.hidden_size
-        self.norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim)
-            for _ in layers
-        ]).to(self.device_norms).float()
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in layers]).to(self.device_norms).float()
 
         self.norms.eval()
         self.first_dev = next(self.model.parameters()).device
@@ -500,16 +539,13 @@ class UniversalLoRATrunkLoader:
                 if m_name in state_dict and hasattr(state_dict[m_name], "weight"):
                     state_dict[m_name].weight.data.copy_(orig.to(state_dict[m_name].weight.device))
 
-    def set_active_layers(self, layers: List[int], max_len: Optional[int] = None):
+    def set_active_layers(self, layers: list[int], max_len: int | None = None):
         """Updates active pooled layers and instantiates LayerNorms matching the checkpoint."""
         self.layers = list(layers)
         if max_len is not None:
             self.max_len = max_len
         hidden_dim = self.model.config.hidden_size
-        self.norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim)
-            for _ in self.layers
-        ]).to(self.device_norms).float()
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in self.layers]).to(self.device_norms).float()
         self.norms.eval()
 
     def load_norm_weights(self, heads_sd: dict):
@@ -528,7 +564,11 @@ class UniversalLoRATrunkLoader:
                     b_k = f"{pfx}.{i}.bias"
                     if w_k in heads_sd:
                         ln.weight.copy_(heads_sd[w_k].to(ln.weight.device, ln.weight.dtype))
-                    elif f"{pfx}.{i}" in heads_sd and hasattr(heads_sd[f"{pfx}.{i}"], "shape") and heads_sd[f"{pfx}.{i}"].shape == ln.weight.shape:
+                    elif (
+                        f"{pfx}.{i}" in heads_sd
+                        and hasattr(heads_sd[f"{pfx}.{i}"], "shape")
+                        and heads_sd[f"{pfx}.{i}"].shape == ln.weight.shape
+                    ):
                         ln.weight.copy_(heads_sd[f"{pfx}.{i}"].to(ln.weight.device, ln.weight.dtype))
 
                     if b_k in heads_sd and hasattr(ln, "bias") and ln.bias is not None:
@@ -542,7 +582,7 @@ class UniversalLoRATrunkLoader:
                         for i, ln in enumerate(self.norms):
                             ln.weight.copy_(stk_t[i].to(ln.weight.device, ln.weight.dtype))
 
-    def _extract_batch_ids(self, id_list: List[List[int]], batch_size: int = 8) -> np.ndarray:
+    def _extract_batch_ids(self, id_list: list[list[int]], batch_size: int = 8) -> np.ndarray:
         order = np.argsort([len(x) for x in id_list], kind="stable")
         total_dim = len(self.layers) * self.model.config.hidden_size
         Z = np.zeros((len(id_list), total_dim), dtype=np.float32)
@@ -553,15 +593,14 @@ class UniversalLoRATrunkLoader:
             enc = {k: v.to(self.first_dev) for k, v in enc.items()}
             fn = self.orig_final_norm if getattr(self, "final_norm_enabled", False) else None
             out_np, n_bad = forward_and_pool_batch(
-                self.model, enc, self.layers, self.norms, torch.float16,
-                drop_first_token=True, final_norm=fn
+                self.model, enc, self.layers, self.norms, torch.float16, drop_first_token=True, final_norm=fn
             )
             self.total_rescued += n_bad
             Z[idx] = out_np
         return Z
 
-    @torch.no_grad()
-    def extract_exact(self, texts: List[str], batch_size: int = 8, end_id: Optional[int] = 151643) -> np.ndarray:
+    @torch.inference_mode()
+    def extract_exact(self, texts: list[str], batch_size: int = 8, end_id: int | None = 151643) -> np.ndarray:
         t0 = time.time()
         self.total_rescued = 0
         raw_ids = self.tok(list(texts), add_special_tokens=False, truncation=True, max_length=self.max_len)["input_ids"]
@@ -579,7 +618,8 @@ class UniversalLoRATrunkLoader:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List[int], default_max_len: int = 447) -> dict:
+
+def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: list[int], default_max_len: int = 447) -> dict:
     """Reads keep, layers, max_len, end_id, and labels dynamically from meta.json or infers from adapter weights."""
     ckpt_dir = Path(ckpt_dir)
     meta_p = ckpt_dir / "meta.json"
@@ -595,7 +635,8 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
 
     if meta_p.exists():
         try:
-            m = json.load(open(meta_p))
+            with open(meta_p, "r", encoding="utf-8") as f:
+                m = json.load(f)
             labels = m.get("labels", m.get("classes", labels))
             cfg = m.get("cfg", m)
             keep = int(cfg.get("keep", keep))
@@ -625,15 +666,16 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
 
     return {"keep": keep, "layers": layers, "max_len": max_len, "end_id": end_id, "no_final_norm": no_final_norm, "labels": labels}
 
+
 def extract_deberta_checkpoint(
     ckpt_dir: Path,
-    base_deb_dir: Optional[Path],
-    texts_test: List[str],
-    texts_train: List[str],
+    base_deb_dir: Path | None,
+    texts_test: list[str],
+    texts_train: list[str],
     y_train: np.ndarray,
     max_len: int = 512,
-    batch_size: int = 8
-) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], list]:
+    batch_size: int = 8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, list]:
     """
     Dedicated feature extractor for DeBERTa-v3-large sequence classification checkpoints.
     Supports both single-layer encoder (Layer 24 float32 last_hidden_state) and multi-layer heads.
@@ -680,6 +722,7 @@ def extract_deberta_checkpoint(
             load_src = model_src
 
     # CRITICAL: Always use torch.float32 for DeBERTa-v3 to avoid FP16 overflow!
+    model = None
     try:
         model = AutoModel.from_pretrained(str(load_src), torch_dtype=torch.float32).to(dev)
     finally:
@@ -690,7 +733,7 @@ def extract_deberta_checkpoint(
 
     hidden_dim = model.config.hidden_size
     has_norm_keys = any(k.startswith("norms.") and k.endswith(".weight") for k in heads_sd)
-    is_single_last_layer = (W_p is not None and W_p.shape[1] == hidden_dim and not has_norm_keys)
+    is_single_last_layer = W_p is not None and W_p.shape[1] == hidden_dim and not has_norm_keys
 
     if not is_single_last_layer:
         if W_p is not None and W_p.shape[1] > 0:
@@ -715,7 +758,7 @@ def extract_deberta_checkpoint(
     else:
         norms = None
 
-    def pool_texts(txt_list: List[str], drop_first: bool = False) -> np.ndarray:
+    def pool_texts(txt_list: list[str], drop_first: bool = False) -> np.ndarray:
         out_dim = hidden_dim if is_single_last_layer else (len(layers) * hidden_dim)
         if len(txt_list) == 0:
             return np.zeros((0, out_dim), dtype=np.float32)
@@ -751,7 +794,7 @@ def extract_deberta_checkpoint(
     best_drop = False if is_single_last_layer else True
     if probe_n > 0 and W_p is not None:
         best_acc = -1.0
-        for cand_drop in ([False, True] if is_single_last_layer else [True, False]):
+        for cand_drop in [False, True] if is_single_last_layer else [True, False]:
             z_pr = pool_texts(texts_train[:probe_n], drop_first=cand_drop)
             preds = align_cols(z_pr @ W_p.T + b_p, ckpt_labels).argmax(axis=1)
             acc = float((preds == y_train[:probe_n]).mean())
@@ -764,7 +807,8 @@ def extract_deberta_checkpoint(
     Z_test = pool_texts(texts_test, drop_first=best_drop)
     Z_train = pool_texts(texts_train, drop_first=best_drop) if len(texts_train) > 0 else np.zeros((0, out_dim), dtype=np.float32)
 
-    del model
+    if model is not None:
+        del model
     if norms is not None:
         del norms
     gc.collect()

@@ -3,26 +3,27 @@ Unit and Integration Tests for namethatllm.postprocess
 ======================================================
 """
 
+import tempfile
 import unittest
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-import tempfile
 
+from namethatllm.config import FAMILIES, LAB2I, LABELS, softmax
 from namethatllm.postprocess import (
-    blend_main_and_complementary,
-    apply_claude_specialist_gate,
-    apply_family_specialist_lora_gate,
     apply_all_family_confidence_gates,
+    apply_claude_specialist_gate,
     apply_cluster_uniqueness_repulsion,
-    apply_unified_handwriting_shield,
-    build_orthographic_penalty_matrix,
     apply_curly_quote_shield,
-    sinkhorn_balancing,
+    apply_family_specialist_lora_gate,
     apply_typobayes_postprocess,
-    generate_submission
+    apply_unified_handwriting_shield,
+    blend_main_and_complementary,
+    generate_submission,
+    sinkhorn_balancing,
 )
-from namethatllm.config import LABELS, K, LAB2I, FAMILIES, softmax
+
 
 class TestPostprocess(unittest.TestCase):
     def test_two_tier_blend_simplex(self):
@@ -68,7 +69,7 @@ class TestPostprocess(unittest.TestCase):
             "Normal plain text without quotes.",
             "Text with \u201ccurly\u201d quotes.",
             "Single \u2018curly\u2019 quote text.",
-            "Another standard text."
+            "Another standard text.",
         ]
         P_mix_before = P_mix.copy()
         P_shielded = apply_curly_quote_shield(P_mix, test_texts)
@@ -108,7 +109,7 @@ class TestPostprocess(unittest.TestCase):
             multi_em_dash_log_penalty=-0.45,
             straight_contr_log_penalty=-0.60,
             curly_contr_log_penalty=-0.40,
-            continuous_hw_weight=0.0
+            continuous_hw_weight=0.0,
         )
         self.assertTrue(np.allclose(P_out.sum(axis=1), 1.0))
 
@@ -128,12 +129,7 @@ class TestPostprocess(unittest.TestCase):
         # Check 4: Continuous log_p_handwriting integration and simplex preservation
         np.random.seed(42)
         mock_lp_hw = np.random.randn(N, 18)
-        P_out_cont = apply_unified_handwriting_shield(
-            P_mix,
-            test_texts,
-            log_p_handwriting=mock_lp_hw,
-            continuous_hw_weight=0.04
-        )
+        P_out_cont = apply_unified_handwriting_shield(P_mix, test_texts, log_p_handwriting=mock_lp_hw, continuous_hw_weight=0.04)
         self.assertTrue(np.allclose(P_out_cont.sum(axis=1), 1.0))
         self.assertFalse(np.allclose(P_out, P_out_cont))
 
@@ -201,6 +197,7 @@ class TestPostprocess(unittest.TestCase):
 
     def test_apply_all_family_confidence_gates_with_specialist_groups(self):
         from namethatllm.config import SPECIALIST_GROUPS
+
         np.random.seed(42)
         N = 30
         P_in = softmax(np.random.randn(N, 18), axis=1)
@@ -278,6 +275,6 @@ class TestPostprocess(unittest.TestCase):
             # 4. Sibling swap resolution: row 0 favored index 1 in specialist logits
             self.assertGreater(P_refined[0, fam_cols[1]], P_refined[0, fam_cols[0]])
 
+
 if __name__ == "__main__":
     unittest.main()
-

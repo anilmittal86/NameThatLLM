@@ -4,11 +4,17 @@ Unit and Integration Tests for namethatllm.spectral_bank
 """
 
 import unittest
+
 import numpy as np
 
-from namethatllm.spectral_bank import fit_joint_spectral_bank, make_spectral_blocks, fit_within_family_spectral_gates
+from namethatllm.config import FAMILIES, PRIOR_SCALES, SPECIALIST_GROUPS, softmax
+from namethatllm.spectral_bank import (
+    fit_joint_spectral_bank,
+    fit_within_family_spectral_gates,
+    make_spectral_blocks,
+)
 from namethatllm.wpca_gaussian import fit_shared_gaussian_lowram
-from namethatllm.config import K, PRIOR_SCALES, FAMILIES, SPECIALIST_GROUPS, softmax
+
 
 class TestSpectralBank(unittest.TestCase):
     def test_make_spectral_blocks(self):
@@ -70,9 +76,17 @@ class TestSpectralBank(unittest.TestCase):
         D_neural = D_tfidf.copy()
 
         P_spec, oof_bacc = fit_joint_spectral_bank(
-            tr_blocks, te_blocks, y_sub, prompts_sub,
-            D_tfidf=D_tfidf, D_neural_sum=D_neural, D_neural_weight_total=1.0,
-            N_test=N_te, plain_C=0.04, center_C=0.03, center_blend=0.35
+            tr_blocks,
+            te_blocks,
+            y_sub,
+            prompts_sub,
+            D_tfidf=D_tfidf,
+            D_neural_sum=D_neural,
+            D_neural_weight_total=1.0,
+            N_test=N_te,
+            plain_C=0.04,
+            center_C=0.03,
+            center_blend=0.35,
         )
 
         self.assertEqual(P_spec.shape, (N_te, 18))
@@ -96,9 +110,15 @@ class TestSpectralBank(unittest.TestCase):
         D_neural = D_tfidf.copy()
 
         family_gates = fit_within_family_spectral_gates(
-            tr_blocks, te_blocks, y_sub, prompts_sub,
-            D_tfidf=D_tfidf, D_neural_sum=D_neural, D_neural_weight_total=1.0,
-            N_test=N_te, max_cluster_size=14
+            tr_blocks,
+            te_blocks,
+            y_sub,
+            prompts_sub,
+            D_tfidf=D_tfidf,
+            D_neural_sum=D_neural,
+            D_neural_weight_total=1.0,
+            N_test=N_te,
+            max_cluster_size=14,
         )
 
         self.assertIsInstance(family_gates, dict)
@@ -108,6 +128,6 @@ class TestSpectralBank(unittest.TestCase):
             p = softmax(gate_lp, axis=1)
             self.assertTrue(np.allclose(p.sum(axis=1), 1.0, atol=1e-5))
 
+
 if __name__ == "__main__":
     unittest.main()
-

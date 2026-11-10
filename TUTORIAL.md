@@ -505,51 +505,102 @@ $$\text{Final Leaderboard Score (0.622)} = \text{Ablation Raw Baseline (0.567)} 
 
 ---
 
-## 10. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `lora_training.ipynb`)
+## 10. Module 5: Two-Stage LoRA Training Engine (`trainer.py` & `scripts/modal_trainer.py`)
 
-Module 5 provides the end-to-end training and artifact generation pipeline used to build our in-house multi-layer LoRA checkpoints (such as `anilmittal/ntl-inhouse-two-stage-lora24` and the new champion `export_champion_qwen3_14b`).
+Module 5 provides the end-to-end training and artifact generation pipeline used to build our in-house multi-layer LoRA checkpoints (including `anilmittal/ntl-inhouse-two-stage-lora24` and the 18-class champion model `export_champion_qwen3_14b`).
 
 <p align="center">
   <img src="assets/model_lineage_and_provenance.jpg" alt="Model Lineage & Dataset Provenance" width="750"/>
 </p>
 
-### 1. 2x T4 Multi-GPU Memory Balancing & Non-Reentrant Gradient Checkpointing
-To train Qwen3-8B across Kaggle's dual T4 GPUs (15 GB VRAM each) without OOM or CUDA context crashes:
-- Device placement is constrained explicitly: `max_memory={"0": "9.0GiB", "1": "9.0GiB"}` via HuggingFace `accelerate`.
-- PyTorch gradient checkpointing is activated with `use_reentrant=False` on the causal transformer backbone, eliminating peak autograd cache spikes.
+### 1. Modal A100-80GB Cloud Infrastructure & FlashAttention-2 Acceleration
+To train `Qwen/Qwen3-14B-Base` (truncated to `keep_layers=27` interior layers) across 123,000+ passages without memory bottlenecks:
+- **Serverless Compute**: Dispatched to dedicated NVIDIA A100-80GB SXM GPUs on Modal (`cuda:0`, 79.3 GiB VRAM).
+- **Native bfloat16 & FlashAttention-2**: Built with precompiled FlashAttention-2 wheels (`flash_attn-2.7.4.post1+cu12torch2.4`), cutting attention memory complexity from $\mathcal{O}(N^2)$ to $\mathcal{O}(N)$ and boosting throughput to **25 steps/min (~800 passages/min)**.
+- **Dynamic Sequence Length Bucketing (`BucketedLengthBatchSampler`)**: Passages are sorted and grouped by token length into variable-length batches (`batch_size=32`). With sequence length capped at `max_len=384` (covering 99.8% of all passages), padding waste is virtually eliminated.
 
-### 2. Stage 1: Sequence Classification Pre-Training
-- Trained across 75,000 augmented passages (`configs/training_lora.json`).
-- Optimizes Cross-Entropy Loss with AdamW ($lr = 10^{-4}, \text{weight\_decay} = 0.01$).
-- Accumulates gradients over micro-batches (`batch_size = 4, gradient_accumulation_steps = 4`).
+### 2. Canonical 123k Pool Dataset Assembly (`pool_120k.parquet`)
+Stage 1 pretraining ingests our unified canonical pool dataset:
+- **Ingestion & Deduplication**: Merges 4 external pool collections (`nlm_matched_clean.parquet`, `pool_v4.parquet`, `nlm_pool_v5.parquet`, and `nlm_pool_v2.parquet`) into a single deduplicated dataset of **123,298 unique passages**.
+- **Strict Holdout Quarantine**: 360 rows (20 per class across 18 classes) are strictly quarantined for the zero-leakage unseen benchmark test set (`local_eval_cache.npz`).
+- **Clean Retained Pool**: 122,937 passages trained across 2 complete epochs (~246,000 forward passes).
 
-### 3. Stage 2: Prompt-Group Multi-Task Contrastive Fine-Tuning
-In Stage 2, samples are grouped into 18-row prompt batches via `PromptGroupBatchSampler`. Each prompt group contains responses to the same topic across all 18 models:
+### 3. Empirical Error-Driven Enhancements
+
+#### A. Hard-Class Loss Upweighting ($1.40\times$)
+In the raw pool dataset, majority classes like `gpt-5.6-luna` (11,183 samples) naturally dominate over difficult minority classes like `gemini-3.7-flash` (4,891 samples) and `qwen3.8-max` (4,189 samples). 
+
+Rather than repeating duplicate text (which risks overfitting LoRA attention weights), we apply an exact **loss-level class weighting tensor**:
+$$\mathcal{L}_{\text{weighted}} = -\frac{1}{B} \sum_{b=1}^{B} w_{y_b} \log \frac{e^{z_{b, y_b}}}{\sum_{j=1}^{K} e^{z_{b, j}}}$$
+
+where:
+$$w_c = \begin{cases} 1.40 & \text{if } c \in \text{HARD\_CLASS\_INDICES} \\ 1.00 & \text{otherwise} \end{cases}$$
+
+`HARD_CLASS_INDICES = [1, 2, 3, 6, 7, 8, 13, 14, 15, 16, 17]` targets the exact 11 highest-error classes identified in the in-house evaluation audit (`gemini-3.7-flash` @ 80%, `glm-5.3` @ 80%, `gpt-5.6-sol` @ 75%, `kimi-k3` @ 80%, etc.).
+
+#### B. Targeted Sibling Margin Penalty Boost
+Standard cross-entropy penalizes all incorrect classes symmetrically. In LLM authorship attribution, cross-family errors (e.g. confusing Gemini with Claude) are rare; the overwhelming majority of errors occur between **sister models within the same provider family**.
+
+In `family_margin_cross_entropy`, we add an additive margin penalty to competing sibling logits during training:
+$$\tilde{z}_{b, j} = z_{b, j} + \mathbb{I}(j \in \text{Sisters}(y_b)) \cdot \text{margin} \cdot M[y_b, j]$$
+
+This artificially inflates the sister's logit in the softmax denominator, penalizing ambiguous predictions. We assign boosted multipliers to the highest-confusion sister pairs:
+* **Gemini Flash Triad**:
+  * `gemini-3.7-flash` $\leftrightarrow$ `gemini-3.8-flash`: **$1.5\times$ margin multiplier**
+  * `gemini-3.6-flash` $\leftrightarrow$ `3.7-flash` / `3.8-flash`: **$1.4\times$ margin multiplier**
+* **GPT-5.6 Triad & Astra**:
+  * `gpt-5.6-luna` $\leftrightarrow$ `gpt-5.6-sol` $\leftrightarrow$ `gpt-5.6-terra`: **$1.4\times$ margin multiplier**
+  * `gpt-5.6-sol` $\leftrightarrow$ `gpt-6-astra`: **$1.3\times$ margin multiplier**
+* **GLM Sisters**:
+  * `glm-5.3` $\leftrightarrow$ `glm-5.3-flash`: **$1.4\times$ margin multiplier**
+
+### 4. Stage 2: Prompt-Group Multi-Task Contrastive Fine-Tuning
+In Stage 2, samples from `train.csv` are grouped into prompt batches via `PromptGroupBatchSampler`. Each prompt group contains responses to the same topic across all 18 models:
 - **Two-Pass Micro-Batched Execution (`train_prompt_group_step`)**:
-  - **Pass 1 (`torch.no_grad()`)**: Iterates through the 18 rows in chunks of 4 to compute the exact prompt mean embedding $\mu_{\text{prompt}} = \frac{1}{18} \sum_{i=1}^{18} z_i$.
-  - **Pass 2 (Autograd Micro-Batches)**: Evaluates loss over micro-batches of size 2 with dynamic sequence length slicing (`:max_l` across the micro-batch), dynamically centering features:
+  - **Pass 1 (`torch.no_grad()`)**: Iterates through the prompt group in chunks of 4 to compute the exact prompt mean embedding:
+    $$\mu_{\text{prompt}} = \frac{1}{N} \sum_{i=1}^{N} z_i$$
+  - **Variable-Size Sub-Cluster Centering Augmentation**: When $N \ge 8$, with 50% probability $\mu_{\text{prompt}}$ is computed over a random subset of $k \sim \text{Uniform}(4, \min(N, 14))$ rows, forcing `centered_head` to generalize to smaller test-time prompt clusters.
+  - **Pass 2 (Autograd Micro-Batches)**: Evaluates loss over micro-batches of size 2 with dynamic sequence length slicing, dynamically centering features:
     $$z_{\text{centered}, i} = z_i - \mu_{\text{prompt}}$$
-    Loss is a dual objective with label smoothing ($\epsilon = 0.10$):
-    $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}}(\text{plain}) + 0.5 \cdot \mathcal{L}_{\text{CE}}(\text{centered})$$
-  - Accumulates gradients directly into parameters with peak VRAM bounded to only 2 sequences.
+    The dual objective combines plain classification, centered contrastive classification, and supervised contrastive (SupCon) repulsion:
+    $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}}(\text{plain}) + 0.65 \cdot \mathcal{L}_{\text{CE}}(\text{centered}) + 0.25 \cdot \mathcal{L}_{\text{SupCon}}$$
+- **Stochastic Weight Averaging (SWA)**: Parameters are averaged across all steps of the final Stage 2 epoch, smoothing out sharp loss landscape valleys.
+- **Closed-Form Dual Ridge Regression Head Blending (`fit_ridge_heads`)**: Combines neural margin boundaries with exact $L_2$-regularized closed-form ridge regression ($w_{\text{neural}} = 0.75, w_{\text{ridge}} = 0.25$) on extracted representations $Z_{\text{train}}$.
 
-### 4. Critical Training Bug Fixes & Protections
-1. **Token-0 Padding Bug**: Qwen token ID `0` is `"!"` (exclamation mark), while `pad_token_id = 151643`. In `collate_text_batch`, `attention_mask` is initialized to 1 for all valid tokens, padded with 0, and `input_ids` padded with 151643. Token `0` (`"!"`) is never masked out.
-2. **Recursive Final Norm Removal (`_disable_final_norm`)**: When wrapping models with PEFT, `norm` is nested under `base_model.model.norm`. `_disable_final_norm` recursively replaces all final RMSNorm modules with `nn.Identity()`, ensuring hidden states extracted at layer 24 during training match the un-normalized representations extracted during inference.
-3. **Closed-Form Dual Ridge Regression Head Calibration (`fit_ridge_heads`)**: Before Stage 2 and immediately prior to exporting artifacts, closed-form $N \times N$ dual Ridge regression ($L_2$-regularized, $\lambda = 1.0$) with label smoothing $0.10$ solves optimal classification weights $W_p$ and $W_c$ directly on extracted training features, preventing overfitting to prompt topics.
+### 5. Training Regime Comparison: In-House vs. Benchmark Champions
 
-### 5. Training Regime Comparison: In-House 14B vs. Dhruv's `v5`
+| Training Stage / Attribute | Previous In-House (`training_v13`) | Dhruv Benchmark (`qwen3_14b_v5`) | In-House Champion (`qwen3_14b_champion`) |
+| :--- | :--- | :--- | :--- |
+| **Stage 1 Passages** | 25,022 passages | 119,899 passages | **122,937 deduplicated passages** |
+| **Stage 1 Epochs** | 0.28 epochs (aborted by Kaggle cutoff) | 2.0 full epochs | **2.0 full epochs (~246,000 passes)** |
+| **Compute Hardware** | Kaggle 2× T4 (15 GB) | External NVIDIA A100 | **Modal Serverless NVIDIA A100-80GB SXM** |
+| **Precision & Attention** | FP16 / Standard PyTorch | BF16 / FlashAttention-2 | **Native BF16 + FlashAttention-2** |
+| **Batch Size & Throughput** | `batch_size=2, accum=8` (~1.5 pass/s) | `batch_size=16` (~15 pass/s) | **`batch_size=32, accum=1` (~25 steps/min = ~800 pass/min)** |
+| **Hard-Class Handling** | None (uniform loss) | None (uniform loss) | **$1.40\times$ Hard-Class Loss Upweighting** |
+| **Sibling Separation** | Flat margin (+0.40 on all) | None (pure CE) | **Empirical Targeted Margin Boost ($1.5\times$ / $1.4\times$)** |
+| **Head Calibration** | Plain linear | Plain linear | **Neural + Closed-Form Dual Ridge Blending** |
 
-The table below contrasts the training regime, dataset coverage, and computational budget of our in-house champion backbone (`qwen3_14b_inhouse`) against Dhruv Tibarewal's external benchmark adapter (`qwen3_14b_v5`):
+### 6. Executing Cloud Training on Modal
 
-| Training Stage / Attribute | Our In-House 14B (`qwen3_14b_inhouse`) | Dhruv's `v5` (`qwen3_14b_v5`) |
-| :--- | :--- | :--- |
-| **Stage 1 Passages** | 25,022 passages | 119,899 passages |
-| **Stage 1 Epochs** | 0.28 epochs (partial pass) | 2.0 full epochs |
-| **Total Stage 1 Forward Passes** | 25,022 passes | 239,798 passes (~10x more!) |
-| **Stage 1 Compute Hardware** | Kaggle Dual T4 (2x 15GB) | External NVIDIA A100 (80GB) |
-| **Stage 1 Wall-Clock Time** | 4.5 hours (stopped by timeout) | 10.0 hours |
-| **Stage 2 Epochs** | 2 epochs (1 full fit) | 2 epochs (across 5 folds + full fit) |
+All training is orchestrated through [`scripts/modal_trainer.py`](file:///c:/Projects/NameThatLLM-Anitgravity/scripts/modal_trainer.py):
+
+```powershell
+# 1. Sync & build canonical pool_120k.parquet in cloud volume
+python -m modal run scripts/modal_trainer.py --mode sync
+
+# 2. Run fast 2-minute smoke test on A100 GPU
+python -m modal run scripts/modal_trainer.py --mode smoke
+
+# 3. Launch full 18-class champion training in detached mode (immune to local network disconnects)
+python -m modal run --detach scripts/modal_trainer.py --mode run --config configs/training_lora.json
+
+# 4. Monitor live training dashboard & logs
+python -m modal app list
+python -m modal app logs <app_id>
+
+# 5. Pull finished checkpoint artifacts to local workspace
+python -m modal volume get ntl-checkpoints export_champion_qwen3_14b ./checkpoints/
+```
 
 ---
 

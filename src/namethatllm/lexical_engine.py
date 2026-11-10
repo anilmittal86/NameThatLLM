@@ -5,98 +5,194 @@ Subprocess memory isolation running 78,482-row 4-View LinearSVC (Output 1)
 and 5-View BPE + SGD + Style Twin + Specialist Complementary Ensemble (Output 2).
 """
 
-import os
-import gc
-import re
-import sys
-import time
-import hashlib
-import unicodedata
 import collections
-import subprocess
+import gc
+import os
+import re
+import unicodedata
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
-from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.svm import LinearSVC
-from sklearn.linear_model import SGDClassifier, LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
 
-LABELS = [
-    "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
-    "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
-    "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
-    "qwen3.8-max", "glm-5.3", "glm-5.3-flash", "kimi-k3"
-]
-K = len(LABELS)
-LAB2I = {l: i for i, l in enumerate(LABELS)}
+from .config import (
+    FAMILIES,
+    HARD_CLASS_INDICES,
+    LAB2I,
+    LABELS,
+    K,
+    _text_hash,
+    log_softmax,
+    resolve_all_pool_files,
+    resolve_dataset_paths,
+    softmax,
+)
 
-FAMILIES = {
-    "gpt": [0, 1, 2, 3, 4],
-    "gemini": [5, 6, 7, 8],
-    "claude": [9, 10, 11, 12, 13],
-    "glm": [15, 16],
-}
-
-# The 6 lowest-recall classes from Table D that require extra pool capacity and margin priority
-# Include BOTH 7 (gemini-3.7-flash) and 8 (gemini-3.8-flash) so their pool caps are 100% symmetric!
-HARD_CLASS_INDICES = [3, 7, 8, 13, 15, 16, 17]
-
-# Extended specialist groups: includes the 4 provider families PLUS the cross-family
-# Straight-Quote / Chinese Frontier confusion cluster (opus-4-8, fable-5, qwen3.8-max, glm-5.3, glm-5.3-flash, kimi-k3)
-# and high-confusion sibling sub-clusters!
-SPECIALIST_GROUPS = {
-    "gpt": [0, 1, 2, 3, 4],
-    "gpt_56_triad": [1, 2, 3],           # gpt-5.6-luna vs gpt-5.6-sol vs gpt-5.6-terra
-    "gemini": [5, 6, 7, 8],
-    "gemini_flash_triad": [6, 7, 8],     # gemini-3.6-flash vs 3.7-flash vs 3.8-flash
-    "gemini_37_38_pair": [7, 8],         # Dedicated 1-vs-1 binary tie-breaker for gemini-3.7-flash vs gemini-3.8-flash!
-    "claude": [9, 10, 11, 12, 13],
-    "glm": [15, 16],                     # Dedicated 1-vs-1 binary tie-breaker for glm-5.3 vs glm-5.3-flash!
-    "glm_kimi_triad": [15, 16, 17],      # Resolves glm-5.3 <-> glm-5.3-flash <-> kimi-k3 confusion!
-    "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
-    "kimi_gpt55_qwen": [0, 14, 17],      # resolves kimi-k3 <-> gpt-5.5 <-> qwen3.8-max confusion!
-}
-
-def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    """Numerically stable softmax."""
-    c = np.max(x, axis=axis, keepdims=True)
-    e = np.exp(x - c)
-    return e / (np.sum(e, axis=axis, keepdims=True) + 1e-15)
-
-def log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    """Numerically stable log-softmax."""
-    c = np.max(x, axis=axis, keepdims=True)
-    return x - c - np.log(np.sum(np.exp(x - c), axis=axis, keepdims=True) + 1e-15)
-
-def _text_hash(text: str) -> str:
-    """Normalized SHA1 hash of NFKC whitespace-collapsed text to guarantee zero exact/near-exact leakage."""
-    import re, unicodedata
-    s = unicodedata.normalize("NFKC", str(text or "")).strip()
-    s = re.sub(r"^\*\*(.*)\*\*$", r"\1", s).strip()
-    norm = " ".join(s.split())
-    return hashlib.sha1(norm.encode("utf-8", errors="ignore")).hexdigest()
 
 def _norm_text_key(value: Any) -> str:
     """Normalized NFKC string key for exact deduplication."""
-    return re.sub(r'\s+', ' ', unicodedata.normalize('NFKC', str(value or ''))).strip()
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value or ""))).strip()
+
 
 FUNCTION_WORDS = set(
-    "a an the and or but if while although because as so than that which who whom whose "
-    "this these those it its they them their theirs he him his she her hers we us our ours "
-    "you your yours i me my mine in on at to from with without for of by over under between "
-    "through into about is are was were be been being have has had do does did can could "
-    "will would shall should may might must not no nor all any some each every both either "
-    "neither other another such only also just very too more most less least here there "
-    "when where why how what whether then now still yet even much many few little "
-    "am having s t re ve ll d m don doesn didn isn aren wasn weren hasn haven hadn won wouldn couldn shouldn".split()
+    [
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "if",
+        "while",
+        "although",
+        "because",
+        "as",
+        "so",
+        "than",
+        "that",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "they",
+        "them",
+        "their",
+        "theirs",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "hers",
+        "we",
+        "us",
+        "our",
+        "ours",
+        "you",
+        "your",
+        "yours",
+        "i",
+        "me",
+        "my",
+        "mine",
+        "in",
+        "on",
+        "at",
+        "to",
+        "from",
+        "with",
+        "without",
+        "for",
+        "of",
+        "by",
+        "over",
+        "under",
+        "between",
+        "through",
+        "into",
+        "about",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "may",
+        "might",
+        "must",
+        "not",
+        "no",
+        "nor",
+        "all",
+        "any",
+        "some",
+        "each",
+        "every",
+        "both",
+        "either",
+        "neither",
+        "other",
+        "another",
+        "such",
+        "only",
+        "also",
+        "just",
+        "very",
+        "too",
+        "more",
+        "most",
+        "less",
+        "least",
+        "here",
+        "there",
+        "when",
+        "where",
+        "why",
+        "how",
+        "what",
+        "whether",
+        "then",
+        "now",
+        "still",
+        "yet",
+        "even",
+        "much",
+        "many",
+        "few",
+        "little",
+        "am",
+        "having",
+        "s",
+        "t",
+        "re",
+        "ve",
+        "ll",
+        "d",
+        "m",
+        "don",
+        "doesn",
+        "didn",
+        "isn",
+        "aren",
+        "wasn",
+        "weren",
+        "hasn",
+        "haven",
+        "hadn",
+        "won",
+        "wouldn",
+        "couldn",
+        "shouldn",
+    ]
 )
 STOP_WORDS = FUNCTION_WORDS
+
 
 def shape_text(t: str) -> str:
     """
@@ -105,6 +201,7 @@ def shape_text(t: str) -> str:
     Captures formatting capitalization rhythm independent of lexical vocabulary.
     """
     return re.sub(r"[^\W\d_]+", lambda m: "X" if m.group(0)[0].isupper() else "x", str(t))
+
 
 def function_text(t: str) -> str:
     """
@@ -117,11 +214,13 @@ def function_text(t: str) -> str:
     tokens = re.findall(r"(?u)\b\w+\b|[^\w\s]", str(t))
     return " ".join([w.lower() if (w.lower() in STOP_WORDS or not w.isalnum()) else "CONTENT" for w in tokens])
 
+
 _RE_CODE_BLOCK = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
 _RE_STRAIGHT_CONTR = re.compile(r"[A-Za-z]'[A-Za-z]")
 _RE_CURLY_CONTR = re.compile(r"[A-Za-z]\u2019[A-Za-z]")
 
-def extract_handwriting_and_orthographic_features(texts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+
+def extract_handwriting_and_orthographic_features(texts: list[str]) -> tuple[np.ndarray, np.ndarray]:
     """
     Single-pass extractor returning:
     - feats: (N, 26) float32 continuous punctuation, contraction, and structural densities
@@ -189,18 +288,41 @@ def extract_handwriting_and_orthographic_features(texts: List[str]) -> Tuple[np.
         ttr = float(len(set(words)) / n_words)
 
         feats[i] = [
-            c_colon, c_semi, c_em_dash, c_double_hyph, c_curly_sq, c_straight_sq,
-            c_curly_dq, c_straight_dq, c_paren, c_comma, c_excl, c_ques,
-            c_ellipsis, c_hyphen, n_straight_contr, n_curly_contr, c_newline,
-            c_bullet, c_upper, c_digits, mean_w_len, std_w_len, mean_s_len,
-            std_s_len, burstiness, ttr
+            c_colon,
+            c_semi,
+            c_em_dash,
+            c_double_hyph,
+            c_curly_sq,
+            c_straight_sq,
+            c_curly_dq,
+            c_straight_dq,
+            c_paren,
+            c_comma,
+            c_excl,
+            c_ques,
+            c_ellipsis,
+            c_hyphen,
+            n_straight_contr,
+            n_curly_contr,
+            c_newline,
+            c_bullet,
+            c_upper,
+            c_digits,
+            mean_w_len,
+            std_w_len,
+            mean_s_len,
+            std_s_len,
+            burstiness,
+            ttr,
         ]
     return feats, rules
 
-def extract_handwriting_features(texts: List[str]) -> np.ndarray:
+
+def extract_handwriting_features(texts: list[str]) -> np.ndarray:
     """Backward-compatible wrapper returning only the (N, 26) continuous matrix."""
     feats, _ = extract_handwriting_and_orthographic_features(texts)
     return feats
+
 
 def fit_handwriting_model(
     hw_tr: np.ndarray,
@@ -209,7 +331,7 @@ def fit_handwriting_model(
     df_tr: pd.DataFrame,
     groups_085: np.ndarray,
     twin_rows_085: np.ndarray,
-    len_tr_raw: int
+    len_tr_raw: int,
 ) -> np.ndarray:
     """
     Fits dedicated LogisticRegression plain (C=0.25) and prompt-centered (C=0.15)
@@ -223,22 +345,24 @@ def fit_handwriting_model(
     if twin_rows_085.any() and len_tr_raw >= 18:
         hw_tr_c = hw_tr[:len_tr_raw].copy()
         for p in np.unique(df_tr["prompt_id"].values):
-            m_p = (df_tr["prompt_id"].values == p)
+            m_p = df_tr["prompt_id"].values == p
             hw_tr_c[m_p] -= hw_tr_c[m_p].mean(axis=0, keepdims=True)
         clf_hw_twin = LogisticRegression(C=0.15, max_iter=1000, random_state=42, class_weight="balanced")
         clf_hw_twin.fit(hw_tr_c, fit_y[:len_tr_raw])
 
         hw_te_c = hw_te.copy()
         for g in np.unique(groups_085[twin_rows_085]):
-            m_g = (groups_085 == g)
+            m_g = groups_085 == g
             hw_te_c[m_g] -= hw_te_c[m_g].mean(axis=0, keepdims=True)
         lp_hw_twin = log_softmax(clf_hw_twin.decision_function(hw_te_c[twin_rows_085]))
         lp_hw[twin_rows_085] = log_softmax(0.70 * lp_hw[twin_rows_085] + 0.30 * lp_hw_twin)
 
     return lp_hw
 
-def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Path],
-                       qwen_tok_dir: str, working_dir: Path) -> Dict[str, np.ndarray]:
+
+def run_lexical_engine(
+    train_path: Path, test_path: Path, pool_file: Path | None, qwen_tok_dir: str, working_dir: Path
+) -> dict[str, np.ndarray]:
     """
     Runs the complete dual-output lexical engine in-process or writes standalone script.
     Saves and returns:
@@ -250,27 +374,33 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     df_tr = pd.read_csv(train_path)
     df_te = pd.read_csv(test_path)
 
-    test_texts = df_te['text'].fillna('').astype(str).tolist()
-    fit_texts = df_tr['text'].fillna('').astype(str).tolist()
-    fit_y = np.array([LAB2I[m] for m in df_tr['model']])
+    test_texts = df_te["text"].fillna("").astype(str).tolist()
+    fit_texts = df_tr["text"].fillna("").astype(str).tolist()
+    fit_y = np.array([LAB2I[m] for m in df_tr["model"]])
     fit_sw = np.ones(len(df_tr), dtype=np.float32)  # Official train rows get 1.00
     seen_texts = {_norm_text_key(t) for t in fit_texts}
     len_tr_raw = len(df_tr)
 
     # 1. Compute stopword TF-IDF distance matrix and topic clusters (t=0.85) on test
-    Xt_tfidf = TfidfVectorizer(
-        stop_words='english',
+    vec_kwargs = dict(
+        stop_words="english",
         sublinear_tf=True,
         min_df=2 if len(test_texts) >= 20 else 1,
-        max_df=0.08 if len(test_texts) >= 50 else 1.0,
+        max_df=0.25 if len(test_texts) >= 100 else 1.0,
         max_features=100000,
-        dtype=np.float32
-    ).fit_transform(test_texts)
+        dtype=np.float32,
+    )
+    try:
+        Xt_tfidf = TfidfVectorizer(**vec_kwargs).fit_transform(test_texts)
+    except ValueError:
+        vec_kwargs["min_df"] = 1
+        vec_kwargs["max_df"] = 1.0
+        Xt_tfidf = TfidfVectorizer(**vec_kwargs).fit_transform(test_texts)
     if len(test_texts) >= 2:
         D = np.clip(1.0 - (Xt_tfidf @ Xt_tfidf.T).toarray(), 0.0, None)
         np.fill_diagonal(D, 0.0)
         cond_d = squareform(D, checks=False)
-        groups_085 = fcluster(linkage(cond_d, method='average'), 0.85, criterion='distance')
+        groups_085 = fcluster(linkage(cond_d, method="average"), 0.85, criterion="distance")
     else:
         D = np.zeros((1, 1), dtype=np.float32)
         groups_085 = np.ones(1, dtype=int)
@@ -281,7 +411,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     # 1.5. Check for quarantined unseen holdout dataset
     working_dir = Path(working_dir)
     unseen_parquet = working_dir / "unseen_holdout.parquet"
-    unseen_texts: List[str] = []
+    unseen_texts: list[str] = []
     unseen_hashes = set()
     if unseen_parquet.exists():
         try:
@@ -300,9 +430,9 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     core_texts = list(fit_texts)
     core_y = fit_y.copy()
     core_sw = fit_sw.copy()
-    extra_fit_texts: List[str] = []
-    extra_fit_y: List[int] = []
-    extra_fit_sw: List[float] = []
+    extra_fit_texts: list[str] = []
+    extra_fit_y: list[int] = []
+    extra_fit_sw: list[float] = []
 
     MAX_CORE_POOL_PER_CLASS = 700
     MAX_TOTAL_POOL_PER_CLASS = 2400
@@ -314,15 +444,15 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     for pf in pool_candidates:
         if pf and os.path.exists(pf):
             try:
-                p_df = pd.read_parquet(pf, columns=['text', 'model'])
-                p_df = p_df[p_df['model'].isin(LABELS)].dropna(subset=['text', 'model']).copy()
+                p_df = pd.read_parquet(pf, columns=["text", "model"])
+                p_df = p_df[p_df["model"].isin(LABELS)].dropna(subset=["text", "model"]).copy()
                 pf_filename = Path(pf).name.lower()
-                is_matched_clean = ('matched' in pf_filename or 'clean' in pf_filename)
+                is_matched_clean = "matched" in pf_filename or "clean" in pf_filename
                 src_w = 0.50 if is_matched_clean else 0.35
 
                 # Filter to competition passage length (25..360 words) when pool is large
                 if len(p_df) > 5000:
-                    w_counts = p_df['text'].astype(str).str.split().str.len()
+                    w_counts = p_df["text"].astype(str).str.split().str.len()
                     p_df = p_df[w_counts.between(25, 360)].copy()
 
                 # Shuffle deterministically before stratified cap
@@ -331,8 +461,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 fit_add_t, fit_add_y, fit_add_sw = [], [], []
                 core_add_t, core_add_y, core_add_sw = [], [], []
 
-                pf_filename = Path(pf).name.lower()
-                for t_val, m_val in zip(p_df['text'].values, p_df['model'].values):
+                for t_val, m_val in zip(p_df["text"].values, p_df["model"].values):
                     c_idx = LAB2I[m_val]
                     max_tot_c = int(1.4 * MAX_TOTAL_POOL_PER_CLASS) if c_idx in HARD_CLASS_INDICES else MAX_TOTAL_POOL_PER_CLASS
                     if total_class_counts[c_idx] >= max_tot_c:
@@ -365,7 +494,9 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                     extra_fit_texts.extend(fit_add_t)
                     extra_fit_y.extend(fit_add_y)
                     extra_fit_sw.extend(fit_add_sw)
-                print(f"[Lexical] Added {len(core_add_t) + len(fit_add_t)} rows (core={len(core_add_t)}) from {Path(pf).name} with source weight {src_w}")
+                print(
+                    f"[Lexical] Added {len(core_add_t) + len(fit_add_t)} rows (core={len(core_add_t)}) from {Path(pf).name} with source weight {src_w}"
+                )
             except Exception as e:
                 print(f"[Lexical] Note: Could not read pool {pf}: {e}")
 
@@ -426,7 +557,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     X_tr_4v = sparse.hstack(tr_mats_4v, format="csr")
     X_te_4v = sparse.hstack(te_mats_4v, format="csr")
     X_unseen_4v = sparse.hstack(unseen_mats_4v, format="csr") if unseen_mats_4v else None
-    X_core_4v = X_tr_4v[:len(core_texts)]
+    X_core_4v = X_tr_4v[: len(core_texts)]
 
     # OUTPUT 1: Pure 4-View LinearSVC (C=0.5, class_weight='balanced', source sample weights)
     svc_main = LinearSVC(C=0.5, dual=True, random_state=42, max_iter=2000, tol=1e-3, class_weight="balanced")
@@ -443,15 +574,33 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     wre = re.compile(r"[A-Za-z’']+")
     cnt = collections.Counter(w.lower() for t in core_texts for w in wre.findall(t))
     distort_keep = {w for w, _ in cnt.most_common(100)}
-    dist_fn = lambda arr: [wre.sub(lambda m_: m_.group(0) if m_.group(0).lower() in distort_keep else '*', t) for t in arr]
+
+    def dist_fn(arr):
+        return [wre.sub(lambda m_: m_.group(0) if m_.group(0).lower() in distort_keep else "*", t) for t in arr]
 
     D_tr = dist_fn(core_texts)
     D_te = dist_fn(test_texts)
     D_unseen = dist_fn(unseen_texts) if unseen_texts else []
 
     vs_dist = [
-        TfidfVectorizer(sublinear_tf=True, lowercase=False, analyzer='char', ngram_range=(2, 6), max_features=100000, dtype=np.float32, min_df=2 if len(core_texts) >= 50 else 1),
-        TfidfVectorizer(sublinear_tf=True, lowercase=True, token_pattern=r"[^\s]+", ngram_range=(1, 3), max_features=60000, dtype=np.float32, min_df=2 if len(core_texts) >= 50 else 1)
+        TfidfVectorizer(
+            sublinear_tf=True,
+            lowercase=False,
+            analyzer="char",
+            ngram_range=(2, 6),
+            max_features=100000,
+            dtype=np.float32,
+            min_df=2 if len(core_texts) >= 50 else 1,
+        ),
+        TfidfVectorizer(
+            sublinear_tf=True,
+            lowercase=True,
+            token_pattern=r"[^\s]+",
+            ngram_range=(1, 3),
+            max_features=60000,
+            dtype=np.float32,
+            min_df=2 if len(core_texts) >= 50 else 1,
+        ),
     ]
     Xa_dist = sparse.hstack([v_.fit_transform(D_tr) for v_ in vs_dist], format="csr")
     Xb_dist = sparse.hstack([v_.transform(D_te) for v_ in vs_dist], format="csr")
@@ -486,12 +635,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     if qwen_tok_dir and os.path.exists(qwen_tok_dir):
         try:
             from transformers import AutoTokenizer
+
             tok = AutoTokenizer.from_pretrained(qwen_tok_dir, use_fast=True)
         except Exception:
             tok = None
 
     if tok is not None:
-        def batch_bpe_strings(texts: List[str], batch_sz: int = 4000) -> List[str]:
+
+        def batch_bpe_strings(texts: list[str], batch_sz: int = 4000) -> list[str]:
             out_strs = []
             for s in range(0, len(texts), batch_sz):
                 batch_ids = tok(
@@ -507,8 +658,13 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         test_bpe_strs = batch_bpe_strings(test_texts)
         unseen_bpe_strs = batch_bpe_strings(unseen_texts) if unseen_texts else []
         v_bpe = TfidfVectorizer(
-            analyzer="word", token_pattern=r"\S+", lowercase=False,
-            ngram_range=(1, 3), max_features=75000, sublinear_tf=True, dtype=np.float32
+            analyzer="word",
+            token_pattern=r"\S+",
+            lowercase=False,
+            ngram_range=(1, 3),
+            max_features=75000,
+            sublinear_tf=True,
+            dtype=np.float32,
         )
         tr_bpe = v_bpe.fit_transform(fit_bpe_strs) * 0.8
         te_bpe = v_bpe.transform(test_bpe_strs) * 0.8
@@ -536,12 +692,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     svc_comp.fit(X_core_5v, core_y, sample_weight=comp_core_sw)
     P_svc_comp = softmax(svc_comp.decision_function(X_te_5v), axis=1)
 
-    sgd_comp = SGDClassifier(loss='log_loss', alpha=1e-4, max_iter=1500, random_state=42)
+    sgd_comp = SGDClassifier(loss="log_loss", alpha=1e-4, max_iter=1500, random_state=42)
     sgd_comp.fit(X_core_5v, core_y, sample_weight=comp_core_sw)
     P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
 
     # Compute baseline probabilities
-    P_unseen_svc = softmax(svc_comp.decision_function(X_unseen_5v), axis=1) if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else None
+    P_unseen_svc = (
+        softmax(svc_comp.decision_function(X_unseen_5v), axis=1) if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else None
+    )
     P_unseen_sgd = sgd_comp.predict_proba(X_unseen_5v) if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else None
 
     # Style Twin on groups_085
@@ -549,7 +707,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     P_unseen_twin = P_unseen_svc.copy() if P_unseen_svc is not None else None
     if twin_rows_085.any() and len_tr_raw >= 18:
         X_train_only = X_core_5v[:len_tr_raw]
-        u_tr, inv_tr = np.unique(df_tr['prompt_id'].values, return_inverse=True)
+        u_tr, inv_tr = np.unique(df_tr["prompt_id"].values, return_inverse=True)
         counts_tr = np.bincount(inv_tr)
         vals_tr = (1.0 / counts_tr[inv_tr]).astype(np.float32)
         G = sparse.csr_matrix((vals_tr, (np.arange(len(inv_tr)), inv_tr)), shape=(len(inv_tr), len(u_tr)), dtype=np.float32)
@@ -569,7 +727,11 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         P_twin_comp[twin_rows_085] = softmax(svc_twin.decision_function(X_te_twin_c), axis=1)
 
         if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
-            if "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_unseen_5v.shape[0]:
+            if (
+                "df_unseen_holdout" in locals()
+                and "prompt_id" in df_unseen_holdout.columns
+                and len(df_unseen_holdout) == X_unseen_5v.shape[0]
+            ):
                 u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
                 counts_u = np.bincount(inv_u)
                 vals_u = (1.0 / counts_u[inv_u]).astype(np.float32)
@@ -594,7 +756,9 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
     P_lex_comp = 0.40 * P_svc_comp + 0.25 * P_sgd_comp + 0.15 * P_twin_comp + 0.20 * P_distort
     P_lex_comp_final = P_lex_comp.copy()
-    unseen_p_lex_comp_final = P_unseen_comp.copy() if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else np.zeros((0, K), dtype=np.float32)
+    unseen_p_lex_comp_final = (
+        P_unseen_comp.copy() if (X_unseen_5v is not None and X_unseen_5v.shape[0] > 0) else np.zeros((0, K), dtype=np.float32)
+    )
 
     hw_c_sp = sparse.csr_matrix(hw_core * 0.25)
     hw_te_sp = sparse.csr_matrix(hw_te * 0.25)
@@ -620,10 +784,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
             P_spec_plain = softmax(logits_spec, axis=1)
 
             train_mask = grp_mask[:len_tr_raw]
-            has_centered_pair = (
-                train_mask.sum() >= 6 * len(grp_cols)
-                and len(np.unique(core_y[:len_tr_raw][train_mask])) == len(grp_cols)
-            )
+            has_centered_pair = train_mask.sum() >= 6 * len(grp_cols) and len(np.unique(core_y[:len_tr_raw][train_mask])) == len(grp_cols)
             if has_centered_pair:
                 X_tr_pair = sparse.hstack([X_core_5v[:len_tr_raw][train_mask], hw_c_sp[:len_tr_raw][train_mask]], format="csr")
                 y_tr_pair = np.array([sub_lab2i[y] for y in core_y[:len_tr_raw][train_mask]], dtype=int)
@@ -663,7 +824,12 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
                 logits_spec_u = np.column_stack([-df_spec_u, df_spec_u]) if df_spec_u.ndim == 1 else df_spec_u
                 P_spec_u_plain = softmax(logits_spec_u, axis=1)
                 P_spec_u = P_spec_u_plain.copy()
-                if has_centered_pair and "df_unseen_holdout" in locals() and "prompt_id" in df_unseen_holdout.columns and len(df_unseen_holdout) == X_u_grp.shape[0]:
+                if (
+                    has_centered_pair
+                    and "df_unseen_holdout" in locals()
+                    and "prompt_id" in df_unseen_holdout.columns
+                    and len(df_unseen_holdout) == X_u_grp.shape[0]
+                ):
                     u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
                     counts_u = np.bincount(inv_u)
                     sz_u = counts_u[inv_u]
@@ -691,22 +857,22 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
     # Save to disk
     os.makedirs(working_dir, exist_ok=True)
-    np.save(working_dir / 'hw_train.npy', hw_core[:len_tr_raw])
-    np.save(working_dir / 'hw_test.npy', hw_te)
+    np.save(working_dir / "hw_train.npy", hw_core[:len_tr_raw])
+    np.save(working_dir / "hw_test.npy", hw_te)
     if hw_unseen is not None:
-        np.save(working_dir / 'hw_unseen.npy', hw_unseen)
-    np.save(working_dir / 'log_p_svc_main.npy', log_p_svc_main)
-    np.save(working_dir / 'p_lex_comp.npy', P_lex_comp_final)
-    np.save(working_dir / 'D_tfidf.npy', D)
-    np.save(working_dir / 'groups_085.npy', groups_085)
-    np.save(working_dir / 'log_p_handwriting.npy', lp_hw)
-    np.save(working_dir / 'rule_flags_test.npy', rule_flags_te)
-    np.save(working_dir / 'unseen_log_p_svc_main.npy', unseen_log_p_svc_main)
-    np.save(working_dir / 'unseen_p_lex_comp.npy', unseen_p_lex_comp_final)
+        np.save(working_dir / "hw_unseen.npy", hw_unseen)
+    np.save(working_dir / "log_p_svc_main.npy", log_p_svc_main)
+    np.save(working_dir / "p_lex_comp.npy", P_lex_comp_final)
+    np.save(working_dir / "D_tfidf.npy", D)
+    np.save(working_dir / "groups_085.npy", groups_085)
+    np.save(working_dir / "log_p_handwriting.npy", lp_hw)
+    np.save(working_dir / "rule_flags_test.npy", rule_flags_te)
+    np.save(working_dir / "unseen_log_p_svc_main.npy", unseen_log_p_svc_main)
+    np.save(working_dir / "unseen_p_lex_comp.npy", unseen_p_lex_comp_final)
     if log_p_distort is not None:
-        np.save(working_dir / 'log_p_distort.npy', log_p_distort)
+        np.save(working_dir / "log_p_distort.npy", log_p_distort)
     if log_p_unseen_distort is not None:
-        np.save(working_dir / 'unseen_log_p_distort.npy', log_p_unseen_distort)
+        np.save(working_dir / "unseen_log_p_distort.npy", log_p_unseen_distort)
 
     return {
         "log_p_svc_main": log_p_svc_main,
@@ -724,6 +890,7 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         "unseen_log_p_distort": log_p_unseen_distort,
     }
 
+
 if __name__ == "__main__":
     working_dir = Path("/kaggle/working")
     if not working_dir.exists():
@@ -734,29 +901,8 @@ if __name__ == "__main__":
     if not input_dir.exists():
         input_dir = Path(".")
 
-    candidates = [
-        input_dir / 'competitions' / 'name-that-llm',
-        input_dir / 'name-that-llm',
-        Path('local_data'),
-        Path('.')
-    ]
-    train_path = None
-    test_path = None
-    for c in candidates:
-        if (c / 'train.csv').exists() and train_path is None:
-            train_path = c / 'train.csv'
-        if (c / 'test.csv').exists() and test_path is None:
-            test_path = c / 'test.csv'
-    if train_path is None:
-        train_path = Path('local_data') / 'train.csv'
-    if test_path is None:
-        test_path = Path('local_data') / 'test.csv'
-
-    pool_files: List[Path] = []
-    for pat in ['nlm_matched_clean.parquet', 'pool_v4.parquet', 'nlm_pool_v5.parquet', 'nlm_pool_v2.parquet']:
-        for p in input_dir.rglob(pat):
-            if p not in pool_files:
-                pool_files.append(p)
+    train_path, test_path, _ = resolve_dataset_paths(input_dir)
+    pool_files = resolve_all_pool_files(input_dir)
 
     tok_paths = list(input_dir.rglob("vocab.json"))
     qwen_tok_dir = str(tok_paths[0].parent) if tok_paths else ""
