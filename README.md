@@ -3,8 +3,10 @@
 [![Kaggle Public Score](https://img.shields.io/badge/Kaggle%20Public%20Score-0.622%20(SOTA)-brightgreen)](https://www.kaggle.com/competitions/name-that-llm)
 [![Codebase Architecture](https://img.shields.io/badge/Architecture-Modular%20PyPA%20Package-blue)](#)
 [![Models](https://img.shields.io/badge/Backbones-Qwen3--14B%20%7C%20Qwen2.5--14B%20%7C%20Qwen3--8B%20%7C%20DeBERTa-orange)](#)
-[![In-House Checkpoint](https://img.shields.io/badge/In--House%20LoRA24-73.19%25%20Validation%20BAcc-brightgreen)](https://www.kaggle.com/datasets/anilmittal/ntl-inhouse-two-stage-lora24)
-[![Unit Tests](https://img.shields.io/badge/Unit%20Tests-87%20Passed%20(100%25)-brightgreen)](#)
+[![In-House Checkpoint](https://img.shields.io/badge/In--House%20LoRA24-78.61%25%20Holdout%20BAcc-brightgreen)](https://www.kaggle.com/datasets/anilmittal/ntl-inhouse-two-stage-lora24)
+[![Unit Tests](https://img.shields.io/badge/Unit%20Tests-89%20Passed%20(100%25)-brightgreen)](#)
+[![Training Guide](https://img.shields.io/badge/Guide-TRAINING.md-purple)](TRAINING.md)
+[![Masterclass](https://img.shields.io/badge/Tutorial-TUTORIAL.md-blue)](TUTORIAL.md)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green)](#)
 
 A competition-grade, memory-isolated machine learning solution for the **Kaggle "Name That LLM"** competition. The objective is to identify which of 18 specific Large Language Models authored an unattributed response passage.
@@ -258,8 +260,9 @@ python -m kaggle kernels push -p kernels/submission
 python -m kaggle kernels push -p kernels/training
 ```
 
-### 5. Cloud Training on Modal (NVIDIA A100-80GB)
-All heavy model training is dispatched to serverless NVIDIA A100-80GB GPUs on Modal:
+### 5. In-House Model Training on Modal Cloud (NVIDIA A100-80GB)
+
+All heavy model training and calibration are executed on serverless NVIDIA A100-80GB SXM GPUs using Modal. For comprehensive mathematical formulations, gap analysis, and hyperparameter tuning, see [**TRAINING.md**](TRAINING.md).
 
 ```powershell
 # 1. Sync competition data and assemble canonical pool_120k.parquet directly into cloud volume
@@ -268,15 +271,30 @@ python -m modal run scripts/modal_trainer.py --mode sync
 # 2. Run fast 2-minute end-to-end smoke test on A100 GPU
 python -m modal run scripts/modal_trainer.py --mode smoke
 
-# 3. Launch full 18-class champion training in detached mode (laptop shutdown & sleep proof):
+# 3. Launch full 18-class champion training in detached mode (sleep & shutdown proof):
 python -m modal run --detach scripts/modal_trainer.py --mode run --config configs/training_lora.json
-# Or spawn asynchronously from python:
-# python scripts/modal_trainer.py --spawn --config configs/training_lora.json
 
-# 4. Check active cloud apps and live logs
+# 4. Launch sequential Family Specialists training (GPT, Gemini, GLM):
+python -m modal run --detach scripts/modal_trainer.py --mode run --config configs/training_specialists.json
+
+# 5. Check active cloud apps and live streaming logs:
 python -m modal app list
 python -m modal app logs <app_id>
 
-# 5. Pull trained champion checkpoint artifacts locally
+# 6. Re-export heads with Path A Centered & Scaled Bias:
+python -m modal run scripts/modal_trainer.py::reexport_heads_cli --export-dir checkpoints/export_champion_qwen3_14b
+
+# 7. Pull trained champion checkpoint artifacts locally:
 python -m modal volume get ntl-checkpoints export_champion_qwen3_14b ./checkpoints/
+
+# 8. Synchronize checkpoint with the production Kaggle dataset:
+kaggle datasets version -p checkpoints/export_champion_qwen3_14b -m "v76: Champion Qwen3-14B with Path A Centered & Scaled Bias"
 ```
+
+---
+
+## 7. Documentation & Learning Resources
+
+- [**TRAINING.md**](TRAINING.md): Deep-dive into in-house Two-Stage LoRA training, multi-layer interior pooling (`[2, 4, 6, 8, 12, 16, 20, 24]`), prompt-mean centering, Modal A100 benchmarks, and family specialists.
+- [**TUTORIAL.md**](TUTORIAL.md): Comprehensive technical masterclass explaining the mathematical foundations of LLM authorship attribution, within-prompt covariance ($w\text{PCA}$), exact $2^{18}$ dynamic programming, Sinkhorn-Knopp mass balancing, and pairwise error mitigation.
+- [**v76_confusion_matrix.md**](v76_confusion_matrix.md): In-depth 18-class pairwise confusion matrix analysis, sibling error breakdowns, and mitigation roadmap for Kaggle Version 76.

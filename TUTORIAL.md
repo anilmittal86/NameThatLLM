@@ -525,99 +525,85 @@ Stage 1 pretraining ingests our unified canonical pool dataset:
 - **Strict Holdout Quarantine**: 360 rows (20 per class across 18 classes) are strictly quarantined for the zero-leakage unseen benchmark test set (`local_eval_cache.npz`).
 - **Clean Retained Pool**: 122,937 passages trained across 2 complete epochs (~246,000 forward passes).
 
-### 3. Empirical Error-Driven Enhancements
+### 3. The Two-Stage Training Curriculum & Architectural Breakthrough
 
-#### A. Hard-Class Loss Upweighting ($1.40\times$)
-In the raw pool dataset, majority classes like `gpt-5.6-luna` (11,183 samples) naturally dominate over difficult minority classes like `gemini-3.7-flash` (4,891 samples) and `qwen3.8-max` (4,189 samples). 
+Early in-house runs (`training_v13`) struggled at **0.4806** holdout BAcc due to artificial margin distortion and premature Kaggle wall-clock cutoffs. The transition to the Modal A100 Champion pipeline lifted performance to **76.39% Raw BAcc / 78.61% Sinkhorn BAcc** through three foundational principles:
 
-Rather than repeating duplicate text (which risks overfitting LoRA attention weights), we apply an exact **loss-level class weighting tensor**:
-$$\mathcal{L}_{\text{weighted}} = -\frac{1}{B} \sum_{b=1}^{B} w_{y_b} \log \frac{e^{z_{b, y_b}}}{\sum_{j=1}^{K} e^{z_{b, j}}}$$
+#### A. Clean Cross-Entropy with Detached Prototypes
+Unlike heuristic margin penalties (which distorted posterior calibration and caused negative lift on test data), Stage 1 utilizes clean cross-entropy with detached prototype heads:
+$$\mathcal{L}_{\text{CE}} = -\frac{1}{B} \sum_{b=1}^{B} \log \frac{e^{z_{b, y_b}}}{\sum_{j=1}^{K} e^{z_{b, j}}}$$
+To prevent contrastive cosine gradients from corrupting the linear classification weights, prototypes are strictly detached during SupCon auxiliary steps (`prototypes = model.head.weight.detach()`). Furthermore, uniform class weighting ($w_c = 1.00$) preserves unskewed priors, allowing Sinkhorn-Knopp mass balancing to operate with exact theoretical guarantees.
 
-where:
-$$w_c = \begin{cases} 1.40 & \text{if } c \in \text{HARD\_CLASS\_INDICES} \\ 1.00 & \text{otherwise} \end{cases}$$
+#### B. Interior 8-Layer Feature Pooling (`[2, 4, 6, 8, 12, 16, 20, 24]`)
+Rather than pulling embeddings from late saturated layers (e.g. layer 27, which merely duplicates the final transformer residual), features are tapped from **8 interior decoder layers**:
+$$\mathcal{L}_{\text{pool}} = [2, 4, 6, 8, 12, 16, 20, 24]$$
+Each layer is average-pooled over non-pad tokens and passed through an independent LayerNorm before concatenation into a $D = 40,960$ stylometric vector:
+$$Z = \left[ \text{LN}_2(\bar{h}^{(2)}) \,\|\, \text{LN}_4(\bar{h}^{(4)}) \,\|\, \dots \,\|\, \text{LN}_{24}(\bar{h}^{(24)}) \right]$$
 
-`HARD_CLASS_INDICES = [1, 2, 3, 6, 7, 8, 13, 14, 15, 16, 17]` targets the exact 11 highest-error classes identified in the in-house evaluation audit (`gemini-3.7-flash` @ 80%, `glm-5.3` @ 80%, `gpt-5.6-sol` @ 75%, `kimi-k3` @ 80%, etc.).
-
-#### B. Targeted Sibling Margin Penalty Boost
-Standard cross-entropy penalizes all incorrect classes symmetrically. In LLM authorship attribution, cross-family errors (e.g. confusing Gemini with Claude) are rare; the overwhelming majority of errors occur between **sister models within the same provider family**.
-
-In `family_margin_cross_entropy`, we add an additive margin penalty to competing sibling logits during training:
-$$\tilde{z}_{b, j} = z_{b, j} + \mathbb{I}(j \in \text{Sisters}(y_b)) \cdot \text{margin} \cdot M[y_b, j]$$
-
-This artificially inflates the sister's logit in the softmax denominator, penalizing ambiguous predictions. We assign boosted multipliers to the highest-confusion sister pairs:
-* **Gemini Flash Triad**:
-  * `gemini-3.7-flash` $\leftrightarrow$ `gemini-3.8-flash`: **$1.5\times$ margin multiplier**
-  * `gemini-3.6-flash` $\leftrightarrow$ `3.7-flash` / `3.8-flash`: **$1.4\times$ margin multiplier**
-* **GPT-5.6 Triad & Astra**:
-  * `gpt-5.6-luna` $\leftrightarrow$ `gpt-5.6-sol` $\leftrightarrow$ `gpt-5.6-terra`: **$1.4\times$ margin multiplier**
-  * `gpt-5.6-sol` $\leftrightarrow$ `gpt-6-astra`: **$1.3\times$ margin multiplier**
-* **GLM Sisters**:
-  * `glm-5.3` $\leftrightarrow$ `glm-5.3-flash`: **$1.4\times$ margin multiplier**
+#### C. Path A Centered & Scaled Bias Calibration (`heads.safetensors`)
+In Stage 2, prompt-mean subtracted features ($\tilde{Z}_i = Z_i - \mu_{\text{prompt}(i)}$) train a topic-invariant centered head $(W_c, b_c)$. To deliver topic-invariant calibration during single-text inference (where prompt groups are unavailable), the plain bias $b_p$ is calibrated with the centered bias:
+$$b_p^* = b_p - \gamma \cdot b_c \quad (\gamma = 0.50)$$
+The resulting logits are standardized to a standard deviation of $\sim 4.0$:
+$$\text{logits}^* = \text{logits} \cdot \left(\frac{4.0}{\text{std}(\text{logits})}\right)$$
+This prevents extreme logit saturation and ensures maximum sensitivity during Sinkhorn mass balancing.
 
 ### 4. Stage 2: Prompt-Group Multi-Task Contrastive Fine-Tuning
 In Stage 2, samples from `train.csv` are grouped into prompt batches via `PromptGroupBatchSampler`. Each prompt group contains responses to the same topic across all 18 models:
 - **Two-Pass Micro-Batched Execution (`train_prompt_group_step`)**:
   - **Pass 1 (`torch.no_grad()`)**: Iterates through the prompt group in chunks of 4 to compute the exact prompt mean embedding:
     $$\mu_{\text{prompt}} = \frac{1}{N} \sum_{i=1}^{N} z_i$$
-  - **Variable-Size Sub-Cluster Centering Augmentation**: When $N \ge 8$, with 50% probability $\mu_{\text{prompt}}$ is computed over a random subset of $k \sim \text{Uniform}(4, \min(N, 14))$ rows, forcing `centered_head` to generalize to smaller test-time prompt clusters.
   - **Pass 2 (Autograd Micro-Batches)**: Evaluates loss over micro-batches of size 2 with dynamic sequence length slicing, dynamically centering features:
     $$z_{\text{centered}, i} = z_i - \mu_{\text{prompt}}$$
-    The dual objective combines plain classification, centered contrastive classification, and supervised contrastive (SupCon) repulsion:
-    $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}}(\text{plain}) + 0.65 \cdot \mathcal{L}_{\text{CE}}(\text{centered}) + 0.25 \cdot \mathcal{L}_{\text{SupCon}}$$
-- **Stochastic Weight Averaging (SWA)**: Parameters are averaged across all steps of the final Stage 2 epoch, smoothing out sharp loss landscape valleys.
-- **Closed-Form Dual Ridge Regression Head Blending (`fit_ridge_heads`)**: Combines neural margin boundaries with exact $L_2$-regularized closed-form ridge regression ($w_{\text{neural}} = 0.75, w_{\text{ridge}} = 0.25$) on extracted representations $Z_{\text{train}}$.
+- **Stochastic Weight Averaging (SWA)**: Parameters are averaged across all steps of the final Stage 2 epoch using FP32 shadow accumulators, smoothing out sharp loss landscape valleys.
+- **Dual Head Export**: Saves both plain linear head ($W_p, b_p$) and prompt-centered head ($W_c, b_c$) into `heads.safetensors`.
 
 ### 5. Training Regime Comparison: In-House vs. Benchmark Champions
 
 | Training Stage / Attribute | Previous In-House (`training_v13`) | Dhruv Benchmark (`qwen3_14b_v5`) | In-House Champion (`qwen3_14b_champion`) |
 | :--- | :--- | :--- | :--- |
-| **Stage 1 Passages** | 25,022 passages | 119,899 passages | **122,937 deduplicated passages** |
-| **Stage 1 Epochs** | 0.28 epochs (aborted by Kaggle cutoff) | 2.0 full epochs | **2.0 full epochs (~246,000 passes)** |
+| **Stage 1 Passages** | 25,022 passages (aborted) | 119,899 passages | **122,937 deduplicated passages** |
+| **Stage 1 Epochs** | 0.28 epochs (cut off) | 2.0 full epochs | **2.0 full epochs (~246,000 passes)** |
 | **Compute Hardware** | Kaggle 2× T4 (15 GB) | External NVIDIA A100 | **Modal Serverless NVIDIA A100-80GB SXM** |
 | **Precision & Attention** | FP16 / Standard PyTorch | BF16 / FlashAttention-2 | **Native BF16 + FlashAttention-2** |
-| **Batch Size & Throughput** | `batch_size=2, accum=8` (~1.5 pass/s) | `batch_size=16` (~15 pass/s) | **`batch_size=32, accum=1` (~25 steps/min = ~800 pass/min)** |
-| **Hard-Class Handling** | None (uniform loss) | None (uniform loss) | **$1.40\times$ Hard-Class Loss Upweighting** |
-| **Sibling Separation** | Flat margin (+0.40 on all) | None (pure CE) | **Empirical Targeted Margin Boost ($1.5\times$ / $1.4\times$)** |
-| **Head Calibration** | Plain linear | Plain linear | **Neural + Closed-Form Dual Ridge Blending** |
+| **Throughput** | ~1.5 pass/s | ~15 pass/s | **~25 steps/min (~800 pass/min)** |
+| **Pooling Layers** | `[2, 4, 6, 9, 13, 17, 22, 27]` | `[2, 4, 6, 8, 12, 16, 20, 24]` | **`[2, 4, 6, 8, 12, 16, 20, 24]` (Interior)** |
+| **Head Calibration** | Raw uncalibrated | Raw uncalibrated | **Path A Centered & Scaled Bias (`b_p^* = b_p - 0.5 b_c`)** |
+| **Holdout BAcc** | 48.06% | 73.06% | **76.39% Raw / 78.61% Sinkhorn Mass-Equalized** |
 
 ### 6. Executing Cloud Training on Modal
 
 All training is orchestrated through [`scripts/modal_trainer.py`](file:///c:/Projects/NameThatLLM-Anitgravity/scripts/modal_trainer.py):
 
 ```powershell
-# 1. Sync & build canonical pool_120k.parquet in cloud volume
-python -m modal run scripts/modal_trainer.py --mode sync
+# 1. Sync & build canonical pool_120k.parquet in cloud volume:
+modal run scripts/modal_trainer.py --mode sync
 
-# 2. Run fast 2-minute smoke test on A100 GPU
-python -m modal run scripts/modal_trainer.py --mode smoke
+# 2. Run fast 2-minute smoke test on A100 GPU:
+modal run scripts/modal_trainer.py --mode smoke
 
-# 3. Launch full 18-class champion training in detached cloud mode (laptop shutdown & sleep proof):
-python -m modal run --detach scripts/modal_trainer.py --mode run --config configs/training_lora.json
-# Or spawn asynchronously from python:
-# python scripts/modal_trainer.py --spawn --config configs/training_lora.json
+# 3. Launch full 18-class champion training in detached cloud mode:
+modal run --detach scripts/modal_trainer.py --mode run --config configs/training_lora.json
 
-# 4. Monitor live training dashboard & logs
-python -m modal app list
-python -m modal app logs <app_id>
+# 4. Launch sequential Family Specialists training (GPT, Gemini, GLM):
+modal run --detach scripts/modal_trainer.py --mode run --config configs/training_specialists.json
 
-# 5. Pull finished checkpoint artifacts to local workspace
-python -m modal volume get ntl-checkpoints export_champion_qwen3_14b ./checkpoints/
+# 5. Re-export heads with Path A Centered & Scaled Bias:
+modal run scripts/modal_trainer.py::reexport_heads_cli --export-dir checkpoints/export_champion_qwen3_14b
+
+# 6. Pull finished checkpoint artifacts to local workspace:
+modal volume get ntl-checkpoints export_champion_qwen3_14b checkpoints/export_champion_qwen3_14b
 ```
 
 ---
 
 ## 11. Single-Source-of-Truth Compilation & Verification
 
-The repository enforces a **Single Source of Truth** architecture:
-- All model logic lives in `src/namethatllm/`.
-- All hyperparameter values live in `configs/production_ensemble.json` and `configs/training_lora.json`.
-- `scripts/compile_notebook.py` parses module ASTs, strips package imports, and bundles everything into two standalone notebooks:
-  1. [`kaggle_submission.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/submission/kaggle_submission.ipynb) (Inference pipeline)
-  2. [`lora_training.ipynb`](file:///c:/Projects/NameThatLLM-Anitgravity/kernels/training/lora_training.ipynb) (Training pipeline)
+The codebase maintains strict AST (Abstract Syntax Tree) parity between `src/namethatllm/` and compiled Jupyter notebooks (`kaggle_submission.ipynb` and `lora_training.ipynb`). Any changes to Python modules are automatically compiled and validated.
 
-### Running the 61 Unit Tests:
+### Running the Complete Unit Test Suite:
+Run the complete 89-test verification suite:
 ```powershell
-python -m pytest tests -v
+pytest tests -v
 ```
 
 All 61 tests cover every component across 7 comprehensive test suites:
