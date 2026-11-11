@@ -656,6 +656,7 @@ def fit_ridge_heads(
     alpha: float = 10.0,
     label_smoothing: float = 0.10,
     num_classes: int = K,
+    scale_by_trace: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Fits closed-form dual Ridge regression heads for plain and centered representations
@@ -672,8 +673,11 @@ def fit_ridge_heads(
     # Plain head: Z_tilde = [Z, 1]
     Z_tilde = np.hstack([Z, np.ones((N, 1), dtype=np.float32)])
     K_mat = Z_tilde @ Z_tilde.T
-    mean_diag_p = float(np.mean(np.sum(Z * Z, axis=1)))
-    eff_alpha_p = float(alpha) * max(mean_diag_p / 512.0, 1.0)
+    if scale_by_trace:
+        mean_diag_p = float(np.mean(np.sum(Z * Z, axis=1)))
+        eff_alpha_p = float(alpha) * max(mean_diag_p / 512.0, 1.0)
+    else:
+        eff_alpha_p = float(alpha)
     K_mat.flat[:: N + 1] += eff_alpha_p
     A = np.linalg.solve(K_mat, Y)
     W_tilde = (A.T @ Z_tilde).astype(np.float32)
@@ -693,8 +697,11 @@ def fit_ridge_heads(
 
     Z_c_tilde = np.hstack([Z_c, np.ones((N, 1), dtype=np.float32)])
     K_mat_c = Z_c_tilde @ Z_c_tilde.T
-    mean_diag_c = float(np.mean(np.sum(Z_c * Z_c, axis=1)))
-    eff_alpha_c = float(alpha) * max(mean_diag_c / 512.0, 1.0)
+    if scale_by_trace:
+        mean_diag_c = float(np.mean(np.sum(Z_c * Z_c, axis=1)))
+        eff_alpha_c = float(alpha) * max(mean_diag_c / 512.0, 1.0)
+    else:
+        eff_alpha_c = float(alpha)
     K_mat_c.flat[:: N + 1] += eff_alpha_c
     A_c = np.linalg.solve(K_mat_c, Y)
     W_c_tilde = (A_c.T @ Z_c_tilde).astype(np.float32)
@@ -704,6 +711,36 @@ def fit_ridge_heads(
     return W_p, b_p, W_c, b_c
 
 
+def _apply_prior_and_sinkhorn(
+    logits: np.ndarray,
+    temperature: float = 1.5,
+    iters: int = 80,
+    sinkhorn_strength: float = 0.85,
+    target_mix: float = 0.15,
+) -> np.ndarray:
+    """
+    Applies per-sample standardization, iterative column-wise logit prior centering (20 steps),
+    and Sinkhorn marginal probability balancing to ensure unbiased class priors.
+    """
+    row_mean = logits.mean(axis=1, keepdims=True)
+    row_std = np.clip(logits.std(axis=1, keepdims=True), 1e-4, None)
+    norm_logits = (logits - row_mean) / row_std
+
+    adj_logits = norm_logits / temperature
+    num_classes = logits.shape[1]
+    for _ in range(20):
+        probs = softmax(adj_logits, axis=1)
+        col_mean = np.clip(probs.mean(axis=0, keepdims=True), 1e-6, None)
+        adj_logits = adj_logits - 0.5 * np.log(col_mean * num_classes)
+
+    return sinkhorn_balancing(
+        softmax(adj_logits, axis=1),
+        iters=iters,
+        sinkhorn_strength=sinkhorn_strength,
+        target_mix=target_mix,
+    )
+
+
 def compute_grouped_inference_logits(
     Z: np.ndarray,
     plain_weight: np.ndarray,
@@ -711,52 +748,57 @@ def compute_grouped_inference_logits(
     centered_weight: np.ndarray,
     centered_bias: np.ndarray,
     groups: list[Any] | np.ndarray | None = None,
-    blend_centered: float = 0.65,
+    blend_centered: float = 0.20,
 ) -> dict[str, np.ndarray]:
     """
-    Computes plain, prompt-group centered, and blended logits for inference.
-    When groups are available, centers features per group (protecting singletons).
+    Computes plain, gated prompt-group centered, and blended logits for inference.
+    When groups are available, only centers groups that have >= 6 samples and >= 4 distinct
+    plain-head predicted classes to prevent self-subtraction on homogeneous/small clusters.
+    Uses shrinkage centering (0.75x mean subtraction) for valid groups.
     When groups are absent and batch size >= 18, centers globally across the batch.
-    Standardizes per-sample logit scale before blending and computes Sinkhorn-balanced probabilities.
+    Computes prior-centered Sinkhorn-balanced probabilities on both logits_plain and logits_blend.
     """
     logits_plain = Z @ plain_weight.T + plain_bias
     if groups is not None and len(groups) == len(Z):
         Z_c = Z.copy()
         singleton_mask = np.zeros(len(Z), dtype=bool)
         grps_arr = np.asarray(groups)
+        plain_preds = logits_plain.argmax(axis=1)
         for g in np.unique(grps_arr):
             mask = (grps_arr == g)
-            if mask.sum() > 1:
-                Z_c[mask] = Z[mask] - Z[mask].mean(axis=0, keepdims=True)
+            distinct_classes = len(np.unique(plain_preds[mask]))
+            if mask.sum() >= 6 and distinct_classes >= 4:
+                Z_c[mask] = Z[mask] - 0.75 * Z[mask].mean(axis=0, keepdims=True)
             else:
                 singleton_mask[mask] = True
         logits_centered = Z_c @ centered_weight.T + centered_bias
         if np.any(singleton_mask):
             logits_centered[singleton_mask] = logits_plain[singleton_mask]
     elif groups is None and len(Z) >= 18:
-        Z_c = Z - Z.mean(axis=0, keepdims=True)
+        Z_c = Z - 0.75 * Z.mean(axis=0, keepdims=True)
         logits_centered = Z_c @ centered_weight.T + centered_bias
     else:
         logits_centered = logits_plain.copy()
 
     # Standardize per-sample logit scale before blending
-    std_p = np.std(logits_plain, axis=1, keepdims=True)
-    std_c = np.std(logits_centered, axis=1, keepdims=True)
-    scale_p = np.where(std_p > 1e-4, 4.0 / std_p, 1.0)
-    scale_c = np.where(std_c > 1e-4, 4.0 / std_c, 1.0)
-    lp_norm = logits_plain * scale_p
-    lc_norm = logits_centered * scale_c
-    logits_blend = (1.0 - blend_centered) * lp_norm + blend_centered * lc_norm
+    row_mean_p = logits_plain.mean(axis=1, keepdims=True)
+    row_std_p = np.clip(logits_plain.std(axis=1, keepdims=True), 1e-4, None)
+    norm_plain = (logits_plain - row_mean_p) / row_std_p
 
-    std_b = float(np.std(logits_blend, axis=1).mean())
-    scale_b = (4.0 / std_b) if std_b > 1e-4 else 1.0
-    P_blend = softmax(logits_blend * scale_b, axis=1)
-    probs_sinkhorn = sinkhorn_balancing(P_blend, iters=60, sinkhorn_strength=0.65, target_mix=0.35)
+    row_mean_c = logits_centered.mean(axis=1, keepdims=True)
+    row_std_c = np.clip(logits_centered.std(axis=1, keepdims=True), 1e-4, None)
+    norm_centered = (logits_centered - row_mean_c) / row_std_c
+
+    logits_blend = (1.0 - blend_centered) * norm_plain + blend_centered * norm_centered
+
+    probs_plain_sinkhorn = _apply_prior_and_sinkhorn(logits_plain)
+    probs_sinkhorn = _apply_prior_and_sinkhorn(logits_blend)
 
     return {
         "logits_plain": logits_plain,
         "logits_centered": logits_centered,
         "logits_blend": logits_blend,
+        "probs_plain_sinkhorn": probs_plain_sinkhorn,
         "probs_sinkhorn": probs_sinkhorn,
     }
 

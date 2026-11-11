@@ -432,12 +432,13 @@ if modal is not None:
             centered_weight=W_c,
             centered_bias=b_c,
             groups=groups,
-            blend_centered=0.65,
+            blend_centered=0.20,
         )
 
         acc_plain = 0.0
         acc_centered = 0.0
         acc_blended = 0.0
+        acc_plain_sinkhorn = 0.0
         acc_sinkhorn = 0.0
 
         if labels is not None:
@@ -445,39 +446,46 @@ if modal is not None:
             pred_p = res_logits["logits_plain"].argmax(axis=1)
             pred_c = res_logits["logits_centered"].argmax(axis=1)
             pred_b = res_logits["logits_blend"].argmax(axis=1)
+            pred_p_sk = res_logits["probs_plain_sinkhorn"].argmax(axis=1)
             pred_sk = res_logits["probs_sinkhorn"].argmax(axis=1)
 
             acc_plain = float(balanced_accuracy_score(y_arr, pred_p))
             acc_centered = float(balanced_accuracy_score(y_arr, pred_c))
             acc_blended = float(balanced_accuracy_score(y_arr, pred_b))
+            acc_plain_sinkhorn = float(balanced_accuracy_score(y_arr, pred_p_sk))
             acc_sinkhorn = float(balanced_accuracy_score(y_arr, pred_sk))
 
-            print(f"[Modal Eval] Plain Head BAcc         : {acc_plain*100:.2f}%")
-            print(f"[Modal Eval] Centered Head BAcc      : {acc_centered*100:.2f}%")
-            print(f"[Modal Eval] Blended Head BAcc       : {acc_blended*100:.2f}%")
-            print(f"[Modal Eval] Sinkhorn-Balanced BAcc  : {acc_sinkhorn*100:.2f}%")
+            print(f"[Modal Eval] Plain Head BAcc              : {acc_plain*100:.2f}%")
+            print(f"[Modal Eval] Centered Head BAcc           : {acc_centered*100:.2f}%")
+            print(f"[Modal Eval] Blended Head BAcc (80/20)    : {acc_blended*100:.2f}%")
+            print(f"[Modal Eval] Plain + Sinkhorn BAcc        : {acc_plain_sinkhorn*100:.2f}%")
+            print(f"[Modal Eval] Blended + Sinkhorn BAcc      : {acc_sinkhorn*100:.2f}%")
 
-            print("\n" + "=" * 95)
-            print(f"{'Class Name':<25} | {'True':<5} | {'Pred (Plain)':<13} | {'BAcc (Plain)':<13} | {'Pred (Sink)':<12} | {'BAcc (Sink)':<12}")
-            print("-" * 95)
+            print("\n" + "=" * 125)
+            print(f"{'Class Name':<24} | {'True':<5} | {'Pred (Plain)':<13} | {'BAcc (Plain)':<13} | {'Pred (P-Sink)':<14} | {'BAcc (P-Sink)':<14} | {'Pred (B-Sink)':<14} | {'BAcc (B-Sink)':<14}")
+            print("-" * 125)
             for idx, c_name in enumerate(classes):
                 m_cls = (y_arr == idx)
                 cnt_true = int(m_cls.sum())
                 cnt_pred_p = int((pred_p == idx).sum())
+                cnt_pred_p_sk = int((pred_p_sk == idx).sum())
                 cnt_pred_sk = int((pred_sk == idx).sum())
                 acc_cls_p = float((pred_p[m_cls] == idx).mean()) if cnt_true > 0 else 0.0
+                acc_cls_p_sk = float((pred_p_sk[m_cls] == idx).mean()) if cnt_true > 0 else 0.0
                 acc_cls_sk = float((pred_sk[m_cls] == idx).mean()) if cnt_true > 0 else 0.0
-                print(f"{c_name:<25} | {cnt_true:<5} | {cnt_pred_p:<13} | {acc_cls_p*100:5.1f}%       | {cnt_pred_sk:<12} | {acc_cls_sk*100:5.1f}%")
-            print("=" * 95 + "\n")
+                print(f"{c_name:<24} | {cnt_true:<5} | {cnt_pred_p:<13} | {acc_cls_p*100:5.1f}%       | {cnt_pred_p_sk:<14} | {acc_cls_p_sk*100:5.1f}%        | {cnt_pred_sk:<14} | {acc_cls_sk*100:5.1f}%")
+            print("=" * 125 + "\n")
 
         return {
             "acc_plain": acc_plain,
             "acc_centered": acc_centered,
             "acc_blended": acc_blended,
+            "acc_plain_sinkhorn": acc_plain_sinkhorn,
             "acc_sinkhorn": acc_sinkhorn,
             "logits_plain": res_logits["logits_plain"].tolist(),
             "logits_centered": res_logits["logits_centered"].tolist(),
             "logits_blend": res_logits["logits_blend"].tolist(),
+            "probs_plain_sinkhorn": res_logits["probs_plain_sinkhorn"].tolist(),
             "probs_sinkhorn": res_logits["probs_sinkhorn"].tolist(),
         }
 
@@ -578,10 +586,18 @@ if modal is not None:
             num_classes=num_classes,
         ).to(device)
 
+        backup_p = ckpt / "heads_legacy_unscaled_bias.safetensors"
         heads_p = ckpt / "heads.safetensors"
-        print(f"[Modal Re-Export] Reading existing heads weights from {heads_p}...")
+        if backup_p.exists():
+            print(f"[Modal Re-Export] Reading untouched legacy heads from backup: {backup_p}...")
+            source_p = backup_p
+        else:
+            print(f"[Modal Re-Export] Backing up untouched heads.safetensors to {backup_p}...")
+            shutil.copyfile(heads_p, backup_p)
+            source_p = backup_p
+
         heads_sd_raw = {}
-        with safe_open(str(heads_p), framework="pt", device="cpu") as sf:
+        with safe_open(str(source_p), framework="pt", device="cpu") as sf:
             for k in sf.keys():
                 heads_sd_raw[k] = sf.get_tensor(k)
 
@@ -647,10 +663,10 @@ if modal is not None:
             num_classes=num_classes,
         )
 
-        # Step 3: Fit closed-form trace-scaled Ridge heads on Z_train
-        print("[Modal Re-Export] Fitting exact closed-form trace-scaled Ridge heads on Z_train...")
-        W_p_r, b_p_r, W_c_r, b_c_r = fit_ridge_heads(
-            Z_train, y_train, prompts_train, alpha=10.0, label_smoothing=0.10, num_classes=num_classes
+        # Step 3: Reconstruct exact legacy unscaled Ridge heads originally blended into backup_p
+        print("[Modal Re-Export] Fitting exact legacy unscaled Ridge heads on Z_train (scale_by_trace=False)...")
+        W_p_r_old, b_p_r_old, W_c_r_old, b_c_r_old = fit_ridge_heads(
+            Z_train, y_train, prompts_train, alpha=10.0, label_smoothing=0.10, num_classes=num_classes, scale_by_trace=False
         )
 
         # Step 4: Extract unseen holdout texts if available to benchmark before vs after
@@ -680,7 +696,7 @@ if modal is not None:
             if Z_u_list:
                 Z_unseen = np.vstack(Z_u_list)
 
-        # Benchmark BEFORE: evaluation using existing heads.safetensors
+        # Benchmark BEFORE: evaluation using backup_p weights
         bacc_old = 0.0
         if Z_unseen is not None and len(y_u_arr) > 0:
             W_p_old = heads_sd_raw["plain.weight"].float().numpy()
@@ -689,25 +705,25 @@ if modal is not None:
             bacc_old = float(balanced_accuracy_score(y_u_arr, logits_old.argmax(axis=1)))
             print(f"[Modal Re-Export] BEFORE (Legacy Plain Head) Unseen BAcc: {bacc_old:.4f} ({bacc_old*100:.2f}%)")
 
-        # Step 5: Invert the blend to recover the true pure neural heads (W_n, b_n)
+        # Step 5: Invert the legacy blend from heads_sd_raw to recover pure neural heads (W_n, b_n)
         W_p_saved = heads_sd_raw["plain.weight"].float().numpy()
         b_p_saved = heads_sd_raw["plain.bias"].float().numpy()
         W_c_saved = heads_sd_raw["centered.weight"].float().numpy()
         b_c_saved = heads_sd_raw["centered.bias"].float().numpy()
 
         norm_p_saved = float(np.linalg.norm(W_p_saved))
-        norm_p_r = float(np.linalg.norm(W_p_r))
-        scale_p_old = (norm_p_saved / norm_p_r) if (norm_p_r > 1e-6 and norm_p_saved > 1e-6) else 1.0
-        W_p_r_scaled = W_p_r * scale_p_old
+        norm_p_r_old = float(np.linalg.norm(W_p_r_old))
+        scale_p_old = (norm_p_saved / norm_p_r_old) if (norm_p_r_old > 1e-6 and norm_p_saved > 1e-6) else 1.0
+        W_p_r_scaled = W_p_r_old * scale_p_old
         W_p_n = (W_p_saved - 0.25 * W_p_r_scaled) / 0.75
-        b_p_n = (b_p_saved - 0.25 * b_p_r) / 0.75
+        b_p_n = (b_p_saved - 0.25 * b_p_r_old) / 0.75
 
         norm_c_saved = float(np.linalg.norm(W_c_saved))
-        norm_c_r = float(np.linalg.norm(W_c_r))
-        scale_c_old = (norm_c_saved / norm_c_r) if (norm_c_r > 1e-6 and norm_c_saved > 1e-6) else 1.0
-        W_c_r_scaled = W_c_r * scale_c_old
+        norm_c_r_old = float(np.linalg.norm(W_c_r_old))
+        scale_c_old = (norm_c_saved / norm_c_r_old) if (norm_c_r_old > 1e-6 and norm_c_saved > 1e-6) else 1.0
+        W_c_r_scaled = W_c_r_old * scale_c_old
         W_c_n = (W_c_saved - 0.25 * W_c_r_scaled) / 0.75
-        b_c_n = (b_c_saved - 0.25 * b_c_r) / 0.75
+        b_c_n = (b_c_saved - 0.25 * b_c_r_old) / 0.75
 
         # Check pure neural BAcc
         bacc_pure_n = 0.0
@@ -716,21 +732,27 @@ if modal is not None:
             bacc_pure_n = float(balanced_accuracy_score(y_u_arr, logits_pure_n.argmax(axis=1)))
             print(f"[Modal Re-Export] PURE NEURAL (No Ridge) Unseen Plain Head BAcc: {bacc_pure_n:.4f} ({bacc_pure_n*100:.2f}%)")
 
-        # Step 6: Compute the CORRECT centered & scaled blend using _blend_head
+        # Step 6: Fit new trace-scaled Ridge heads (scale_by_trace=True) and blend
+        print("[Modal Re-Export] Fitting new trace-scaled Ridge heads on Z_train (scale_by_trace=True)...")
+        W_p_r_new, b_p_r_new, W_c_r_new, b_c_r_new = fit_ridge_heads(
+            Z_train, y_train, prompts_train, alpha=10.0, label_smoothing=0.10, num_classes=num_classes, scale_by_trace=True
+        )
+
         plain_linear = torch.nn.Linear(W_p_n.shape[1], W_p_n.shape[0])
         plain_linear.weight.data.copy_(torch.from_numpy(W_p_n))
         plain_linear.bias.data.copy_(torch.from_numpy(b_p_n))
-        _blend_head(plain_linear, W_p_r, b_p_r, w_neural=0.75, w_ridge=0.25)
+        _blend_head(plain_linear, W_p_r_new, b_p_r_new, w_neural=0.75, w_ridge=0.25)
 
         centered_linear = torch.nn.Linear(W_c_n.shape[1], W_c_n.shape[0])
         centered_linear.weight.data.copy_(torch.from_numpy(W_c_n))
         centered_linear.bias.data.copy_(torch.from_numpy(b_c_n))
-        _blend_head(centered_linear, W_c_r, b_c_r, w_neural=0.75, w_ridge=0.25)
+        _blend_head(centered_linear, W_c_r_new, b_c_r_new, w_neural=0.75, w_ridge=0.25)
 
         # Benchmark AFTER: evaluation with corrected centered & scaled bias
         bacc_new = 0.0
         acc_cent_new = 0.0
         acc_blend_new = 0.0
+        acc_p_sink_new = 0.0
         acc_sink_new = 0.0
         if Z_unseen is not None and len(y_u_arr) > 0:
             W_p_new = plain_linear.weight.detach().cpu().float().numpy()
@@ -745,25 +767,22 @@ if modal is not None:
                 centered_weight=W_c_new,
                 centered_bias=b_c_new,
                 groups=groups_unseen,
-                blend_centered=0.65,
+                blend_centered=0.20,
             )
             bacc_new = float(balanced_accuracy_score(y_u_arr, eval_res["logits_plain"].argmax(axis=1)))
             acc_cent_new = float(balanced_accuracy_score(y_u_arr, eval_res["logits_centered"].argmax(axis=1)))
             acc_blend_new = float(balanced_accuracy_score(y_u_arr, eval_res["logits_blend"].argmax(axis=1)))
+            acc_p_sink_new = float(balanced_accuracy_score(y_u_arr, eval_res["probs_plain_sinkhorn"].argmax(axis=1)))
             acc_sink_new = float(balanced_accuracy_score(y_u_arr, eval_res["probs_sinkhorn"].argmax(axis=1)))
             print(f"[Modal Re-Export] AFTER (Trace-Scaled Ridge & Centered Bias):")
-            print(f"  Plain Head BAcc    : {bacc_new:.4f} ({bacc_new*100:.2f}%)")
-            print(f"  Centered Head BAcc : {acc_cent_new:.4f} ({acc_cent_new*100:.2f}%)")
-            print(f"  Blended Head BAcc  : {acc_blend_new:.4f} ({acc_blend_new*100:.2f}%)")
-            print(f"  Sinkhorn BAcc      : {acc_sink_new:.4f} ({acc_sink_new*100:.2f}%)")
-            print(f"  NET LIFT (Plain)   : {bacc_new - bacc_old:+.4f} ({(bacc_new - bacc_old)*100:+.2f}%)")
+            print(f"  Plain Head BAcc          : {bacc_new:.4f} ({bacc_new*100:.2f}%)")
+            print(f"  Centered Head BAcc       : {acc_cent_new:.4f} ({acc_cent_new*100:.2f}%)")
+            print(f"  Blended Head BAcc (80/20): {acc_blend_new:.4f} ({acc_blend_new*100:.2f}%)")
+            print(f"  Plain + Sinkhorn BAcc    : {acc_p_sink_new:.4f} ({acc_p_sink_new*100:.2f}%)")
+            print(f"  Blended + Sinkhorn BAcc  : {acc_sink_new:.4f} ({acc_sink_new*100:.2f}%)")
+            print(f"  NET LIFT (Plain)         : {bacc_new - bacc_old:+.4f} ({(bacc_new - bacc_old)*100:+.2f}%)")
 
-        # Step 7: Backup old heads.safetensors and save new heads.safetensors
-        backup_p = ckpt / "heads_legacy_unscaled_bias.safetensors"
-        if not backup_p.exists():
-            shutil.copyfile(heads_p, backup_p)
-            print(f"[Modal Re-Export] Backed up legacy heads to {backup_p}")
-
+        # Step 7: Save new heads.safetensors
         new_heads_dict = {}
         for k, v in heads_sd_raw.items():
             if k == "plain.weight":
@@ -774,6 +793,14 @@ if modal is not None:
                 new_heads_dict[k] = centered_linear.weight.detach().cpu().contiguous()
             elif k == "centered.bias":
                 new_heads_dict[k] = centered_linear.bias.detach().cpu().contiguous()
+            else:
+                new_heads_dict[k] = v.contiguous()
+
+        save_file(new_heads_dict, str(heads_p))
+        print(f"[Modal Re-Export] Saved new blended heads to {heads_p}")
+
+        checkpoints_volume.commit()
+        print("[Modal Re-Export] checkpoints_volume committed successfully!")
             else:
                 new_heads_dict[k] = v.contiguous()
 

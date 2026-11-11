@@ -819,26 +819,34 @@ class TestTrainer(unittest.TestCase):
         y = np.random.randint(0, 18, size=N)
         prompts = np.repeat(np.arange(12), 3)
 
-        W_p, b_p, W_c, b_c = fit_ridge_heads(Z, y, prompts=prompts, alpha=10.0, num_classes=18)
+        W_p, b_p, W_c, b_c = fit_ridge_heads(Z, y, prompts=prompts, alpha=10.0, num_classes=18, scale_by_trace=True)
         self.assertEqual(W_p.shape, (18, D))
         self.assertEqual(W_c.shape, (18, D))
 
+        # Test unscaled Ridge option
+        W_p_old, b_p_old, W_c_old, b_c_old = fit_ridge_heads(Z, y, prompts=prompts, alpha=10.0, num_classes=18, scale_by_trace=False)
+        self.assertEqual(W_p_old.shape, (18, D))
+
         # Test grouped inference with prompt groups
         res_grouped = compute_grouped_inference_logits(
-            Z, W_p, b_p, W_c, b_c, groups=prompts, blend_centered=0.65
+            Z, W_p, b_p, W_c, b_c, groups=prompts, blend_centered=0.20
         )
         self.assertIn("logits_plain", res_grouped)
         self.assertIn("logits_centered", res_grouped)
         self.assertIn("logits_blend", res_grouped)
+        self.assertIn("probs_plain_sinkhorn", res_grouped)
         self.assertIn("probs_sinkhorn", res_grouped)
         self.assertEqual(res_grouped["probs_sinkhorn"].shape, (N, 18))
+        self.assertEqual(res_grouped["probs_plain_sinkhorn"].shape, (N, 18))
         self.assertTrue(np.allclose(res_grouped["probs_sinkhorn"].sum(axis=1), 1.0, atol=1e-5))
+        self.assertTrue(np.allclose(res_grouped["probs_plain_sinkhorn"].sum(axis=1), 1.0, atol=1e-5))
 
         # Test grouped inference with None groups (global batch centering fallback)
         res_none = compute_grouped_inference_logits(
-            Z, W_p, b_p, W_c, b_c, groups=None, blend_centered=0.65
+            Z, W_p, b_p, W_c, b_c, groups=None, blend_centered=0.20
         )
         self.assertEqual(res_none["probs_sinkhorn"].shape, (N, 18))
+        self.assertEqual(res_none["probs_plain_sinkhorn"].shape, (N, 18))
 
 
 if __name__ == "__main__":
