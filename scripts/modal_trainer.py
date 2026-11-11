@@ -801,14 +801,6 @@ if modal is not None:
 
         checkpoints_volume.commit()
         print("[Modal Re-Export] checkpoints_volume committed successfully!")
-            else:
-                new_heads_dict[k] = v.contiguous()
-
-        save_file(new_heads_dict, str(heads_p))
-        print(f"[Modal Re-Export] Saved corrected heads to {heads_p}")
-
-        checkpoints_volume.commit()
-        print("[Modal Re-Export] Volume ntl-checkpoints committed permanently!")
 
         return {
             "bacc_old": bacc_old,
