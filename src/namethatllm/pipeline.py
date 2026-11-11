@@ -113,6 +113,7 @@ from .postprocess import (
     apply_claude_specialist_gate,
     apply_cluster_uniqueness_repulsion,
     apply_family_specialist_lora_gate,
+    apply_prior_and_sinkhorn,
     apply_typobayes_postprocess,
     apply_unified_handwriting_shield,
     blend_main_and_complementary,
@@ -1728,15 +1729,37 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
     )
 
     # -------------------------------------------------------------------------
-    # STAGE 6: Multiplicative Sinkhorn Column Mass Balancing
+    # STAGE 6: Multiplicative Sinkhorn Column Mass Balancing & Prior Centering
     # -------------------------------------------------------------------------
-    sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
-    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
-    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
-    train_prior = np.bincount(y_sub, minlength=18).astype(np.float64) + 1.0 if len(y_sub) > 0 else None
-    P_final = sinkhorn_balancing(
-        P_mix, iters=sinkhorn_iters, sinkhorn_strength=sinkhorn_strength, target_mix=sinkhorn_target_mix, train_prior=train_prior
-    )
+    sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 80)
+    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.0))
+    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.15))
+    enable_prior_centering = bool(post_cfg.get("enable_prior_centering", False))
+    temperature = float(post_cfg.get("sinkhorn_temperature", 1.5))
+    if len(P_mix) >= 18 and sinkhorn_strength > 0.0:
+        if enable_prior_centering:
+            P_final = apply_prior_and_sinkhorn(
+                np.log(np.clip(P_mix, 1e-12, 1.0)),
+                temperature=temperature,
+                iters=sinkhorn_iters,
+                sinkhorn_strength=sinkhorn_strength,
+                target_mix=sinkhorn_target_mix,
+            )
+            print(
+                f"[Pipeline] Applied Iterative Prior Centering & Soft Sinkhorn "
+                f"(iters={sinkhorn_iters}, strength={sinkhorn_strength:.2f}, target_mix={sinkhorn_target_mix:.2f}, temp={temperature:.2f})"
+            )
+        else:
+            train_prior = np.bincount(y_sub, minlength=18).astype(np.float64) + 1.0 if len(y_sub) > 0 else None
+            P_final = sinkhorn_balancing(
+                P_mix, iters=sinkhorn_iters, sinkhorn_strength=sinkhorn_strength, target_mix=sinkhorn_target_mix, train_prior=train_prior
+            )
+            print(
+                f"[Pipeline] Applied standard Sinkhorn balancing "
+                f"(iters={sinkhorn_iters}, strength={sinkhorn_strength:.2f}, target_mix={sinkhorn_target_mix:.2f})"
+            )
+    else:
+        P_final = P_mix
 
     # -------------------------------------------------------------------------
     # STAGE 7: TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing

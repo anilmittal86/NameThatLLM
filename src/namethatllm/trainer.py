@@ -39,7 +39,7 @@ from .config import (
     resolve_dataset_paths,
     softmax,
 )
-from .postprocess import sinkhorn_balancing
+from .postprocess import apply_prior_and_sinkhorn as _apply_prior_and_sinkhorn, sinkhorn_balancing
 from .wpca_gaussian import fit_shared_gaussian_lowram
 
 
@@ -709,36 +709,6 @@ def fit_ridge_heads(
     b_c = W_c_tilde[:, -1]
 
     return W_p, b_p, W_c, b_c
-
-
-def _apply_prior_and_sinkhorn(
-    logits: np.ndarray,
-    temperature: float = 1.5,
-    iters: int = 80,
-    sinkhorn_strength: float = 0.85,
-    target_mix: float = 0.15,
-) -> np.ndarray:
-    """
-    Applies per-sample standardization, iterative column-wise logit prior centering (20 steps),
-    and Sinkhorn marginal probability balancing to ensure unbiased class priors.
-    """
-    row_mean = logits.mean(axis=1, keepdims=True)
-    row_std = np.clip(logits.std(axis=1, keepdims=True), 1e-4, None)
-    norm_logits = (logits - row_mean) / row_std
-
-    adj_logits = norm_logits / temperature
-    num_classes = logits.shape[1]
-    for _ in range(20):
-        probs = softmax(adj_logits, axis=1)
-        col_mean = np.clip(probs.mean(axis=0, keepdims=True), 1e-6, None)
-        adj_logits = adj_logits - 0.5 * np.log(col_mean * num_classes)
-
-    return sinkhorn_balancing(
-        softmax(adj_logits, axis=1),
-        iters=iters,
-        sinkhorn_strength=sinkhorn_strength,
-        target_mix=target_mix,
-    )
 
 
 def compute_grouped_inference_logits(
