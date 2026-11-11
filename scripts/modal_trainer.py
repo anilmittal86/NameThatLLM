@@ -305,6 +305,7 @@ if modal is not None:
         checkpoint_dir: str = "/checkpoints/export_champion_qwen3_14b",
         texts: list[str] | None = None,
         labels: list[int] | None = None,
+        groups: list[Any] | None = None,
     ) -> dict[str, Any]:
         """Runs fast inference on holdout texts using the champion checkpoint on an A100 GPU."""
         import json
@@ -315,8 +316,9 @@ if modal is not None:
         from transformers import AutoConfig, AutoTokenizer, AutoModel
         from safetensors import safe_open
         from namethatllm.config import LABELS
-        from namethatllm.trainer import MultiLayerLoRAClassifier, collate_text_batch, TextSequenceDataset
+        from namethatllm.trainer import MultiLayerLoRAClassifier, collate_text_batch, TextSequenceDataset, compute_grouped_inference_logits
         from torch.utils.data import DataLoader
+        from sklearn.metrics import balanced_accuracy_score
 
         ckpt = Path(checkpoint_dir)
         meta_p = ckpt / "meta.json"
@@ -397,52 +399,87 @@ if modal is not None:
             texts = df_unseen["text"].tolist()
             lab_map = {name: i for i, name in enumerate(classes)}
             labels = [lab_map[m] for m in df_unseen["model"]]
+            if groups is None and "prompt_id" in df_unseen.columns:
+                groups = df_unseen["prompt_id"].tolist()
 
-        print(f"[Modal Eval] Running forward pass on {len(texts)} holdout texts...")
+        print(f"[Modal Eval] Extracting features Z_unseen on {len(texts)} holdout texts...")
         dummy_labels = [0] * len(texts)
         ds = TextSequenceDataset(texts, dummy_labels, None, tok, max_len=max_len, end_id=end_id)
         loader = DataLoader(ds, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
 
-        plain_lps = []
-        centered_lps = []
+        Z_list = []
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 for batch in loader:
                     mb_ids = batch["input_ids"].to(device)
                     mb_mask = batch["attention_mask"].to(device)
                     max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
-                    _, lp_p, lp_c = model(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
-                    plain_lps.append(lp_p.float().cpu().numpy())
-                    centered_lps.append(lp_c.float().cpu().numpy())
+                    z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                    Z_list.append(z_b.float().cpu().numpy())
 
-        p_mat = np.vstack(plain_lps)
-        c_mat = np.vstack(centered_lps)
+        Z_unseen = np.vstack(Z_list)
+        print(f"[Modal Eval] Extracted Z_unseen: shape={Z_unseen.shape}, dtype={Z_unseen.dtype}")
 
-        def _to_logp(m):
-            m_max = np.max(m, axis=1, keepdims=True)
-            e = np.exp(m - m_max)
-            p = e / np.sum(e, axis=1, keepdims=True)
-            return np.log(np.clip(p, 1e-12, 1.0))
+        W_p = model.plain_head.weight.detach().cpu().float().numpy()
+        b_p = model.plain_head.bias.detach().cpu().float().numpy()
+        W_c = model.centered_head.weight.detach().cpu().float().numpy()
+        b_c = model.centered_head.bias.detach().cpu().float().numpy()
 
-        plain_logp = _to_logp(p_mat)
-        centered_logp = _to_logp(c_mat)
-        blended_logp = _to_logp(0.75 * c_mat + 0.25 * p_mat)
+        res_logits = compute_grouped_inference_logits(
+            Z_unseen,
+            plain_weight=W_p,
+            plain_bias=b_p,
+            centered_weight=W_c,
+            centered_bias=b_c,
+            groups=groups,
+            blend_centered=0.65,
+        )
 
-        out_res = {
-            "plain_logp": plain_logp.tolist(),
-            "centered_logp": centered_logp.tolist(),
-            "blended_logp": blended_logp.tolist(),
-        }
+        acc_plain = 0.0
+        acc_centered = 0.0
+        acc_blended = 0.0
+        acc_sinkhorn = 0.0
 
         if labels is not None:
             y_arr = np.array(labels)
-            for name, lp in [("plain", plain_logp), ("centered", centered_logp), ("blended", blended_logp)]:
-                pred = np.argmax(lp, axis=1)
-                acc = float(np.mean(pred == y_arr))
-                out_res[f"acc_{name}"] = acc
-                print(f"[Modal Eval] Model ({name}): Top-1 Accuracy = {acc*100:.2f}%")
+            pred_p = res_logits["logits_plain"].argmax(axis=1)
+            pred_c = res_logits["logits_centered"].argmax(axis=1)
+            pred_b = res_logits["logits_blend"].argmax(axis=1)
+            pred_sk = res_logits["probs_sinkhorn"].argmax(axis=1)
 
-        return out_res
+            acc_plain = float(balanced_accuracy_score(y_arr, pred_p))
+            acc_centered = float(balanced_accuracy_score(y_arr, pred_c))
+            acc_blended = float(balanced_accuracy_score(y_arr, pred_b))
+            acc_sinkhorn = float(balanced_accuracy_score(y_arr, pred_sk))
+
+            print(f"[Modal Eval] Plain Head BAcc         : {acc_plain*100:.2f}%")
+            print(f"[Modal Eval] Centered Head BAcc      : {acc_centered*100:.2f}%")
+            print(f"[Modal Eval] Blended Head BAcc       : {acc_blended*100:.2f}%")
+            print(f"[Modal Eval] Sinkhorn-Balanced BAcc  : {acc_sinkhorn*100:.2f}%")
+
+            print("\n" + "=" * 95)
+            print(f"{'Class Name':<25} | {'True':<5} | {'Pred (Plain)':<13} | {'BAcc (Plain)':<13} | {'Pred (Sink)':<12} | {'BAcc (Sink)':<12}")
+            print("-" * 95)
+            for idx, c_name in enumerate(classes):
+                m_cls = (y_arr == idx)
+                cnt_true = int(m_cls.sum())
+                cnt_pred_p = int((pred_p == idx).sum())
+                cnt_pred_sk = int((pred_sk == idx).sum())
+                acc_cls_p = float((pred_p[m_cls] == idx).mean()) if cnt_true > 0 else 0.0
+                acc_cls_sk = float((pred_sk[m_cls] == idx).mean()) if cnt_true > 0 else 0.0
+                print(f"{c_name:<25} | {cnt_true:<5} | {cnt_pred_p:<13} | {acc_cls_p*100:5.1f}%       | {cnt_pred_sk:<12} | {acc_cls_sk*100:5.1f}%")
+            print("=" * 95 + "\n")
+
+        return {
+            "acc_plain": acc_plain,
+            "acc_centered": acc_centered,
+            "acc_blended": acc_blended,
+            "acc_sinkhorn": acc_sinkhorn,
+            "logits_plain": res_logits["logits_plain"].tolist(),
+            "logits_centered": res_logits["logits_centered"].tolist(),
+            "logits_blend": res_logits["logits_blend"].tolist(),
+            "probs_sinkhorn": res_logits["probs_sinkhorn"].tolist(),
+        }
 
     @app.function(
         gpu="A100-80GB:1",
@@ -455,16 +492,20 @@ if modal is not None:
     )
     def reexport_heads_worker(
         checkpoint_dir: str = "/checkpoints/export_champion_qwen3_14b",
+        unseen_texts: list[str] | None = None,
+        y_unseen: list[int] | None = None,
+        groups_unseen: list[Any] | None = None,
     ) -> dict[str, Any]:
         """
         Re-exports classification heads using the patched _blend_head formula with centered & scaled bias:
         1. Loads the frozen 14B LoRA model from checkpoint_dir/adapter.
         2. Loads /datasets/train.csv (5,000 samples) and extracts features Z_train.
-        3. Fits exact closed-form Ridge heads: fit_ridge_heads(Z_train, y_train, prompts_train).
-        4. Recovers pure neural weights (W_n, b_n) and blends with centered and scaled bias.
-        5. Evaluates holdout accuracy on df_unseen_holdout before vs after.
-        6. Backs up legacy heads.safetensors and writes the new corrected heads.safetensors.
-        7. Commits volume permanently.
+        3. Runs 5-fold GroupKFold OOF CV with trace-scaled Ridge heads to verify regularization.
+        4. Fits exact closed-form trace-scaled Ridge heads: fit_ridge_heads(Z_train, y_train, prompts_train).
+        5. Recovers pure neural weights (W_n, b_n) and blends with centered and scaled bias.
+        6. Evaluates holdout accuracy with compute_grouped_inference_logits before vs after.
+        7. Backs up legacy heads.safetensors and writes the new corrected heads.safetensors.
+        8. Commits volume permanently.
         """
         import json
         import shutil
@@ -486,6 +527,8 @@ if modal is not None:
             TextSequenceDataset,
             fit_ridge_heads,
             _blend_head,
+            evaluate_stage2_oof_cv,
+            compute_grouped_inference_logits,
         )
         from namethatllm.ablation import build_unseen_holdout_dataset
 
@@ -593,21 +636,36 @@ if modal is not None:
         Z_train = np.vstack(Z_list)
         print(f"[Modal Re-Export] Extracted Z_train: shape={Z_train.shape}, dtype={Z_train.dtype}")
 
-        # Step 3: Fit closed-form Ridge heads on Z_train
-        print("[Modal Re-Export] Fitting exact closed-form Ridge heads on Z_train...")
+        # Step 2b: Run 5-fold GroupKFold OOF CV with trace-scaled Ridge heads
+        print("[Modal Re-Export] Running 5-fold GroupKFold OOF CV with trace-scaled Ridge heads...")
+        oof_cv_res = evaluate_stage2_oof_cv(
+            Z_train,
+            y_train,
+            prompts_train,
+            alpha=10.0,
+            label_smoothing=0.10,
+            num_classes=num_classes,
+        )
+
+        # Step 3: Fit closed-form trace-scaled Ridge heads on Z_train
+        print("[Modal Re-Export] Fitting exact closed-form trace-scaled Ridge heads on Z_train...")
         W_p_r, b_p_r, W_c_r, b_c_r = fit_ridge_heads(
             Z_train, y_train, prompts_train, alpha=10.0, label_smoothing=0.10, num_classes=num_classes
         )
 
         # Step 4: Extract unseen holdout texts if available to benchmark before vs after
-        df_unseen, _ = build_unseen_holdout_dataset(ds_root)
-        unseen_texts = df_unseen["text"].tolist() if len(df_unseen) > 0 else []
-        y_unseen = np.array([LAB2I[m] for m in df_unseen["model"]]) if len(df_unseen) > 0 else np.array([])
+        if unseen_texts is None:
+            df_unseen, _ = build_unseen_holdout_dataset(ds_root)
+            unseen_texts = df_unseen["text"].tolist() if len(df_unseen) > 0 else []
+            y_unseen = [LAB2I[m] for m in df_unseen["model"]] if len(df_unseen) > 0 else []
+            if groups_unseen is None and "prompt_id" in df_unseen.columns:
+                groups_unseen = df_unseen["prompt_id"].tolist()
+        y_u_arr = np.array(y_unseen) if y_unseen is not None and len(y_unseen) > 0 else np.array([])
         print(f"[Modal Re-Export] Extracting Z_unseen on {len(unseen_texts)} holdout samples...")
 
         Z_unseen = None
         if len(unseen_texts) > 0:
-            ds_u = TextSequenceDataset(unseen_texts, y_unseen.tolist(), None, tok, max_len=max_len, end_id=end_id)
+            ds_u = TextSequenceDataset(unseen_texts, y_u_arr.tolist(), None, tok, max_len=max_len, end_id=end_id)
             loader_u = DataLoader(ds_u, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
 
             Z_u_list = []
@@ -624,12 +682,12 @@ if modal is not None:
 
         # Benchmark BEFORE: evaluation using existing heads.safetensors
         bacc_old = 0.0
-        if Z_unseen is not None and len(y_unseen) > 0:
+        if Z_unseen is not None and len(y_u_arr) > 0:
             W_p_old = heads_sd_raw["plain.weight"].float().numpy()
             b_p_old = heads_sd_raw["plain.bias"].float().numpy()
             logits_old = Z_unseen @ W_p_old.T + b_p_old
-            bacc_old = float(balanced_accuracy_score(y_unseen, logits_old.argmax(axis=1)))
-            print(f"[Modal Re-Export] BEFORE (Unscaled Bias) Unseen Plain Head BAcc: {bacc_old:.4f} ({bacc_old*100:.2f}%)")
+            bacc_old = float(balanced_accuracy_score(y_u_arr, logits_old.argmax(axis=1)))
+            print(f"[Modal Re-Export] BEFORE (Legacy Plain Head) Unseen BAcc: {bacc_old:.4f} ({bacc_old*100:.2f}%)")
 
         # Step 5: Invert the blend to recover the true pure neural heads (W_n, b_n)
         W_p_saved = heads_sd_raw["plain.weight"].float().numpy()
@@ -653,9 +711,9 @@ if modal is not None:
 
         # Check pure neural BAcc
         bacc_pure_n = 0.0
-        if Z_unseen is not None and len(y_unseen) > 0:
+        if Z_unseen is not None and len(y_u_arr) > 0:
             logits_pure_n = Z_unseen @ W_p_n.T + b_p_n
-            bacc_pure_n = float(balanced_accuracy_score(y_unseen, logits_pure_n.argmax(axis=1)))
+            bacc_pure_n = float(balanced_accuracy_score(y_u_arr, logits_pure_n.argmax(axis=1)))
             print(f"[Modal Re-Export] PURE NEURAL (No Ridge) Unseen Plain Head BAcc: {bacc_pure_n:.4f} ({bacc_pure_n*100:.2f}%)")
 
         # Step 6: Compute the CORRECT centered & scaled blend using _blend_head
@@ -671,14 +729,34 @@ if modal is not None:
 
         # Benchmark AFTER: evaluation with corrected centered & scaled bias
         bacc_new = 0.0
-        if Z_unseen is not None and len(y_unseen) > 0:
-            W_p_new = plain_linear.weight.detach().cpu().numpy()
-            b_p_new = plain_linear.bias.detach().cpu().numpy()
-            logits_new = Z_unseen @ W_p_new.T + b_p_new
-            bacc_new = float(balanced_accuracy_score(y_unseen, logits_new.argmax(axis=1)))
-            print(f"[Modal Re-Export] AFTER (Centered & Scaled Bias) Unseen Plain Head BAcc: {bacc_new:.4f} ({bacc_new*100:.2f}%)")
-            print(f"[Modal Re-Export] NET LIFT: {bacc_new - bacc_old:+.4f} ({(bacc_new - bacc_old)*100:+.2f}%)")
-        print(f"[Modal Re-Export] NET LIFT: {bacc_new - bacc_old:+.4f} ({(bacc_new - bacc_old)*100:+.2f}%)")
+        acc_cent_new = 0.0
+        acc_blend_new = 0.0
+        acc_sink_new = 0.0
+        if Z_unseen is not None and len(y_u_arr) > 0:
+            W_p_new = plain_linear.weight.detach().cpu().float().numpy()
+            b_p_new = plain_linear.bias.detach().cpu().float().numpy()
+            W_c_new = centered_linear.weight.detach().cpu().float().numpy()
+            b_c_new = centered_linear.bias.detach().cpu().float().numpy()
+
+            eval_res = compute_grouped_inference_logits(
+                Z_unseen,
+                plain_weight=W_p_new,
+                plain_bias=b_p_new,
+                centered_weight=W_c_new,
+                centered_bias=b_c_new,
+                groups=groups_unseen,
+                blend_centered=0.65,
+            )
+            bacc_new = float(balanced_accuracy_score(y_u_arr, eval_res["logits_plain"].argmax(axis=1)))
+            acc_cent_new = float(balanced_accuracy_score(y_u_arr, eval_res["logits_centered"].argmax(axis=1)))
+            acc_blend_new = float(balanced_accuracy_score(y_u_arr, eval_res["logits_blend"].argmax(axis=1)))
+            acc_sink_new = float(balanced_accuracy_score(y_u_arr, eval_res["probs_sinkhorn"].argmax(axis=1)))
+            print(f"[Modal Re-Export] AFTER (Trace-Scaled Ridge & Centered Bias):")
+            print(f"  Plain Head BAcc    : {bacc_new:.4f} ({bacc_new*100:.2f}%)")
+            print(f"  Centered Head BAcc : {acc_cent_new:.4f} ({acc_cent_new*100:.2f}%)")
+            print(f"  Blended Head BAcc  : {acc_blend_new:.4f} ({acc_blend_new*100:.2f}%)")
+            print(f"  Sinkhorn BAcc      : {acc_sink_new:.4f} ({acc_sink_new*100:.2f}%)")
+            print(f"  NET LIFT (Plain)   : {bacc_new - bacc_old:+.4f} ({(bacc_new - bacc_old)*100:+.2f}%)")
 
         # Step 7: Backup old heads.safetensors and save new heads.safetensors
         backup_p = ckpt / "heads_legacy_unscaled_bias.safetensors"
@@ -709,7 +787,11 @@ if modal is not None:
             "bacc_old": bacc_old,
             "bacc_pure_n": bacc_pure_n,
             "bacc_new": bacc_new,
+            "acc_centered": acc_cent_new,
+            "acc_blended": acc_blend_new,
+            "acc_sinkhorn": acc_sink_new,
             "lift": bacc_new - bacc_old,
+            "oof_cv": oof_cv_res,
         }
 
     @app.local_entrypoint()
@@ -734,33 +816,58 @@ if modal is not None:
         elif mode == "eval":
             import numpy as np
             cache_p = Path("local_data/local_eval_cache.npz")
+            if not cache_p.exists():
+                cache_p = Path("local_data/v76_output/local_eval_cache.npz")
             if cache_p.exists():
                 cache = np.load(cache_p, allow_pickle=True)
-                texts = cache["unseen_texts"].tolist()
-                labels = cache["y_unseen"].tolist()
-                print(f"[Modal Launcher] Loaded {len(texts)} unseen holdout texts from {cache_p}...")
+                texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
+                labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
+                groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
+                print(f"[Modal Launcher] Loaded {len(texts) if texts else 0} unseen holdout texts from {cache_p}...")
             else:
                 texts = None
                 labels = None
+                groups = None
                 print("[Modal Launcher] Evaluating on default holdout dataset...")
 
             res = eval_cloud_worker.remote(
                 checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
                 texts=texts,
                 labels=labels,
+                groups=groups,
             )
             print("[Modal Launcher] Holdout Evaluation Results:")
-            print(f"  Plain Head Accuracy   : {res.get('acc_plain', 0.0)*100:.2f}%")
-            print(f"  Centered Head Accuracy: {res.get('acc_centered', 0.0)*100:.2f}%")
-            print(f"  Blended Head Accuracy : {res.get('acc_blended', 0.0)*100:.2f}%")
+            print(f"  Plain Head BAcc       : {res.get('acc_plain', 0.0)*100:.2f}%")
+            print(f"  Centered Head BAcc    : {res.get('acc_centered', 0.0)*100:.2f}%")
+            print(f"  Blended Head BAcc     : {res.get('acc_blended', 0.0)*100:.2f}%")
+            print(f"  Sinkhorn-Balanced BAcc: {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
         elif mode == "reexport":
-            print("[Modal Launcher] Launching A100-80GB head re-export with centered & scaled bias...")
-            res = reexport_heads_worker.remote(checkpoint_dir="/checkpoints/export_champion_qwen3_14b")
+            print("[Modal Launcher] Launching A100-80GB head re-export with trace-scaled Ridge & centered bias...")
+            import numpy as np
+            cache_p = Path("local_data/local_eval_cache.npz")
+            if not cache_p.exists():
+                cache_p = Path("local_data/v76_output/local_eval_cache.npz")
+            if cache_p.exists():
+                cache = np.load(cache_p, allow_pickle=True)
+                texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
+                labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
+                groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
+            else:
+                texts, labels, groups = None, None, None
+            res = reexport_heads_worker.remote(
+                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
+                unseen_texts=texts,
+                y_unseen=labels,
+                groups_unseen=groups,
+            )
             print("[Modal Launcher] Re-export finished successfully!")
             print(f"  Legacy Unscaled BAcc   : {res.get('bacc_old', 0.0)*100:.2f}%")
             print(f"  Pure Neural BAcc       : {res.get('bacc_pure_n', 0.0)*100:.2f}%")
             print(f"  Centered & Scaled BAcc : {res.get('bacc_new', 0.0)*100:.2f}%")
-            print(f"  Net Lift               : {res.get('lift', 0.0)*100:+.2f}%")
+            print(f"  Centered Head BAcc     : {res.get('acc_centered', 0.0)*100:.2f}%")
+            print(f"  Blended Head BAcc      : {res.get('acc_blended', 0.0)*100:.2f}%")
+            print(f"  Sinkhorn Balanced BAcc : {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
+            print(f"  Net Lift (Plain)       : {res.get('lift', 0.0)*100:+.2f}%")
         else:
             print(f"[Modal Launcher] Launching A100-80GB cloud training with config: {config}")
             res = train_cloud_worker.remote(config_path=config)
@@ -794,32 +901,56 @@ if __name__ == "__main__":
             smoke_cloud_worker.remote(backbone=args.backbone)
         elif args.cmd == "sync":
             sync_cloud_datasets.remote()
-        elif args.cmd == "eval":
+        elif mode == "eval" if "mode" in locals() else args.cmd == "eval":
             import numpy as np
             cache_p = Path("local_data/local_eval_cache.npz")
+            if not cache_p.exists():
+                cache_p = Path("local_data/v76_output/local_eval_cache.npz")
             if cache_p.exists():
                 cache = np.load(cache_p, allow_pickle=True)
-                texts = cache["unseen_texts"].tolist()
-                labels = cache["y_unseen"].tolist()
+                texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
+                labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
+                groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
+                print(f"[Modal Launcher] Loaded {len(texts) if texts else 0} unseen holdout texts from {cache_p}...")
             else:
-                texts = None
-                labels = None
+                texts, labels, groups = None, None, None
             res = eval_cloud_worker.remote(
                 checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
                 texts=texts,
                 labels=labels,
+                groups=groups,
             )
             print("[Modal Launcher] Holdout Evaluation Results:")
-            print(f"  Plain Head Accuracy   : {res.get('acc_plain', 0.0)*100:.2f}%")
-            print(f"  Centered Head Accuracy: {res.get('acc_centered', 0.0)*100:.2f}%")
-            print(f"  Blended Head Accuracy : {res.get('acc_blended', 0.0)*100:.2f}%")
-        elif args.cmd == "reexport":
-            print("[Modal Launcher] Launching A100-80GB head re-export with centered & scaled bias...")
-            res = reexport_heads_worker.remote(checkpoint_dir="/checkpoints/export_champion_qwen3_14b")
+            print(f"  Plain Head BAcc       : {res.get('acc_plain', 0.0)*100:.2f}%")
+            print(f"  Centered Head BAcc    : {res.get('acc_centered', 0.0)*100:.2f}%")
+            print(f"  Blended Head BAcc     : {res.get('acc_blended', 0.0)*100:.2f}%")
+            print(f"  Sinkhorn-Balanced BAcc: {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
+        elif mode == "reexport" if "mode" in locals() else args.cmd == "reexport":
+            print("[Modal Launcher] Launching A100-80GB head re-export with trace-scaled Ridge & centered bias...")
+            import numpy as np
+            cache_p = Path("local_data/local_eval_cache.npz")
+            if not cache_p.exists():
+                cache_p = Path("local_data/v76_output/local_eval_cache.npz")
+            if cache_p.exists():
+                cache = np.load(cache_p, allow_pickle=True)
+                texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
+                labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
+                groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
+            else:
+                texts, labels, groups = None, None, None
+            res = reexport_heads_worker.remote(
+                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
+                unseen_texts=texts,
+                y_unseen=labels,
+                groups_unseen=groups,
+            )
             print("[Modal Launcher] Re-export finished successfully!")
             print(f"  Legacy Unscaled BAcc   : {res.get('bacc_old', 0.0)*100:.2f}%")
             print(f"  Pure Neural BAcc       : {res.get('bacc_pure_n', 0.0)*100:.2f}%")
             print(f"  Centered & Scaled BAcc : {res.get('bacc_new', 0.0)*100:.2f}%")
-            print(f"  Net Lift               : {res.get('lift', 0.0)*100:+.2f}%")
+            print(f"  Centered Head BAcc     : {res.get('acc_centered', 0.0)*100:.2f}%")
+            print(f"  Blended Head BAcc      : {res.get('acc_blended', 0.0)*100:.2f}%")
+            print(f"  Sinkhorn Balanced BAcc : {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
+            print(f"  Net Lift (Plain)       : {res.get('lift', 0.0)*100:+.2f}%")
         else:
             train_cloud_worker.remote(config_path=args.config)

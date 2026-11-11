@@ -60,9 +60,11 @@ from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
 from .trainer import (
     MultiLayerLoRAClassifier,
     PromptGroupBatchSampler,
+    compute_grouped_inference_logits,
     compute_two_stage_loss,
     evaluate_stage2_oof_cv,
     export_compatible_checkpoint,
+    fit_ridge_heads,
     run_training_pipeline,
 )
 from .wpca_gaussian import (
@@ -101,6 +103,7 @@ __all__ = [
     "calibrate_model_lp",
     "compute_centered_logits",
     "compute_family_centered_logits",
+    "compute_grouped_inference_logits",
     "compute_two_stage_loss",
     "evaluate_stage2_oof_cv",
     "export_compatible_checkpoint",
@@ -109,6 +112,7 @@ __all__ = [
     "extract_handwriting_features",
     "fit_handwriting_model",
     "fit_joint_spectral_bank",
+    "fit_ridge_heads",
     "fit_shared_gaussian_lowram",
     "forward_and_pool_batch",
     "function_text",

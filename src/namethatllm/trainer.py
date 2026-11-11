@@ -225,27 +225,35 @@ def _build_sister_mask(device: torch.device, boosted: bool = False) -> torch.Ten
                     M[m1, m2] = 1.0
 
     if boosted:
-        # 1. Gemini Flash Triad (indices 6, 7, 8)
-        M[7, 8] = 1.5
-        M[8, 7] = 1.5
+        # 1. Gemini Flash Triad (indices 6, 7, 8) & 3.1-pro (5) - Asymmetric protection for 3.7-flash (7) and 3.6-flash (6)
+        M[7, 8] = 2.0  # True: gemini-3.7-flash -> False: gemini-3.8-flash
+        M[8, 7] = 1.3  # True: gemini-3.8-flash -> False: gemini-3.7-flash
         M[6, 7] = 1.4
         M[7, 6] = 1.4
-        M[6, 8] = 1.4
-        M[8, 6] = 1.4
+        M[6, 8] = 1.5
+        M[8, 6] = 1.3
+        M[6, 5] = 1.6  # True: gemini-3.6-flash -> False: gemini-3.1-pro-preview
+        M[7, 5] = 1.5  # True: gemini-3.7-flash -> False: gemini-3.1-pro-preview
 
-        # 2. GPT-5.6 Triad (indices 1, 2, 3) & Astra (4)
+        # 2. GPT-5.6 Triad (indices 1, 2, 3) & GPT-6-Astra (4) - Asymmetric protection for Astra
         for i in (1, 2, 3):
             for j in (1, 2, 3):
                 if i != j:
                     M[i, j] = 1.4
-        M[2, 4] = 1.3
-        M[4, 2] = 1.3
+        M[4, 2] = 1.8  # True: gpt-6-astra -> False: gpt-5.6-sol
+        M[2, 4] = 1.2
+        M[4, 1] = 1.7  # True: gpt-6-astra -> False: gpt-5.6-luna
         M[1, 4] = 1.2
-        M[4, 1] = 1.2
+        M[4, 3] = 1.5  # True: gpt-6-astra -> False: gpt-5.6-terra
+        M[3, 4] = 1.2
 
-        # 3. GLM Sisters (indices 15, 16)
-        M[15, 16] = 1.4
-        M[16, 15] = 1.4
+        # 3. GLM Sisters (15, 16) & Cross-Family RLHF Sinks (Claude Sonnet 5 [12], Fable 5 [13], Kimi-K3 [17])
+        M[15, 16] = 1.5  # True: glm-5.3 -> False: glm-5.3-flash
+        M[16, 15] = 1.7  # True: glm-5.3-flash -> False: glm-5.3
+        M[15, 12] = 1.7  # True: glm-5.3 -> False: claude-sonnet-5
+        M[12, 15] = 1.2
+        M[15, 13] = 1.5  # True: glm-5.3 -> False: claude-fable-5
+        M[17, 13] = 1.4  # True: kimi-k3 -> False: claude-fable-5
 
     return M
 
@@ -473,7 +481,13 @@ class TextSequenceDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        raw_ids = self.tok(str(self.texts[idx]), add_special_tokens=False, truncation=True, max_length=self.max_len)["input_ids"]
+        full_ids = self.tok(str(self.texts[idx]), add_special_tokens=False, truncation=False)["input_ids"]
+        if len(full_ids) > self.max_len:
+            head_len = self.max_len // 2
+            tail_len = self.max_len - head_len
+            raw_ids = full_ids[:head_len] + full_ids[-tail_len:]
+        else:
+            raw_ids = full_ids
         input_ids = raw_ids + [self.end_id]
         item: dict[str, Any] = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -645,7 +659,8 @@ def fit_ridge_heads(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Fits closed-form dual Ridge regression heads for plain and centered representations
-    with label smoothing. Uses dual formulation (N x N) for ultra-fast, numerically stable solution.
+    with label smoothing and feature-dimension trace scaling.
+    Uses dual formulation (N x N) for ultra-fast, numerically stable solution.
     """
     N, D = Z.shape
     Y = np.zeros((N, num_classes), dtype=np.float32)
@@ -657,7 +672,9 @@ def fit_ridge_heads(
     # Plain head: Z_tilde = [Z, 1]
     Z_tilde = np.hstack([Z, np.ones((N, 1), dtype=np.float32)])
     K_mat = Z_tilde @ Z_tilde.T
-    K_mat.flat[:: N + 1] += alpha
+    mean_diag_p = float(np.mean(np.sum(Z * Z, axis=1)))
+    eff_alpha_p = float(alpha) * max(mean_diag_p / 512.0, 1.0)
+    K_mat.flat[:: N + 1] += eff_alpha_p
     A = np.linalg.solve(K_mat, Y)
     W_tilde = (A.T @ Z_tilde).astype(np.float32)
     W_p = W_tilde[:, :-1]
@@ -676,13 +693,72 @@ def fit_ridge_heads(
 
     Z_c_tilde = np.hstack([Z_c, np.ones((N, 1), dtype=np.float32)])
     K_mat_c = Z_c_tilde @ Z_c_tilde.T
-    K_mat_c.flat[:: N + 1] += alpha
+    mean_diag_c = float(np.mean(np.sum(Z_c * Z_c, axis=1)))
+    eff_alpha_c = float(alpha) * max(mean_diag_c / 512.0, 1.0)
+    K_mat_c.flat[:: N + 1] += eff_alpha_c
     A_c = np.linalg.solve(K_mat_c, Y)
     W_c_tilde = (A_c.T @ Z_c_tilde).astype(np.float32)
     W_c = W_c_tilde[:, :-1]
     b_c = W_c_tilde[:, -1]
 
     return W_p, b_p, W_c, b_c
+
+
+def compute_grouped_inference_logits(
+    Z: np.ndarray,
+    plain_weight: np.ndarray,
+    plain_bias: np.ndarray,
+    centered_weight: np.ndarray,
+    centered_bias: np.ndarray,
+    groups: list[Any] | np.ndarray | None = None,
+    blend_centered: float = 0.65,
+) -> dict[str, np.ndarray]:
+    """
+    Computes plain, prompt-group centered, and blended logits for inference.
+    When groups are available, centers features per group (protecting singletons).
+    When groups are absent and batch size >= 18, centers globally across the batch.
+    Standardizes per-sample logit scale before blending and computes Sinkhorn-balanced probabilities.
+    """
+    logits_plain = Z @ plain_weight.T + plain_bias
+    if groups is not None and len(groups) == len(Z):
+        Z_c = Z.copy()
+        singleton_mask = np.zeros(len(Z), dtype=bool)
+        grps_arr = np.asarray(groups)
+        for g in np.unique(grps_arr):
+            mask = (grps_arr == g)
+            if mask.sum() > 1:
+                Z_c[mask] = Z[mask] - Z[mask].mean(axis=0, keepdims=True)
+            else:
+                singleton_mask[mask] = True
+        logits_centered = Z_c @ centered_weight.T + centered_bias
+        if np.any(singleton_mask):
+            logits_centered[singleton_mask] = logits_plain[singleton_mask]
+    elif groups is None and len(Z) >= 18:
+        Z_c = Z - Z.mean(axis=0, keepdims=True)
+        logits_centered = Z_c @ centered_weight.T + centered_bias
+    else:
+        logits_centered = logits_plain.copy()
+
+    # Standardize per-sample logit scale before blending
+    std_p = np.std(logits_plain, axis=1, keepdims=True)
+    std_c = np.std(logits_centered, axis=1, keepdims=True)
+    scale_p = np.where(std_p > 1e-4, 4.0 / std_p, 1.0)
+    scale_c = np.where(std_c > 1e-4, 4.0 / std_c, 1.0)
+    lp_norm = logits_plain * scale_p
+    lc_norm = logits_centered * scale_c
+    logits_blend = (1.0 - blend_centered) * lp_norm + blend_centered * lc_norm
+
+    std_b = float(np.std(logits_blend, axis=1).mean())
+    scale_b = (4.0 / std_b) if std_b > 1e-4 else 1.0
+    P_blend = softmax(logits_blend * scale_b, axis=1)
+    probs_sinkhorn = sinkhorn_balancing(P_blend, iters=60, sinkhorn_strength=0.65, target_mix=0.35)
+
+    return {
+        "logits_plain": logits_plain,
+        "logits_centered": logits_centered,
+        "logits_blend": logits_blend,
+        "probs_sinkhorn": probs_sinkhorn,
+    }
 
 
 def _blend_head(head_linear: nn.Linear, W_r: np.ndarray, b_r: np.ndarray, w_neural: float = 0.65, w_ridge: float = 0.35) -> None:
@@ -1430,7 +1506,7 @@ def run_training_pipeline(
             opt1, num_warmup_steps=int(stage1_cfg.get("warmup_steps", 100)), num_training_steps=math.ceil(total_steps1 / accum1)
         )
 
-        stage1_hard_weight = float(stage1_cfg.get("hard_class_weight", train_cfg.get("hard_class_weight", 1.40)))
+        stage1_hard_weight = float(stage1_cfg.get("hard_class_weight", train_cfg.get("hard_class_weight", 1.0)))
         stage1_class_weights = torch.ones(num_classes, device=device, dtype=torch.float32)
         for lbl, local_idx in sub_lab2i.items():
             if LAB2I.get(lbl) in hard_set:
@@ -1525,6 +1601,11 @@ def run_training_pipeline(
 
     # Stage 2: Prompt-Grouped Fine-Tuning on train.csv
     stage2_cfg = train_cfg.get("stage2", {})
+    freeze_backbone_s2 = bool(stage2_cfg.get("freeze_backbone", False))
+    if freeze_backbone_s2:
+        print("[Trainer] Freezing backbone parameters for Stage 2 (exclusively training norms, plain_head, and centered_head)...")
+        for p in model.backbone.parameters():
+            p.requires_grad = False
     df_tr = pd.read_csv(train_path)
     if is_specialist:
         df_tr = df_tr[df_tr["model"].isin(active_labels)].reset_index(drop=True)

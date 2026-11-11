@@ -280,10 +280,11 @@ class TestTrainer(unittest.TestCase):
 
         # Boosted 18-class sister mask checks:
         boosted_mask = _build_sister_mask(torch.device("cpu"), boosted=True)
-        self.assertAlmostEqual(boosted_mask[7, 8].item(), 1.5, places=5)
-        self.assertAlmostEqual(boosted_mask[8, 7].item(), 1.5, places=5)
+        self.assertAlmostEqual(boosted_mask[7, 8].item(), 2.0, places=5)
+        self.assertAlmostEqual(boosted_mask[8, 7].item(), 1.3, places=5)
         self.assertAlmostEqual(boosted_mask[2, 3].item(), 1.4, places=5)
-        self.assertAlmostEqual(boosted_mask[15, 16].item(), 1.4, places=5)
+        self.assertAlmostEqual(boosted_mask[15, 16].item(), 1.5, places=5)
+        self.assertAlmostEqual(boosted_mask[16, 15].item(), 1.7, places=5)
 
     def test_family_specialists_checkpoint_export_and_inference_load(self):
         """Verify export_compatible_checkpoint and resolve_head_tensors for 5-class, 4-class, and 2-class specialists."""
@@ -807,6 +808,37 @@ class TestTrainer(unittest.TestCase):
 
             discovered = resolve_all_pool_files(tmp_p)
             self.assertIn(p120, discovered)
+
+    def test_compute_grouped_inference_logits_and_trace_scaled_ridge(self):
+        """Verify trace-scaled fit_ridge_heads and compute_grouped_inference_logits."""
+        from namethatllm.trainer import fit_ridge_heads, compute_grouped_inference_logits
+
+        np.random.seed(42)
+        N, D = 36, 64
+        Z = np.random.randn(N, D).astype(np.float32) * 5.0
+        y = np.random.randint(0, 18, size=N)
+        prompts = np.repeat(np.arange(12), 3)
+
+        W_p, b_p, W_c, b_c = fit_ridge_heads(Z, y, prompts=prompts, alpha=10.0, num_classes=18)
+        self.assertEqual(W_p.shape, (18, D))
+        self.assertEqual(W_c.shape, (18, D))
+
+        # Test grouped inference with prompt groups
+        res_grouped = compute_grouped_inference_logits(
+            Z, W_p, b_p, W_c, b_c, groups=prompts, blend_centered=0.65
+        )
+        self.assertIn("logits_plain", res_grouped)
+        self.assertIn("logits_centered", res_grouped)
+        self.assertIn("logits_blend", res_grouped)
+        self.assertIn("probs_sinkhorn", res_grouped)
+        self.assertEqual(res_grouped["probs_sinkhorn"].shape, (N, 18))
+        self.assertTrue(np.allclose(res_grouped["probs_sinkhorn"].sum(axis=1), 1.0, atol=1e-5))
+
+        # Test grouped inference with None groups (global batch centering fallback)
+        res_none = compute_grouped_inference_logits(
+            Z, W_p, b_p, W_c, b_c, groups=None, blend_centered=0.65
+        )
+        self.assertEqual(res_none["probs_sinkhorn"].shape, (N, 18))
 
 
 if __name__ == "__main__":
