@@ -24,6 +24,9 @@ from .config import LABELS, K, _text_hash, calibrate_model_lp, log_softmax, soft
 from .postprocess import sinkhorn_balancing as _sinkhorn_balancing
 from .wpca_gaussian import split_oversized_clusters_dist
 
+if "_sinkhorn_balancing" not in globals() and "sinkhorn_balancing" in globals():
+    _sinkhorn_balancing = globals()["sinkhorn_balancing"]
+
 # =============================================================================
 # HELPER FUNCTIONS: MASS BALANCING & ZERO-LEAKAGE TEXT HASHING
 # =============================================================================
