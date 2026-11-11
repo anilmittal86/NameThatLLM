@@ -96,8 +96,8 @@ def build_unseen_holdout_dataset(
             except Exception:
                 pass
 
-    # 2. Mark only pool_v4.parquet and pool_v1.parquet as contaminated
-    # (seen by Part-2 LoRAs, DeBERTa, inhouse)
+    # 2. Mark pool_v4.parquet and pool_v1.parquet as contaminated
+    # (seen by Part-2 LoRAs, DeBERTa; pool_120k is the superset pool and excluded from candidates via pattern skip)
     for pat in ["pool_v4.parquet", "pool_v1.parquet"]:
         for p in input_dir.rglob(pat):
             try:
@@ -145,7 +145,7 @@ def build_unseen_holdout_dataset(
             if p in seen_paths:
                 continue
             p_name = p.name.lower()
-            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_120k", "pool_v4", "pool_v1"]):
                 continue
             seen_paths.add(p)
             df_c = _process_candidate_file(p)
@@ -159,7 +159,7 @@ def build_unseen_holdout_dataset(
                 continue
             p_str = str(p).lower().replace("\\", "/")
             p_name = p.name.lower()
-            if any(skip in p_name for skip in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+            if any(skip in p_name for skip in ["train", "test", "submission", "pool_120k", "pool_v4", "pool_v1"]):
                 continue
             if any(k in p_str for k in ["openrouter", "harvest", "passages", "generations"]):
                 seen_paths.add(p)
@@ -174,7 +174,7 @@ def build_unseen_holdout_dataset(
                 if p in seen_paths:
                     continue
                 p_name = p.name.lower()
-                if any(x in p_name for x in ["train", "test", "submission", "pool_v4", "pool_v1"]):
+                if any(x in p_name for x in ["train", "test", "submission", "pool_120k", "pool_v4", "pool_v1"]):
                     continue
                 seen_paths.add(p)
                 df_c = _process_candidate_file(p)
@@ -355,7 +355,7 @@ class UnseenStepwiseAuditor:
             if extra_test_log_probs:
                 for ex_name, w_ex, lp_ex in extra_test_log_probs:
                     if len(lp_ex) == self.N_test and w_ex > 0.0:
-                        logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
+                        logit_flat += float(w_ex) * calibrate_model_lp(lp_ex, model_name=ex_name)
                         weights_map[ex_name] = float(w_ex)
             P_mix = softmax(logit_flat, axis=1)
             df_summary = pd.DataFrame(
@@ -471,7 +471,7 @@ class UnseenStepwiseAuditor:
                 eff_b = _effective_bacc(m_info)
                 if eff_b < 0.22 or m_info["weight"] <= 0.0:
                     active_weights[idx] = 0.0
-                elif eff_b >= 0.34 and m_info["weight"] > 0.0:
+                elif eff_b >= 0.34 and m_info["weight"] > 0.0 and active_weights[idx] > 0.0:
                     active_weights[idx] = max(active_weights[idx], 0.75 * m_info["weight"])
 
         weights_map: dict[str, float] = {}
@@ -488,7 +488,7 @@ class UnseenStepwiseAuditor:
         if extra_test_log_probs:
             for ex_name, w_ex, lp_ex in extra_test_log_probs:
                 if len(lp_ex) == self.N_test and w_ex > 0.0:
-                    logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
+                    logit_flat += float(w_ex) * calibrate_model_lp(lp_ex, model_name=ex_name)
                     weights_map[ex_name] = float(w_ex)
 
         P_mix = softmax(logit_flat, axis=1)
@@ -515,7 +515,7 @@ class UnseenStepwiseAuditor:
 
         cum_unseen_lp = np.zeros((len(self.y_unseen), K), dtype=np.float64)
         for m in self.models:
-            w_m = m["weight"] if "learned_weight" in m else (m["weight"] if m["weight"] > 0 else m.get("prior_weight", 0.15))
+            w_m = m["weight"] if "learned_weight" in m else (m["weight"] if m["weight"] > 0 else (m.get("prior_weight") or 0.15))
             if w_m <= 0.0:
                 continue
             cum_unseen_lp += w_m * m["unseen_lp"]
@@ -591,7 +591,7 @@ class UnseenStepwiseAuditor:
                     cand_w = (
                         cand["weight"]
                         if "learned_weight" in cand
-                        else (cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15))
+                        else (cand["weight"] if cand["weight"] > 0 else (cand.get("prior_weight") or 0.15))
                     )
                     if cand_w <= 0.0:
                         continue
@@ -608,7 +608,7 @@ class UnseenStepwiseAuditor:
                     cand_w = (
                         cand["weight"]
                         if "learned_weight" in cand
-                        else (cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15))
+                        else (cand["weight"] if cand["weight"] > 0 else (cand.get("prior_weight") or 0.15))
                     )
                     if cand_w <= 0.0:
                         continue
@@ -632,7 +632,7 @@ class UnseenStepwiseAuditor:
             m = self.models[best_cand_idx]
             remaining.remove(best_cand_idx)
 
-            w = m["weight"] if "learned_weight" in m else (m["weight"] if m["weight"] > 0 else m.get("prior_weight", 0.15))
+            w = m["weight"] if "learned_weight" in m else (m["weight"] if m["weight"] > 0 else (m.get("prior_weight") or 0.15))
             cum_unseen_lp = cum_unseen_lp + w * m["unseen_lp"]
             cum_test_lp = cum_test_lp + w * m["test_lp"]
 
@@ -683,7 +683,7 @@ class UnseenStepwiseAuditor:
             for r in range(1, M + 1):
                 for sub in combinations(range(M), r):
                     sub_unseen_lp = sum(
-                        (self.models[i]["weight"] if self.models[i]["weight"] > 0 else self.models[i].get("prior_weight", 0.15))
+                        (self.models[i]["weight"] if self.models[i]["weight"] > 0 else (self.models[i].get("prior_weight") or 0.15))
                         * self.models[i]["unseen_lp"]
                         for i in sub
                     )
@@ -709,7 +709,7 @@ class UnseenStepwiseAuditor:
                     else:
                         loo_sub = [j for j in best_subset if j != i]
                         loo_lp = sum(
-                            (self.models[j]["weight"] if self.models[j]["weight"] > 0 else self.models[j].get("prior_weight", 0.15))
+                            (self.models[j]["weight"] if self.models[j]["weight"] > 0 else (self.models[j].get("prior_weight") or 0.15))
                             * self.models[j]["unseen_lp"]
                             for j in loo_sub
                         )
@@ -719,7 +719,7 @@ class UnseenStepwiseAuditor:
                 else:
                     with_m_sub = list(best_subset) + [i]
                     with_m_lp = sum(
-                        (self.models[j]["weight"] if self.models[j]["weight"] > 0 else self.models[j].get("prior_weight", 0.15))
+                        (self.models[j]["weight"] if self.models[j]["weight"] > 0 else (self.models[j].get("prior_weight") or 0.15))
                         * self.models[j]["unseen_lp"]
                         for j in with_m_sub
                     )

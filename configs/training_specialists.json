@@ -16,7 +16,7 @@
   ],
   "family_margin": 0.40,
   "supcon_weight": 0.25,
-  "hard_class_weight": 1.40,
+  "hard_class_weight": 1.00,
   "stage1": {
     "enabled": true,
     "lr_lora": 1.5e-4,

@@ -6,6 +6,7 @@ LayerNorm heads, causal attention-sink masking (m[:, 0] = 0.0), prompt-grouped
 contrastive centering, and standard checkpoint export.
 """
 
+import copy
 import gc
 import importlib.util
 import json
@@ -191,10 +192,8 @@ class MultiLayerLoRAClassifier(nn.Module):
             h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
             pooled = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
             norm = self.norms[idx]
-            if next(norm.parameters()).device != layer_dev:
-                norm = norm.to(layer_dev)
-                self.norms[idx] = norm
-            normed = norm(pooled)
+            norm_dev = next(norm.parameters()).device
+            normed = norm(pooled.to(norm_dev))
             pooled_list.append(normed.to(first_device))
 
         return torch.cat(pooled_list, dim=-1)
@@ -419,7 +418,7 @@ def compute_two_stage_loss(
 
     total_loss = loss_plain + float(centered_weight) * loss_centered
     if supcon_weight > 0.0:
-        loss_sup = compute_supcon_loss(Z_c, labels_dev, prototypes=model.centered_head.weight)
+        loss_sup = compute_supcon_loss(Z_c, labels_dev, prototypes=model.centered_head.weight.detach())
         total_loss = total_loss + float(supcon_weight) * loss_sup
 
     return total_loss, loss_plain, loss_centered
@@ -620,7 +619,7 @@ def train_prompt_group_step(
             loss_mb = loss_p + float(centered_weight) * loss_c
             if supcon_weight > 0.0:
                 loss_sup = compute_supcon_loss(
-                    Z_c_mb, labels_dev[s:e], temperature=0.10, prototypes=model.centered_head.weight, Z_group_centered=Z_group_centered
+                    Z_c_mb, labels_dev[s:e], temperature=0.10, prototypes=model.centered_head.weight.detach(), Z_group_centered=Z_group_centered
                 )
                 loss_mb = loss_mb + float(supcon_weight) * loss_sup
 
@@ -693,12 +692,11 @@ def _blend_head(head_linear: nn.Linear, W_r: np.ndarray, b_r: np.ndarray, w_neur
         b_n = head_linear.bias.detach().cpu().float().numpy()
         norm_n = float(np.linalg.norm(W_n))
         norm_r = float(np.linalg.norm(W_r))
-        if norm_r > 1e-6 and norm_n > 1e-6:
-            W_r_scaled = W_r * (norm_n / norm_r)
-        else:
-            W_r_scaled = W_r
+        scale = (norm_n / norm_r) if (norm_r > 1e-6 and norm_n > 1e-6) else 1.0
+        W_r_scaled = W_r * scale
+        b_r_centered = (b_r - b_r.mean()) * scale + b_n.mean()
         W_blend = w_neural * W_n + w_ridge * W_r_scaled
-        b_blend = w_neural * b_n + w_ridge * b_r
+        b_blend = w_neural * b_n + w_ridge * b_r_centered
         head_linear.weight.copy_(torch.from_numpy(W_blend).to(head_linear.weight.device, dtype=head_linear.weight.dtype))
         head_linear.bias.copy_(torch.from_numpy(b_blend).to(head_linear.bias.device, dtype=head_linear.bias.dtype))
 
@@ -768,21 +766,27 @@ def evaluate_stage2_oof_cv(
         # Validation evaluation (strictly unseen prompt groups)
         val_plain = Z_val @ W_p.T + b_p
         Z_val_c = Z_val.copy()
+        singleton_mask = np.zeros(len(p_val), dtype=bool)
         for p in np.unique(p_val):
             m = p_val == p
             if m.sum() > 1:
                 Z_val_c[m] -= Z_val_c[m].mean(axis=0, keepdims=True)
             else:
                 Z_val_c[m] = 0.0
+                singleton_mask[m] = True
         val_centered = Z_val_c @ W_c.T + b_c
+        if np.any(singleton_mask):
+            val_centered[singleton_mask] = val_plain[singleton_mask]
         val_blend = 0.5 * val_plain + 0.5 * val_centered
 
         val_plain_bacc = float(balanced_accuracy_score(y_val, val_plain.argmax(axis=1)))
         val_center_bacc = float(balanced_accuracy_score(y_val, val_centered.argmax(axis=1)))
         val_blend_bacc = float(balanced_accuracy_score(y_val, val_blend.argmax(axis=1)))
 
-        # Val Soft Sinkhorn
-        P_val = softmax(val_blend, axis=1)
+        # Val Soft Sinkhorn (scale ridge outputs to standard logit std ~4.0 before softmax)
+        val_std = float(np.std(val_blend, axis=1).mean())
+        val_scale = (4.0 / val_std) if val_std > 1e-4 else 1.0
+        P_val = softmax(val_blend * val_scale, axis=1)
         P_val_sk = sinkhorn_balancing(P_val, iters=60, sinkhorn_strength=0.65, target_mix=0.35)
         val_sink_bacc = float(balanced_accuracy_score(y_val, P_val_sk.argmax(axis=1)))
 
@@ -816,7 +820,9 @@ def evaluate_stage2_oof_cv(
     oof_center_bacc = float(balanced_accuracy_score(y, oof_centered_lp.argmax(axis=1)))
     oof_blend_bacc = float(balanced_accuracy_score(y, oof_blend_lp.argmax(axis=1)))
 
-    P_oof = softmax(oof_blend_lp, axis=1)
+    oof_std = float(np.std(oof_blend_lp, axis=1).mean())
+    oof_scale = (4.0 / oof_std) if oof_std > 1e-4 else 1.0
+    P_oof = softmax(oof_blend_lp * oof_scale, axis=1)
     P_oof_sk = sinkhorn_balancing(P_oof, iters=60, sinkhorn_strength=0.65, target_mix=0.35)
     oof_sink_bacc = float(balanced_accuracy_score(y, P_oof_sk.argmax(axis=1)))
 
@@ -1055,8 +1061,13 @@ def run_training_pipeline(
     if train_cfg.get("specialist_jobs") and isinstance(train_cfg["specialist_jobs"], list):
         final_out = out_dir
         for job in train_cfg["specialist_jobs"]:
-            job_cfg = {**train_cfg, **job}
+            job_cfg = copy.deepcopy(train_cfg)
             job_cfg.pop("specialist_jobs", None)
+            for k, v in job.items():
+                if isinstance(v, dict) and isinstance(job_cfg.get(k), dict):
+                    job_cfg[k] = {**job_cfg[k], **v}
+                else:
+                    job_cfg[k] = v
             final_out = run_training_pipeline(job_cfg, step_callback=step_callback)
             gc.collect()
             if torch.cuda.is_available():
@@ -1365,9 +1376,9 @@ def run_training_pipeline(
 
         # Raise default max_samples to 150000 and upweight HARD_CLASS_INDICES by 1.30x
         max_s = int(stage1_cfg.get("max_samples", 2000 * num_classes if is_specialist else 150000))
+        hard_set = set(HARD_CLASS_INDICES)
         if len(df_p) > max_s:
-            hard_set = set(HARD_CLASS_INDICES)
-            cls_multipliers = {lbl: (1.30 if sub_lab2i[lbl] in hard_set else 1.0) for lbl in active_labels}
+            cls_multipliers = {lbl: (1.30 if LAB2I[lbl] in hard_set else 1.0) for lbl in active_labels}
             total_multiplier = sum(cls_multipliers.values())
             target_per_c = {lbl: int(max_s * (cls_multipliers[lbl] / total_multiplier)) for lbl in active_labels}
             sampled = []
@@ -1393,6 +1404,13 @@ def run_training_pipeline(
         lengths = [min(len(t) // 4 + 1, max_len) for t in df_p["text"]]
         bs1 = int(stage1_cfg.get("batch_size", 2))
         accum1 = int(stage1_cfg.get("gradient_accumulation_steps", 8))
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if vram_gb < 24.0 and bs1 > 4:
+                old_bs1 = bs1
+                bs1 = 2
+                accum1 = max(accum1 * (old_bs1 // 2), 8)
+                print(f"[Trainer] Low VRAM GPU ({vram_gb:.1f} GiB) detected: adjusted Stage 1 batch_size from {old_bs1} to {bs1}, accum_steps to {accum1}")
         epochs1 = int(stage1_cfg.get("epochs", 2 if not is_specialist else 1))
         ds1 = TextSequenceDataset(df_p["text"].tolist(), [sub_lab2i[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id)
         bucket_sampler = BucketedLengthBatchSampler(lengths, batch_size=bs1, shuffle=True)
@@ -1414,9 +1432,9 @@ def run_training_pipeline(
 
         stage1_hard_weight = float(stage1_cfg.get("hard_class_weight", train_cfg.get("hard_class_weight", 1.40)))
         stage1_class_weights = torch.ones(num_classes, device=device, dtype=torch.float32)
-        for h_idx in HARD_CLASS_INDICES:
-            if h_idx < num_classes:
-                stage1_class_weights[h_idx] = stage1_hard_weight
+        for lbl, local_idx in sub_lab2i.items():
+            if LAB2I.get(lbl) in hard_set:
+                stage1_class_weights[local_idx] = stage1_hard_weight
 
         model.train()
         opt1.zero_grad()
@@ -1438,7 +1456,7 @@ def run_training_pipeline(
                 with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=compute_dtype):
                     Z_s1, logits_p, _ = model(mb_ids, mb_mask, drop_first_token=not is_deberta)
                     loss_ce = family_margin_cross_entropy(logits_p, labels_dev, family_margin=family_margin, weight=stage1_class_weights)
-                    loss_sup = compute_supcon_loss(Z_s1, labels_dev, temperature=0.10, prototypes=model.plain_head.weight)
+                    loss_sup = compute_supcon_loss(Z_s1, labels_dev, temperature=0.10, prototypes=model.plain_head.weight.detach())
                     loss = (loss_ce + 0.15 * loss_sup) / accum1
 
                 loss.backward()
@@ -1534,18 +1552,20 @@ def run_training_pipeline(
         opt2, num_warmup_steps=int(stage2_cfg.get("warmup_steps", 50)), num_training_steps=math.ceil(total_steps2 / accum2)
     )
 
-    # SWA setup: average parameters across the final epoch of Stage 2
+    # SWA setup: average parameters across the final epoch of Stage 2 (accumulate in FP32)
     swa_enabled = bool(stage2_cfg.get("swa", True))
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    swa_shadow = {p: torch.zeros_like(p.data, device="cpu") for p in trainable_params} if swa_enabled else {}
+    swa_shadow = {p: torch.zeros_like(p.data, dtype=torch.float32, device="cpu") for p in trainable_params} if swa_enabled else {}
     swa_steps = 0
 
-    # Hard-Class Loss Upweighting for Stage 2 fine-tuning
-    stage2_hard_weight = float(stage2_cfg.get("hard_class_weight", train_cfg.get("hard_class_weight", 1.40)))
+    # Hard-Class Loss Upweighting for Stage 2 fine-tuning (default to 1.0 to preserve unbiased prior margins when Sinkhorn is disabled)
+    stage2_hard_weight = float(stage2_cfg.get("hard_class_weight", 1.0))
     stage2_class_weights = torch.ones(num_classes, device=device, dtype=torch.float32)
-    for h_idx in HARD_CLASS_INDICES:
-        if h_idx < num_classes:
-            stage2_class_weights[h_idx] = stage2_hard_weight
+    if stage2_hard_weight != 1.0:
+        hard_set = set(HARD_CLASS_INDICES)
+        for lbl, local_idx in sub_lab2i.items():
+            if LAB2I.get(lbl) in hard_set:
+                stage2_class_weights[local_idx] = stage2_hard_weight
 
     model.train()
     global_step2 = 0
@@ -1583,7 +1603,7 @@ def run_training_pipeline(
     if swa_enabled and swa_steps > 0:
         print(f"[Trainer] Applying SWA weight averaging across {swa_steps} steps in final Stage 2 epoch...")
         for p in trainable_params:
-            p.data.copy_((swa_shadow[p] / float(swa_steps)).to(p.device))
+            p.data.copy_((swa_shadow[p] / float(swa_steps)).to(p.device, p.dtype))
         del swa_shadow
 
     # Feature extraction for wPCA bank & checkpoint export

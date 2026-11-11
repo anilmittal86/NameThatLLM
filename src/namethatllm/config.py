@@ -124,7 +124,7 @@ def calibrate_model_lp(
     row_max = np.max(out, axis=1)
     row_min = float(np.min(out))
     row_std = float(out.std(axis=1).mean())
-    if np.all(row_max <= 1e-4) and row_min >= -16.5 and (1.4 <= row_std <= max_std + 0.1):
+    if np.all(row_max <= 1e-4) and row_min >= -19.5 and (1.4 <= row_std <= max_std + 0.1):
         return log_softmax(out, axis=1)
 
     if row_std > max_std and row_std > 1e-6:
@@ -385,10 +385,12 @@ def find_checkpoints(input_dir: Path) -> dict[str, Path]:
                 break
 
     # 3. Check for DeBERTa sequence classification head
-    for p in list(input_dir.rglob("head.safetensors")) + list(input_dir.rglob("heads.safetensors")):
-        if "deberta" in str(p).lower():
-            ckpts["deberta_p2"] = p.parent
-            break
+    if "deberta_p2" not in ckpts:
+        for p in list(input_dir.rglob("head.safetensors")) + list(input_dir.rglob("heads.safetensors")):
+            p_s = str(p).lower().replace("\\", "/")
+            if "deberta" in p_s and p.parent != ckpts.get("deberta_inhouse"):
+                ckpts["deberta_p2"] = p.parent
+                break
 
     # 4. Fallback search for instyle
     if "instyle" not in ckpts:

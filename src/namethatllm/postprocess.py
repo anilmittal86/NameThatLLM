@@ -603,15 +603,15 @@ def apply_typobayes_postprocess(
 
     y_tr = np.array([LAB2I[y] if isinstance(y, str) else int(y) for y in y_train], dtype=int)
     marks = [
-        " — ",
-        "—",
-        "–",
-        "’",
-        "‘",
-        "“",
-        "”",
-        "«",
-        "»",
+        " \u2014 ",
+        "\u2014",
+        "\u2013",
+        "\u2019",
+        "\u2018",
+        "\u201c",
+        "\u201d",
+        "\u00ab",
+        "\u00bb",
         '"',
         ";",
         ":",
@@ -621,8 +621,8 @@ def apply_typobayes_postprocess(
         "]",
         "**",
         "`",
-        "…",
-        "•",
+        "\u2026",
+        "\u2022",
         "\n",
         "\n\n",
         "e.g.",
@@ -646,9 +646,9 @@ def apply_typobayes_postprocess(
     def _extract_marker_row(t: str) -> list[float]:
         # Mutually exclusive decoupling for overlapping substrings:
         # 1. ' — ' vs unspaced '—'
-        has_spaced_em = " — " in t
-        t_no_spaced = t.replace(" — ", "")
-        has_unspaced_em = "—" in t_no_spaced
+        has_spaced_em = " \u2014 " in t
+        t_no_spaced = t.replace(" \u2014 ", "")
+        has_unspaced_em = "\u2014" in t_no_spaced
 
         # 2. '\n\n', '\n- ', '\n1.' vs standalone '\n'
         has_double_nl = "\n\n" in t
@@ -659,9 +659,9 @@ def apply_typobayes_postprocess(
 
         row = []
         for m in marks:
-            if m == " — ":
+            if m == " \u2014 ":
                 row.append(float(has_spaced_em))
-            elif m == "—":
+            elif m == "\u2014":
                 row.append(float(has_unspaced_em))
             elif m == "\n\n":
                 row.append(float(has_double_nl))

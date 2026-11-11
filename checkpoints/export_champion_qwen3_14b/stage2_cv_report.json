@@ -1,0 +1,69 @@
+{
+  "n_splits": 5,
+  "n_samples": 2699,
+  "n_prompts": 150,
+  "mean_train_bacc": 1.0,
+  "oof_plain_bacc": 0.7524484215759384,
+  "oof_center_bacc": 0.7999005717126523,
+  "oof_blend_bacc": 0.7869251802137709,
+  "oof_sink_bacc": 0.7869251802137709,
+  "overfit_gap": 0.2130748197862291,
+  "verdict": "HIGH (Prompt Memorization Risk - Increase supcon/family margin)",
+  "folds": [
+    {
+      "fold": 1,
+      "train_prompts": 120,
+      "val_prompts": 30,
+      "train_bacc": 1.0,
+      "val_plain_bacc": 0.7370370370370369,
+      "val_center_bacc": 0.7925925925925926,
+      "val_blend_bacc": 0.7814814814814816,
+      "val_sink_bacc": 0.7814814814814816,
+      "overfit_gap": 0.21851851851851845
+    },
+    {
+      "fold": 2,
+      "train_prompts": 120,
+      "val_prompts": 30,
+      "train_bacc": 1.0,
+      "val_plain_bacc": 0.7555555555555555,
+      "val_center_bacc": 0.8092592592592592,
+      "val_blend_bacc": 0.8018518518518518,
+      "val_sink_bacc": 0.8037037037037036,
+      "overfit_gap": 0.1962962962962964
+    },
+    {
+      "fold": 3,
+      "train_prompts": 120,
+      "val_prompts": 30,
+      "train_bacc": 1.0,
+      "val_plain_bacc": 0.7592592592592593,
+      "val_center_bacc": 0.8092592592592592,
+      "val_blend_bacc": 0.7925925925925925,
+      "val_sink_bacc": 0.7944444444444444,
+      "overfit_gap": 0.2055555555555556
+    },
+    {
+      "fold": 4,
+      "train_prompts": 120,
+      "val_prompts": 30,
+      "train_bacc": 1.0,
+      "val_plain_bacc": 0.7462962962962965,
+      "val_center_bacc": 0.7814814814814816,
+      "val_blend_bacc": 0.7740740740740741,
+      "val_sink_bacc": 0.7740740740740741,
+      "overfit_gap": 0.22592592592592586
+    },
+    {
+      "fold": 5,
+      "train_prompts": 120,
+      "val_prompts": 30,
+      "train_bacc": 1.0,
+      "val_plain_bacc": 0.764176245210728,
+      "val_center_bacc": 0.8070242656449553,
+      "val_blend_bacc": 0.7846743295019158,
+      "val_sink_bacc": 0.7865900383141763,
+      "overfit_gap": 0.2134099616858237
+    }
+  ]
+}

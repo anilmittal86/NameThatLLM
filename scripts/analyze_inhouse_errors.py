@@ -6,7 +6,24 @@ from src.namethatllm.config import LABELS, FAMILIES
 
 cache = np.load('local_data/local_eval_cache.npz', allow_pickle=True)
 y_unseen = cache['y_unseen']
-inhouse_lp = cache['m_4_unseen_lp']  # qwen3_14b_inhouse
+
+model_names = [str(x) for x in cache['model_names']] if 'model_names' in cache else []
+inhouse_idx = None
+for idx, name in enumerate(model_names):
+    if 'inhouse' in name.lower() or 'qwen3_14b' in name.lower():
+        inhouse_idx = idx
+        break
+
+if inhouse_idx is not None and f'm_{inhouse_idx}_unseen_lp' in cache:
+    inhouse_lp = cache[f'm_{inhouse_idx}_unseen_lp']
+elif 'm_4_unseen_lp' in cache:
+    inhouse_lp = cache['m_4_unseen_lp']
+elif 'qwen3_14b_inhouse_unseen_lp' in cache:
+    inhouse_lp = cache['qwen3_14b_inhouse_unseen_lp']
+else:
+    lp_keys = [k for k in cache.keys() if k.endswith('_unseen_lp')]
+    inhouse_lp = cache[lp_keys[-1]]
+
 pred = np.argmax(inhouse_lp, axis=1)
 
 print("=" * 80)

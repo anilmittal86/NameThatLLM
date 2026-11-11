@@ -444,6 +444,274 @@ if modal is not None:
 
         return out_res
 
+    @app.function(
+        gpu="A100-80GB:1",
+        timeout=1800,  # 30 minutes max
+        image=trainer_image,
+        volumes={
+            "/checkpoints": checkpoints_volume,
+            "/datasets": datasets_volume,
+        },
+    )
+    def reexport_heads_worker(
+        checkpoint_dir: str = "/checkpoints/export_champion_qwen3_14b",
+    ) -> dict[str, Any]:
+        """
+        Re-exports classification heads using the patched _blend_head formula with centered & scaled bias:
+        1. Loads the frozen 14B LoRA model from checkpoint_dir/adapter.
+        2. Loads /datasets/train.csv (5,000 samples) and extracts features Z_train.
+        3. Fits exact closed-form Ridge heads: fit_ridge_heads(Z_train, y_train, prompts_train).
+        4. Recovers pure neural weights (W_n, b_n) and blends with centered and scaled bias.
+        5. Evaluates holdout accuracy on df_unseen_holdout before vs after.
+        6. Backs up legacy heads.safetensors and writes the new corrected heads.safetensors.
+        7. Commits volume permanently.
+        """
+        import json
+        import shutil
+        import torch
+        import numpy as np
+        import pandas as pd
+        from pathlib import Path
+        from peft import PeftModel
+        from transformers import AutoConfig, AutoTokenizer, AutoModel
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+        from torch.utils.data import DataLoader
+        from sklearn.metrics import balanced_accuracy_score
+
+        from namethatllm.config import LABELS, LAB2I, K
+        from namethatllm.trainer import (
+            MultiLayerLoRAClassifier,
+            collate_text_batch,
+            TextSequenceDataset,
+            fit_ridge_heads,
+            _blend_head,
+        )
+        from namethatllm.ablation import build_unseen_holdout_dataset
+
+        ckpt = Path(checkpoint_dir)
+        meta_p = ckpt / "meta.json"
+        if not meta_p.exists():
+            raise FileNotFoundError(f"meta.json not found in {checkpoint_dir}")
+        with open(meta_p, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        backbone_name = meta.get("backbone", "Qwen/Qwen3-14B-Base")
+        keep_layers = int(meta.get("cfg", {}).get("keep", 27))
+        layers = meta.get("cfg", {}).get("layers", [2, 4, 6, 9, 13, 17, 22, 27])
+        max_len = int(meta.get("cfg", {}).get("max_len", 384))
+        end_id = int(meta.get("cfg", {}).get("end_token_id", 151643))
+        classes = meta.get("classes", LABELS)
+        num_classes = len(classes)
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"[Modal Re-Export] Initializing Qwen3-14B ({keep_layers} layers) on A100 GPU...")
+        tok = AutoTokenizer.from_pretrained(backbone_name, trust_remote_code=True, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        base_cfg = AutoConfig.from_pretrained(backbone_name, trust_remote_code=True)
+        base_cfg.num_hidden_layers = keep_layers
+        base_cfg.use_cache = False
+        if getattr(base_cfg, "layer_types", None) is not None:
+            base_cfg.layer_types = base_cfg.layer_types[:keep_layers]
+
+        base_model = AutoModel.from_pretrained(
+            backbone_name,
+            config=base_cfg,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2",
+        ).to(device)
+
+        adapter_dir = ckpt / "adapter"
+        print(f"[Modal Re-Export] Loading LoRA adapter from {adapter_dir}...")
+        peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+
+        model = MultiLayerLoRAClassifier(
+            peft_model,
+            hidden_size=base_cfg.hidden_size,
+            layers=layers,
+            num_classes=num_classes,
+        ).to(device)
+
+        heads_p = ckpt / "heads.safetensors"
+        print(f"[Modal Re-Export] Reading existing heads weights from {heads_p}...")
+        heads_sd_raw = {}
+        with safe_open(str(heads_p), framework="pt", device="cpu") as sf:
+            for k in sf.keys():
+                heads_sd_raw[k] = sf.get_tensor(k)
+
+        # Load norm layers
+        for i in range(len(model.norms)):
+            w_k = f"norms.{i}.weight"
+            if w_k in heads_sd_raw:
+                model.norms[i].weight.data.copy_(heads_sd_raw[w_k].to(device))
+            b_k = f"norms.{i}.bias"
+            if b_k in heads_sd_raw and hasattr(model.norms[i], "bias") and model.norms[i].bias is not None:
+                model.norms[i].bias.data.copy_(heads_sd_raw[b_k].to(device))
+
+        # Copy existing heads into model
+        if "plain.weight" in heads_sd_raw:
+            model.plain_head.weight.data.copy_(heads_sd_raw["plain.weight"].to(device))
+        if "plain.bias" in heads_sd_raw:
+            model.plain_head.bias.data.copy_(heads_sd_raw["plain.bias"].to(device))
+        if "centered.weight" in heads_sd_raw:
+            model.centered_head.weight.data.copy_(heads_sd_raw["centered.weight"].to(device))
+        if "centered.bias" in heads_sd_raw:
+            model.centered_head.bias.data.copy_(heads_sd_raw["centered.bias"].to(device))
+
+        model.eval()
+
+        # Step 1: Load train.csv dataset to extract Z_train
+        ds_root = Path("/datasets")
+        train_p = ds_root / "train.csv"
+        if not train_p.exists():
+            raise FileNotFoundError("train.csv not found in /datasets")
+
+        df_train = pd.read_csv(train_p)
+        print(f"[Modal Re-Export] Loaded train.csv with {len(df_train)} rows.")
+        y_train = np.array([LAB2I[m] for m in df_train["model"]])
+        prompts_train = df_train["prompt_id"].values
+        texts_train = df_train["text"].tolist()
+
+        # Step 2: Extract representations Z_train using model.forward_features
+        print(f"[Modal Re-Export] Extracting Z_train representations on {len(texts_train)} samples...")
+        ds_tr = TextSequenceDataset(texts_train, y_train.tolist(), None, tok, max_len=max_len, end_id=end_id)
+        loader_tr = DataLoader(ds_tr, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
+
+        Z_list = []
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                for batch in loader_tr:
+                    mb_ids = batch["input_ids"].to(device)
+                    mb_mask = batch["attention_mask"].to(device)
+                    max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                    z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                    Z_list.append(z_b.cpu().float().numpy())
+
+        Z_train = np.vstack(Z_list)
+        print(f"[Modal Re-Export] Extracted Z_train: shape={Z_train.shape}, dtype={Z_train.dtype}")
+
+        # Step 3: Fit closed-form Ridge heads on Z_train
+        print("[Modal Re-Export] Fitting exact closed-form Ridge heads on Z_train...")
+        W_p_r, b_p_r, W_c_r, b_c_r = fit_ridge_heads(
+            Z_train, y_train, prompts_train, alpha=10.0, label_smoothing=0.10, num_classes=num_classes
+        )
+
+        # Step 4: Extract unseen holdout texts if available to benchmark before vs after
+        df_unseen, _ = build_unseen_holdout_dataset(ds_root)
+        unseen_texts = df_unseen["text"].tolist() if len(df_unseen) > 0 else []
+        y_unseen = np.array([LAB2I[m] for m in df_unseen["model"]]) if len(df_unseen) > 0 else np.array([])
+        print(f"[Modal Re-Export] Extracting Z_unseen on {len(unseen_texts)} holdout samples...")
+
+        Z_unseen = None
+        if len(unseen_texts) > 0:
+            ds_u = TextSequenceDataset(unseen_texts, y_unseen.tolist(), None, tok, max_len=max_len, end_id=end_id)
+            loader_u = DataLoader(ds_u, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
+
+            Z_u_list = []
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    for batch in loader_u:
+                        mb_ids = batch["input_ids"].to(device)
+                        mb_mask = batch["attention_mask"].to(device)
+                        max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                        z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                        Z_u_list.append(z_b.cpu().float().numpy())
+            if Z_u_list:
+                Z_unseen = np.vstack(Z_u_list)
+
+        # Benchmark BEFORE: evaluation using existing heads.safetensors
+        bacc_old = 0.0
+        if Z_unseen is not None and len(y_unseen) > 0:
+            W_p_old = heads_sd_raw["plain.weight"].float().numpy()
+            b_p_old = heads_sd_raw["plain.bias"].float().numpy()
+            logits_old = Z_unseen @ W_p_old.T + b_p_old
+            bacc_old = float(balanced_accuracy_score(y_unseen, logits_old.argmax(axis=1)))
+            print(f"[Modal Re-Export] BEFORE (Unscaled Bias) Unseen Plain Head BAcc: {bacc_old:.4f} ({bacc_old*100:.2f}%)")
+
+        # Step 5: Invert the blend to recover the true pure neural heads (W_n, b_n)
+        W_p_saved = heads_sd_raw["plain.weight"].float().numpy()
+        b_p_saved = heads_sd_raw["plain.bias"].float().numpy()
+        W_c_saved = heads_sd_raw["centered.weight"].float().numpy()
+        b_c_saved = heads_sd_raw["centered.bias"].float().numpy()
+
+        norm_p_saved = float(np.linalg.norm(W_p_saved))
+        norm_p_r = float(np.linalg.norm(W_p_r))
+        scale_p_old = (norm_p_saved / norm_p_r) if (norm_p_r > 1e-6 and norm_p_saved > 1e-6) else 1.0
+        W_p_r_scaled = W_p_r * scale_p_old
+        W_p_n = (W_p_saved - 0.25 * W_p_r_scaled) / 0.75
+        b_p_n = (b_p_saved - 0.25 * b_p_r) / 0.75
+
+        norm_c_saved = float(np.linalg.norm(W_c_saved))
+        norm_c_r = float(np.linalg.norm(W_c_r))
+        scale_c_old = (norm_c_saved / norm_c_r) if (norm_c_r > 1e-6 and norm_c_saved > 1e-6) else 1.0
+        W_c_r_scaled = W_c_r * scale_c_old
+        W_c_n = (W_c_saved - 0.25 * W_c_r_scaled) / 0.75
+        b_c_n = (b_c_saved - 0.25 * b_c_r) / 0.75
+
+        # Check pure neural BAcc
+        bacc_pure_n = 0.0
+        if Z_unseen is not None and len(y_unseen) > 0:
+            logits_pure_n = Z_unseen @ W_p_n.T + b_p_n
+            bacc_pure_n = float(balanced_accuracy_score(y_unseen, logits_pure_n.argmax(axis=1)))
+            print(f"[Modal Re-Export] PURE NEURAL (No Ridge) Unseen Plain Head BAcc: {bacc_pure_n:.4f} ({bacc_pure_n*100:.2f}%)")
+
+        # Step 6: Compute the CORRECT centered & scaled blend using _blend_head
+        plain_linear = torch.nn.Linear(W_p_n.shape[1], W_p_n.shape[0])
+        plain_linear.weight.data.copy_(torch.from_numpy(W_p_n))
+        plain_linear.bias.data.copy_(torch.from_numpy(b_p_n))
+        _blend_head(plain_linear, W_p_r, b_p_r, w_neural=0.75, w_ridge=0.25)
+
+        centered_linear = torch.nn.Linear(W_c_n.shape[1], W_c_n.shape[0])
+        centered_linear.weight.data.copy_(torch.from_numpy(W_c_n))
+        centered_linear.bias.data.copy_(torch.from_numpy(b_c_n))
+        _blend_head(centered_linear, W_c_r, b_c_r, w_neural=0.75, w_ridge=0.25)
+
+        # Benchmark AFTER: evaluation with corrected centered & scaled bias
+        bacc_new = 0.0
+        if Z_unseen is not None and len(y_unseen) > 0:
+            W_p_new = plain_linear.weight.detach().cpu().numpy()
+            b_p_new = plain_linear.bias.detach().cpu().numpy()
+            logits_new = Z_unseen @ W_p_new.T + b_p_new
+            bacc_new = float(balanced_accuracy_score(y_unseen, logits_new.argmax(axis=1)))
+            print(f"[Modal Re-Export] AFTER (Centered & Scaled Bias) Unseen Plain Head BAcc: {bacc_new:.4f} ({bacc_new*100:.2f}%)")
+            print(f"[Modal Re-Export] NET LIFT: {bacc_new - bacc_old:+.4f} ({(bacc_new - bacc_old)*100:+.2f}%)")
+        print(f"[Modal Re-Export] NET LIFT: {bacc_new - bacc_old:+.4f} ({(bacc_new - bacc_old)*100:+.2f}%)")
+
+        # Step 7: Backup old heads.safetensors and save new heads.safetensors
+        backup_p = ckpt / "heads_legacy_unscaled_bias.safetensors"
+        if not backup_p.exists():
+            shutil.copyfile(heads_p, backup_p)
+            print(f"[Modal Re-Export] Backed up legacy heads to {backup_p}")
+
+        new_heads_dict = {}
+        for k, v in heads_sd_raw.items():
+            if k == "plain.weight":
+                new_heads_dict[k] = plain_linear.weight.detach().cpu().contiguous()
+            elif k == "plain.bias":
+                new_heads_dict[k] = plain_linear.bias.detach().cpu().contiguous()
+            elif k == "centered.weight":
+                new_heads_dict[k] = centered_linear.weight.detach().cpu().contiguous()
+            elif k == "centered.bias":
+                new_heads_dict[k] = centered_linear.bias.detach().cpu().contiguous()
+            else:
+                new_heads_dict[k] = v.contiguous()
+
+        save_file(new_heads_dict, str(heads_p))
+        print(f"[Modal Re-Export] Saved corrected heads to {heads_p}")
+
+        checkpoints_volume.commit()
+        print("[Modal Re-Export] Volume ntl-checkpoints committed permanently!")
+
+        return {
+            "bacc_old": bacc_old,
+            "bacc_pure_n": bacc_pure_n,
+            "bacc_new": bacc_new,
+            "lift": bacc_new - bacc_old,
+        }
+
     @app.local_entrypoint()
     def main(
         mode: str = "run",
@@ -485,6 +753,14 @@ if modal is not None:
             print(f"  Plain Head Accuracy   : {res.get('acc_plain', 0.0)*100:.2f}%")
             print(f"  Centered Head Accuracy: {res.get('acc_centered', 0.0)*100:.2f}%")
             print(f"  Blended Head Accuracy : {res.get('acc_blended', 0.0)*100:.2f}%")
+        elif mode == "reexport":
+            print("[Modal Launcher] Launching A100-80GB head re-export with centered & scaled bias...")
+            res = reexport_heads_worker.remote(checkpoint_dir="/checkpoints/export_champion_qwen3_14b")
+            print("[Modal Launcher] Re-export finished successfully!")
+            print(f"  Legacy Unscaled BAcc   : {res.get('bacc_old', 0.0)*100:.2f}%")
+            print(f"  Pure Neural BAcc       : {res.get('bacc_pure_n', 0.0)*100:.2f}%")
+            print(f"  Centered & Scaled BAcc : {res.get('bacc_new', 0.0)*100:.2f}%")
+            print(f"  Net Lift               : {res.get('lift', 0.0)*100:+.2f}%")
         else:
             print(f"[Modal Launcher] Launching A100-80GB cloud training with config: {config}")
             res = train_cloud_worker.remote(config_path=config)
@@ -495,7 +771,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Modal Cloud Launcher for NameThatLLM Training")
-    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval"], help="Command (run, smoke, test, sync, eval)")
+    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval", "reexport"], help="Command (run, smoke, test, sync, eval, reexport)")
     parser.add_argument("--config", default="configs/training_lora.json", help="Path to training config json")
     parser.add_argument("--backbone", default="Qwen/Qwen2.5-0.5B", help="Backbone model for smoke test")
     parser.add_argument("--spawn", action="store_true", help="Spawn asynchronously on deployed app and exit immediately")
@@ -537,5 +813,13 @@ if __name__ == "__main__":
             print(f"  Plain Head Accuracy   : {res.get('acc_plain', 0.0)*100:.2f}%")
             print(f"  Centered Head Accuracy: {res.get('acc_centered', 0.0)*100:.2f}%")
             print(f"  Blended Head Accuracy : {res.get('acc_blended', 0.0)*100:.2f}%")
+        elif args.cmd == "reexport":
+            print("[Modal Launcher] Launching A100-80GB head re-export with centered & scaled bias...")
+            res = reexport_heads_worker.remote(checkpoint_dir="/checkpoints/export_champion_qwen3_14b")
+            print("[Modal Launcher] Re-export finished successfully!")
+            print(f"  Legacy Unscaled BAcc   : {res.get('bacc_old', 0.0)*100:.2f}%")
+            print(f"  Pure Neural BAcc       : {res.get('bacc_pure_n', 0.0)*100:.2f}%")
+            print(f"  Centered & Scaled BAcc : {res.get('bacc_new', 0.0)*100:.2f}%")
+            print(f"  Net Lift               : {res.get('lift', 0.0)*100:+.2f}%")
         else:
             train_cloud_worker.remote(config_path=args.config)

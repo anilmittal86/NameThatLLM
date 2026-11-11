@@ -189,17 +189,37 @@ def forward_and_pool_batch(
             h_good = h_raw.to(first_norm_dev).float()
             pooled_layers[idx_l][good_rows] = (h_good * m[good_rows]).sum(dim=1) / den[good_rows]
 
-    # Rescue overflowed rows in bfloat16 (exact exponent range as float32, NEVER overflows!)
+    # Rescue overflowed rows safely without mutating model parameters in-place
+    # (In-place model.to(torch.bfloat16) permanently truncates FP16 mantissa bits when restoring).
     if n_bad > 0:
         bad_rows = torch.where(bad_mask)[0]
+        bad_rows_dev = bad_rows.to(first_norm_dev)
+
+        # Baseline fallback: sanitize existing raw activations so bad rows are never left as zeros
+        for idx_l, l in enumerate(layers):
+            h_fallback = hs[l][bad_rows.to(hs[l].device)]
+            if final_norm is not None and idx_l == len(layers) - 1:
+                fn_params = list(final_norm.parameters())
+                fn_dev = fn_params[0].device if fn_params else h_fallback.device
+                fn_dtype = fn_params[0].dtype if fn_params else h_fallback.dtype
+                h_fallback = final_norm(h_fallback.to(device=fn_dev, dtype=fn_dtype)).to(h_fallback.device)
+            h_fb = torch.nan_to_num(h_fallback.to(first_norm_dev).float(), nan=0.0, posinf=1e4, neginf=-1e4)
+            pooled_layers[idx_l][bad_rows_dev] = (h_fb * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
+
         del hs
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        model.to(torch.bfloat16)
+
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        emb_mod = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        hook = None
+        if emb_mod is not None:
+            hook = emb_mod.register_forward_hook(lambda _m, _inp, out: out.float())
+
         try:
             enc_bad = {k: v[bad_rows] for k, v in enc.items()}
-            hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
-            bad_rows_dev = bad_rows.to(first_norm_dev)
+            with torch.autocast(device_type=device_type, dtype=torch.float32):
+                hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
             for idx_l, l in enumerate(layers):
                 h_b = hs_bad[l]
                 if final_norm is not None and idx_l == len(layers) - 1:
@@ -211,8 +231,11 @@ def forward_and_pool_batch(
                 h_b = torch.nan_to_num(h_b, nan=0.0, posinf=1e4, neginf=-1e4)
                 pooled_layers[idx_l][bad_rows_dev] = (h_b * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
             del hs_bad
+        except Exception as e:
+            print(f"[NeuralExtractor] Warning: Exception during overflow rescue, keeping sanitized fallback: {e}")
         finally:
-            model.to(dtype)
+            if hook is not None:
+                hook.remove()
 
     out = torch.cat([nm(pooled_layers[idx_l]) for idx_l, nm in enumerate(norms)], dim=-1)
     return out.cpu().numpy(), n_bad
@@ -730,6 +753,18 @@ def extract_deberta_checkpoint(
             shutil.rmtree(stage_dir, ignore_errors=True)
 
     model.eval()
+
+    # Merge LoRA adapter if present (e.g. deberta_inhouse)
+    has_adapter = (
+        (ckpt_dir / "adapter" / "adapter_model.safetensors").exists()
+        or (ckpt_dir / "adapter" / "adapter_model.bin").exists()
+        or (ckpt_dir / "adapter_model.safetensors").exists()
+        or (ckpt_dir / "adapter_model.bin").exists()
+    )
+    if has_adapter:
+        merged_deb = merge_lora(model, ckpt_dir, sign=+1.0)
+        if merged_deb:
+            print(f"[DeBERTa] Merged LoRA adapter from {ckpt_dir}")
 
     hidden_dim = model.config.hidden_size
     has_norm_keys = any(k.startswith("norms.") and k.endswith(".weight") for k in heads_sd)

@@ -244,7 +244,9 @@ def _combine_plain_and_twin_lp(
     """
     if lp_twin is None or w_twin <= 0.0 or len(lp_twin) != len(lp_plain):
         return log_softmax(lp_plain, axis=1)
-    ratio = float(w_twin) / max(float(w_plain), 1e-6)
+    if w_plain <= 0.0:
+        return log_softmax(lp_twin, axis=1)
+    ratio = float(w_twin) / float(w_plain)
     return log_softmax(lp_plain + ratio * lp_twin, axis=1)
 
 
@@ -287,8 +289,24 @@ def extract_family_specialist_logits(
     if N_test <= 60:
         te_mask = np.ones(N_test, dtype=bool)
     else:
-        P_cur = softmax(LOGIT_MAIN, axis=1)
+        blend_test_lp = None
+        if hasattr(auditor, "models") and auditor.models:
+            active_weights = [float(m.get("weight", 1.0)) for m in auditor.models if m.get("test_lp") is not None and len(m.get("test_lp")) == N_test]
+            active_lps = [m.get("test_lp") for m in auditor.models if m.get("test_lp") is not None and len(m.get("test_lp")) == N_test]
+            if len(active_lps) > 0 and sum(active_weights) > 0.0:
+                tot_w = sum(active_weights)
+                blend_test_lp = sum(w * lp for w, lp in zip(active_weights, active_lps)) / tot_w
+
+        if blend_test_lp is not None:
+            P_cur = softmax(blend_test_lp, axis=1)
+        elif np.any(LOGIT_MAIN != 0.0):
+            P_cur = softmax(LOGIT_MAIN, axis=1)
+        else:
+            P_cur = np.ones((N_test, K), dtype=np.float32) / float(K)
+
         te_mask = np.isin(P_cur.argmax(axis=1), fam_cols) | (P_cur[:, fam_cols].sum(axis=1) >= 0.15)
+        if not te_mask.any() and N_test > 0:
+            te_mask[:] = True
 
     # 2. Selective Family Masking for Unseen holdout set
     if N_unseen <= 60:
@@ -500,11 +518,40 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
     family_spec_logits_unseen: dict[str, np.ndarray] = {}
     family_spec_classes: dict[str, list] = {}
 
+    # Read configuration hierarchies from configs/production_ensemble.json early
+    main_cfg = cfg.get("main_stack", {})
+    comp_cfg = cfg.get("complementary_stack", {})
+    fusion_cfg = cfg.get("fusion", {})
+    post_cfg = cfg.get("postprocess", {})
+    model_weights = cfg.get("model_weights", {})
+
+    svc_weight = model_weights.get("svc_4view", {}).get("plain_weight", main_cfg.get("linear_svc_weight", 1.00))
+    main_members = main_cfg.get("members", {})
+    comp_streams = comp_cfg.get("stream_weights", {})
+    comp_members = comp_cfg.get("lora_members", {})
+    lex_comp_weight = model_weights.get("lexical_5v", {}).get("plain_weight", comp_streams.get("lexical", 0.20))
+    any_twin_active = any(
+        m.get("twin_weight", 0.0) > 0.0 for m in model_weights.values() if isinstance(m, dict)
+    )
+    need_lexical = bool(
+        svc_weight > 0.0 or lex_comp_weight > 0.0 or any_twin_active or cfg.get("require_lexical_engine", False)
+    )
+
     # 2. MODULE 1: Subprocess Dual-Output Lexical Engine
     run_lex_script = working_dir / "run_lexical.py"
-    if run_lex_script.exists() and not is_smoke:
+    if not need_lexical and not is_smoke:
+        print("[Pipeline] Module 1: Skipping lexical engine (svc_weight=0.0, lex_comp_weight=0.0, no active twin heads).")
+        log_p_svc_main = np.zeros((N_test, K), dtype=np.float32)
+        p_lex_comp = np.ones((N_test, K), dtype=np.float32) / float(K)
+        D_tfidf = np.zeros((N_test, N_test), dtype=np.float32)
+        groups_085 = np.ones(N_test, dtype=int)
+        log_p_handwriting = None
+        rule_flags_test = None
+        unseen_log_p_svc_main = np.zeros((N_unseen, K), dtype=np.float32)
+        unseen_p_lex_comp = np.ones((N_unseen, K), dtype=np.float32) / float(K)
+    elif run_lex_script.exists() and not is_smoke:
         print("[Pipeline] Module 1: Launching subprocess run_lexical.py...")
-        subprocess.run([sys.executable, str(run_lex_script)], check=True)
+        subprocess.run([sys.executable, str(run_lex_script), str(train_path), str(test_path), str(working_dir)], check=True)
         log_p_svc_main = np.load(working_dir / "log_p_svc_main.npy")
         p_lex_comp = np.load(working_dir / "p_lex_comp.npy")
         D_tfidf = np.load(working_dir / "D_tfidf.npy")
@@ -536,15 +583,6 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         unseen_p_lex_comp = lex_out.get("unseen_p_lex_comp", np.zeros((0, K), dtype=np.float32))
 
     print(f"[Pipeline] Module 1 complete: log_p_svc_main shape = {log_p_svc_main.shape}")
-
-    # Read configuration hierarchies from configs/production_ensemble.json
-    main_cfg = cfg.get("main_stack", {})
-    comp_cfg = cfg.get("complementary_stack", {})
-    fusion_cfg = cfg.get("fusion", {})
-    post_cfg = cfg.get("postprocess", {})
-    model_weights = cfg.get("model_weights", {})
-
-    svc_weight = model_weights.get("svc_4view", {}).get("plain_weight", main_cfg.get("linear_svc_weight", 1.00))
     main_members = main_cfg.get("members", {})
     comp_streams = comp_cfg.get("stream_weights", {})
     comp_members = comp_cfg.get("lora_members", {})
@@ -786,9 +824,24 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                     torch.cuda.empty_cache()
 
             # Checkpoint 1B / Optional Whitelisted Checkpoints on Trunk 1
-            for opt_14b_key in ("qwen3_14b_inhouse",):
+            for opt_14b_key in ("qwen3_14b_inhouse", "qwen3_14b_v5", "qwen3_14b_ts", "qwen3_14b_p1"):
                 if opt_14b_key in ckpts:
                     primary_ts14_dir = ckpts[opt_14b_key]
+                    p_comp_def = 0.12 if opt_14b_key == "qwen3_14b_p1" else 0.22
+                    c_comp_def = 0.04 if opt_14b_key == "qwen3_14b_p1" else 0.08
+                    comp_alias = "lora14b_v1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
+                    w_comp_p = model_weights.get(opt_14b_key, {}).get(
+                        "plain_weight", comp_members.get(comp_alias, {}).get("plain_weight", p_comp_def)
+                    )
+                    w_comp_c = model_weights.get(opt_14b_key, {}).get(
+                        "twin_weight", comp_members.get(comp_alias, {}).get("twin_weight", c_comp_def)
+                    )
+                    w_comp_tot = w_comp_p + w_comp_c
+                    is_opt_req = opt_14b_key in req_assets.get("required_checkpoints", [])
+                    if w_comp_tot <= 0.0 and not is_opt_req and bool(cfg.get("lock_prior_weights", True)):
+                        print(f"[Pipeline] {opt_14b_key} weight is 0.0 and not required; skipping extraction.")
+                        continue
+
                     prefix_14b = "q14v5" if "v5" in opt_14b_key else "ts_q3b14" if "ts" in opt_14b_key else opt_14b_key
                     found_14b_folds = find_fold_adapters(input_dir, prefix_14b)
 
@@ -825,16 +878,6 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                         trunk1.load_norm_weights(heads_sd)
                         W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
                         ts14_labels = meta_ts14["labels"]
-                        p_comp_def = 0.12 if opt_14b_key == "qwen3_14b_p1" else 0.22
-                        c_comp_def = 0.04 if opt_14b_key == "qwen3_14b_p1" else 0.08
-                        comp_alias = "lora14b_v1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
-                        w_comp_p = model_weights.get(opt_14b_key, {}).get(
-                            "plain_weight", comp_members.get(comp_alias, {}).get("plain_weight", p_comp_def)
-                        )
-                        w_comp_c = model_weights.get(opt_14b_key, {}).get(
-                            "twin_weight", comp_members.get(comp_alias, {}).get("twin_weight", c_comp_def)
-                        )
-                        w_comp_tot = w_comp_p + w_comp_c
 
                         # Stage A: Fast 360-row probe on df_unseen
                         if N_unseen >= 36 and W_p is not None:
@@ -1137,9 +1180,13 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                         w_comp_c,
                                     )
                                     aud_name_14b = opt_14b_key
+                                    m_cfg_14b = model_weights.get(opt_14b_key, {})
+                                    m_tier_14b = m_cfg_14b.get("tier", "Main" if opt_14b_key == "qwen3_14b_inhouse" else "Comp")
                                     auditor.add_model(
-                                        name=aud_name_14b, tier="Comp", weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te
+                                        name=aud_name_14b, tier=m_tier_14b, weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te
                                     )
+                                    if m_tier_14b == "Main" or opt_14b_key == "qwen3_14b_inhouse":
+                                        LOGIT_MAIN += lp_m_te * w_tot_ts14
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
 
@@ -1189,7 +1236,23 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         # TRUNK 3: Qwen3-8B (36 layers, hidden=4096)
         # ==============================================================================
         base_q3_8b = verified_bases.get("qwen3_8b") or find_base_model(input_dir, "qwen3", 4096, 36)
-        if base_q3_8b and "qwen3_8b_claude" in ckpts:
+        w_comp_p_cl = model_weights.get("qwen3_8b_claude", {}).get(
+            "plain_weight", comp_members.get("qwen3_8b_claude", {}).get("plain_weight", 0.15)
+        )
+        w_comp_c_cl = model_weights.get("qwen3_8b_claude", {}).get(
+            "twin_weight", comp_members.get("qwen3_8b_claude", {}).get("twin_weight", 0.05)
+        )
+        claude_spec_w = float(cfg.get("claude_specialist_weight", 0.0))
+        is_cl_req = "qwen3_8b_claude" in req_assets.get("required_checkpoints", [])
+        skip_cl = (
+            (w_comp_p_cl + w_comp_c_cl) <= 0.0
+            and claude_spec_w <= 0.0
+            and not need_sub_train
+            and not is_cl_req
+            and bool(cfg.get("lock_prior_weights", True))
+        )
+
+        if base_q3_8b and "qwen3_8b_claude" in ckpts and not skip_cl:
             print(f"[Pipeline] Loading Trunk 3: Qwen3-8B from {base_q3_8b}...")
             trunk3 = UniversalLoRATrunkLoader(base_q3_8b, keep_layers=24, layers=[2, 4, 6, 8, 12, 16, 20, 24], max_len=447)
 
@@ -1355,15 +1418,19 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         # ==============================================================================
         # TRUNK 4: DeBERTa-v3-Large
         # ==============================================================================
-        for deb_key in ("deberta_p2",):
+        for deb_key in ("deberta_p2", "deberta_inhouse"):
             if deb_key not in ckpts:
                 continue
             deb_dir = ckpts[deb_key]
-            w_main_deb = model_weights.get(deb_key, {}).get(
-                "plain_weight", main_members.get("deberta_v3_large", {}).get("plain_weight", 0.25)
-            )
-            w_comp_deb = comp_members.get("deberta_v3_large", {}).get("plain_weight", 0.18)
-            w_comp_c = model_weights.get(deb_key, {}).get("twin_weight", comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06))
+            m_deb_cfg = model_weights.get(deb_key)
+            if m_deb_cfg is not None:
+                w_main_deb = float(m_deb_cfg.get("plain_weight", 0.0))
+                w_comp_deb = float(m_deb_cfg.get("comp_plain_weight", 0.0))
+                w_comp_c = float(m_deb_cfg.get("twin_weight", 0.0))
+            else:
+                w_main_deb = main_members.get("deberta_v3_large", {}).get("plain_weight", 0.25)
+                w_comp_deb = comp_members.get("deberta_v3_large", {}).get("plain_weight", 0.18)
+                w_comp_c = comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06)
             if (w_main_deb + w_comp_deb + w_comp_c) <= 0.0 and deb_key not in req_assets.get("required_checkpoints", []):
                 print(f"[Pipeline] {deb_key} has zero weight and not required; skipping extraction.")
                 continue
@@ -1770,8 +1837,13 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
             cache_dict["unseen_texts"] = np.array(unseen_texts, dtype=object)
         if "train_sub_texts" in locals() and train_sub_texts:
             cache_dict["train_texts"] = np.array(train_sub_texts, dtype=object)
-        if "y_sub" in locals() and y_sub is not None:
+        elif "df_train" in locals() and df_train is not None and "text" in df_train.columns:
+            cache_dict["train_texts"] = np.array(df_train["text"].fillna("").astype(str).tolist(), dtype=object)
+
+        if "y_sub" in locals() and y_sub is not None and len(y_sub) > 0:
             cache_dict["y_train"] = np.asarray(y_sub, dtype=np.int32)
+        elif "df_train" in locals() and df_train is not None and "model" in df_train.columns:
+            cache_dict["y_train"] = np.array([LAB2I[m] for m in df_train["model"].values], dtype=np.int32)
 
         cache_file_path = working_dir / "local_eval_cache.npz"
         np.savez_compressed(cache_file_path, **cache_dict)

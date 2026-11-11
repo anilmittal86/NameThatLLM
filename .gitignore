@@ -19,7 +19,7 @@ artifacts/
 output/
 output_*/
 cache/
-checkpoints/
+checkpoints/*
 scratch/
 temp_meta/
 archive/
@@ -43,8 +43,13 @@ powershell.exe
 
 # Allow tracked neural evaluation cache and in-house champion checkpoint
 !local_data/local_eval_cache.npz
+!checkpoints/export_champion_qwen3_14b/
 checkpoints/export_smoke_test/
 
 # Git & OS
 .DS_Store
 Thumbs.db
+
+repo_dump.txt
+local_data/v76_output/
+

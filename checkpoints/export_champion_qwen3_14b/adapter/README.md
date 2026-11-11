@@ -1,8 +1,8 @@
 ---
-base_model: /kaggle/input/models/qwen-lm/qwen-3/transformers/14b-base/1
+base_model: Qwen/Qwen3-14B-Base
 library_name: peft
 tags:
-- base_model:adapter:/kaggle/input/models/qwen-lm/qwen-3/transformers/14b-base/1
+- base_model:adapter:Qwen/Qwen3-14B-Base
 - lora
 - transformers
 ---
@@ -203,4 +203,4 @@ Carbon emissions can be estimated using the [Machine Learning Impact calculator]
 [More Information Needed]
 ### Framework versions
 
-- PEFT 0.20.0
+- PEFT 0.21.2

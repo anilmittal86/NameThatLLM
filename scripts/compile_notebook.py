@@ -12,6 +12,7 @@ from pathlib import Path
 
 SUBMISSION_MODULES = [
     "config.py",
+    "lexical_engine.py",
     "wpca_gaussian.py",
     "spectral_bank.py",
     "neural_extractor.py",
@@ -86,6 +87,8 @@ def compile_submission_notebook(config_path: Path, output_path: Path) -> Path:
         raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
         if mod == "config.py":
             raw = f"ENSEMBLE_CONFIG = {cfg_data!r}\n\n" + raw
+        elif mod == "lexical_engine.py":
+            raw = re.sub(r'if __name__ == "__main__"[\s\S]*$', '', raw).strip() + "\n"
         ast.parse(raw, filename=mod)
         cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
 

@@ -571,7 +571,7 @@ def run_lexical_engine(
         unseen_log_p_svc_main = np.zeros((0, K), dtype=np.float32)
 
     # OUTPUT 2: Stamatatos Text Distortion Model (trained strictly on core_texts with feature caps)
-    wre = re.compile(r"[A-Za-z’']+")
+    wre = re.compile(r"[A-Za-z\u2019']+")
     cnt = collections.Counter(w.lower() for t in core_texts for w in wre.findall(t))
     distort_keep = {w for w, _ in cnt.most_common(100)}
 
@@ -727,6 +727,7 @@ def run_lexical_engine(
         P_twin_comp[twin_rows_085] = softmax(svc_twin.decision_function(X_te_twin_c), axis=1)
 
         if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
+            P_unseen_twin = P_unseen_svc.copy()
             if (
                 "df_unseen_holdout" in locals()
                 and "prompt_id" in df_unseen_holdout.columns
@@ -734,13 +735,16 @@ def run_lexical_engine(
             ):
                 u_u, inv_u = np.unique(df_unseen_holdout["prompt_id"].values, return_inverse=True)
                 counts_u = np.bincount(inv_u)
-                vals_u = (1.0 / counts_u[inv_u]).astype(np.float32)
-                G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u)), inv_u)), shape=(len(inv_u), len(u_u)), dtype=np.float32)
-                X_unseen_twin_c = X_unseen_5v - G_u @ (G_u.T @ X_unseen_5v)
-                P_unseen_twin = softmax(svc_twin.decision_function(X_unseen_twin_c), axis=1)
-                del G_u, X_unseen_twin_c
-            else:
-                P_unseen_twin = softmax(svc_twin.decision_function(X_unseen_5v), axis=1)
+                twin_u_mask = (counts_u[inv_u] >= 2) & (counts_u[inv_u] <= 18)
+                if np.any(twin_u_mask):
+                    X_u_twin = X_unseen_5v[twin_u_mask]
+                    u_u_sub, inv_u_sub = np.unique(df_unseen_holdout["prompt_id"].values[twin_u_mask], return_inverse=True)
+                    counts_u_sub = np.bincount(inv_u_sub)
+                    vals_u = (1.0 / counts_u_sub[inv_u_sub]).astype(np.float32)
+                    G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u_sub)), inv_u_sub)), shape=(len(inv_u_sub), len(u_u_sub)), dtype=np.float32)
+                    X_unseen_twin_c = X_u_twin - G_u @ (G_u.T @ X_u_twin)
+                    P_unseen_twin[twin_u_mask] = softmax(svc_twin.decision_function(X_unseen_twin_c), axis=1)
+                    del G_u, X_unseen_twin_c, X_u_twin
 
         del svc_twin, X_te_twin, G_t, X_te_twin_c
         gc.collect()
@@ -891,17 +895,22 @@ def run_lexical_engine(
     }
 
 
-if __name__ == "__main__":
-    working_dir = Path("/kaggle/working")
-    if not working_dir.exists():
-        working_dir = Path("local_data")
-    working_dir.mkdir(parents=True, exist_ok=True)
-
+if __name__ == "__main__" and "run_submission_pipeline" not in globals() and "ENSEMBLE_CONFIG" not in globals():
     input_dir = Path("/kaggle/input")
     if not input_dir.exists():
         input_dir = Path(".")
 
-    train_path, test_path, _ = resolve_dataset_paths(input_dir)
+    if len(sys.argv) >= 4:
+        train_path = Path(sys.argv[1])
+        test_path = Path(sys.argv[2])
+        working_dir = Path(sys.argv[3])
+    else:
+        working_dir = Path("/kaggle/working")
+        if not working_dir.exists():
+            working_dir = Path("local_data")
+        train_path, test_path, _ = resolve_dataset_paths(input_dir)
+
+    working_dir.mkdir(parents=True, exist_ok=True)
     pool_files = resolve_all_pool_files(input_dir)
 
     tok_paths = list(input_dir.rglob("vocab.json"))

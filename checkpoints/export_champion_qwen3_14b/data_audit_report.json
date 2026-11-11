@@ -1,0 +1,45 @@
+{
+  "source_files": {
+    "pool_120k.parquet": 123298
+  },
+  "total_raw_rows": 123298,
+  "deduplicated_rows": 123297,
+  "quarantined_holdout_rows": 360,
+  "retained_pool_rows": 122937,
+  "class_distribution": {
+    "gpt-5.6-luna": 11183,
+    "glm-5.3-flash": 9621,
+    "gemini-3.8-flash": 9478,
+    "gpt-5.6-terra": 9457,
+    "gpt-5.6-sol": 9162,
+    "glm-5.3": 8210,
+    "gpt-5.5": 8097,
+    "gemini-3.6-flash": 6897,
+    "claude-fable-5": 6851,
+    "gpt-6-astra": 6781,
+    "kimi-k3": 6698,
+    "claude-sonnet-5": 5177,
+    "gemini-3.7-flash": 4891,
+    "claude-opus-4-8": 4814,
+    "claude-opus-4-6": 4256,
+    "qwen3.8-max": 4189,
+    "gemini-3.1-pro-preview": 3936,
+    "claude-opus-5": 3239
+  },
+  "word_length_percentiles": {
+    "p10": 49.0,
+    "p25": 65.0,
+    "p50": 102.0,
+    "p75": 156.0,
+    "p90": 205.0,
+    "p99": 251.0
+  },
+  "token_length_percentiles": {
+    "p10": 82.0,
+    "p25": 107.0,
+    "p50": 166.0,
+    "p75": 250.0,
+    "p90": 328.0,
+    "p99": 384.0
+  }
+}

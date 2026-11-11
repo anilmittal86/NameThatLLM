@@ -749,6 +749,53 @@ class TestTrainer(unittest.TestCase):
         self.assertTrue(math.isfinite(p_loss))
         self.assertTrue(math.isfinite(c_loss))
 
+    def test_specialist_hard_class_weights_mapping(self):
+        """Verify hard class weights in specialist training map correctly by label name (not local index)."""
+        from namethatllm.config import HARD_CLASS_INDICES, LAB2I
+
+        hard_set = set(HARD_CLASS_INDICES)
+        sub_lab2i_glm = {"glm-5.3": 0, "glm-5.3-flash": 1}
+        num_classes = len(sub_lab2i_glm)
+        stage1_hard_weight = 1.40
+
+        stage1_class_weights = torch.ones(num_classes, dtype=torch.float32)
+        for lbl, local_idx in sub_lab2i_glm.items():
+            if LAB2I.get(lbl) in hard_set:
+                stage1_class_weights[local_idx] = stage1_hard_weight
+
+        # Both glm-5.3 (15) and glm-5.3-flash (16) are in HARD_CLASS_INDICES
+        self.assertAlmostEqual(stage1_class_weights[0].item(), 1.40, places=4)
+        self.assertAlmostEqual(stage1_class_weights[1].item(), 1.40, places=4)
+
+        # Non-hard specialist class test (e.g., gpt-5.6-astra is 0 (not hard), gpt-5.6-luna is 1 (hard))
+        sub_lab2i_gpt = {"gpt-5.6-astra": 0, "gpt-5.6-luna": 1}
+        weights_gpt = torch.ones(2, dtype=torch.float32)
+        for lbl, local_idx in sub_lab2i_gpt.items():
+            if LAB2I.get(lbl) in hard_set:
+                weights_gpt[local_idx] = stage1_hard_weight
+
+        self.assertAlmostEqual(weights_gpt[0].item(), 1.00, places=4)
+        self.assertAlmostEqual(weights_gpt[1].item(), 1.40, places=4)
+
+    def test_blend_head_scaled_and_centered_bias(self):
+        """Verify _blend_head scales and centers the ridge bias to prevent class prior distortion."""
+        from namethatllm.trainer import _blend_head
+
+        head = torch.nn.Linear(4, 2)
+        head.weight.data = torch.tensor([[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]])
+        head.bias.data = torch.tensor([0.5, -0.5])
+
+        # W_r has norm 10x smaller than head.weight
+        W_r = np.array([[0.1, 0.1, 0.1, 0.1], [0.2, 0.2, 0.2, 0.2]], dtype=np.float32)
+        b_r = np.array([0.05, -0.05], dtype=np.float32)
+
+        _blend_head(head, W_r, b_r, w_neural=0.5, w_ridge=0.5)
+
+        # Scale is 10.0. b_r centered & scaled: (0.05 - 0)*10 + 0 = 0.5. Blended bias = 0.5*0.5 + 0.5*0.5 = 0.5
+        self.assertAlmostEqual(head.bias.data[0].item(), 0.50, places=4)
+        self.assertAlmostEqual(head.bias.data[1].item(), -0.50, places=4)
+        self.assertAlmostEqual(head.weight.data[0, 0].item(), 1.00, places=4)
+
     def test_resolve_all_pool_files_includes_pool_120k(self):
         """Verify resolve_all_pool_files discovers pool_120k.parquet."""
         from namethatllm.config import resolve_all_pool_files
