@@ -292,13 +292,165 @@ if modal is not None:
         print(f"[Modal Worker] Training successfully completed. Checkpoints committed to: {out_path}")
         return str(out_path)
 
+    @app.function(
+        gpu="A100-80GB:1",
+        timeout=600,
+        image=trainer_image,
+        volumes={
+            "/checkpoints": checkpoints_volume,
+            "/datasets": datasets_volume,
+        },
+    )
+    def eval_cloud_worker(
+        checkpoint_dir: str = "/checkpoints/export_champion_qwen3_14b",
+        texts: list[str] | None = None,
+        labels: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Runs fast inference on holdout texts using the champion checkpoint on an A100 GPU."""
+        import json
+        import torch
+        import numpy as np
+        from pathlib import Path
+        from peft import PeftModel
+        from transformers import AutoConfig, AutoTokenizer, AutoModel
+        from safetensors import safe_open
+        from namethatllm.config import LABELS
+        from namethatllm.trainer import MultiLayerLoRAClassifier, collate_text_batch, TextSequenceDataset
+        from torch.utils.data import DataLoader
+
+        ckpt = Path(checkpoint_dir)
+        meta_p = ckpt / "meta.json"
+        if meta_p.exists():
+            with open(meta_p, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        else:
+            meta = {}
+
+        backbone_name = meta.get("backbone", "Qwen/Qwen3-14B-Base")
+        keep_layers = int(meta.get("cfg", {}).get("keep", 27))
+        layers = meta.get("cfg", {}).get("layers", [2, 4, 6, 9, 13, 17, 22, 27])
+        max_len = int(meta.get("cfg", {}).get("max_len", 384))
+        end_id = int(meta.get("cfg", {}).get("end_token_id", 151643))
+        classes = meta.get("classes", LABELS)
+        num_classes = len(classes)
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"[Modal Eval] Loading tokenizer and config for {backbone_name} (keep_layers={keep_layers})...")
+        tok = AutoTokenizer.from_pretrained(backbone_name, trust_remote_code=True, use_fast=True)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        base_cfg = AutoConfig.from_pretrained(backbone_name, trust_remote_code=True)
+        base_cfg.num_hidden_layers = keep_layers
+        base_cfg.use_cache = False
+        if getattr(base_cfg, "layer_types", None) is not None:
+            base_cfg.layer_types = base_cfg.layer_types[:keep_layers]
+
+        print(f"[Modal Eval] Loading base model on A100 GPU...")
+        base_model = AutoModel.from_pretrained(
+            backbone_name,
+            config=base_cfg,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2",
+        ).to(device)
+
+        adapter_dir = ckpt / "adapter"
+        if adapter_dir.exists():
+            print(f"[Modal Eval] Loading LoRA adapter from {adapter_dir}...")
+            peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
+        else:
+            peft_model = base_model
+
+        model = MultiLayerLoRAClassifier(
+            peft_model,
+            hidden_size=base_cfg.hidden_size,
+            layers=layers,
+            num_classes=num_classes,
+        ).to(device)
+
+        heads_p = ckpt / "heads.safetensors"
+        if heads_p.exists():
+            print(f"[Modal Eval] Loading heads weights from {heads_p}...")
+            with safe_open(str(heads_p), framework="pt", device="cpu") as sf:
+                for i in range(len(model.norms)):
+                    w_k = f"norms.{i}.weight"
+                    if w_k in sf.keys():
+                        model.norms[i].weight.data.copy_(sf.get_tensor(w_k).to(device))
+                    b_k = f"norms.{i}.bias"
+                    if b_k in sf.keys() and hasattr(model.norms[i], "bias") and model.norms[i].bias is not None:
+                        model.norms[i].bias.data.copy_(sf.get_tensor(b_k).to(device))
+                if "plain.weight" in sf.keys():
+                    model.plain_head.weight.data.copy_(sf.get_tensor("plain.weight").to(device))
+                if "plain.bias" in sf.keys():
+                    model.plain_head.bias.data.copy_(sf.get_tensor("plain.bias").to(device))
+                if "centered.weight" in sf.keys():
+                    model.centered_head.weight.data.copy_(sf.get_tensor("centered.weight").to(device))
+                if "centered.bias" in sf.keys():
+                    model.centered_head.bias.data.copy_(sf.get_tensor("centered.bias").to(device))
+
+        model.eval()
+
+        if texts is None:
+            from namethatllm.ablation import build_unseen_holdout_dataset
+            df_unseen, _ = build_unseen_holdout_dataset(Path("/datasets"))
+            texts = df_unseen["text"].tolist()
+            lab_map = {name: i for i, name in enumerate(classes)}
+            labels = [lab_map[m] for m in df_unseen["model"]]
+
+        print(f"[Modal Eval] Running forward pass on {len(texts)} holdout texts...")
+        dummy_labels = [0] * len(texts)
+        ds = TextSequenceDataset(texts, dummy_labels, None, tok, max_len=max_len, end_id=end_id)
+        loader = DataLoader(ds, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
+
+        plain_lps = []
+        centered_lps = []
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                for batch in loader:
+                    mb_ids = batch["input_ids"].to(device)
+                    mb_mask = batch["attention_mask"].to(device)
+                    max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                    _, lp_p, lp_c = model(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                    plain_lps.append(lp_p.float().cpu().numpy())
+                    centered_lps.append(lp_c.float().cpu().numpy())
+
+        p_mat = np.vstack(plain_lps)
+        c_mat = np.vstack(centered_lps)
+
+        def _to_logp(m):
+            m_max = np.max(m, axis=1, keepdims=True)
+            e = np.exp(m - m_max)
+            p = e / np.sum(e, axis=1, keepdims=True)
+            return np.log(np.clip(p, 1e-12, 1.0))
+
+        plain_logp = _to_logp(p_mat)
+        centered_logp = _to_logp(c_mat)
+        blended_logp = _to_logp(0.75 * c_mat + 0.25 * p_mat)
+
+        out_res = {
+            "plain_logp": plain_logp.tolist(),
+            "centered_logp": centered_logp.tolist(),
+            "blended_logp": blended_logp.tolist(),
+        }
+
+        if labels is not None:
+            y_arr = np.array(labels)
+            for name, lp in [("plain", plain_logp), ("centered", centered_logp), ("blended", blended_logp)]:
+                pred = np.argmax(lp, axis=1)
+                acc = float(np.mean(pred == y_arr))
+                out_res[f"acc_{name}"] = acc
+                print(f"[Modal Eval] Model ({name}): Top-1 Accuracy = {acc*100:.2f}%")
+
+        return out_res
+
     @app.local_entrypoint()
     def main(
         mode: str = "run",
         config: str = "configs/training_lora.json",
         backbone: str = "Qwen/Qwen2.5-0.5B",
     ):
-        """Entrypoint for: modal run scripts/modal_trainer.py [--mode test|smoke|sync|run] [--config ...] [--backbone ...]"""
+        """Entrypoint for: modal run scripts/modal_trainer.py [--mode test|smoke|sync|run|eval] [--config ...] [--backbone ...]"""
         if mode == "test":
             print("[Modal Launcher] Dispatching cloud test suite to Modal A100...")
             res = test_cloud_worker.remote()
@@ -311,6 +463,28 @@ if modal is not None:
             print("[Modal Launcher] Syncing and downloading all datasets (train.csv, pool files, pool_120k)...")
             res = sync_cloud_datasets.remote()
             print(f"[Modal Launcher] Datasets ready in /datasets volume! Deduplicated pool rows: {res:,}")
+        elif mode == "eval":
+            import numpy as np
+            cache_p = Path("local_data/local_eval_cache.npz")
+            if cache_p.exists():
+                cache = np.load(cache_p, allow_pickle=True)
+                texts = cache["unseen_texts"].tolist()
+                labels = cache["y_unseen"].tolist()
+                print(f"[Modal Launcher] Loaded {len(texts)} unseen holdout texts from {cache_p}...")
+            else:
+                texts = None
+                labels = None
+                print("[Modal Launcher] Evaluating on default holdout dataset...")
+
+            res = eval_cloud_worker.remote(
+                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
+                texts=texts,
+                labels=labels,
+            )
+            print("[Modal Launcher] Holdout Evaluation Results:")
+            print(f"  Plain Head Accuracy   : {res.get('acc_plain', 0.0)*100:.2f}%")
+            print(f"  Centered Head Accuracy: {res.get('acc_centered', 0.0)*100:.2f}%")
+            print(f"  Blended Head Accuracy : {res.get('acc_blended', 0.0)*100:.2f}%")
         else:
             print(f"[Modal Launcher] Launching A100-80GB cloud training with config: {config}")
             res = train_cloud_worker.remote(config_path=config)
@@ -321,7 +495,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Modal Cloud Launcher for NameThatLLM Training")
-    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync"], help="Command (run, smoke, test, sync)")
+    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval"], help="Command (run, smoke, test, sync, eval)")
     parser.add_argument("--config", default="configs/training_lora.json", help="Path to training config json")
     parser.add_argument("--backbone", default="Qwen/Qwen2.5-0.5B", help="Backbone model for smoke test")
     parser.add_argument("--spawn", action="store_true", help="Spawn asynchronously on deployed app and exit immediately")
@@ -344,5 +518,24 @@ if __name__ == "__main__":
             smoke_cloud_worker.remote(backbone=args.backbone)
         elif args.cmd == "sync":
             sync_cloud_datasets.remote()
+        elif args.cmd == "eval":
+            import numpy as np
+            cache_p = Path("local_data/local_eval_cache.npz")
+            if cache_p.exists():
+                cache = np.load(cache_p, allow_pickle=True)
+                texts = cache["unseen_texts"].tolist()
+                labels = cache["y_unseen"].tolist()
+            else:
+                texts = None
+                labels = None
+            res = eval_cloud_worker.remote(
+                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
+                texts=texts,
+                labels=labels,
+            )
+            print("[Modal Launcher] Holdout Evaluation Results:")
+            print(f"  Plain Head Accuracy   : {res.get('acc_plain', 0.0)*100:.2f}%")
+            print(f"  Centered Head Accuracy: {res.get('acc_centered', 0.0)*100:.2f}%")
+            print(f"  Blended Head Accuracy : {res.get('acc_blended', 0.0)*100:.2f}%")
         else:
             train_cloud_worker.remote(config_path=args.config)

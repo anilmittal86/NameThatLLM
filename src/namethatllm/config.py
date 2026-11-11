@@ -342,7 +342,14 @@ def find_checkpoints(input_dir: Path) -> dict[str, Path]:
             if "2.5" in backbone or "qwen25" in backbone or (dim == 40960 and (keep >= 30 or "25" in p_str or "qwen25" in p_str)):
                 ckpts["qwen25_14b_inhouse"] = p.parent
             elif dim == 40960 or "14b" in p_str or "14b" in backbone:
-                ckpts["qwen3_14b_inhouse"] = p.parent
+                if "qwen3_14b_inhouse" in ckpts:
+                    existing = str(ckpts["qwen3_14b_inhouse"]).lower().replace("\\", "/")
+                    if ("ntl-inhouse" in p_str or "export_champion" in p_str or keep >= 27) and not (
+                        "ntl-inhouse" in existing or "export_champion" in existing
+                    ):
+                        ckpts["qwen3_14b_inhouse"] = p.parent
+                else:
+                    ckpts["qwen3_14b_inhouse"] = p.parent
             elif dim == 8192 or "deberta" in p_str or "deberta" in backbone:
                 ckpts["deberta_inhouse"] = p.parent
             else:
