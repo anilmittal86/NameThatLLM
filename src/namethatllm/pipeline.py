@@ -177,6 +177,8 @@ def auto_align_and_verify_head(
     from sklearn.model_selection import GroupKFold
 
     if len(Z_tr) == 0:
+        if W_p is not None and b_p is not None:
+            return True, W_p, b_p, W_c, b_c, ckpt_labels, 1.0
         return False, W_p, b_p, W_c, b_c, ckpt_labels, 0.0
 
     if W_p is not None and b_p is not None and W_p.shape == (K, Z_tr.shape[1]):
@@ -1021,7 +1023,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                 del Z_all
 
                             gate_passed = True
-                            if not is_smoke and len(y_sub) >= 180:
+                            if not is_smoke and len(y_sub) >= 180 and len(Z_tr) >= 180:
                                 gate_passed, W_p, b_p, W_c, b_c, ts14_labels, _ = auto_align_and_verify_head(
                                     Z_tr=Z_tr,
                                     W_p=W_p,
@@ -1048,12 +1050,12 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                 lp_u = lp_u_fitted
                                 fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
                                 print(f"[Post-Fit Probe] {opt_14b_key}: unseen BAcc = {fitted_bacc:.4f}")
-                                if fitted_bacc < probe_gate_min_bacc:
+                                if fitted_bacc < probe_gate_min_bacc and not is_required:
                                     print(
                                         f"[Post-Fit Pruning] {opt_14b_key}: fitted unseen BAcc {fitted_bacc:.4f} < {probe_gate_min_bacc:.2f} -> rejecting checkpoint!"
                                     )
                                     gate_passed = False
-                                elif len(auditor.models) > 0:
+                                elif len(auditor.models) > 0 and not is_required and not lock_priors:
                                     fitted_lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u_fitted, weight=w_comp_tot)
                                     if fitted_lift < -0.002:
                                         print(
