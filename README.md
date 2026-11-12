@@ -100,28 +100,28 @@ The production pipeline achieves **0.622 Balanced Accuracy** on the public leade
 A central discovery of our forensic investigation across 120k pretraining passages and the 1,800 unleaked benchmark is that **attribution difficulty is fundamentally asymmetrical**:
 
 <p align="center">
-  <img src="assets/analysis_of_prompts_different_ai_models_infographic.png" alt="Analysis of Prompts from Different AI models: Latent Manifold and Cosine Similarity" width="950"/>
+  <img src="assets/analysis_of_prompts_different_ai_models.png" alt="Analysis of Prompts from Different AI Models: Inter-Family Latent Manifold" width="850"/>
 </p>
 
 ### Empirical Experimental Setup
 To eliminate prompt topic bias, **1,800 unleaked completions** (100 per model across 18 frontier LLMs) were generated against the **identical prompt distribution** and passed through our champion frozen Qwen3-14B backbone. Stylistic hidden states ($Z \in \mathbb{R}^{40,960}$) were extracted across 8 intermediate layers and projected into a whitened stylistic subspace ($m_{\text{wPCA}} \in \mathbb{R}^{256}$):
-- **Panel A (t-SNE Manifold)**: Captures 2D non-linear clustering of all 1,800 responses.
-- **Panel B (Cosine Similarity Matrix)**: Quantifies the empirical angular correlation between all 18 model centroids.
+- **2D Latent Manifold (t-SNE)**: Captures non-linear clustering and stylistic boundaries across all 1,800 responses.
+- **Stylistic Cosine Metric**: Quantifies the empirical angular correlation between all 18 model centroids in 40,960-dim space.
 
 ---
 
 ### Core Forensic Insights: Cross-Model Distillation & Lineages
 
 #### 1. GLM $\leftrightarrow$ Claude Manifold Overlap ($\cos \theta = +0.75$) — *Distillation Footprint*
-- **Empirical Observation**: In Panel A, GLM samples (red circles) do **not** form an independent cluster; they are embedded directly inside the Claude manifold (purple crosses). In Panel B, `glm-5.3` and `claude-fable-5` exhibit an extraordinary **$+0.748$ cosine similarity** (and $+0.710$ with `glm-5.3-flash`).
+- **Empirical Observation**: In the latent manifold above, GLM samples (red circles) do **not** form an independent cluster; they are embedded directly inside the Claude manifold (purple crosses). Centroid analysis reveals an extraordinary **$+0.748$ cosine similarity** between `glm-5.3` and `claude-fable-5` (and $+0.710$ with `glm-5.3-flash`).
 - **Forensic Takeaway**: This correlation exceeds the similarity between several intra-family sister models from other labs. It provides strong empirical evidence that GLM's post-training alignment and reasoning tuning incorporate substantial Claude-distilled synthetic Chain-of-Thought (COT) data or bilingual instruction-tuning corpora.
 
 #### 2. Qwen $\leftrightarrow$ GPT Stylistic Alignment ($\cos \theta = +0.47$) — *Shared Synthetic Distribution*
-- **Empirical Observation**: In Panel A, `qwen3.8-max` (amber triangles) directly flanks and forms a seamless boundary with the OpenAI GPT cluster (green pluses). In Panel B, Qwen's highest cross-family correlation is with `gpt-5.5` (**$+0.467$**) and `gpt-5.6-luna` (**$+0.410$**).
+- **Empirical Observation**: In the manifold, `qwen3.8-max` (amber triangles) directly flanks and forms a seamless boundary with the OpenAI GPT cluster (green pluses). Qwen's highest cross-family correlation is with `gpt-5.5` (**$+0.467$**) and `gpt-5.6-luna` (**$+0.410$**).
 - **Forensic Takeaway**: Unlike open-weight European or historical Chinese architectures, Qwen’s formatting, paragraph cadence, and reasoning tokens mirror GPT's stylistic distribution, pointing to synthetic COT generation and RLHF alignment seeded from GPT demonstrations.
 
 #### 3. Gemini as an Isolated Stylistic Island ($\cos \theta = -0.45$) — *Strict Native Alignment*
-- **Empirical Observation**: Gemini (blue squares) sits completely detached at the top of the t-SNE manifold ($y \in [+25, +50]$). In Panel B, Gemini displays uniformly **negative/orthogonal cosine similarities** ($-0.35$ to $-0.50$) with every other frontier model family.
+- **Empirical Observation**: Gemini (blue squares) sits completely detached at the top of the t-SNE manifold ($y \in [+25, +50]$). Centroid analysis displays uniformly **negative/orthogonal cosine similarities** ($-0.35$ to $-0.50$) with every other frontier model family.
 - **Forensic Takeaway**: Google's native pretraining, distinct tokenizer vocabulary, and rigid post-training formatting (concise bullet structures, characteristic punctuation) create an orthogonal syntactic footprint that shares virtually zero synthetic DNA with the OpenAI/Anthropic ecosystem.
 
 ---
@@ -129,6 +129,10 @@ To eliminate prompt topic bias, **1,800 unleaked completions** (100 per model ac
 ### Intra-Family Geometry: Sister Model Collisions & Boundary Collapse
 
 While separating different model families is straightforward, separating models **within the same provider family** is fundamentally harder due to shared pretraining foundations:
+
+<p align="center">
+  <img src="assets/empirical_latent_similarity_matrix.png" alt="Empirical Cosine Similarity Matrix Across 18 Models" width="750"/>
+</p>
 
 | Metric | **Inter-Family Pairs** (e.g. Claude $\leftrightarrow$ Gemini) | **Intra-Family Pairs** (e.g. Gemini 3.7 $\leftrightarrow$ 3.8) | Geometric Significance |
 | :--- | :---: | :---: | :--- |
