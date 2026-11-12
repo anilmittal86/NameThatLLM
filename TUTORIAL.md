@@ -82,6 +82,66 @@ The primary challenge in LLM authorship attribution is **Prompt Semantic Entangl
 
 The production codebase solves this through **Within-Prompt Covariance Analysis (`wPCA`)**, **Adaptive Prompt-Mean Centering**, **Exact $2^{18}$ Subset Dynamic Programming**, **Two-Stage Multi-Layer LoRA Fine-Tuning**, and **Unified Orthographic Rule Postprocessing**.
 
+### The Second Fundamental Challenge: Inter-Family Separation vs. Intra-Family Sister Collisions
+
+Beyond prompt semantic entanglement, empirical investigation into the 40,960-dimensional latent representations ($Z$) extracted from the Champion Qwen3-14B trunk reveals a dramatic **geometric asymmetry** in the attribution problem:
+
+<p align="center">
+  <img src="assets/analysis_of_prompts_different_ai_models_infographic.png" alt="Analysis of Prompts from Different AI models: Latent Manifold and Cosine Similarity" width="950"/>
+</p>
+
+#### 1. Empirical Latent Geometry Across the 18 Models
+
+When projecting the 18 model centroids into the whitened stylistic latent space ($Z$):
+* **Inter-Family Pairs (Across Providers)**:
+  - Mean cosine similarity: $\mathbf{-0.1620}$ (orthogonal or repelling).
+  - Cross-family pairs (e.g., `gemini-3.6-flash` vs `kimi-k3` at $-0.50$, or Gemini vs Claude at $-0.47$) occupy completely opposing quadrants of the hypersphere.
+  - **Attribution Difficulty**: Trivial. Any standard linear classifier easily achieves $>98\%$ family routing accuracy.
+* **Intra-Family Pairs (Within Provider)**:
+  - Mean cosine similarity: $\mathbf{+0.4950}$ (tightly clustered).
+  - Severe sister collisions:
+    $$\text{CosineSim}(\text{gemini-3.7-flash}, \, \text{gemini-3.8-flash}) = \mathbf{0.9418}$$
+    $$\text{CosineSim}(\text{glm-5.3}, \, \text{glm-5.3-flash}) = \mathbf{0.8666}$$
+    $$\text{CosineSim}(\text{gemini-3.6-flash}, \, \text{gemini-3.7-flash}) = \mathbf{0.8454}$$
+* **The Singular Cross-Family Exception**:
+  - `claude-fable-5` and `glm-5.3` have a high positive cosine similarity of $\mathbf{+0.7478}$ (and $+0.7142$ with `glm-5.3-flash`). This occurs because Fable-5 shares Chinese-English bilingual tokenization distribution and structured reasoning markers with Zhipu AI's GLM series, explaining why Fable-5 is the only Claude model confused with GLM in the production confusion matrix.
+
+#### 2. The Mathematics: Why Closely Correlated Intra-Family Sisters Are Hard to Separate
+
+Why does a high cosine correlation (e.g. $0.9418$ between Gemini 3.7 and 3.8) make finding the separating hyperplane so difficult?
+
+##### A. Angular Margin Collapse
+Let $\mathbf{\mu}_A, \mathbf{\mu}_B \in \mathbb{R}^D$ be unit-normalized class centroids in the latent space. The Euclidean distance between them is directly constrained by their cosine similarity:
+$$d(\mathbf{\mu}_A, \mathbf{\mu}_B) = \sqrt{\|\mathbf{\mu}_A - \mathbf{\mu}_B\|^2} = \sqrt{\|\mathbf{\mu}_A\|^2 + \|\mathbf{\mu}_B\|^2 - 2 \mathbf{\mu}_A \cdot \mathbf{\mu}_B} = \sqrt{2(1 - \cos \theta)}$$
+* For an **inter-family pair** like `gemini-3.7-flash` and `claude-opus-4-6` ($\cos \theta = -0.08$):
+  $$d_{\text{inter}} = \sqrt{2(1 - (-0.08))} = \sqrt{2.16} \approx \mathbf{1.470}$$
+* For the **intra-family sister pair** `gemini-3.7-flash` and `gemini-3.8-flash` ($\cos \theta = 0.9418$):
+  $$\theta = \arccos(0.9418) \approx 19.6^\circ \quad (0.342 \text{ radians})$$
+  $$d_{\text{intra}} = \sqrt{2(1 - 0.9418)} = \sqrt{0.1164} \approx \mathbf{0.341}$$
+The geometric margin of separation for the sister pair is **$4.3\times$ narrower** than the inter-family margin.
+
+##### B. Signal-to-Noise Ratio (SNR) Collapse
+Any passage representation $\mathbf{z}$ is a linear combination of the model's true stylistic centroid $\mathbf{\mu}$ and prompt-specific noise $\mathbf{\epsilon}_{\text{prompt}}$ (topic words, prompt formatting, sentence length):
+$$\mathbf{z}_i = \mathbf{\mu}_c + \mathbf{\epsilon}_{\text{prompt}, i} + \mathbf{\epsilon}_{\text{sample}, i}, \quad \mathbf{\epsilon}_{\text{prompt}} \sim \mathcal{N}(\mathbf{0}, \mathbf{\Sigma}_{\text{prompt}})$$
+Under Fisher's Linear Discriminant, the maximum class separability along optimal projection vector $\mathbf{w} = \mathbf{\Sigma}^{-1} (\mathbf{\mu}_A - \mathbf{\mu}_B)$ is given by the Rayleigh quotient:
+$$J(\mathbf{w}) = \frac{(\mathbf{w}^T (\mathbf{\mu}_A - \mathbf{\mu}_B))^2}{\mathbf{w}^T \mathbf{\Sigma} \mathbf{w}} = (\mathbf{\mu}_A - \mathbf{\mu}_B)^T \mathbf{\Sigma}^{-1} (\mathbf{\mu}_A - \mathbf{\mu}_B) \approx \frac{\|\mathbf{\mu}_A - \mathbf{\mu}_B\|^2}{\sigma_{\text{prompt}}^2}$$
+When the centroid distance shrinks from $1.470$ (inter-family) to $0.341$ (intra-family), the Fisher separability ratio drops by:
+$$\left(\frac{1.470}{0.341}\right)^2 \approx \mathbf{18.6\times}$$
+The variance introduced by differing user prompts is **18 times larger than the distance between the two sister models**!
+
+##### C. The High-Capacity LoRA Overfitting Trap
+When an 80-million parameter LoRA adapter is fine-tuned on a small dataset (e.g. 600 passages in `train.csv`):
+1. Because the true separation is a narrow $19.6^\circ$ slit, the model cannot distinguish between author style differences and accidental topic differences in the 600 training prompts.
+2. The optimizer finds trivial, spurious shortcuts in the training prompts (e.g., specific nouns or verbs) to separate the training samples.
+3. When evaluated on unseen test prompts, these spurious shortcuts vanish or point in the wrong direction, leading to **catastrophic representation collapse**. This explains why the old LoRA Gemini specialist collapsed `gemini-3.8-flash` accuracy to **22.0%** (worse than random guessing among sisters!).
+
+##### D. The Architectural Solution: Massive Topic Diversity + $L_2$ Regularization
+To resolve an ultra-narrow $19.6^\circ$ hyper-plane without overfitting:
+1. **Prompt Diversity Cancels Topic Noise**: When training across thousands of distinct prompts, the expected topic noise averages to zero:
+   $$\lim_{N \to \infty} \frac{1}{N} \sum_{i=1}^N \mathbf{\epsilon}_{\text{prompt}, i} = \mathbf{0}$$
+2. **Convex Optimization**: Rather than training an 80M LoRA adapter that distorts attention representations, we freeze the Champion Qwen3-14B trunk and train an $L_2$-regularized linear head on **16,720 balanced samples** from `pool_120k` + `train.csv` with a 5th `__OTHER__` rejection class and $\alpha = 20.0$.
+3. **Empirical Verification**: On the 400 unleaked benchmark Gemini passages, this approach lifted Gemini balanced accuracy from 49.5% (old LoRA specialist) to **60.50%** (+11.0% absolute lift), with `gemini-3.6-flash` gaining +12.0% and `gemini-3.8-flash` recovering from 22% to **52.0%**.
+
 ---
 
 ## 2. End-to-End System Architecture

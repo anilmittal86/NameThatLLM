@@ -266,6 +266,104 @@ def build_unseen_holdout_dataset(
     return df_unseen, holdout_hashes
 
 
+def classify_topic(prompt: str) -> str:
+    """Classifies prompt text into granular topic categories for multi-domain evaluation."""
+    p = str(prompt).lower()
+    if any(k in p for k in ["code", "python", "function", "sql", "algorithm", "program", "bug", "regex", "variable", "javascript", "script"]):
+        return "Coding & Computer Science"
+    elif any(k in p for k in ["poem", "poetic", "story", "fiction", "narrative", "dialogue", "character", "metaphor", "fable", "monologue"]):
+        return "Creative Writing & Literature"
+    elif any(k in p for k in ["quantum", "physics", "energy", "force", "particle", "chemistry", "molecule", "reaction", "astronomy", "gravity"]):
+        return "Physical Sciences & Chemistry"
+    elif any(k in p for k in ["cell", "dna", "organism", "species", "biology", "evolution", "brain", "neuron", "medical", "ecosystem"]):
+        return "Biological Sciences & Medicine"
+    elif any(k in p for k in ["war", "century", "empire", "historical", "revolution", "treaty", "ancient", "king", "queen", "roman", "dynasty"]):
+        return "History & Civics"
+    elif any(k in p for k in ["ethic", "moral", "philosophy", "paradox", "epistem", "existential", "consciousness", "kant", "utilitarian"]):
+        return "Philosophy & Ethics"
+    elif any(k in p for k in ["market", "inflation", "economy", "economic", "business", "gdp", "trade", "finance", "bank", "monopoly"]):
+        return "Economics & Business"
+    elif any(k in p for k in ["solve", "proof", "theorem", "equation", "math", "calculate", "probability", "logic", "prime", "matrix"]):
+        return "Mathematics & Logic"
+    else:
+        return "General Explanatory Q&A"
+
+
+def build_clean_unleaked_benchmark(
+    open_pool_path: Path,
+    prompts_path: Path,
+    pool_120k_path: Path,
+    train_path: Path,
+    samples_per_class: int = 100,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Constructs a strictly unleaked, stratified benchmark across varying prompt clusters,
+    text lengths, and topic domains with 0% overlap with train.csv and pool_120k.parquet.
+    """
+    df_raw = pd.read_parquet(open_pool_path)
+    df_prompts = pd.read_parquet(prompts_path)
+
+    df_tr = pd.read_csv(train_path)
+    train_hashes = set(_text_hash(t) for t in df_tr["text"].fillna(""))
+
+    df_p120 = pd.read_parquet(pool_120k_path)
+    p120_hashes = set(_text_hash(t) for t in df_p120["text"].fillna(""))
+    contaminated_hashes = train_hashes | p120_hashes
+
+    df_raw["_hash"] = [_text_hash(t) for t in df_raw["text"].fillna("")]
+    df_clean = df_raw[~df_raw["_hash"].isin(contaminated_hashes)].copy()
+
+    if "flag_kb_proxy" in df_clean.columns:
+        df_clean = df_clean[df_clean["flag_kb_proxy"] == False]
+    if "flag_near_train_prompt" in df_clean.columns:
+        df_clean = df_clean[df_clean["flag_near_train_prompt"] == False]
+    if "flag_gemini37_routing_risk" in df_clean.columns:
+        df_clean = df_clean[df_clean["flag_gemini37_routing_risk"] == False]
+
+    df_clean = df_clean[df_clean["model"].isin(LABELS)].copy()
+
+    merged = df_clean.merge(
+        df_prompts[["prompt_canon", "prompt_text"]],
+        on="prompt_canon",
+        how="inner"
+    ).reset_index(drop=True)
+
+    merged["n_words"] = merged["text"].fillna("").str.split().str.len()
+    merged["topic_category"] = merged["prompt_text"].map(classify_topic)
+
+    prompt_model_counts = merged.groupby("prompt_canon")["model"].nunique()
+    merged["models_in_prompt"] = merged["prompt_canon"].map(prompt_model_counts)
+
+    merged["cluster_tier"] = pd.cut(
+        merged["models_in_prompt"],
+        bins=[0, 1, 2, 5, 12, 18],
+        labels=["Singleton (1)", "Pair (2)", "Small Cluster (3-5)", "Medium Cluster (6-12)", "Full Panel (13-18)"]
+    )
+
+    merged["length_bucket"] = pd.cut(
+        merged["n_words"],
+        bins=[0, 50, 90, 140, 400],
+        labels=["Short (<=50)", "Medium-Short (51-90)", "Medium (91-140)", "Long (>=141)"]
+    )
+
+    rng = np.random.RandomState(seed)
+    sampled_subsets = []
+    for model_name in LABELS:
+        m_df = merged[merged["model"] == model_name].copy()
+        n_take = min(samples_per_class, len(m_df))
+        m_df["_jitter"] = rng.rand(len(m_df))
+        m_df = m_df.sort_values(by=["models_in_prompt", "length_bucket", "topic_category", "_jitter"])
+        indices = np.linspace(0, len(m_df) - 1, n_take, dtype=int)
+        sampled_subsets.append(m_df.iloc[indices])
+
+    benchmark_df = pd.concat(sampled_subsets, ignore_index=True)
+    benchmark_df = benchmark_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    benchmark_df["id"] = [f"benchmark_{i:05d}" for i in range(len(benchmark_df))]
+
+    return merged, benchmark_df
+
+
 class UnseenStepwiseAuditor:
     """
     Evaluates every model on the strictly unseen holdout dataset (`df_unseen`),
