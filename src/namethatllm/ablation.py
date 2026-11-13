@@ -315,11 +315,11 @@ def build_clean_unleaked_benchmark(
     df_clean = df_raw[~df_raw["_hash"].isin(contaminated_hashes)].copy()
 
     if "flag_kb_proxy" in df_clean.columns:
-        df_clean = df_clean[df_clean["flag_kb_proxy"] == False]
+        df_clean = df_clean[~df_clean["flag_kb_proxy"]]
     if "flag_near_train_prompt" in df_clean.columns:
-        df_clean = df_clean[df_clean["flag_near_train_prompt"] == False]
+        df_clean = df_clean[~df_clean["flag_near_train_prompt"]]
     if "flag_gemini37_routing_risk" in df_clean.columns:
-        df_clean = df_clean[df_clean["flag_gemini37_routing_risk"] == False]
+        df_clean = df_clean[~df_clean["flag_gemini37_routing_risk"]]
 
     df_clean = df_clean[df_clean["model"].isin(LABELS)].copy()
 

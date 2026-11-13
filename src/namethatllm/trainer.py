@@ -1226,6 +1226,8 @@ def run_training_pipeline(
     family_margin = float(train_cfg.get("family_margin", 0.35))
     supcon_weight = float(train_cfg.get("supcon_weight", 0.20))
     is_deberta = "deberta" in backbone_name.lower()
+    is_smoke = bool(train_cfg.get("smoke", False))
+    checkpoints_volume = train_cfg.get("checkpoints_volume", None)
 
     input_dir = Path(train_cfg.get("input_dir", "/kaggle/input"))
 
@@ -2638,9 +2640,9 @@ def extract_and_export_embeddings(
         device = next(model.parameters()).device
 
     target_clean = target.lower().strip()
-    print(f"\n==========================================================================================")
+    print("\n==========================================================================================")
     print(f" [Features Extraction] Target: '{target_clean}' | Save All Layers: {save_all_layers} | Max Len: {max_len}")
-    print(f"==========================================================================================")
+    print("==========================================================================================")
 
     # 1. Zero leakage quarantining against clean benchmark holdout
     if eval_texts is not None and len(eval_texts) > 0:

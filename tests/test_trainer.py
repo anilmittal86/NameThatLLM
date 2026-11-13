@@ -849,7 +849,7 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(res_none["probs_plain_sinkhorn"].shape, (N, 18))
 
     def test_family_mlp_head_and_zero_cost_fold_in(self):
-        from namethatllm.trainer import FamilyMLPHead, fit_family_mlp_head
+        from namethatllm.trainer import fit_family_mlp_head
 
         np.random.seed(42)
         torch.manual_seed(42)
