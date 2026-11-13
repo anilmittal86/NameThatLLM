@@ -894,6 +894,22 @@ class TestTrainer(unittest.TestCase):
         logits_out = (h @ w2.T + b2).detach().numpy()
         self.assertEqual(logits_out.shape, (N, 5))
 
+        # Test pure 4-class intra-family gate training (negative_ratio = 0.0)
+        y_tr_4 = np.array([i % 4 for i in range(N)])
+        head_dict_4, best_acc_4, _ = fit_family_mlp_head(
+            Z_train=Z_tr,
+            y_train=y_tr_4,
+            num_gate_classes=4,
+            num_family_classes=4,
+            hidden_dim=32,
+            epochs=3,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(head_dict_4["mlp_w2"].shape, (4, 32))
+        self.assertEqual(head_dict_4["mlp_b2"].shape, (4,))
+        self.assertEqual(head_dict_4["plain.weight"].shape, (4, D))
+        self.assertEqual(head_dict_4["plain.bias"].shape, (4,))
+
     def test_load_and_slice_champion_heads_for_specialist(self):
         from namethatllm.trainer import load_and_slice_champion_heads
         from safetensors.torch import save_file

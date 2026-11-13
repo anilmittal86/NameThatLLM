@@ -15,7 +15,7 @@
   "mlp_lr": 0.0002,
   "mlp_dropout": 0.25,
   "samples_per_class": 3800,
-  "negative_ratio": 0.1,
+  "negative_ratio": 0.0,
   "batch_size": 8,
   "output_dir": "export_gemini_gate_mlp"
 }

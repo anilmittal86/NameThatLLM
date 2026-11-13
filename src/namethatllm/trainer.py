@@ -2116,7 +2116,7 @@ def fit_family_gate_head(
         Y_onehot[i, lab] = 1.0
     Y_smooth = (1.0 - label_smoothing) * Y_onehot + (label_smoothing / float(num_gate_classes))
 
-    K_eval_classes = num_family_classes or (num_gate_classes - 1)
+    K_eval_classes = num_family_classes if num_family_classes is not None else num_gate_classes
 
     # Move to PyTorch tensors on GPU for blazing-fast linear algebra
     Z_t = torch.from_numpy(Z_train).to(device, dtype=torch.float32)
@@ -2926,7 +2926,8 @@ def train_family_gate(
     family_cols = FAMILIES[target_family]
     family_classes = [LABELS[i] for i in family_cols]
     num_family_classes = len(family_classes)
-    num_gate_classes = num_family_classes + 1  # Last class is __OTHER__ distractors
+    has_negatives = bool(negative_ratio > 0.0 and df_pool is not None and len(df_pool) > 0)
+    num_gate_classes = num_family_classes + (1 if has_negatives else 0)
 
     if samples_per_class <= 0:
         default_samples = {
@@ -2970,23 +2971,27 @@ def train_family_gate(
     df_fam_all = pd.concat(fam_dfs, ignore_index=True)
     total_fam_samples = len(df_fam_all)
 
-    # 10% negative distractor sampling from non-family models
-    n_neg = int(total_fam_samples * negative_ratio)
-    df_non_fam = df_pool[~df_pool["model"].isin(family_classes)].copy()
-    other_fams = [f for f in ["gpt", "gemini", "claude", "glm", "qwen", "kimi"] if f != target_family]
-    neg_dfs = []
-    n_per_fam = max(n_neg // len(other_fams), 1)
-    for fam in other_fams:
-        fam_sub = df_non_fam[df_non_fam["model"].str.startswith(fam)]
-        if len(fam_sub) > 0:
-            neg_dfs.append(fam_sub.sample(n=min(n_per_fam, len(fam_sub)), random_state=42))
-    df_neg_all = pd.concat(neg_dfs, ignore_index=True)
-    print(f"[{target_family.upper()} Gate] Sampled {len(df_neg_all)} negative distractors across {len(other_fams)} non-{target_family.upper()} families.")
+    # Negative distractor sampling from non-family models (if negative_ratio > 0)
+    if has_negatives:
+        n_neg = int(total_fam_samples * negative_ratio)
+        df_non_fam = df_pool[~df_pool["model"].isin(family_classes)].copy()
+        other_fams = [f for f in ["gpt", "gemini", "claude", "glm", "qwen", "kimi"] if f != target_family]
+        neg_dfs = []
+        n_per_fam = max(n_neg // max(len(other_fams), 1), 1)
+        for fam in other_fams:
+            fam_sub = df_non_fam[df_non_fam["model"].str.startswith(fam)]
+            if len(fam_sub) > 0:
+                neg_dfs.append(fam_sub.sample(n=min(n_per_fam, len(fam_sub)), random_state=42))
+        df_neg_all = pd.concat(neg_dfs, ignore_index=True) if neg_dfs else pd.DataFrame()
+        print(f"[{target_family.upper()} Gate] Sampled {len(df_neg_all)} negative distractors across {len(other_fams)} non-{target_family.upper()} families.")
+    else:
+        df_neg_all = pd.DataFrame()
 
-    train_texts = df_fam_all["text"].tolist() + df_neg_all["text"].tolist()
+    train_texts = df_fam_all["text"].tolist() + (df_neg_all["text"].tolist() if len(df_neg_all) > 0 else [])
     fam_map = {name: i for i, name in enumerate(family_classes)}
-    train_labels = [fam_map[m] for m in df_fam_all["model"].tolist()] + [num_family_classes] * len(df_neg_all)
-    print(f"[{target_family.upper()} Gate] Total training dataset: {len(train_texts):,} samples ({num_gate_classes} classes: {num_family_classes} {target_family.upper()} + 1 Other).")
+    train_labels = [fam_map[m] for m in df_fam_all["model"].tolist()] + ([num_family_classes] * len(df_neg_all) if len(df_neg_all) > 0 else [])
+    other_str = " + 1 Other" if len(df_neg_all) > 0 else ""
+    print(f"[{target_family.upper()} Gate] Total training dataset: {len(train_texts):,} samples ({num_gate_classes} classes: {num_family_classes} {target_family.upper()}{other_str}).")
 
     amp_dtype = (
         torch.bfloat16
