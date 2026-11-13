@@ -351,3 +351,132 @@ To run the full unit test suite:
 pytest tests/ -v
 ```
 All tests must pass with 100% success before deploying any checkpoint into production.
+
+---
+
+## 7. Future Exploration: Intermediate Transformer Hidden State Probing & Aggregation
+
+Several open-source toolkits and architectural patterns exist for probing, selecting, and combining intermediate transformer hidden states to maximize downstream classification head accuracy. Depending on whether you want an out-of-the-box library to sweep across layers simultaneously or an end-to-end differentiable weighting mechanism, the problem splits into two primary approaches: automated multi-layer probing libraries and learnable layer-aggregation architectures.
+
+### 7.1 Open-Source Libraries for Layer Probing & Extraction
+
+| Library / Repository | Core Mechanism | Best Use Case | Overhead & Constraints |
+| :--- | :--- | :--- | :--- |
+| **transformer-heads**<br>(`center-for-humans-and-machines`) | Attaches multiple independent classification/regression heads (`HeadConfig`) to arbitrary `layer_hook` indices simultaneously. | Training linear probes or MLP heads across all $L$ layers in a single forward pass to empirically find the highest-accuracy layer. | Requires mapping custom architectures in `model_type_map` if not using standard Llama/Mistral/Qwen/GPT classes. |
+| **pyvene**<br>(`stanfordnlp/pyvene`) | Declarative intervention and activation-collection schemas across PyTorch module trees. | Extracting exact submodule states (e.g., post-attention vs. post-MLP residual stream) without writing brittle `register_forward_hook` boilerplate. | Slightly steeper configuration learning curve; geared toward causal interventions as well as probing. |
+| **nnsight**<br>(`ndif-team/nnsight`) | Deferred computation graphs that wrap native Hugging Face models via `.save()` proxies. | Clean, zero-copy extraction of intermediate activations across any HF architecture without modifying model forward code. | Extraction-only; you still manage your own downstream probe/classifier loop. |
+| **TransformerLens**<br>(`TransformerLensOrg`) | `TransformerBridge` / `HookedTransformer` caching every internal activation (`run_with_cache`). | Granular sub-layer analysis (isolating specific attention heads, QKV projections, or pre/post-LayerNorm states) across 140+ model families. | High VRAM footprint if caching all tensors simultaneously without selective hook filtering. |
+| **LLM2Vec**<br>(`McGill-NLP/llm2vec`) | Converts decoder-only LLMs into bidirectional encoders via MNTP + unsupervised contrastive learning. | Extracting dense sequence representations from causal LLMs when standard last-token or single-layer mean pooling underperforms. | Modifies the attention mask and requires LoRA adaptation rather than pure frozen-layer selection. |
+
+#### Spotlight: `transformer-heads` for Automated Layer Sweeps
+If your goal is to empirically evaluate which layer $l \in \{1, \dots, L\}$ yields the highest validation accuracy without running $L$ separate forward passes, `transformer-heads` (`pip install transformer-heads`) is purpose-built for this. You can attach a probe head to every layer simultaneously, freeze the backbone (or train jointly with QLoRA), and evaluate all heads in a single pass:
+
+```python
+from transformer_heads import load_headed, HeadConfig
+from transformers import AutoModelForCausalLM
+
+# Attach a classification probe to every layer from -1 to -28
+head_configs = [
+    HeadConfig(
+        name=f"probe_layer_{i}",
+        layer_hook=-i,               # Hooks into the output of layer -i
+        in_size=hidden_size,
+        output_activation="linear",
+        pred_for_sequence=True,      # Sequence-level classification
+        loss_fct="cross_entropy",
+        num_outputs=num_classes,
+        target="label"
+    )
+    for i in range(1, num_layers + 1)
+]
+
+model = load_headed(AutoModelForCausalLM, "Qwen/Qwen2.5-7B", head_configs=head_configs)
+```
+
+Because the base model forward pass executes once per batch and feeds the cached hidden states to each lightweight head, sweeping 28–32 layers costs virtually the same compute as training a single head.
+
+---
+
+### 7.2 Why Single-Layer Selection Often Sub-Optimizes Accuracy
+
+Empirical probing literature (e.g., Tenney et al., *"BERT Rediscovers the Classical NLP Pipeline"*; skean et al., *"Layer by Layer: Uncovering Hidden Representations in Language Models"*) consistently demonstrates that no single layer holds the global optimum for fine-grained classification:
+
+- **Final Layers ($L, L-1$):** Heavily specialized for the pre-training objective (next-token prediction via the causal LM head). Representations suffer from severe anisotropy (rogue dimensions / attention sink spikes) and collapse fine-grained stylistic or syntactic features that aren't immediately needed for the very next token.
+- **Middle-to-Late Layers ($0.5L$ to $0.85L$):** Typically yield the highest accuracy for semantic, stylistic, and authorship/source attribution tasks because syntactic structure and high-level semantics are fully formed before collapsing into next-token logits.
+- **Early Layers ($0.1L$ to $0.4L$):** Capture surface-level lexical cadence, punctuation distribution, and token-frequency artifacts.
+
+When distinguishing subtle class boundaries (such as separating sister model families that share semantic reasoning but differ slightly in lexical formatting and middle-layer syntax), committing to a single layer discards orthogonal signal from other depths.
+
+---
+
+### 7.3 Architectural Alternative: Learnable Layer Aggregation (ScalarMix)
+
+Rather than discrete layer selection, the standard high-accuracy pattern—originally popularized by AllenNLP (ScalarMix) and ELMo—is to let the classification head learn a differentiable convex combination of all (or a subset of) normalized hidden layers.
+
+Formally, given pooled hidden states $\mathbf{h}_1, \mathbf{h}_2, \dots, \mathbf{h}_K \in \mathbb{R}^d$ across $K$ selected layers, a Layer-Normalized Scalar Mix computes:
+
+$$\mathbf{h}_{\text{mix}} = \gamma \sum_{k=1}^{K} s_k \cdot \text{LayerNorm}_k(\mathbf{h}_k), \quad \text{where } s_k = \frac{\exp(w_k)}{\sum_{j=1}^{K} \exp(w_j)}$$
+
+Here, $w_k \in \mathbb{R}$ are learnable scalar weights (initialized to $0$ for uniform weighting) and $\gamma \in \mathbb{R}$ is a learnable global scale parameter.
+
+#### Why LayerNorm per layer is mandatory before mixing:
+In modern transformers (especially Pre-LN architectures like LLaMA, Qwen, and Gemma), the residual stream norm $\Vert\mathbf{h}_l\Vert_2$ grows monotonically with depth $l$. If you compute a weighted sum or concatenate raw hidden states without per-layer normalization, deeper layers will numerically dominate the gradient and ridge/linear weights solely due to activation magnitude, causing MLP heads to diverge or underfit early-layer features.
+
+#### Zero-Dependency PyTorch Implementation (ScalarMix + Attention-Sink Masking)
+If you already extract hidden states into `.npz` caches or run an in-memory PyTorch loop, a ~25-line module outperforms external dependencies while giving you exact inspection of which layers the head relies on:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class LayerScalarMixWithHead(nn.Module):
+    def __init__(self, num_layers: int, hidden_dim: int, num_classes: int, dropout: float = 0.1):
+        super().__init__()
+        # Independent LayerNorm per layer to equalize growing residual stream norms
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim, elementwise_affine=False) for _ in range(num_layers)
+        ])
+        self.scalar_weights = nn.Parameter(torch.zeros(num_layers))
+        self.gamma = nn.Parameter(torch.ones(1))
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, layer_pooled_states: list[torch.Tensor]) -> torch.Tensor:
+        """
+        layer_pooled_states: list of K tensors, each of shape [batch_size, hidden_dim]
+        """
+        normed_states = [
+            ln(h) for ln, h in zip(self.layer_norms, layer_pooled_states)
+        ]
+        # Stack to [batch_size, num_layers, hidden_dim]
+        stacked = torch.stack(normed_states, dim=1)
+        
+        # Softmax weights over layers: [1, num_layers, 1]
+        probs = F.softmax(self.scalar_weights, dim=0).view(1, -1, 1)
+        
+        # Weighted combination
+        mixed = self.gamma * torch.sum(stacked * probs, dim=1)
+        return self.classifier(self.dropout(mixed))
+
+    def get_layer_importance(self) -> dict[int, float]:
+        probs = F.softmax(self.scalar_weights.detach(), dim=0).cpu().tolist()
+        return {idx: round(p, 4) for idx, p in enumerate(probs)}
+```
+
+---
+
+### 7.4 Practical Selection Protocol for Closed-Form / Ridge Heads
+
+If you are using a closed-form solver (such as trace-scaled Ridge regression or LinearSVC) on pre-extracted embeddings where end-to-end gradient backpropagation through ScalarMix is not used:
+
+1. **Sink-Free Pooling + Per-Layer Z-Scoring / L2-Norm:**
+   Before evaluating any layer, zero out position 0 (BOS / attention sink token) in the attention mask prior to mean pooling, then apply L2 normalization ($\mathbf{h}_l / \Vert\mathbf{h}_l\Vert_2$) independently to each layer's pooled vector.
+
+2. **Fast Leave-One-Group-Out Layer Sweep:**
+   Run your fast closed-form Ridge solver independently on each layer $l \in \{1, \dots, L\}$ using cached pooled vectors. Because a $d \times d$ Cholesky solve on $d \in [1024, 5120]$ takes less than 1 second on GPU/CPU, you can score all 28–48 layers via cross-validation in under 30 seconds.
+
+3. **Top-$K$ Strided Concatenation vs. Out-of-Fold Stacking:**
+   - Rather than concatenating adjacent layers (e.g., layers 20, 21, 22), which suffer from high collinearity due to the residual connection $\mathbf{h}_{l} = \mathbf{h}_{l-1} + f(\mathbf{h}_{l-1})$, select strided layers across the top-performing quantiles (e.g., $\{0.25L, 0.50L, 0.75L, 0.90L\}$) or compute residual deltas ($\Delta \mathbf{h}_l = \text{LN}(\mathbf{h}_l) - \text{LN}(\mathbf{h}_{l-4})$) to isolate what a specific block added to the representation.
+   - Alternatively, fit a separate Ridge classifier per layer to produce out-of-fold probability logits $[N, C]$ for each layer, and learn a meta-ridge or Dirichlet-constrained weight over the layer logits—which scales linearly with the number of classes $C$ rather than quadratically with $K \times d$.
+
