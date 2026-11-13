@@ -486,7 +486,7 @@ if modal is not None:
         if getattr(base_cfg, "layer_types", None) is not None:
             base_cfg.layer_types = base_cfg.layer_types[:keep_layers]
 
-        print(f"[Modal Eval] Loading base model on A100 GPU...")
+        print("[Modal Eval] Loading base model on A100 GPU...")
         base_model = AutoModel.from_pretrained(
             backbone_name,
             config=base_cfg,
@@ -618,8 +618,6 @@ if modal is not None:
         specialist_classes = {}
 
         if eval_specialists and texts is not None and len(texts) > 0:
-            import os
-            import subprocess
             import gc
             from namethatllm.config import FAMILIES
             from scipy.special import softmax as sp_softmax
@@ -964,7 +962,7 @@ if modal is not None:
         from torch.utils.data import DataLoader
         from sklearn.metrics import balanced_accuracy_score
 
-        from namethatllm.config import LABELS, LAB2I, K
+        from namethatllm.config import LABELS, LAB2I
         from namethatllm.trainer import (
             MultiLayerLoRAClassifier,
             collate_text_batch,
@@ -1210,7 +1208,7 @@ if modal is not None:
             acc_blend_new = float(balanced_accuracy_score(y_u_arr, eval_res["logits_blend"].argmax(axis=1)))
             acc_p_sink_new = float(balanced_accuracy_score(y_u_arr, eval_res["probs_plain_sinkhorn"].argmax(axis=1)))
             acc_sink_new = float(balanced_accuracy_score(y_u_arr, eval_res["probs_sinkhorn"].argmax(axis=1)))
-            print(f"[Modal Re-Export] AFTER (Trace-Scaled Ridge & Centered Bias):")
+            print("[Modal Re-Export] AFTER (Trace-Scaled Ridge & Centered Bias):")
             print(f"  Plain Head BAcc          : {bacc_new:.4f} ({bacc_new*100:.2f}%)")
             print(f"  Centered Head BAcc       : {acc_cent_new:.4f} ({acc_cent_new*100:.2f}%)")
             print(f"  Blended Head BAcc (80/20): {acc_blend_new:.4f} ({acc_blend_new*100:.2f}%)")
@@ -1281,24 +1279,13 @@ if modal is not None:
         """
         import json
         import torch
-        import numpy as np
         import pandas as pd
         from pathlib import Path
         from peft import PeftModel
         from transformers import AutoConfig, AutoTokenizer, AutoModel
         from safetensors import safe_open
-        from safetensors.torch import save_file
-        from torch.utils.data import DataLoader
-        from sklearn.metrics import balanced_accuracy_score
-        from scipy.special import softmax as sp_softmax
-
-        from namethatllm.config import LABELS, LAB2I, K, FAMILIES
-        from namethatllm.trainer import (
-            MultiLayerLoRAClassifier,
-            collate_text_batch,
-            TextSequenceDataset,
-        )
-        from namethatllm.postprocess import sinkhorn_balancing
+        from namethatllm.config import FAMILIES, LABELS
+        from namethatllm.trainer import MultiLayerLoRAClassifier
 
         target_family = target_family.lower()
         assert target_family in FAMILIES, f"Unknown family {target_family}. Must be one of {list(FAMILIES.keys())}"
@@ -1743,7 +1730,7 @@ if __name__ == "__main__":
                     spec_classes_claude=np.array(res.get("spec_classes_claude", [])),
                 )
                 print(f"[Modal Launcher] Saved evaluation predictions to {out_p} ({out_p.stat().st_size:,} bytes).")
-        elif mode == "reexport" if "mode" in locals() else args.cmd == "reexport":
+        elif args.cmd == "reexport":
             print("[Modal Launcher] Launching A100-80GB head re-export with trace-scaled Ridge & centered bias...")
             import numpy as np
             cache_p = Path("local_data/local_eval_cache.npz")

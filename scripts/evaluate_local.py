@@ -2185,7 +2185,7 @@ Sibling errors within the same model family account for **{(sibling_errors/total
         err_badge = f"**{ep['err_type']}**" if ep['err_type'] == "Sibling" else ep['err_type']
         md_content += f"| **{r_idx}** | `{ep['true_name']}` | `{ep['pred_name']}` | **{ep['count']}** | {err_badge} | {ep['family']} | {ep['pct_of_true']:.1f}% |\n"
 
-    md_content += f"""
+    md_content += """
 ---
 
 ## 4. Per-Class Precision & Accuracy Breakdown
@@ -2196,7 +2196,7 @@ Sibling errors within the same model family account for **{(sibling_errors/total
     for cs in class_stats:
         md_content += f"| `{cs['name']}` | {cs['total']} | **{cs['correct']}** | {cs['errors']} | **{cs['accuracy']:.1f}%** | {cs['primary_sink']} |\n"
 
-    md_content += f"""
+    md_content += """
 ---
 
 ## 5. Domain / Topic Category Breakdown
@@ -2211,7 +2211,7 @@ Does model attribution perform evenly across different subject matters?
         diff_str = f"{diff:+.1f}%" if diff != 0 else "0.0%"
         md_content += f"| {tr['topic_category']} | {int(tr['n_samples'])} | **{tr['acc_plain']:.1f}%** | {tr['acc_sinkhorn']:.1f}% | {diff_str} |\n"
 
-    md_content += f"""
+    md_content += """
 ---
 
 ## 6. Text Length Breakdown
@@ -2228,7 +2228,7 @@ Attribution performance as a function of passage length:
         words_desc = "≤ 50 words" if "Short" in b_name and "Medium" not in b_name else ("51–90 words" if "Medium-Short" in b_name else ("91–140 words" if "Medium (91" in b_name else "≥ 141 words"))
         md_content += f"| {b_name} | {words_desc} | {int(lr['n_samples'])} | **{lr['acc_plain']:.1f}%** | {lr['acc_sinkhorn']:.1f}% | {diff_str} |\n"
 
-    md_content += f"""
+    md_content += """
 ---
 
 ## 7. Prompt Cluster Size Breakdown
