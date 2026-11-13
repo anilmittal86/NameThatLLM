@@ -848,6 +848,219 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(res_none["probs_sinkhorn"].shape, (N, 18))
         self.assertEqual(res_none["probs_plain_sinkhorn"].shape, (N, 18))
 
+    def test_family_mlp_head_and_zero_cost_fold_in(self):
+        from namethatllm.trainer import FamilyMLPHead, fit_family_mlp_head
+
+        np.random.seed(42)
+        torch.manual_seed(42)
+        N, D = 60, 64
+        Z_tr = np.random.randn(N, D).astype(np.float32)
+        # Shift family classes by a constant vector to simulate lab DNA
+        mu_sim = np.random.randn(1, D).astype(np.float32) * 2.0
+        y_tr = np.array([i % 5 for i in range(N)])
+        for i in range(N):
+            if y_tr[i] < 4:
+                Z_tr[i] += mu_sim[0]
+
+        head_dict, best_acc, best_logits = fit_family_mlp_head(
+            Z_train=Z_tr,
+            y_train=y_tr,
+            num_gate_classes=5,
+            num_family_classes=4,
+            hidden_dim=32,
+            epochs=5,
+            device=torch.device("cpu"),
+        )
+
+        for expected_k in ["mlp_w1", "mlp_b1", "ln_weight", "ln_bias", "mlp_w2", "mlp_b2", "plain.weight", "plain.bias"]:
+            self.assertIn(expected_k, head_dict)
+
+        self.assertEqual(head_dict["mlp_w1"].shape, (32, D))
+        self.assertEqual(head_dict["mlp_b1"].shape, (32,))
+        self.assertEqual(head_dict["mlp_w2"].shape, (5, 32))
+        self.assertEqual(head_dict["mlp_b2"].shape, (5,))
+
+        # Verify zero-cost fold-in forward pass runs on raw Z
+        w1 = head_dict["mlp_w1"]
+        b1 = head_dict["mlp_b1"]
+        ln_w = head_dict["ln_weight"]
+        ln_b = head_dict["ln_bias"]
+        w2 = head_dict["mlp_w2"]
+        b2 = head_dict["mlp_b2"]
+
+        z_t = torch.from_numpy(Z_tr).float()
+        h = torch.nn.functional.gelu(z_t @ w1.T + b1)
+        h = torch.nn.functional.layer_norm(h, (h.shape[-1],), ln_w, ln_b)
+        logits_out = (h @ w2.T + b2).detach().numpy()
+        self.assertEqual(logits_out.shape, (N, 5))
+
+    def test_load_and_slice_champion_heads_for_specialist(self):
+        from namethatllm.trainer import load_and_slice_champion_heads
+        from safetensors.torch import save_file
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir) / "heads.safetensors"
+            w_18 = torch.randn(18, 128)
+            b_18 = torch.randn(18)
+            save_file({"plain.weight": w_18, "plain.bias": b_18}, str(p))
+
+            class DummyModel(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.plain_head = torch.nn.Linear(128, 4)
+
+            model = DummyModel()
+            fam_cols = [5, 6, 7, 8]
+            res = load_and_slice_champion_heads(p, model, fam_cols=fam_cols)
+            self.assertTrue(res)
+            self.assertEqual(model.plain_head.weight.shape, (4, 128))
+            self.assertTrue(torch.allclose(model.plain_head.weight, w_18[fam_cols]))
+            self.assertTrue(torch.allclose(model.plain_head.bias, b_18[fam_cols]))
+
+    def test_find_compatible_champion_lora_rejects_qwen25_and_picks_qwen3(self):
+        from namethatllm.trainer import find_compatible_champion_lora
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            # Confusing adapter 1: Qwen2.5 with r=16
+            dir_a = base / "ntl-two-stage-lora" / "lora_qwen25_14b"
+            dir_a.mkdir(parents=True)
+            (dir_a / "adapter_model.safetensors").touch()
+            (dir_a / "adapter_config.json").write_text(
+                json.dumps({"r": 16, "base_model_name_or_path": "Qwen/Qwen2.5-14B-Base"})
+            )
+
+            # Champion adapter 2: Qwen3-14B with r=32
+            dir_b = base / "ntl-inhouse-two-stage-lora24" / "export_champion_qwen3_14b"
+            dir_b.mkdir(parents=True)
+            (dir_b / "adapter_model.safetensors").touch()
+            (dir_b / "adapter_config.json").write_text(
+                json.dumps({"r": 32, "base_model_name_or_path": "Qwen/Qwen3-14B-Base"})
+            )
+
+            # Should pick dir_b for Qwen3 backbone with r=32
+            chosen = find_compatible_champion_lora(base, backbone_name="Qwen/Qwen3-14B-Base", lora_r=32)
+            self.assertIsNotNone(chosen)
+            self.assertEqual(chosen.resolve(), dir_b.resolve())
+
+            # Should pick dir_a for Qwen2.5 backbone with r=16
+            chosen_25 = find_compatible_champion_lora(base, backbone_name="Qwen/Qwen2.5-14B-Base", lora_r=16)
+            self.assertIsNotNone(chosen_25)
+            self.assertEqual(chosen_25.resolve(), dir_a.resolve())
+
+            # Should return None if looking for incompatible rank
+            chosen_none = find_compatible_champion_lora(base, backbone_name="Qwen/Qwen3-14B-Base", lora_r=64)
+            self.assertIsNone(chosen_none)
+
+
+    def test_forward_features_returns_by_layer_and_extract_all_layers(self):
+        """Test MultiLayerLoRAClassifier.forward_features returns layer-by-layer representations."""
+        class DummyBackbone(nn.Module):
+            def __init__(self, hidden_dim=64, num_layers=4):
+                super().__init__()
+                self.hidden_dim = hidden_dim
+                self.num_layers = num_layers
+
+            def forward(self, input_ids, attention_mask=None, output_hidden_states=True, return_dict=True, use_cache=False):
+                B, S = input_ids.shape
+                # hidden_states: embedding output + num_layers transformer blocks = num_layers + 1
+                hs = tuple(torch.randn(B, S, self.hidden_dim) for _ in range(self.num_layers + 1))
+                from types import SimpleNamespace
+                return SimpleNamespace(hidden_states=hs)
+
+        backbone = DummyBackbone(hidden_dim=32, num_layers=4)
+        tapped_layers = [1, 3]
+        model = MultiLayerLoRAClassifier(backbone, hidden_size=32, layers=tapped_layers, num_classes=5)
+
+        ids = torch.randint(0, 100, (4, 16))
+        mask = torch.ones(4, 16)
+
+        # 1. Default call (concatenated 2D tensor only)
+        z_default = model.forward_features(ids, mask)
+        self.assertEqual(z_default.shape, (4, 32 * len(tapped_layers)))
+
+        # 2. return_by_layer=True (tapped layers: [B, 2, 32])
+        z_cat, z_tapped = model.forward_features(ids, mask, return_by_layer=True, extract_all_layers=False)
+        self.assertEqual(z_cat.shape, (4, 64))
+        self.assertEqual(z_tapped.shape, (4, 2, 32))
+
+        # 3. extract_all_layers=True (all 5 hidden states: [B, 5, 32])
+        z_cat_all, z_all = model.forward_features(ids, mask, return_by_layer=True, extract_all_layers=True)
+        self.assertEqual(z_cat_all.shape, (4, 64))
+        self.assertEqual(z_all.shape, (4, 5, 32))
+
+    def test_save_extracted_features_bundle(self):
+        """Test save_extracted_features_bundle creates all expected files in Kaggle dataset format."""
+        import tempfile
+        import pandas as pd
+        from safetensors.torch import load_file
+        from namethatllm.trainer import save_extracted_features_bundle
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_p = Path(tmp_dir) / "bundle"
+            N = 20
+            D = 128
+            L = 4
+            feat_cat = np.random.randn(N, D).astype(np.float32)
+            feat_layer = np.random.randn(N, L, 32).astype(np.float32)
+            texts = [f"This is sample text number {i} for testing." for i in range(N)]
+            labels = [i % 4 for i in range(N)]
+            models = [f"model_{lab}" for lab in labels]
+
+            eval_cat = np.random.randn(10, D).astype(np.float32)
+            eval_layer = np.random.randn(10, L, 32).astype(np.float32)
+            eval_texts = [f"Benchmark prompt sample {j}" for j in range(10)]
+            eval_labels = [j % 4 for j in range(10)]
+
+            saved_dir = save_extracted_features_bundle(
+                output_dir=out_p,
+                target="gemini",
+                features_concat=feat_cat,
+                features_by_layer=feat_layer,
+                texts=texts,
+                labels=labels,
+                model_names=models,
+                eval_features_concat=eval_cat,
+                eval_features_by_layer=eval_layer,
+                eval_texts=eval_texts,
+                eval_labels=eval_labels,
+                dataset_title="NTL Gemini Features",
+                dataset_slug="ntl-gemini-features",
+            )
+            self.assertTrue(saved_dir.exists())
+
+            # Check files exist
+            self.assertTrue((out_p / "features_concat.safetensors").exists())
+            self.assertTrue((out_p / "features_by_layer.safetensors").exists())
+            self.assertTrue((out_p / "metadata.parquet").exists())
+            self.assertTrue((out_p / "benchmark_features_concat.safetensors").exists())
+            self.assertTrue((out_p / "benchmark_features_by_layer.safetensors").exists())
+            self.assertTrue((out_p / "benchmark_metadata.parquet").exists())
+            self.assertTrue((out_p / "dataset-metadata.json").exists())
+            self.assertTrue((out_p / "features_summary.json").exists())
+
+            # Check tensor shapes
+            sd = load_file(str(out_p / "features_concat.safetensors"))
+            self.assertEqual(sd["features_concat"].shape, (N, D))
+            self.assertEqual(sd["features_concat"].dtype, torch.float16)
+
+            sd_layer = load_file(str(out_p / "features_by_layer.safetensors"))
+            self.assertEqual(sd_layer["features_by_layer"].shape, (N, L, 32))
+
+            # Check metadata parquet
+            df_meta = pd.read_parquet(out_p / "metadata.parquet")
+            self.assertEqual(len(df_meta), N)
+            self.assertIn("text_hash", df_meta.columns)
+            self.assertIn("model", df_meta.columns)
+
+            # Check dataset-metadata.json
+            with open(out_p / "dataset-metadata.json") as f:
+                k_meta = json.load(f)
+            self.assertEqual(k_meta["id"], "anilmittal/ntl-gemini-features")
+
 
 if __name__ == "__main__":
     unittest.main()

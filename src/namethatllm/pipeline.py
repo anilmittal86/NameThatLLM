@@ -489,6 +489,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         "qwen3_14b_gpt",
         "qwen3_14b_gemini",
         "qwen3_14b_glm",
+        "qwen3_14b_claude",
     }
     if "required_checkpoints" in req_assets or "optional_checkpoints" in req_assets:
         allowed_ckpts = set(req_assets.get("required_checkpoints", [])) | set(req_assets.get("optional_checkpoints", []))
@@ -1188,6 +1189,75 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                     )
                                     if m_tier_14b == "Main" or opt_14b_key == "qwen3_14b_inhouse":
                                         LOGIT_MAIN += lp_m_te * w_tot_ts14
+
+                                    # Fast-path: Execute In-House Family Specialist Gates on frozen 14B features Z_te
+                                    if opt_14b_key == "qwen3_14b_inhouse" and Z_te is not None:
+                                        inhouse_spec_ckpts = [
+                                            ("qwen3_14b_gpt", "gpt"),
+                                            ("qwen3_14b_gemini", "gemini"),
+                                            ("qwen3_14b_glm", "glm"),
+                                            ("qwen3_14b_claude", "claude"),
+                                        ]
+                                        for spec_k, fam_nm in inhouse_spec_ckpts:
+                                            if spec_k in ckpts:
+                                                spec_p = ckpts[spec_k]
+                                                spec_has_adapter = (
+                                                    (spec_p / "adapter_model.safetensors").exists()
+                                                    or (spec_p / "adapter" / "adapter_model.safetensors").exists()
+                                                )
+                                                if not spec_has_adapter and (spec_p / "heads.safetensors").exists():
+                                                    print(f"[Pipeline] Running In-House Family Gate: {spec_k} ({fam_nm}) on frozen 14B features...")
+                                                    heads_spec = load_head_file(spec_p)
+                                                    meta_spec = read_checkpoint_meta(spec_p, default_keep=27, default_layers=[], default_max_len=447)
+                                                    fam_classes = meta_spec.get("classes", meta_spec.get("labels", []))
+                                                    K_fam = len(FAMILIES[fam_nm])
+
+                                                    if "mlp_w1" in heads_spec:
+                                                        w1 = torch.as_tensor(heads_spec["mlp_w1"], dtype=torch.float32)
+                                                        b1 = torch.as_tensor(heads_spec["mlp_b1"], dtype=torch.float32)
+                                                        w2 = torch.as_tensor(heads_spec["mlp_w2"], dtype=torch.float32)
+                                                        b2 = torch.as_tensor(heads_spec["mlp_b2"], dtype=torch.float32)
+                                                        ln_w = torch.as_tensor(heads_spec["ln_weight"], dtype=torch.float32) if "ln_weight" in heads_spec else None
+                                                        ln_b = torch.as_tensor(heads_spec["ln_bias"], dtype=torch.float32) if "ln_bias" in heads_spec else None
+                                                        dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                                                        w1, b1, w2, b2 = w1.to(dev), b1.to(dev), w2.to(dev), b2.to(dev)
+                                                        if ln_w is not None and ln_b is not None:
+                                                            ln_w, ln_b = ln_w.to(dev), ln_b.to(dev)
+
+                                                        def _eval_mlp_gate(z_arr):
+                                                            with torch.no_grad():
+                                                                z_t = torch.from_numpy(z_arr).to(dev, dtype=torch.float32)
+                                                                h = torch.nn.functional.gelu(z_t @ w1.T + b1)
+                                                                if ln_w is not None and ln_b is not None:
+                                                                    h = torch.nn.functional.layer_norm(h, (h.shape[-1],), ln_w, ln_b)
+                                                                out = (h @ w2.T + b2)[:, :K_fam].cpu().numpy().astype(np.float32)
+                                                                del z_t, h
+                                                            return out
+
+                                                        raw_spec_te = _eval_mlp_gate(Z_te)
+                                                    else:
+                                                        W_spec, b_spec, _, _ = resolve_head_tensors(heads_spec)
+                                                        raw_spec_te = (Z_te @ W_spec.T + b_spec)[:, :K_fam].astype(np.float32) if W_spec is not None else None
+
+                                                    if raw_spec_te is not None:
+                                                        family_spec_logits_te[fam_nm] = raw_spec_te
+                                                        family_spec_classes[fam_nm] = fam_classes[:K_fam]
+                                                        if fam_nm == "claude":
+                                                            claude_spec_logits = raw_spec_te
+                                                            claude_classes = fam_classes[:K_fam]
+                                                        if (
+                                                            "Z_unseen" in locals()
+                                                            and Z_unseen is not None
+                                                            and len(Z_unseen) == N_unseen
+                                                            and N_unseen > 0
+                                                        ):
+                                                            if "mlp_w1" in heads_spec:
+                                                                raw_spec_u = _eval_mlp_gate(Z_unseen)
+                                                            else:
+                                                                raw_spec_u = (Z_unseen @ W_spec.T + b_spec)[:, :K_fam].astype(np.float32)
+                                                            family_spec_logits_unseen[fam_nm] = raw_spec_u
+                                                            if fam_nm == "claude":
+                                                                claude_spec_logits_unseen = raw_spec_u
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from logits and spectral bank.")
 
@@ -1202,30 +1272,36 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
-            # Execute Family Specialists on Trunk 1 (Qwen3-14B)
+            # Execute Family Specialists on Trunk 1 (Qwen3-14B) if not already evaluated
             spec_candidates = [
                 ("qwen3_14b_gpt", "gpt"),
                 ("qwen3_14b_gemini", "gemini"),
                 ("qwen3_14b_glm", "glm"),
+                ("qwen3_14b_claude", "claude"),
             ]
             for ckpt_key, fam_name in spec_candidates:
-                if ckpt_key in ckpts:
+                if ckpt_key in ckpts and fam_name not in family_spec_logits_te:
                     spec_p = ckpts[ckpt_key]
-                    print(f"[Pipeline] Running Trunk 1 Family Specialist: {ckpt_key} ({fam_name}) from {spec_p}...")
-                    te_l, u_l, cls_l = extract_family_specialist_logits(
-                        trunk1=trunk1,
-                        spec_dir=spec_p,
-                        family_name=fam_name,
-                        test_texts=test_texts,
-                        unseen_texts=unseen_texts if N_unseen > 0 else [],
-                        LOGIT_MAIN=LOGIT_MAIN,
-                        auditor=auditor,
-                        groups_test_multi=(groups_085, groups_072, groups_065),
-                        groups_unseen=groups_unseen,
+                    spec_has_adapter = (
+                        (spec_p / "adapter_model.safetensors").exists()
+                        or (spec_p / "adapter" / "adapter_model.safetensors").exists()
                     )
-                    family_spec_logits_te[fam_name] = te_l
-                    family_spec_logits_unseen[fam_name] = u_l
-                    family_spec_classes[fam_name] = cls_l
+                    if spec_has_adapter:
+                        print(f"[Pipeline] Running Trunk 1 Family Specialist: {ckpt_key} ({fam_name}) from {spec_p}...")
+                        te_l, u_l, cls_l = extract_family_specialist_logits(
+                            trunk1=trunk1,
+                            spec_dir=spec_p,
+                            family_name=fam_name,
+                            test_texts=test_texts,
+                            unseen_texts=unseen_texts if N_unseen > 0 else [],
+                            LOGIT_MAIN=LOGIT_MAIN,
+                            auditor=auditor,
+                            groups_test_multi=(groups_085, groups_072, groups_065),
+                            groups_unseen=groups_unseen,
+                        )
+                        family_spec_logits_te[fam_name] = te_l
+                        family_spec_logits_unseen[fam_name] = u_l
+                        family_spec_classes[fam_name] = cls_l
 
             trunk1.free_memory()
             del trunk1
@@ -1247,7 +1323,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         is_cl_req = "qwen3_8b_claude" in req_assets.get("required_checkpoints", [])
         skip_cl = (
             (w_comp_p_cl + w_comp_c_cl) <= 0.0
-            and claude_spec_w <= 0.0
+            and (claude_spec_logits is not None or "qwen3_14b_claude" in ckpts or claude_spec_w <= 0.0)
             and not need_sub_train
             and not is_cl_req
             and bool(cfg.get("lock_prior_weights", True))

@@ -310,16 +310,28 @@ def find_checkpoints(input_dir: Path) -> dict[str, Path]:
                 pass
 
         # Critical routing guard: check family specialists before general inhouse / lora-peft-training
+        def _set_family_ckpt(key: str, path: Path):
+            if key in ckpts:
+                existing_s = str(ckpts[key]).lower()
+                cand_s = str(path).lower()
+                if "mlp" in cand_s and "mlp" not in existing_s:
+                    ckpts[key] = path
+            else:
+                ckpts[key] = path
+
         if target_family == "gpt" or any(t in p_str for t in ("export_gpt", "gpt_specialist", "gpt_spec", "qwen3_14b_gpt")):
-            ckpts["qwen3_14b_gpt"] = p.parent
+            _set_family_ckpt("qwen3_14b_gpt", p.parent)
             continue
         elif target_family == "gemini" or any(
             t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini")
         ):
-            ckpts["qwen3_14b_gemini"] = p.parent
+            _set_family_ckpt("qwen3_14b_gemini", p.parent)
             continue
         elif target_family == "glm" or any(t in p_str for t in ("export_glm", "glm_specialist", "glm_spec", "qwen3_14b_glm")):
-            ckpts["qwen3_14b_glm"] = p.parent
+            _set_family_ckpt("qwen3_14b_glm", p.parent)
+            continue
+        elif target_family == "claude" or any(t in p_str for t in ("export_claude", "claude_specialist", "claude_spec", "qwen3_14b_claude")):
+            _set_family_ckpt("qwen3_14b_claude", p.parent)
             continue
 
         if "lora_qwen3_14b" in p_str or "qwen3_14b_part2" in p_str or ("14b" in p_str and "part2" in p_str and "qwen3" in p_str):

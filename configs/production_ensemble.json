@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
   "name": "production_ensemble",
-  "description": "Pure Solo In-House 14B LoRA [qwen3_14b_inhouse (1.00 plain)] - Trace-Scaled Regularized Heads, No Sinkhorn",
+  "description": "Solo In-House 14B LoRA Plain Head + 4 Family Specialist Gates (Gemini, GLM, GPT, Claude) + Soft Sinkhorn",
   "probe_gate_min_bacc": 0.35,
   "enable_ablation_probe": true,
   "ablation_samples_per_class": 20,
@@ -20,12 +20,16 @@
     "glm": [15, 16]
   },
   "required_assets": {
-    "require_pool_parquet": true,
+    "require_pool_parquet": false,
     "required_base_models": [
       { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 }
     ],
     "required_checkpoints": [
-      "qwen3_14b_inhouse"
+      "qwen3_14b_inhouse",
+      "qwen3_14b_claude",
+      "qwen3_14b_gemini",
+      "qwen3_14b_glm",
+      "qwen3_14b_gpt"
     ],
     "optional_checkpoints": []
   },
@@ -103,19 +107,19 @@
   "postprocess": {
     "enable_within_family_confidence_gates": false,
     "family_gate_strength": 0.0,
-    "claude_specialist_weight": 0.0,
-    "gpt_specialist_weight": 0.0,
-    "gemini_specialist_weight": 0.0,
-    "glm_specialist_weight": 0.0,
+    "claude_specialist_weight": 0.25,
+    "gemini_specialist_weight": 0.20,
+    "gpt_specialist_weight": 0.05,
+    "glm_specialist_weight": 0.10,
     "curly_quote_multiplier": 1.0,
     "multi_em_dash_log_penalty": 0.0,
     "straight_contr_log_penalty": 0.0,
     "curly_contr_log_penalty": 0.0,
     "continuous_hw_weight": 0.0,
     "cluster_repulsion_strength": 0.0,
-    "sinkhorn_iterations": 0,
-    "sinkhorn_strength": 0.0,
-    "sinkhorn_target_mix": 0.0,
+    "sinkhorn_iterations": 50,
+    "sinkhorn_strength": 0.65,
+    "sinkhorn_target_mix": 0.35,
     "enable_prior_centering": false,
     "sinkhorn_temperature": 1.5,
     "enable_typobayes": false,

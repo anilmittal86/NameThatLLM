@@ -1,0 +1,30 @@
+{
+  "version": "1.0.0",
+  "name": "qwen3_14b_gemini_mlp_gate",
+  "description": "Phase 3 Non-Linear MLP Gate for Gemini Sister Decoupling (3.7 vs 3.8) on Frozen Champion 14B Features",
+  "pipeline_mode": "family_gate",
+  "backbone": "Qwen/Qwen3-14B-Base",
+  "keep_layers": 27,
+  "layers": [
+    2,
+    4,
+    6,
+    8,
+    12,
+    16,
+    20,
+    24
+  ],
+  "max_len": 384,
+  "end_id": 151643,
+  "target_family": "gemini",
+  "head_type": "mlp",
+  "hidden_dim": 256,
+  "mlp_epochs": 20,
+  "mlp_lr": 0.0003,
+  "mlp_dropout": 0.2,
+  "samples_per_class": 3800,
+  "negative_ratio": 0.1,
+  "batch_size": 8,
+  "output_dir": "export_gemini_gate_mlp"
+}

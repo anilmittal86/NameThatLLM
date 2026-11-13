@@ -9,6 +9,8 @@
   "enable_tpu": false,
   "enable_internet": false,
   "dataset_sources": [
+    "anilmittal/ntl-clean-benchmark-1800",
+    "anilmittal/ntl-inhouse-two-stage-lora24",
     "nishantdahal/ntl-handwriting-blend",
     "dhruvtibarewal/nlm-matched-clean",
     "nishantdahal/ntl-two-stage-lora",
@@ -17,9 +19,7 @@
   "competition_sources": [
     "name-that-llm"
   ],
-  "kernel_sources": [
-    "anilmittal/name-that-llm-lora-peft-training"
-  ],
+  "kernel_sources": [],
   "model_sources": [
     "qwen-lm/qwen-3/Transformers/14b-base/1",
     "qwen-lm/qwen2.5/Transformers/14b/1",

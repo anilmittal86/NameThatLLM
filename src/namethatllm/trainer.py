@@ -1,9 +1,72 @@
 """
-Two-Stage Multi-Layer LoRA Training Engine
-==========================================
-Implements production Two-Stage Multi-Layer LoRA training with 8 intermediate
-LayerNorm heads, causal attention-sink masking (m[:, 0] = 0.0), prompt-grouped
-contrastive centering, and standard checkpoint export.
+Name That LLM - Production Multi-Layer LoRA Training & Feature Extraction Engine
+================================================================================
+A unified, high-performance training and representation engine supporting three core execution modes:
+
+1. Full LoRA Foundation Model Training with Dual Heads (Stage 1 & Stage 2):
+   - Backbones: Qwen3-14B, Qwen2.5-14B, Qwen3-8B, DeBERTa-v3-large.
+   - Intermediate Layer Extraction: Taps 8 intermediate hidden states (e.g., layers 2, 4, 6, 8, 12, 16, 20, 24)
+     with dedicated per-layer LayerNorm projections to capture rich syntactic and stylistic representations.
+   - Causal Attention-Sink Masking: Automatically masks the first token (m[:, 0] = 0.0) to remove BOS softmax artifacts.
+   - Dual Classification Heads:
+       * plain_head: Linear projection Z -> R^K for direct sequence-level attribution.
+       * centered_head: Linear projection (Z - mu_prompt) -> R^K trained on prompt-centered features to decouple
+         pure model writing style from the user's prompt topic.
+   - Multi-Sample Dropout (MSD): 5-branch dropout (p in [0.1, 0.5]) during training for accelerated regularized convergence.
+   - Stage 1 Pool Pre-Training: Pre-trains on up to 120,000+ deduplicated external samples with dynamic length slicing and AMP.
+   - Stage 2 Gold Fine-Tuning: Trains on competition train.csv with prompt-group batch sampling, LoRA+ learning rate ratios,
+     supervised contrastive loss (SupCon), and SWA parameter averaging across the final epoch.
+
+2. Specialist Model & Family Gate Training (Phase 3):
+   - Trains dedicated gates on frozen Champion 14B features for hard intra-family sister decoupling:
+       * Gemini Family: gemini-3.7-flash vs gemini-3.8-flash (cosine similarity 0.9418).
+       * GPT Family: gpt-5.6-sol vs gpt-5.6-terra vs gpt-5.6-luna vs gpt-5.5 vs gpt-6-astra.
+       * GLM Family: glm-5.3 vs glm-5.3-flash.
+       * Claude Family: claude-opus-4-8 vs claude-sonnet-5 vs claude-opus-4-6 vs claude-fable-5.
+   - Head Types Supported:
+       * Linear Ridge Regression Head: Closed-form dual solver with trace-scaled regularization across alpha sweeps.
+       * Non-Linear MLP Head: 2-layer MLP (fc1 -> GELU -> LayerNorm -> Dropout -> fc2).
+   - Zero-Cost Centroid Fold-In: Folds intra-family mean subtraction directly into Layer 1 bias:
+       b1* = b1 - mu_family @ W1.T
+     allowing downstream inference to evaluate raw Z vectors without runtime centering latency.
+   - Zero-Leakage Holdout Quarantine: Automatically cross-references texts against clean_benchmark_1800_rows.parquet
+     to guarantee 0.0% data leakage during gate training.
+
+3. Configurable Embedding & Layer-by-Layer Feature Extraction (Dataset Export):
+   - Pre-extracts and saves multi-layer representations as a reusable Kaggle Dataset so subsequent downstream
+     gate training and model ablation take seconds instead of repeating 30-minute GPU forward passes.
+   - Configurable Subsets ("target"):
+       * "all": All 18 competition classes across pool and gold data.
+       * "gemini": Gemini models (3.1-pro, 3.6-flash, 3.7-flash, 3.8-flash) + negative distractors.
+       * "gpt": GPT models (5.5, 5.6-luna, 5.6-sol, 5.6-terra, 6-astra) + negative distractors.
+       * "claude": Claude models (opus-4-6, opus-4-8, opus-5, sonnet-5, fable-5) + negative distractors.
+       * "glm": GLM models (5.3, 5.3-flash) + negative distractors.
+       * "gold": Pure gold competition training data (2,699 samples).
+   - Configurable Layer Storage ("save_all_layers"):
+       * false (default): Saves the 8 champion tapped layers ([N, 8, hidden_size] and [N, 40960]).
+       * true: Saves all backbone hidden states ([N, num_layers, hidden_size], e.g. [N, 28, 5120]).
+   - Export Artifacts Produced:
+       * features_concat.safetensors: Full concatenated representation in FP16.
+       * features_by_layer.safetensors: 3D tensor [N, L, hidden_size] in FP16.
+       * metadata.parquet: Text hashes, sample IDs, prompt IDs, lengths, and model labels.
+       * benchmark_features_concat.safetensors & benchmark_metadata.parquet: Exact holdout features.
+       * dataset-metadata.json: Pre-formatted for instant 1-click `kaggle datasets create`.
+       * features_summary.json: Human-readable inspection metadata.
+
+Config Schema Summary:
+----------------------
+{
+  "pipeline_mode": "full_lora" | "family_gate" | "export_embeddings",
+  "backbone": "Qwen/Qwen3-14B-Base",
+  "target_family": "gemini" | "gpt" | "claude" | "glm",
+  "export_embeddings": {
+    "enabled": true,
+    "target": "all" | "gemini" | "gpt" | "claude" | "glm" | "gold",
+    "save_all_layers": false,
+    "output_dir": "export_embeddings",
+    "samples_per_class": 3800
+  }
+}
 """
 
 import copy
@@ -157,7 +220,14 @@ class MultiLayerLoRAClassifier(nn.Module):
             return torch.mean(torch.stack([self.centered_head(d(Z)) for d in self.dropouts], dim=0), dim=0)
         return self.centered_head(Z)
 
-    def forward_features(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, drop_first_token: bool = True) -> torch.Tensor:
+    def forward_features(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        drop_first_token: bool = True,
+        return_by_layer: bool = False,
+        extract_all_layers: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Extracts pooled multi-layer representations with causal attention-sink masking.
 
@@ -168,6 +238,12 @@ class MultiLayerLoRAClassifier(nn.Module):
         regardless of whether token 0 carries semantic meaning. If token 0 is included in
         mean pooling across the sequence length, it injects noise that masks subtle stylistic
         differences. Setting m[:, 0] = 0.0 cleans the representation.
+
+        Parameters:
+        -----------
+        return_by_layer: If True, returns (Z_cat, Z_layers).
+        extract_all_layers: If True, Z_layers stacks all backbone hidden states [B, num_all_layers, hidden_size].
+                            If False, Z_layers stacks the configured tapped layers [B, len(self.layers), hidden_size].
         """
         m = attention_mask.clone().float()
         if drop_first_token and m.shape[1] > 1:
@@ -183,6 +259,18 @@ class MultiLayerLoRAClassifier(nn.Module):
             outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
 
         hidden_states = getattr(outputs, "hidden_states", outputs)
+
+        all_layers_pooled = []
+        if extract_all_layers:
+            for l_idx in range(len(hidden_states)):
+                h = hidden_states[l_idx].float()
+                layer_dev = h.device
+                m_l = m.to(layer_dev)
+                den_l = den.to(layer_dev)
+                h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
+                p_l = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
+                all_layers_pooled.append(p_l.to(first_device))
+
         pooled_list = []
         for idx, l in enumerate(self.layers):
             h = hidden_states[l].float()
@@ -196,7 +284,15 @@ class MultiLayerLoRAClassifier(nn.Module):
             normed = norm(pooled.to(norm_dev))
             pooled_list.append(normed.to(first_device))
 
-        return torch.cat(pooled_list, dim=-1)
+        Z_cat = torch.cat(pooled_list, dim=-1)
+        if return_by_layer:
+            if extract_all_layers:
+                Z_layers = torch.stack(all_layers_pooled, dim=1)
+            else:
+                Z_layers = torch.stack(pooled_list, dim=1)
+            return Z_cat, Z_layers
+
+        return Z_cat
 
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor, drop_first_token: bool = True
@@ -1352,6 +1448,212 @@ def run_training_pipeline(
     else:
         model = model.to(device)
 
+    # Pipeline Mode: Feature & Layer-by-Layer Embedding Extraction (Dataset Export)
+    if train_cfg.get("pipeline_mode") in ("export_embeddings", "extract_features"):
+        exp_cfg = train_cfg.get("export_embeddings", {})
+        if not isinstance(exp_cfg, dict):
+            exp_cfg = {}
+        target = exp_cfg.get("target") or train_cfg.get("embeddings_target") or target_family or "gemini"
+        save_all = bool(exp_cfg.get("save_all_layers", train_cfg.get("save_all_layers", False)))
+        emb_out = exp_cfg.get("output_dir") or train_cfg.get("embeddings_output_dir") or out_dir
+
+        pool_list = all_pools if all_pools else ([pool_file] if pool_file else [])
+        dfs = []
+        for p in pool_list:
+            try:
+                if str(p).endswith(".parquet"):
+                    df_one = pd.read_parquet(p, columns=["text", "model"])
+                else:
+                    df_one = pd.read_csv(p, usecols=["text", "model"])
+                dfs.append(df_one)
+            except Exception:
+                pass
+        df_p = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=["text", "model"])
+
+        df_tr = None
+        if train_path and Path(train_path).exists():
+            try:
+                df_tr = pd.read_csv(train_path)
+            except Exception:
+                pass
+
+        eval_texts, eval_labels = None, None
+        bench_paths = list(input_dir.rglob("clean_benchmark_1800_rows.parquet"))
+        if bench_paths:
+            try:
+                df_bench = pd.read_parquet(bench_paths[0])
+                eval_texts = df_bench["text"].tolist()
+                eval_labels = [LAB2I[m] for m in df_bench["model"].tolist()]
+                print(f"[Trainer] Loaded {len(eval_texts)} benchmark samples from {bench_paths[0]}")
+            except Exception as e:
+                print(f"[Trainer] Note on reading clean benchmark: {e}")
+
+        # If a champion LoRA checkpoint exists, load it
+        lora_r_val = int(train_cfg.get("lora_r", 32))
+        adapter_found = find_compatible_champion_lora(input_dir, backbone_name=backbone_name, lora_r=lora_r_val)
+        if adapter_found is not None:
+            try:
+                from peft import set_peft_model_state_dict
+                from safetensors.torch import load_file
+                adapter_file = adapter_found / "adapter_model.safetensors"
+                if not adapter_file.exists():
+                    adapter_file = adapter_found / "adapter" / "adapter_model.safetensors"
+                if not adapter_file.exists():
+                    adapter_file = adapter_found / "adapter_model.bin"
+                adapter_sd = load_file(str(adapter_file))
+                set_peft_model_state_dict(base_model, adapter_sd)
+                print(f"[Trainer] Loaded champion LoRA weights from {adapter_found} for extraction.")
+            except Exception as e:
+                print(f"[Trainer] Note on loading adapter for extraction: {e}")
+
+        extract_and_export_embeddings(
+            model=model,
+            tok=tok,
+            df_pool=df_p,
+            df_train=df_tr,
+            target=target,
+            save_all_layers=save_all,
+            output_dir=emb_out,
+            samples_per_class=int(train_cfg.get("samples_per_class", 0)),
+            negative_ratio=float(train_cfg.get("negative_ratio", 0.10)),
+            eval_texts=eval_texts,
+            eval_labels=eval_labels,
+            batch_size=int(train_cfg.get("batch_size", 16)),
+            max_len=int(train_cfg.get("max_len", 384)),
+            end_id=end_id,
+            device=device,
+            checkpoints_volume=checkpoints_volume,
+        )
+        return Path(emb_out)
+
+    # Phase 3: Family Gate Training Mode (Non-Linear MLP or Ridge)
+    if train_cfg.get("pipeline_mode") == "family_gate" or train_cfg.get("mode") == "family_gate" or train_cfg.get("gate_training"):
+        print(f"[Trainer] Running Phase 3 Family Gate Pipeline for target family: {target_family} (head_type={train_cfg.get('head_type', 'mlp')})...")
+
+        lora_r_val = int(train_cfg.get("lora_r", 32))
+        adapter_found = find_compatible_champion_lora(
+            input_dir,
+            backbone_name=backbone_name,
+            lora_r=lora_r_val,
+            target_family=target_family or "",
+        )
+        if adapter_found is not None:
+            try:
+                from peft import set_peft_model_state_dict
+                from safetensors.torch import load_file
+
+                adapter_file = adapter_found / "adapter_model.safetensors"
+                if not adapter_file.exists():
+                    adapter_file = adapter_found / "adapter" / "adapter_model.safetensors"
+                if not adapter_file.exists():
+                    adapter_file = adapter_found / "adapter_model.bin"
+                adapter_sd = load_file(str(adapter_file))
+
+                # Pre-validate tensor shapes against base_model
+                model_sd = base_model.state_dict()
+                mismatches = []
+                for k_sd, v_sd in adapter_sd.items():
+                    if k_sd in model_sd and model_sd[k_sd].shape != v_sd.shape:
+                        mismatches.append(f"{k_sd}: checkpoint {v_sd.shape} vs model {model_sd[k_sd].shape}")
+
+                if mismatches:
+                    raise ValueError(f"Shape mismatches in adapter {adapter_found}: {mismatches[:3]}...")
+
+                set_peft_model_state_dict(base_model, adapter_sd)
+                print(f"[Trainer] Successfully loaded champion LoRA weights from {adapter_found}")
+            except Exception as e:
+                print(f"[Trainer] Error loading champion adapter weights: {e}")
+                if not is_smoke:
+                    raise RuntimeError(f"Failed to load champion LoRA adapter from {adapter_found}: {e}")
+        else:
+            print(f"[Trainer] Warning: No compatible champion LoRA adapter found for {backbone_name} (r={lora_r_val}) in {input_dir}")
+            if not is_smoke and input_dir.exists():
+                found_all = list(input_dir.rglob("adapter_model.safetensors"))
+                if found_all:
+                    raise RuntimeError(f"Discovered adapters on disk but none were compatible with {backbone_name} (r={lora_r_val}): {found_all}")
+
+        head_loaded = False
+        for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
+            if "export_champion" in str(cand) or "inhouse" in str(cand):
+                fam_cols_to_slice = fam_cols if is_specialist else None
+                if load_and_slice_champion_heads(cand, model, fam_cols=fam_cols_to_slice):
+                    print(f"[Trainer] Successfully loaded champion plain head from {cand}")
+                    head_loaded = True
+                    break
+
+        pool_list = all_pools if all_pools else ([pool_file] if pool_file else [])
+        dfs = []
+        for p in pool_list:
+            try:
+                if str(p).endswith(".parquet"):
+                    df_one = pd.read_parquet(p, columns=["text", "model"])
+                else:
+                    df_one = pd.read_csv(p, usecols=["text", "model"])
+                dfs.append(df_one)
+            except Exception:
+                pass
+        df_p = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=["text", "model"])
+
+        df_tr = None
+        if train_path and Path(train_path).exists():
+            try:
+                df_tr = pd.read_csv(train_path)
+            except Exception:
+                pass
+
+        eval_texts, eval_labels = None, None
+        bench_paths = list(input_dir.rglob("clean_benchmark_1800_rows.parquet"))
+        if bench_paths:
+            try:
+                df_bench = pd.read_parquet(bench_paths[0])
+                eval_texts = df_bench["text"].tolist()
+                eval_labels = [LAB2I[m] for m in df_bench["model"].tolist()]
+                print(f"[Trainer] Loaded {len(eval_texts)} benchmark samples from {bench_paths[0]}")
+            except Exception as e:
+                print(f"[Trainer] Note on reading clean benchmark: {e}")
+
+        exp_cfg = train_cfg.get("export_embeddings", {})
+        if isinstance(exp_cfg, bool):
+            exp_enabled = exp_cfg
+            exp_save_all = bool(train_cfg.get("save_all_layers", False))
+            exp_out = train_cfg.get("embeddings_output_dir")
+        elif isinstance(exp_cfg, dict):
+            exp_enabled = bool(exp_cfg.get("enabled", True))
+            exp_save_all = bool(exp_cfg.get("save_all_layers", False))
+            exp_out = exp_cfg.get("output_dir") or train_cfg.get("embeddings_output_dir")
+        else:
+            exp_enabled = bool(train_cfg.get("export_embeddings", False))
+            exp_save_all = bool(train_cfg.get("save_all_layers", False))
+            exp_out = train_cfg.get("embeddings_output_dir")
+
+        gate_res = train_family_gate(
+            model=model,
+            tok=tok,
+            df_pool=df_p,
+            df_train=df_tr,
+            target_family=target_family or "gemini",
+            samples_per_class=int(train_cfg.get("samples_per_class", 3800)),
+            negative_ratio=float(train_cfg.get("negative_ratio", 0.10)),
+            eval_texts=eval_texts,
+            eval_labels=eval_labels,
+            batch_size=int(train_cfg.get("batch_size", 32)),
+            max_len=int(train_cfg.get("max_len", 384)),
+            end_id=end_id,
+            device=device,
+            output_dir=out_dir,
+            checkpoints_volume=checkpoints_volume,
+            head_type=train_cfg.get("head_type", "mlp"),
+            hidden_dim=int(train_cfg.get("hidden_dim", 256)),
+            mlp_epochs=int(train_cfg.get("mlp_epochs", 20)),
+            mlp_lr=float(train_cfg.get("mlp_lr", 3e-4)),
+            mlp_dropout=float(train_cfg.get("mlp_dropout", 0.20)),
+            export_embeddings=exp_enabled,
+            save_all_layers=exp_save_all,
+            embeddings_output_dir=exp_out,
+        )
+        print(f"[Trainer] Phase 3 Family Gate Training Complete: {gate_res}")
+        return out_dir
+
     # Stage 1: Pool Pretraining
     stage1_cfg = train_cfg.get("stage1", {})
     if stage1_cfg.get("enabled", True) and (all_pools or pool_file):
@@ -1771,3 +2073,1028 @@ def run_training_pipeline(
             print(f"[Trainer Callback Warning] {e}")
     print(f"[Trainer] Checkpoint exported to {out_dir}")
     return out_dir
+
+
+def fit_family_gate_head(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    num_gate_classes: int,
+    alphas: list[float] | None = None,
+    label_smoothing: float = 0.05,
+    Z_eval: np.ndarray | None = None,
+    y_eval_true: np.ndarray | None = None,
+    eval_mask: np.ndarray | None = None,
+    num_family_classes: int | None = None,
+    device: torch.device | None = None,
+) -> tuple[np.ndarray, np.ndarray, float, float, np.ndarray | None]:
+    """
+    Fits an L2-regularized Plain Ridge Head for intra-family gating using GPU-accelerated PyTorch solve.
+    Returns: (best_W, best_b, best_alpha, best_eval_acc, best_eval_logits)
+    """
+    if alphas is None:
+        alphas = [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    N_tr, D_feat = Z_train.shape
+    Y_onehot = np.zeros((N_tr, num_gate_classes), dtype=np.float32)
+    for i, lab in enumerate(y_train):
+        Y_onehot[i, lab] = 1.0
+    Y_smooth = (1.0 - label_smoothing) * Y_onehot + (label_smoothing / float(num_gate_classes))
+
+    # Move to PyTorch tensors on GPU for blazing-fast linear algebra
+    Z_t = torch.from_numpy(Z_train).to(device, dtype=torch.float32)
+    Y_t = torch.from_numpy(Y_smooth).to(device, dtype=torch.float32)
+
+    mu_Z = Z_t.mean(dim=0, keepdim=True)
+    mu_Y = Y_t.mean(dim=0, keepdim=True)
+    Z_c = Z_t - mu_Z
+    Y_c = Y_t - mu_Y
+
+    # trace(Z_c @ Z_c.T) is simply the sum of squares ||Z_c||_F^2!
+    scale = float(torch.sum(Z_c ** 2).item() / N_tr)
+
+    use_primal = (N_tr >= D_feat)
+    if use_primal:
+        Cov = Z_c.T @ Z_c
+        Zt_Y = Z_c.T @ Y_c
+    else:
+        K_mat = Z_c @ Z_c.T
+
+    best_w, best_b = None, None
+    best_acc = 0.0
+    best_alpha = 1.0
+    best_eval_logits = None
+    K_eval_classes = num_family_classes or (num_gate_classes - 1)
+
+    for alpha in alphas:
+        eff_alpha = alpha * scale
+        if use_primal:
+            reg = eff_alpha * torch.eye(D_feat, device=device, dtype=torch.float32)
+            W_head = torch.linalg.solve(Cov + reg, Zt_Y)
+        else:
+            reg = eff_alpha * torch.eye(N_tr, device=device, dtype=torch.float32)
+            A_mat = torch.linalg.solve(K_mat + reg, Y_c)
+            W_head = Z_c.T @ A_mat
+        b_head = (mu_Y - mu_Z @ W_head).squeeze(0)
+
+        W_np = W_head.cpu().numpy()
+        b_np = b_head.cpu().numpy()
+
+        if Z_eval is not None and y_eval_true is not None and eval_mask is not None:
+            logits_ev = Z_eval @ W_np + b_np
+            fam_pred = logits_ev[eval_mask, :K_eval_classes].argmax(axis=1)
+            acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
+            if acc > best_acc or best_w is None:
+                best_acc = acc
+                best_w = W_np
+                best_b = b_np
+                best_alpha = alpha
+                best_eval_logits = logits_ev
+        else:
+            if best_w is None:
+                best_w = W_np
+                best_b = b_np
+                best_alpha = alpha
+
+    # Clean up GPU memory
+    del Z_t, Y_t, Z_c, Y_c
+    if use_primal:
+        del Cov, Zt_Y
+    else:
+        del K_mat
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return best_w, best_b, best_alpha, best_acc, best_eval_logits
+
+
+class FamilyMLPHead(nn.Module):
+    """
+    2-Layer Non-Linear MLP Head for intra-family sister decoupling (Phase 3):
+    Linear(D -> hidden_dim) -> GELU -> LayerNorm(hidden_dim) -> Dropout(p) -> Linear(hidden_dim -> num_classes)
+    """
+
+    def __init__(
+        self,
+        in_features: int = 40960,
+        hidden_dim: int = 256,
+        num_classes: int = 5,
+        dropout: float = 0.20,
+    ):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_dim)
+        self.act = nn.GELU()
+        self.ln = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc1(x)
+        h = self.act(h)
+        h = self.ln(h)
+        h = self.drop(h)
+        return self.fc2(h)
+
+    def forward_eval(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc1(x)
+        h = self.act(h)
+        h = self.ln(h)
+        return self.fc2(h)
+
+
+def fit_family_mlp_head(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    num_gate_classes: int,
+    num_family_classes: int,
+    hidden_dim: int = 256,
+    epochs: int = 20,
+    lr: float = 3e-4,
+    dropout: float = 0.20,
+    weight_decay: float = 0.01,
+    batch_size: int = 64,
+    label_smoothing: float = 0.05,
+    Z_eval: np.ndarray | None = None,
+    y_eval_true: np.ndarray | None = None,
+    eval_mask: np.ndarray | None = None,
+    device: torch.device | None = None,
+) -> tuple[dict[str, torch.Tensor], float, np.ndarray | None]:
+    """
+    Trains a 2-Layer Non-Linear MLP Head on Z_train with fixed centroid subtraction.
+    Performs zero-cost fold-in: b1* = b1 - mu_family @ W1.T
+    so that downstream inference evaluates raw Z without runtime centering.
+    Returns: (head_dict, best_eval_acc, best_eval_logits)
+    """
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    N_tr, D_feat = Z_train.shape
+
+    # 1. Fixed centroid calculation on intra-family training samples
+    fam_mask_tr = (y_train < num_family_classes)
+    if fam_mask_tr.sum() > 0:
+        mu_family = Z_train[fam_mask_tr].mean(axis=0, keepdims=True)
+    else:
+        mu_family = np.zeros((1, D_feat), dtype=np.float32)
+
+    Z_tr_res = (Z_train - mu_family).astype(np.float32)
+
+    # 2. PyTorch Dataset & DataLoader
+    X_t = torch.from_numpy(Z_tr_res).float()
+    y_t = torch.from_numpy(y_train).long()
+    ds = torch.utils.data.TensorDataset(X_t, y_t)
+    train_loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    # 3. Model, Optimizer, Loss
+    mlp = FamilyMLPHead(
+        in_features=D_feat,
+        hidden_dim=hidden_dim,
+        num_classes=num_gate_classes,
+        dropout=dropout,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(mlp.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    Z_ev_t = None
+    if Z_eval is not None:
+        Z_ev_res = (Z_eval - mu_family).astype(np.float32)
+        Z_ev_t = torch.from_numpy(Z_ev_res).float().to(device)
+
+    best_state = None
+    best_acc = 0.0
+    best_eval_logits = None
+
+    for ep in range(epochs):
+        mlp.train()
+        for b_x, b_y in train_loader:
+            b_x, b_y = b_x.to(device), b_y.to(device)
+            optimizer.zero_grad()
+            out = mlp(b_x)
+            loss = criterion(out, b_y)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        if Z_ev_t is not None and y_eval_true is not None and eval_mask is not None:
+            mlp.eval()
+            with torch.no_grad():
+                logits_ev = mlp.forward_eval(Z_ev_t).cpu().numpy()
+            fam_pred = logits_ev[eval_mask, :num_family_classes].argmax(axis=1)
+            acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
+            if acc > best_acc or best_state is None:
+                best_acc = acc
+                best_state = copy.deepcopy(mlp.state_dict())
+                best_eval_logits = logits_ev
+        else:
+            if best_state is None or ep == epochs - 1:
+                best_state = copy.deepcopy(mlp.state_dict())
+            if ep == epochs - 1:
+                mlp.eval()
+                with torch.no_grad():
+                    tr_preds = []
+                    for b_x, _ in train_loader:
+                        b_x = b_x.to(device)
+                        logits_tr = mlp.forward_eval(b_x)
+                        tr_preds.append(logits_tr[:, :num_family_classes].argmax(dim=1).cpu())
+                    all_tr_preds = torch.cat(tr_preds).numpy()
+                fam_tr_mask = (y_train < num_family_classes)
+                if fam_tr_mask.sum() > 0:
+                    best_acc = float(balanced_accuracy_score(y_train[fam_tr_mask], all_tr_preds[fam_tr_mask]))
+
+    if best_state is not None:
+        mlp.load_state_dict(best_state)
+    mlp.eval()
+
+    # 4. Zero-Cost Centroid Fold-In:
+    # (Z - mu) @ W1.T + b1 = Z @ W1.T + (b1 - mu @ W1.T)
+    with torch.no_grad():
+        W1 = mlp.fc1.weight.detach()
+        b1 = mlp.fc1.bias.detach()
+        mu_t = torch.from_numpy(mu_family).to(device=W1.device, dtype=W1.dtype)
+        b1_folded = (b1 - (mu_t @ W1.T).squeeze(0)).contiguous()
+        mlp.fc1.bias.copy_(b1_folded)
+
+    head_dict = {
+        "mlp_w1": mlp.fc1.weight.detach().cpu().to(torch.float32),
+        "mlp_b1": mlp.fc1.bias.detach().cpu().to(torch.float32),
+        "ln_weight": mlp.ln.weight.detach().cpu().to(torch.float32),
+        "ln_bias": mlp.ln.bias.detach().cpu().to(torch.float32),
+        "mlp_w2": mlp.fc2.weight.detach().cpu().to(torch.float32),
+        "mlp_b2": mlp.fc2.bias.detach().cpu().to(torch.float32),
+    }
+
+    # Linear fallback approximation
+    with torch.no_grad():
+        W_eff = (head_dict["mlp_w2"] @ head_dict["mlp_w1"]).T
+        b_eff = head_dict["mlp_b2"] + head_dict["mlp_b1"] @ head_dict["mlp_w2"].T
+        head_dict["plain.weight"] = W_eff.T.contiguous()
+        head_dict["plain.bias"] = b_eff.contiguous()
+
+    del X_t, y_t, ds, mlp
+    if Z_ev_t is not None:
+        del Z_ev_t
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return head_dict, best_acc, best_eval_logits
+
+
+def find_compatible_champion_lora(
+    input_dir: Path,
+    backbone_name: str,
+    lora_r: int = 32,
+    target_family: str = "",
+) -> Path | None:
+    """
+    Finds the matching fine-tuned LoRA adapter directory for the given backbone and rank.
+    Pre-validates adapter_config.json to ensure:
+    1. Rank r matches expected lora_r (e.g. 32 vs 16).
+    2. Backbone family matches (e.g. Qwen3 vs Qwen2.5 vs DeBERTa vs Llama).
+    3. Never greedily returns an incompatible adapter (e.g. Qwen2.5-14B when running Qwen3-14B).
+    """
+    if not input_dir or not Path(input_dir).exists():
+        return None
+
+    input_p = Path(input_dir)
+    candidates = list(input_p.rglob("adapter_model.safetensors")) + list(input_p.rglob("adapter_model.bin"))
+    if not candidates:
+        return None
+
+    b_lower = backbone_name.lower()
+    is_qwen3 = "qwen3" in b_lower or ("qwen" in b_lower and "2" not in b_lower and "2.5" not in b_lower)
+    is_qwen25 = "qwen2" in b_lower or "2.5" in b_lower
+    is_deberta = "deberta" in b_lower
+
+    matching_dirs: list[tuple[int, Path]] = []
+
+    for cand in candidates:
+        p_dir = cand.parent
+        p_str = str(p_dir).lower().replace("\\", "/")
+
+        if target_family:
+            other_fams = [f for f in FAMILIES.keys() if f != target_family.lower()]
+            if any(f"export_{f}" in p_str or f"{f}_gate" in p_str or f"{f}_spec" in p_str for f in other_fams):
+                continue
+
+        cfg_p = p_dir / "adapter_config.json"
+        if not cfg_p.exists():
+            cfg_p = p_dir.parent / "adapter_config.json"
+
+        score = 0
+        if cfg_p.exists():
+            try:
+                with open(cfg_p, "r", encoding="utf-8") as f:
+                    c_data = json.load(f)
+
+                r_found = int(c_data.get("r", 0))
+                if lora_r > 0 and r_found > 0 and r_found != lora_r:
+                    continue
+
+                base_str = str(c_data.get("base_model_name_or_path", "")).lower()
+
+                if is_qwen3 and ("qwen2" in base_str or "2.5" in base_str or "llama" in base_str):
+                    continue
+                if is_qwen25 and ("qwen3" in base_str or "llama" in base_str) and "2.5" not in base_str and "qwen2" not in base_str:
+                    continue
+                if is_deberta and "deberta" not in base_str and base_str:
+                    continue
+
+                if is_qwen3 and "qwen3" in base_str:
+                    score += 10
+                if is_qwen25 and ("qwen2" in base_str or "2.5" in base_str):
+                    score += 10
+            except Exception:
+                pass
+
+        if "export_champion" in p_str:
+            score += 20
+        if "inhouse" in p_str:
+            score += 15
+        if is_qwen3 and "qwen3_14b" in p_str:
+            score += 10
+        if is_qwen25 and ("qwen25" in p_str or "qwen2" in p_str):
+            score += 10
+
+        if is_qwen3 and ("qwen2" in p_str or "2.5" in p_str or "8b" in p_str):
+            continue
+        if is_qwen25 and ("qwen3" in p_str or "8b" in p_str):
+            continue
+
+        matching_dirs.append((score, p_dir))
+
+    if not matching_dirs:
+        return None
+
+    matching_dirs.sort(key=lambda x: x[0], reverse=True)
+    return matching_dirs[0][1]
+
+
+def load_and_slice_champion_heads(
+    heads_path: Path,
+    model: nn.Module,
+    fam_cols: list[int] | None = None,
+) -> bool:
+    """
+    Loads champion plain head weights into model.plain_head.
+    If the checkpoint contains an 18-class head (e.g. [18, 40960]) and the model is
+    a specialist with num_classes == len(fam_cols) (e.g. [4, 40960]), slices the
+    exact target family classes to avoid tensor size mismatch errors.
+    """
+    if not Path(heads_path).exists():
+        return False
+
+    try:
+        if str(heads_path).endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            h_sd = load_file(str(heads_path))
+        else:
+            h_sd = torch.load(str(heads_path), map_location="cpu")
+
+        if not hasattr(model, "plain_head") or model.plain_head is None:
+            return False
+
+        w_ckpt = h_sd.get("plain.weight") if "plain.weight" in h_sd else h_sd.get("weight", None)
+        b_ckpt = h_sd.get("plain.bias") if "plain.bias" in h_sd else h_sd.get("bias", None)
+
+        if w_ckpt is None or b_ckpt is None:
+            return False
+
+        tgt_w = model.plain_head.weight
+        tgt_b = model.plain_head.bias
+
+        # Case A: Exact shape match
+        if tgt_w.shape == w_ckpt.shape and tgt_b.shape == b_ckpt.shape:
+            tgt_w.data.copy_(w_ckpt)
+            tgt_b.data.copy_(b_ckpt)
+            return True
+
+        # Case B: Checkpoint is 18-class, model is a specialist (e.g. 4-class)
+        if fam_cols is not None and w_ckpt.shape[0] >= max(fam_cols) + 1:
+            sliced_w = w_ckpt[fam_cols]
+            sliced_b = b_ckpt[fam_cols]
+            if sliced_w.shape == tgt_w.shape and sliced_b.shape == tgt_b.shape:
+                tgt_w.data.copy_(sliced_w)
+                tgt_b.data.copy_(sliced_b)
+                return True
+
+        return False
+    except Exception as e:
+        print(f"[Trainer] Note on loading/slicing champion head: {e}")
+        return False
+
+
+def save_extracted_features_bundle(
+    output_dir: Path | str,
+    target: str,
+    features_concat: np.ndarray,
+    features_by_layer: np.ndarray | None,
+    texts: list[str],
+    labels: list[int] | np.ndarray,
+    model_names: list[str],
+    prompt_ids: list[Any] | None = None,
+    eval_features_concat: np.ndarray | None = None,
+    eval_features_by_layer: np.ndarray | None = None,
+    eval_texts: list[str] | None = None,
+    eval_labels: list[int] | None = None,
+    eval_model_names: list[str] | None = None,
+    dataset_title: str | None = None,
+    dataset_slug: str | None = None,
+    checkpoints_volume: Any | None = None,
+) -> Path:
+    """
+    Saves extracted features and metadata in Kaggle Dataset format:
+    1. features_concat.safetensors: FP16 tensor [N, D]
+    2. features_by_layer.safetensors: FP16 tensor [N, L, hidden_size] (if provided)
+    3. metadata.parquet: [id, model, label, prompt_id, text_hash, char_len]
+    4. benchmark_features_concat.safetensors & benchmark_metadata.parquet (if eval provided)
+    5. dataset-metadata.json: For instant 1-click `kaggle datasets create`
+    6. features_summary.json: Human-readable inspection stats
+    """
+    from safetensors.torch import save_file
+
+    out_p = Path(output_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n[Features Export] Saving features bundle for target '{target}' to: {out_p}...")
+
+    # 1. Save concatenated representations in FP16
+    feat_cat_t = torch.from_numpy(features_concat).to(torch.float16)
+    save_file({"features_concat": feat_cat_t}, str(out_p / "features_concat.safetensors"))
+    sz_cat_mb = (out_p / "features_concat.safetensors").stat().st_size / (1024**2)
+    print(f"  Saved features_concat.safetensors: shape={list(feat_cat_t.shape)}, size={sz_cat_mb:.1f} MB")
+
+    # 2. Save layer-by-layer representations if provided
+    sz_layer_mb = 0.0
+    if features_by_layer is not None:
+        feat_layers_t = torch.from_numpy(features_by_layer).to(torch.float16)
+        save_file({"features_by_layer": feat_layers_t}, str(out_p / "features_by_layer.safetensors"))
+        sz_layer_mb = (out_p / "features_by_layer.safetensors").stat().st_size / (1024**2)
+        print(f"  Saved features_by_layer.safetensors: shape={list(feat_layers_t.shape)}, size={sz_layer_mb:.1f} MB")
+
+    # 3. Save training metadata parquet
+    meta_df = pd.DataFrame({
+        "id": np.arange(len(texts), dtype=np.int64),
+        "model": model_names,
+        "label": np.asarray(labels, dtype=np.int64),
+        "prompt_id": prompt_ids if prompt_ids is not None else [-1] * len(texts),
+        "text_hash": [_text_hash(t) for t in texts],
+        "char_len": [len(t) for t in texts],
+    })
+    meta_df.to_parquet(out_p / "metadata.parquet", index=False)
+    print(f"  Saved metadata.parquet: {len(meta_df):,} rows")
+
+    # 4. Save benchmark holdout representations if provided
+    if eval_features_concat is not None and eval_texts is not None:
+        ev_cat_t = torch.from_numpy(eval_features_concat).to(torch.float16)
+        save_file({"benchmark_features_concat": ev_cat_t}, str(out_p / "benchmark_features_concat.safetensors"))
+        if eval_features_by_layer is not None:
+            ev_layer_t = torch.from_numpy(eval_features_by_layer).to(torch.float16)
+            save_file({"benchmark_features_by_layer": ev_layer_t}, str(out_p / "benchmark_features_by_layer.safetensors"))
+
+        eval_models = eval_model_names if eval_model_names is not None else [
+            LABELS[i] if i < len(LABELS) else f"class_{i}" for i in (eval_labels if eval_labels is not None else [0] * len(eval_texts))
+        ]
+        bench_df = pd.DataFrame({
+            "id": np.arange(len(eval_texts), dtype=np.int64),
+            "model": eval_models,
+            "label": np.asarray(eval_labels, dtype=np.int64) if eval_labels is not None else np.zeros(len(eval_texts), dtype=np.int64),
+            "text_hash": [_text_hash(t) for t in eval_texts],
+            "char_len": [len(t) for t in eval_texts],
+        })
+        bench_df.to_parquet(out_p / "benchmark_metadata.parquet", index=False)
+        print(f"  Saved benchmark features & metadata: {len(bench_df):,} samples")
+
+    # 5. Save Kaggle dataset-metadata.json
+    slug = dataset_slug or f"ntl-{target.lower()}-features-qwen3-14b"
+    title = dataset_title or f"NTL {target.upper()} Extracted Features (Qwen3-14B)"
+    kaggle_meta = {
+        "title": title,
+        "id": f"anilmittal/{slug}",
+        "licenses": [{"name": "CC0-1.0"}],
+        "description": (
+            f"Pre-extracted high-dimensional feature representations for {target.upper()} models "
+            f"using Champion Multi-Layer Qwen3-14B backbone with causal attention-sink masking."
+        ),
+    }
+    (out_p / "dataset-metadata.json").write_text(json.dumps(kaggle_meta, indent=2), encoding="utf-8")
+
+    # 6. Save inspection summary JSON
+    summary = {
+        "target": target,
+        "num_train_samples": len(texts),
+        "num_classes": len(set(model_names)),
+        "class_counts": {k: int(v) for k, v in pd.Series(model_names).value_counts().items()},
+        "feature_dim_concat": int(features_concat.shape[1]),
+        "features_by_layer_shape": list(features_by_layer.shape) if features_by_layer is not None else None,
+        "has_benchmark": eval_features_concat is not None,
+        "num_benchmark_samples": len(eval_texts) if eval_texts is not None else 0,
+        "total_bundle_size_mb": round(sz_cat_mb + sz_layer_mb, 2),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+    }
+    (out_p / "features_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    if checkpoints_volume is not None and hasattr(checkpoints_volume, "commit"):
+        try:
+            checkpoints_volume.commit()
+        except Exception:
+            pass
+
+    print(f"[Features Export] Complete! Bundle ready for Kaggle Dataset creation at: {out_p} ({summary['total_bundle_size_mb']:.1f} MB)\n")
+    return out_p
+
+
+def extract_and_export_embeddings(
+    model: MultiLayerLoRAClassifier,
+    tok: Any,
+    df_pool: pd.DataFrame,
+    df_train: pd.DataFrame | None = None,
+    target: str = "gemini",
+    save_all_layers: bool = False,
+    output_dir: Path | str = "export_embeddings",
+    samples_per_class: int = 0,
+    negative_ratio: float = 0.10,
+    eval_texts: list[str] | None = None,
+    eval_labels: list[int] | None = None,
+    eval_model_names: list[str] | None = None,
+    batch_size: int = 16,
+    max_len: int = 384,
+    end_id: int = 151643,
+    device: torch.device | None = None,
+    dataset_title: str | None = None,
+    dataset_slug: str | None = None,
+    checkpoints_volume: Any | None = None,
+) -> Path:
+    """
+    Configurable feature extraction and dataset export pipeline.
+    Filters data for target ('all', 'gemini', 'gpt', 'claude', 'glm', 'gold'),
+    extracts representations batch-by-batch across model layers, and packages into a Kaggle Dataset.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    target_clean = target.lower().strip()
+    print(f"\n==========================================================================================")
+    print(f" [Features Extraction] Target: '{target_clean}' | Save All Layers: {save_all_layers} | Max Len: {max_len}")
+    print(f"==========================================================================================")
+
+    # 1. Zero leakage quarantining against clean benchmark holdout
+    if eval_texts is not None and len(eval_texts) > 0:
+        bench_set = set(t.strip().lower() for t in eval_texts)
+        if df_pool is not None and len(df_pool) > 0:
+            init_p = len(df_pool)
+            df_pool = df_pool[~df_pool["text"].str.strip().str.lower().isin(bench_set)].copy()
+            quar_p = init_p - len(df_pool)
+            if quar_p > 0:
+                print(f"[Features Extraction] Quarantined {quar_p} pool samples matching benchmark.")
+        if df_train is not None and len(df_train) > 0:
+            init_t = len(df_train)
+            df_train = df_train[~df_train["text"].str.strip().str.lower().isin(bench_set)].copy()
+            quar_t = init_t - len(df_train)
+            if quar_t > 0:
+                print(f"[Features Extraction] Quarantined {quar_t} gold train samples matching benchmark.")
+
+    # 2. Data Selection according to target
+    if target_clean == "gold" or target_clean == "train":
+        assert df_train is not None and len(df_train) > 0, "No gold df_train provided for target='gold'"
+        df_target_all = df_train.copy()
+        df_neg_all = pd.DataFrame()
+    elif target_clean == "all":
+        # All 18 classes
+        all_dfs = []
+        for c in LABELS:
+            sub_tr = df_train[df_train["model"] == c] if (df_train is not None and len(df_train) > 0) else pd.DataFrame()
+            sub_pool = df_pool[df_pool["model"] == c] if (df_pool is not None and len(df_pool) > 0) else pd.DataFrame()
+            if samples_per_class > 0:
+                n_take = min(samples_per_class - len(sub_tr), len(sub_pool))
+                sampled_pool = sub_pool.sample(n=max(n_take, 0), random_state=42) if n_take > 0 else pd.DataFrame()
+            else:
+                sampled_pool = sub_pool
+            c_df = pd.concat([sub_tr, sampled_pool], ignore_index=True)
+            all_dfs.append(c_df)
+            print(f"  Class {c}: {len(c_df)} samples ({len(sub_tr)} gold, {len(c_df)-len(sub_tr)} pool)")
+        df_target_all = pd.concat(all_dfs, ignore_index=True)
+        df_neg_all = pd.DataFrame()
+    elif target_clean in FAMILIES:
+        target_cols = FAMILIES[target_clean]
+        target_classes = [LABELS[i] for i in target_cols]
+        cap = samples_per_class if samples_per_class > 0 else 3800
+        fam_dfs = []
+        for c in target_classes:
+            sub_tr = df_train[df_train["model"] == c] if (df_train is not None and len(df_train) > 0) else pd.DataFrame()
+            sub_pool = df_pool[df_pool["model"] == c] if (df_pool is not None and len(df_pool) > 0) else pd.DataFrame()
+            n_take = min(cap - len(sub_tr), len(sub_pool))
+            sampled_pool = sub_pool.sample(n=max(n_take, 0), random_state=42) if n_take > 0 else pd.DataFrame()
+            c_df = pd.concat([sub_tr, sampled_pool], ignore_index=True)
+            fam_dfs.append(c_df)
+            print(f"  {target_clean.upper()} class {c}: {len(c_df)} samples ({len(sub_tr)} gold, {len(c_df)-len(sub_tr)} pool)")
+        df_target_all = pd.concat(fam_dfs, ignore_index=True)
+
+        # Distractor sampling if negative_ratio > 0
+        if negative_ratio > 0.0 and df_pool is not None and len(df_pool) > 0:
+            n_neg = int(len(df_target_all) * negative_ratio)
+            df_non_fam = df_pool[~df_pool["model"].isin(target_classes)].copy()
+            other_fams = [f for f in ["gpt", "gemini", "claude", "glm", "qwen", "kimi"] if f != target_clean]
+            neg_dfs = []
+            n_per_fam = max(n_neg // max(len(other_fams), 1), 1)
+            for fam in other_fams:
+                fam_sub = df_non_fam[df_non_fam["model"].str.startswith(fam)]
+                if len(fam_sub) > 0:
+                    neg_dfs.append(fam_sub.sample(n=min(n_per_fam, len(fam_sub)), random_state=42))
+            df_neg_all = pd.concat(neg_dfs, ignore_index=True) if neg_dfs else pd.DataFrame()
+            print(f"  Sampled {len(df_neg_all)} negative distractors across non-{target_clean.upper()} families.")
+        else:
+            df_neg_all = pd.DataFrame()
+    else:
+        raise ValueError(f"Unknown target '{target}'. Must be one of: 'all', 'gold', or a valid family {list(FAMILIES.keys())}.")
+
+    # Assemble final extraction list
+    train_texts = df_target_all["text"].tolist() + (df_neg_all["text"].tolist() if len(df_neg_all) > 0 else [])
+    model_names = df_target_all["model"].tolist() + (["__OTHER__"] * len(df_neg_all) if len(df_neg_all) > 0 else [])
+
+    unique_models = sorted(list(set(model_names)))
+    lab_map = {m: i for i, m in enumerate(unique_models)}
+    train_labels = [lab_map[m] for m in model_names]
+    prompt_ids = df_target_all["prompt_id"].tolist() if "prompt_id" in df_target_all.columns else None
+
+    print(f"[Features Extraction] Extracting features on {len(train_texts):,} samples (batch_size={batch_size})...")
+
+    # 3. Extract Train Features
+    ds_tr = TextSequenceDataset(train_texts, train_labels, None, tok, max_len=max_len, end_id=end_id)
+    loader_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=False, collate_fn=collate_text_batch)
+
+    Z_cat_list = []
+    Z_layers_list = []
+    with torch.no_grad():
+        with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+            for batch in loader_tr:
+                mb_ids = batch["input_ids"].to(device)
+                mb_mask = batch["attention_mask"].to(device)
+                max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                z_b, z_l = model.forward_features(
+                    mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                    return_by_layer=True, extract_all_layers=save_all_layers,
+                )
+                Z_cat_list.append(z_b.cpu().float().numpy())
+                Z_layers_list.append(z_l.cpu().to(torch.float16).numpy())
+
+    features_concat = np.vstack(Z_cat_list)
+    features_by_layer = np.vstack(Z_layers_list)
+
+    # 4. Extract Benchmark Features if provided
+    eval_cat = None
+    eval_layers = None
+    if eval_texts is not None and len(eval_texts) > 0:
+        print(f"[Features Extraction] Extracting benchmark features on {len(eval_texts)} holdout samples...")
+        dummy_y = [0] * len(eval_texts)
+        ds_ev = TextSequenceDataset(eval_texts, dummy_y, None, tok, max_len=max_len, end_id=end_id)
+        loader_ev = DataLoader(ds_ev, batch_size=batch_size, shuffle=False, collate_fn=collate_text_batch)
+        ev_cat_list = []
+        ev_layers_list = []
+        with torch.no_grad():
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+                for batch in loader_ev:
+                    mb_ids = batch["input_ids"].to(device)
+                    mb_mask = batch["attention_mask"].to(device)
+                    max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                    z_b, z_l = model.forward_features(
+                        mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                        return_by_layer=True, extract_all_layers=save_all_layers,
+                    )
+                    ev_cat_list.append(z_b.cpu().float().numpy())
+                    ev_layers_list.append(z_l.cpu().to(torch.float16).numpy())
+        eval_cat = np.vstack(ev_cat_list)
+        eval_layers = np.vstack(ev_layers_list)
+
+    # 5. Save features bundle
+    out_dir_path = save_extracted_features_bundle(
+        output_dir=output_dir,
+        target=target_clean,
+        features_concat=features_concat,
+        features_by_layer=features_by_layer,
+        texts=train_texts,
+        labels=train_labels,
+        model_names=model_names,
+        prompt_ids=prompt_ids,
+        eval_features_concat=eval_cat,
+        eval_features_by_layer=eval_layers,
+        eval_texts=eval_texts,
+        eval_labels=eval_labels,
+        eval_model_names=eval_model_names,
+        dataset_title=dataset_title,
+        dataset_slug=dataset_slug,
+        checkpoints_volume=checkpoints_volume,
+    )
+    return out_dir_path
+
+
+def train_family_gate(
+    model: nn.Module,
+    tok: Any,
+    df_pool: pd.DataFrame,
+    df_train: pd.DataFrame | None,
+    target_family: str,
+    samples_per_class: int = 0,
+    negative_ratio: float = 0.10,
+    eval_texts: list[str] | None = None,
+    eval_labels: list[int] | None = None,
+    batch_size: int = 32,
+    max_len: int = 384,
+    end_id: int = 151643,
+    device: torch.device | None = None,
+    output_dir: Path | str | None = None,
+    checkpoints_volume: Any | None = None,
+    head_type: str = "mlp",
+    hidden_dim: int = 256,
+    mlp_epochs: int = 20,
+    mlp_lr: float = 3e-4,
+    mlp_dropout: float = 0.20,
+    export_embeddings: bool = False,
+    save_all_layers: bool = False,
+    embeddings_output_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """
+    End-to-end family gate training pipeline (HB-WRH):
+    1. Quarantines benchmark overlap to guarantee 0% leakage.
+    2. Curates balanced class samples + 10% negative distractors.
+    3. Extracts Z_train and Z_eval on model forward_features.
+    4. Solves closed-form L2 Ridge with trace-scaled regularization across alpha sweep.
+    5. Evaluates within-family accuracy & sweeps blending weights into champion plain head.
+    6. Saves heads.safetensors and meta.json if output_dir provided.
+    """
+    from safetensors.torch import save_file
+    from scipy.special import softmax as sp_softmax
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    target_family = target_family.lower()
+    assert target_family in FAMILIES, f"Unknown family {target_family}. Must be one of {list(FAMILIES.keys())}"
+    family_cols = FAMILIES[target_family]
+    family_classes = [LABELS[i] for i in family_cols]
+    num_family_classes = len(family_classes)
+    num_gate_classes = num_family_classes + 1  # Last class is __OTHER__ distractors
+
+    if samples_per_class <= 0:
+        default_samples = {
+            "glm": 4000,
+            "gemini": 3800,
+            "gpt": 2500,
+            "claude": 2500,
+        }
+        samples_per_class = default_samples.get(target_family, 2500)
+
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if vram_gb < 16.0 and batch_size > 8:
+            print(f"[{target_family.upper()} Gate] Low VRAM ({vram_gb:.1f} GiB) detected: clamping extraction batch_size from {batch_size} to 8.")
+            batch_size = 8
+
+    # 1. Zero leakage quarantining
+    if eval_texts is not None and len(eval_texts) > 0:
+        bench_set = set(t.strip().lower() for t in eval_texts)
+        init_pool_len = len(df_pool)
+        df_pool = df_pool[~df_pool["text"].str.strip().str.lower().isin(bench_set)].copy()
+        if df_train is not None and len(df_train) > 0:
+            df_train = df_train[~df_train["text"].str.strip().str.lower().isin(bench_set)].copy()
+        quarantined = init_pool_len - len(df_pool)
+        print(f"[{target_family.upper()} Gate] Quarantined {quarantined} benchmark overlap rows. Clean pool: {len(df_pool):,}.")
+
+    # 2. Balanced intra-family sampling
+    fam_dfs = []
+    for c in family_classes:
+        sub_tr = df_train[df_train["model"] == c] if (df_train is not None and len(df_train) > 0) else pd.DataFrame()
+        sub_pool = df_pool[df_pool["model"] == c]
+        needed = samples_per_class
+        n_take = min(needed - len(sub_tr), len(sub_pool))
+        sampled_pool = sub_pool.sample(n=n_take, random_state=42)
+        c_df = pd.concat([sub_tr, sampled_pool], ignore_index=True)
+        fam_dfs.append(c_df)
+        print(f"  {target_family.upper()} class {c}: {len(c_df)} samples ({len(sub_tr)} train, {len(c_df)-len(sub_tr)} pool)")
+
+    df_fam_all = pd.concat(fam_dfs, ignore_index=True)
+    total_fam_samples = len(df_fam_all)
+
+    # 10% negative distractor sampling from non-family models
+    n_neg = int(total_fam_samples * negative_ratio)
+    df_non_fam = df_pool[~df_pool["model"].isin(family_classes)].copy()
+    other_fams = [f for f in ["gpt", "gemini", "claude", "glm", "qwen", "kimi"] if f != target_family]
+    neg_dfs = []
+    n_per_fam = max(n_neg // len(other_fams), 1)
+    for fam in other_fams:
+        fam_sub = df_non_fam[df_non_fam["model"].str.startswith(fam)]
+        if len(fam_sub) > 0:
+            neg_dfs.append(fam_sub.sample(n=min(n_per_fam, len(fam_sub)), random_state=42))
+    df_neg_all = pd.concat(neg_dfs, ignore_index=True)
+    print(f"[{target_family.upper()} Gate] Sampled {len(df_neg_all)} negative distractors across {len(other_fams)} non-{target_family.upper()} families.")
+
+    train_texts = df_fam_all["text"].tolist() + df_neg_all["text"].tolist()
+    fam_map = {name: i for i, name in enumerate(family_classes)}
+    train_labels = [fam_map[m] for m in df_fam_all["model"].tolist()] + [num_family_classes] * len(df_neg_all)
+    print(f"[{target_family.upper()} Gate] Total training dataset: {len(train_texts):,} samples ({num_gate_classes} classes: {num_family_classes} {target_family.upper()} + 1 Other).")
+
+    # 3. Extract Z_train representations
+    print(f"[{target_family.upper()} Gate] Extracting Z_train on {len(train_texts)} samples (batch_size={batch_size})...")
+    ds_tr = TextSequenceDataset(train_texts, train_labels, None, tok, max_len=max_len, end_id=end_id)
+    loader_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=False, collate_fn=collate_text_batch)
+
+    Z_tr_list = []
+    Z_tr_layers_list = []
+    need_layers = bool(export_embeddings or save_all_layers)
+    with torch.no_grad():
+        with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+            for batch in loader_tr:
+                mb_ids = batch["input_ids"].to(device)
+                mb_mask = batch["attention_mask"].to(device)
+                max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                if need_layers:
+                    z_b, z_l = model.forward_features(
+                        mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                        return_by_layer=True, extract_all_layers=save_all_layers,
+                    )
+                    Z_tr_layers_list.append(z_l.cpu().to(torch.float16).numpy())
+                else:
+                    z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                Z_tr_list.append(z_b.cpu().float().numpy())
+    Z_train = np.vstack(Z_tr_list)
+    Z_train_layers = np.vstack(Z_tr_layers_list) if Z_tr_layers_list else None
+    y_train = np.array(train_labels, dtype=np.int64)
+    print(f"[{target_family.upper()} Gate] Extracted Z_train: shape={Z_train.shape}, dtype={Z_train.dtype}" +
+          (f", layers_shape={Z_train_layers.shape}" if Z_train_layers is not None else ""))
+
+    # 4. Extract Z_eval on benchmark samples
+    Z_eval = None
+    Z_eval_layers = None
+    main_logits_eval = None
+    if eval_texts is not None and len(eval_texts) > 0:
+        print(f"[{target_family.upper()} Gate] Extracting Z_eval on {len(eval_texts)} benchmark samples...")
+        dummy_eval_y = [0] * len(eval_texts)
+        ds_ev = TextSequenceDataset(eval_texts, dummy_eval_y, None, tok, max_len=max_len, end_id=end_id)
+        loader_ev = DataLoader(ds_ev, batch_size=batch_size, shuffle=False, collate_fn=collate_text_batch)
+        Z_ev_list = []
+        Z_ev_layers_list = []
+        with torch.no_grad():
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+                for batch in loader_ev:
+                    mb_ids = batch["input_ids"].to(device)
+                    mb_mask = batch["attention_mask"].to(device)
+                    max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                    if need_layers:
+                        z_b, z_l = model.forward_features(
+                            mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                            return_by_layer=True, extract_all_layers=save_all_layers,
+                        )
+                        Z_ev_layers_list.append(z_l.cpu().to(torch.float16).numpy())
+                    else:
+                        z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                    Z_ev_list.append(z_b.cpu().float().numpy())
+        Z_eval = np.vstack(Z_ev_list)
+        Z_eval_layers = np.vstack(Z_ev_layers_list) if Z_ev_layers_list else None
+
+        if hasattr(model, "plain_head"):
+            W_p = model.plain_head.weight.detach().cpu().float().numpy()
+            b_p = model.plain_head.bias.detach().cpu().float().numpy()
+            main_logits_eval = Z_eval @ W_p.T + b_p
+
+    # Optional: Export Extracted Features Dataset for Kaggle / Local
+    if export_embeddings:
+        emb_dir = Path(embeddings_output_dir) if embeddings_output_dir else (Path(output_dir) / "embeddings" if output_dir else Path("export_embeddings"))
+        save_extracted_features_bundle(
+            output_dir=emb_dir,
+            target=target_family,
+            features_concat=Z_train,
+            features_by_layer=Z_train_layers,
+            texts=train_texts,
+            labels=train_labels,
+            model_names=df_fam_all["model"].tolist() + ["__OTHER__"] * len(df_neg_all),
+            eval_features_concat=Z_eval,
+            eval_features_by_layer=Z_eval_layers,
+            eval_texts=eval_texts,
+            eval_labels=eval_labels,
+            dataset_title=f"NTL {target_family.upper()} Extracted Features (Qwen3-14B)",
+            dataset_slug=f"ntl-{target_family.lower()}-features-qwen3-14b",
+            checkpoints_volume=checkpoints_volume,
+        )
+
+    # 5. Fit Head (Non-Linear MLP or Linear Ridge)
+    y_ev_arr = np.array(eval_labels) if eval_labels is not None else None
+    fam_eval_mask = np.isin(y_ev_arr, family_cols) if y_ev_arr is not None else None
+    col_to_local = {c: i for i, c in enumerate(family_cols)}
+    y_fam_true = np.array([col_to_local[v] for v in y_ev_arr[fam_eval_mask]]) if fam_eval_mask is not None else None
+
+    acc_plain_within = 0.0
+    if main_logits_eval is not None and fam_eval_mask is not None:
+        plain_fam_pred = main_logits_eval[fam_eval_mask][:, family_cols].argmax(axis=1)
+        acc_plain_within = float(balanced_accuracy_score(y_fam_true, plain_fam_pred))
+
+    # 5. Fit Head (Non-Linear MLP or Linear Ridge)
+    if head_type.lower() == "mlp":
+        print(f"[{target_family.upper()} Gate] Fitting {num_gate_classes}-class Non-Linear MLP Head (dim={hidden_dim}, epochs={mlp_epochs}, lr={mlp_lr})...")
+        mlp_head_dict, best_fam_acc, best_fam_logits = fit_family_mlp_head(
+            Z_train=Z_train,
+            y_train=y_train,
+            num_gate_classes=num_gate_classes,
+            num_family_classes=num_family_classes,
+            hidden_dim=hidden_dim,
+            epochs=mlp_epochs,
+            lr=mlp_lr,
+            dropout=mlp_dropout,
+            label_smoothing=0.05,
+            Z_eval=Z_eval,
+            y_eval_true=y_fam_true,
+            eval_mask=fam_eval_mask,
+            device=device,
+        )
+        best_alpha = 0.0
+        best_w = mlp_head_dict["plain.weight"].T.cpu().numpy()
+        best_b = mlp_head_dict["plain.bias"].cpu().numpy()
+        print(f"[{target_family.upper()} Gate] Non-Linear MLP Head trained with {target_family.upper()} Acc: {best_fam_acc*100:.2f}% (Lift: {(best_fam_acc - acc_plain_within)*100:+.2f}%)")
+    else:
+        print(f"[{target_family.upper()} Gate] Fitting {num_gate_classes}-class Ridge Head on Z_train...")
+        best_w, best_b, best_alpha, best_fam_acc, best_fam_logits = fit_family_gate_head(
+            Z_train=Z_train,
+            y_train=y_train,
+            num_gate_classes=num_gate_classes,
+            alphas=[0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0],
+            label_smoothing=0.05,
+            Z_eval=Z_eval,
+            y_eval_true=y_fam_true,
+            eval_mask=fam_eval_mask,
+            num_family_classes=num_family_classes,
+            device=device,
+        )
+        mlp_head_dict = {
+            "plain.weight": torch.from_numpy(best_w.T).contiguous(),
+            "plain.bias": torch.from_numpy(best_b).contiguous(),
+        }
+        print(f"[{target_family.upper()} Gate] Optimal Ridge Head selected: alpha={best_alpha:.2f} with {target_family.upper()} Acc: {best_fam_acc*100:.2f}% (Lift: {(best_fam_acc - acc_plain_within)*100:+.2f}%)")
+
+    # 6. Evaluate Full Pipeline on all benchmark samples
+    pipe_results = {}
+    if main_logits_eval is not None and best_fam_logits is not None and y_ev_arr is not None:
+        P_main = sp_softmax(main_logits_eval, axis=1)
+        acc_plain_solo = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
+        print(f"[{target_family.upper()} Gate] Champion Plain Head Benchmark BAcc: {acc_plain_solo*100:.2f}%")
+
+        best_pipe_acc = 0.0
+        best_pipe_w = 0.0
+        cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
+
+        for gw in [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50]:
+            P_fused = P_main.copy()
+            spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
+            for idx in np.flatnonzero(cand_mask):
+                orig_mass = P_main[idx, family_cols].sum()
+                fused_fam = (1.0 - gw) * P_main[idx, family_cols] + gw * spec_probs[idx]
+                fused_fam = fused_fam / fused_fam.sum() * orig_mass
+                P_fused[idx, family_cols] = fused_fam
+
+            acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
+            P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
+            acc_gated_sk = float(balanced_accuracy_score(y_ev_arr, P_sk.argmax(axis=1)))
+            print(f"  [Gate Blend Sweep] gw={gw:.2f} | Gate Alone BAcc: {acc_gated*100:.2f}% | Gate + Sinkhorn BAcc: {acc_gated_sk*100:.2f}%")
+            if acc_gated_sk > best_pipe_acc:
+                best_pipe_acc = acc_gated_sk
+                best_pipe_w = gw
+
+        pipe_results = {
+            "plain_solo_bacc": acc_plain_solo,
+            "best_pipe_bacc": best_pipe_acc,
+            "best_gate_weight": best_pipe_w,
+            "lift_over_plain": best_pipe_acc - acc_plain_solo,
+        }
+
+    # 7. Save Checkpoint
+    if output_dir is not None:
+        out_p = Path(output_dir)
+        out_p.mkdir(parents=True, exist_ok=True)
+        save_file(mlp_head_dict, str(out_p / "heads.safetensors"))
+        meta_fam = {
+            "classes": family_classes + ["__OTHER__"],
+            "labels": family_classes + ["__OTHER__"],
+            "target_family": target_family,
+            "head_type": head_type.lower(),
+            "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
+            "alpha": float(best_alpha),
+            "within_family_acc": float(best_fam_acc),
+            "plain_within_family_acc": float(acc_plain_within),
+        }
+        (out_p / "meta.json").write_text(json.dumps(meta_fam, indent=2), encoding="utf-8")
+        if checkpoints_volume is not None and hasattr(checkpoints_volume, "commit"):
+            checkpoints_volume.commit()
+        print(f"[{target_family.upper()} Gate] Checkpoint saved to {out_p}.")
+
+    return {
+        "target_family": target_family,
+        "within_family_balanced_acc": float(best_fam_acc),
+        "plain_within_family_acc": float(acc_plain_within),
+        "delta_within_family": float(best_fam_acc - acc_plain_within),
+        "best_alpha": float(best_alpha),
+        "pipe_results": pipe_results,
+        "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
+        "spec_classes": family_classes,
+    }

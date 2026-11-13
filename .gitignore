@@ -14,6 +14,7 @@ venv/
 # Local data, logs, and scratch directories
 local_data/*
 kaggle_logs/
+kaggle_output/
 references/
 artifacts/
 output/
@@ -44,6 +45,7 @@ powershell.exe
 # Allow tracked neural evaluation cache and in-house champion checkpoint
 !local_data/local_eval_cache.npz
 !checkpoints/export_champion_qwen3_14b/
+checkpoints/export_champion_qwen3_14b/family_gates/
 checkpoints/export_smoke_test/
 
 # Git & OS

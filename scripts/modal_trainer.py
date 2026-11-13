@@ -187,9 +187,23 @@ if modal is not None:
             meta_content = '{"title": "NTL In-House Two-Stage LoRA24", "id": "anilmittal/ntl-inhouse-two-stage-lora24", "licenses": [{"name": "CC0-1.0"}]}'
             meta_p.write_text(meta_content, encoding="utf-8")
 
+        # Ensure the 4 family specialist gates are copied into family_gates/
+        import shutil
+        gates_dst = ckpt / "family_gates"
+        gates_dst.mkdir(parents=True, exist_ok=True)
+        for g_name in ["export_gemini_gate_clean", "export_glm_gate_clean", "export_gpt_gate_clean", "export_claude_gate_clean"]:
+            src_g = Path("/checkpoints") / g_name
+            dst_g = gates_dst / g_name
+            dst_g.mkdir(parents=True, exist_ok=True)
+            for fname in ["heads.safetensors", "meta.json"]:
+                if (src_g / fname).exists():
+                    shutil.copy2(src_g / fname, dst_g / fname)
+        checkpoints_volume.commit()
+        print("[Modal Kaggle Push] Synced 4 family specialist gates to family_gates/ and committed volume.")
+
         print(f"[Modal Kaggle Push] Uploading dataset version from {ckpt}...")
         res = subprocess.run(
-            ["kaggle", "datasets", "version", "-p", str(ckpt), "-m", "Restore heads.safetensors to commit ae26404 (0.594 champion weights)", "-r", "zip"],
+            ["kaggle", "datasets", "version", "-p", str(ckpt), "-m", "Add 4 in-house family specialist gates (Gemini, GLM, GPT, Claude)", "-r", "zip"],
             capture_output=True,
             text=True,
         )
@@ -616,16 +630,37 @@ if modal is not None:
             # 4. Run 14B specialists (gemini, glm, gpt) using the loaded Qwen3-14B base
             P_main = sp_softmax(res_logits["logits_plain"], axis=1)
 
-            spec_configs = [
-                ("gemini", spec_root / "export_gemini_specialist_14b", FAMILIES["gemini"]),
-                ("glm", spec_root / "export_glm_specialist_14b", FAMILIES["glm"]),
-                ("gpt", spec_root / "export_gpt_specialist_14b", FAMILIES["gpt"]),
-            ]
+            spec_candidate_dirs = {
+                "gemini": [
+                    Path("/checkpoints/export_gemini_gate_mlp"),
+                    Path("/checkpoints/export_champion_qwen3_14b/family_gates/export_gemini_gate_mlp"),
+                    Path("/checkpoints/export_gemini_gate_clean"),
+                    Path("/checkpoints/export_champion_qwen3_14b/family_gates/export_gemini_gate_clean"),
+                    spec_root / "export_gemini_specialist_14b",
+                ],
+                "glm": [
+                    Path("/checkpoints/export_glm_gate_clean"),
+                    Path("/checkpoints/export_champion_qwen3_14b/family_gates/export_glm_gate_clean"),
+                    spec_root / "export_glm_specialist_14b",
+                ],
+                "gpt": [
+                    Path("/checkpoints/export_gpt_gate_clean"),
+                    Path("/checkpoints/export_champion_qwen3_14b/family_gates/export_gpt_gate_clean"),
+                    spec_root / "export_gpt_specialist_14b",
+                ],
+            }
 
-            for fam_name, s_dir, fam_cols in spec_configs:
-                if not s_dir.exists():
-                    print(f"[Modal Specialist] Warning: {s_dir} not found; skipping {fam_name}.")
+            for fam_name, fam_cols in [("gemini", FAMILIES["gemini"]), ("glm", FAMILIES["glm"]), ("gpt", FAMILIES["gpt"])]:
+                s_dir = None
+                for cand in spec_candidate_dirs[fam_name]:
+                    if cand.exists() and ((cand / "heads.safetensors").exists() or (cand / "adapter").exists()):
+                        s_dir = cand
+                        break
+
+                if s_dir is None:
+                    print(f"[Modal Specialist] Warning: No valid checkpoint found for {fam_name}; skipping.")
                     continue
+
                 meta_s_p = s_dir / "meta.json"
                 if meta_s_p.exists():
                     with open(meta_s_p, "r", encoding="utf-8") as f:
@@ -639,53 +674,120 @@ if modal is not None:
                 fam_prob_mass = P_main[:, fam_cols].sum(axis=1)
                 cand_mask = np.isin(P_main.argmax(axis=1), fam_cols) | (fam_prob_mass >= 0.10)
                 cand_idx = np.flatnonzero(cand_mask)
-                print(f"[Modal Specialist {fam_name}] Running 14B specialist on {len(cand_idx)}/{len(texts)} candidate rows...")
+                print(f"[Modal Specialist {fam_name}] Running specialist from {s_dir} on {len(cand_idx)}/{len(texts)} candidate rows...")
 
                 if len(cand_idx) > 0:
-                    s_adapter = s_dir / "adapter"
-                    peft_model.load_adapter(str(s_adapter), adapter_name=fam_name)
-                    peft_model.set_adapter(fam_name)
-
                     s_heads = s_dir / "heads.safetensors"
-                    with safe_open(str(s_heads), framework="pt", device="cpu") as sf:
-                        for i in range(len(model.norms)):
-                            w_k = f"norms.{i}.weight"
-                            if w_k in sf.keys():
-                                model.norms[i].weight.data.copy_(sf.get_tensor(w_k).to(device))
-                            b_k = f"norms.{i}.bias"
-                            if b_k in sf.keys() and hasattr(model.norms[i], "bias") and model.norms[i].bias is not None:
-                                model.norms[i].bias.data.copy_(sf.get_tensor(b_k).to(device))
-                        w_plain = sf.get_tensor("plain.weight").to(device)
-                        b_plain = sf.get_tensor("plain.bias").to(device)
+                    s_adapter = s_dir / "adapter"
+                    has_adapter = s_adapter.exists() and (s_adapter / "adapter_config.json").exists()
 
-                    cand_texts = [texts[i] for i in cand_idx]
-                    cand_ds = TextSequenceDataset(cand_texts, [0] * len(cand_texts), None, tok, max_len=max_len, end_id=end_id)
-                    cand_loader = DataLoader(cand_ds, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
+                    if not has_adapter and s_heads.exists():
+                        # Frozen feature gate (Non-linear MLP or Linear Ridge)
+                        with safe_open(str(s_heads), framework="pt", device="cpu") as sf:
+                            if "mlp_w1" in sf.keys():
+                                print(f"[Modal Specialist {fam_name}] Evaluating Non-Linear MLP Head on frozen 14B features...")
+                                w1 = sf.get_tensor("mlp_w1").to(device)
+                                b1 = sf.get_tensor("mlp_b1").to(device)
+                                w2 = sf.get_tensor("mlp_w2").to(device)
+                                b2 = sf.get_tensor("mlp_b2").to(device)
+                                ln_w = sf.get_tensor("ln_weight").to(device) if "ln_weight" in sf.keys() else None
+                                ln_b = sf.get_tensor("ln_bias").to(device) if "ln_bias" in sf.keys() else None
 
-                    z_fam_list = []
-                    with torch.no_grad():
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            for batch in cand_loader:
-                                mb_ids = batch["input_ids"].to(device)
-                                mb_mask = batch["attention_mask"].to(device)
-                                max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
-                                z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
-                                z_fam_list.append(z_b)
+                                with torch.no_grad():
+                                    z_t = torch.from_numpy(Z_unseen).to(device, dtype=torch.float32)
+                                    h = torch.nn.functional.gelu(z_t @ w1.T + b1)
+                                    if ln_w is not None and ln_b is not None:
+                                        h = torch.nn.functional.layer_norm(h, (h.shape[-1],), ln_w, ln_b)
+                                    raw_logits_all = (h @ w2.T + b2)[:, :K_fam].float().cpu().numpy()
+                            else:
+                                print(f"[Modal Specialist {fam_name}] Evaluating Linear Ridge Head on frozen 14B features...")
+                                w_plain = sf.get_tensor("plain.weight").to(device)
+                                b_plain = sf.get_tensor("plain.bias").to(device)
+                                with torch.no_grad():
+                                    z_t = torch.from_numpy(Z_unseen).to(device, dtype=torch.float32)
+                                    raw_logits_all = (z_t @ w_plain.T + b_plain)[:, :K_fam].float().cpu().numpy()
 
-                    if z_fam_list:
-                        z_fam = torch.cat(z_fam_list, dim=0)
-                        raw_logits = (z_fam @ w_plain.T + b_plain).float().cpu().numpy()
-                        std_fam = float(np.std(raw_logits, axis=1).mean()) if len(raw_logits) > 0 else 1.0
+                        std_fam = float(np.std(raw_logits_all, axis=1).mean()) if len(raw_logits_all) > 0 else 1.0
                         temp_fam = max(1.0, std_fam / 4.2)
-                        sc_logits = raw_logits / temp_fam
+                        sc_logits_all = raw_logits_all / temp_fam
 
                         fam_logits_full = np.zeros((len(texts), K_fam), dtype=np.float32)
-                        fam_logits_full[cand_idx] = sc_logits
+                        fam_logits_full[cand_idx] = sc_logits_all[cand_idx]
                         specialist_logits[fam_name] = fam_logits_full
                     else:
-                        specialist_logits[fam_name] = np.zeros((len(texts), K_fam), dtype=np.float32)
+                        # Full adapter specialist
+                        peft_model.load_adapter(str(s_adapter), adapter_name=fam_name)
+                        peft_model.set_adapter(fam_name)
 
-                    peft_model.delete_adapter(fam_name)
+                        with safe_open(str(s_heads), framework="pt", device="cpu") as sf:
+                            for i in range(len(model.norms)):
+                                w_k = f"norms.{i}.weight"
+                                if w_k in sf.keys():
+                                    model.norms[i].weight.data.copy_(sf.get_tensor(w_k).to(device))
+                                b_k = f"norms.{i}.bias"
+                                if b_k in sf.keys() and hasattr(model.norms[i], "bias") and model.norms[i].bias is not None:
+                                    model.norms[i].bias.data.copy_(sf.get_tensor(b_k).to(device))
+                            w_plain = sf.get_tensor("plain.weight").to(device)
+                            b_plain = sf.get_tensor("plain.bias").to(device)
+
+                        cand_texts = [texts[i] for i in cand_idx]
+                        cand_ds = TextSequenceDataset(cand_texts, [0] * len(cand_texts), None, tok, max_len=max_len, end_id=end_id)
+                        cand_loader = DataLoader(cand_ds, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
+
+                        z_fam_list = []
+                        with torch.no_grad():
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                                for batch in cand_loader:
+                                    mb_ids = batch["input_ids"].to(device)
+                                    mb_mask = batch["attention_mask"].to(device)
+                                    max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
+                                    z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                                    z_fam_list.append(z_b)
+
+                        if z_fam_list:
+                            z_fam = torch.cat(z_fam_list, dim=0)
+                            raw_logits = (z_fam @ w_plain.T + b_plain).float().cpu().numpy()
+                            std_fam = float(np.std(raw_logits, axis=1).mean()) if len(raw_logits) > 0 else 1.0
+                            temp_fam = max(1.0, std_fam / 4.2)
+                            sc_logits = raw_logits / temp_fam
+
+                            fam_logits_full = np.zeros((len(texts), K_fam), dtype=np.float32)
+                            fam_logits_full[cand_idx] = sc_logits
+                            specialist_logits[fam_name] = fam_logits_full
+                        else:
+                            specialist_logits[fam_name] = np.zeros((len(texts), K_fam), dtype=np.float32)
+
+                        peft_model.delete_adapter(fam_name)
+
+                    if fam_name == "gemini" and labels is not None:
+                        from namethatllm.config import LAB2I
+                        y_np = np.array(labels)
+                        idx_37 = LAB2I["gemini-3.7-flash"]
+                        idx_38 = LAB2I["gemini-3.8-flash"]
+                        gem_mask = np.isin(y_np, fam_cols)
+                        pair_mask = np.isin(y_np, [idx_37, idx_38])
+                        loc_37 = fam_cols.index(idx_37)
+                        loc_38 = fam_cols.index(idx_38)
+
+                        pred_gem_spec = fam_logits_full[gem_mask].argmax(axis=1)
+                        y_gem_loc = np.array([fam_cols.index(y) for y in y_np[gem_mask]])
+                        acc_gem_spec = float(balanced_accuracy_score(y_gem_loc, pred_gem_spec))
+
+                        pred_gem_37 = float((pred_gem_spec[y_gem_loc == loc_37] == loc_37).mean())
+                        pred_gem_38 = float((pred_gem_spec[y_gem_loc == loc_38] == loc_38).mean())
+
+                        # Pairwise direct
+                        pair_loc_preds = fam_logits_full[pair_mask][:, [loc_37, loc_38]].argmax(axis=1)
+                        y_pair_loc = (y_np[pair_mask] == idx_38).astype(int)
+                        acc_pair = float(balanced_accuracy_score(y_pair_loc, pair_loc_preds))
+
+                        print("\n" + "=" * 80)
+                        print(" [GEMINI SPECIALIST GATE BENCHMARK AUDIT (N=400, 100/class)]")
+                        print(f"  Within-Gemini Balanced Accuracy (4 classes): {acc_gem_spec*100:.2f}%")
+                        print(f"  gemini-3.7-flash Recall                    : {pred_gem_37*100:.2f}%")
+                        print(f"  gemini-3.8-flash Recall                    : {pred_gem_38*100:.2f}%")
+                        print(f"  Gemini 3.7 vs 3.8 Pairwise Balanced Acc    : {acc_pair*100:.2f}%")
+                        print("=" * 80 + "\n")
 
             # 5. Free 14B model from GPU memory before loading Claude 8B
             del model, peft_model, base_model
@@ -1156,24 +1258,26 @@ if modal is not None:
             "/datasets": datasets_volume,
         },
     )
-    def train_gemini_gate_worker(
+    def train_family_gate_worker(
+        target_family: str = "glm",
         checkpoint_dir: str = "/checkpoints/export_champion_qwen3_14b",
-        samples_per_class: int = 3800,
+        samples_per_class: int = 0,
         negative_ratio: float = 0.10,
         eval_texts: list[str] | None = None,
         eval_labels: list[int] | None = None,
         eval_groups: list[Any] | None = None,
+        batch_size: int = 32,
     ) -> dict[str, Any]:
         """
-        Trains an L2-regularized Plain Head for the Gemini family (Approach 1):
+        Trains an L2-regularized Plain Head for any target model family (HB-WRH):
         1. Loads frozen Qwen3-14B trunk from checkpoint_dir.
         2. Quarantines eval_texts to ensure 0% benchmark leakage.
-        3. Samples balanced Gemini (samples_per_class per variant) + 10% negative distractors from other families.
-        4. Extracts Z_train (6,600 samples) and Z_eval (1,800 samples) through the frozen trunk.
-        5. Fits 5-class L2-regularized Ridge Head on Z_train.
-        6. Evaluates within-family accuracy on 400 Gemini benchmark passages (comparing to 57.0% plain head baseline).
+        3. Samples balanced target family passages + 10% negative distractors from other families.
+        4. Extracts Z_train and Z_eval representations through the frozen trunk on A100.
+        5. Fits (K_fam + 1)-class Ridge Head on Z_train using optimal primal/dual formulation.
+        6. Evaluates within-family balanced accuracy on benchmark passages.
         7. Evaluates full 1,800-sample pipeline balanced accuracy with logit blending.
-        8. Exports export_gemini_gate_clean/heads.safetensors and commits volume.
+        8. Exports export_{target_family}_gate_clean/heads.safetensors and commits volume.
         """
         import json
         import torch
@@ -1196,6 +1300,22 @@ if modal is not None:
         )
         from namethatllm.postprocess import sinkhorn_balancing
 
+        target_family = target_family.lower()
+        assert target_family in FAMILIES, f"Unknown family {target_family}. Must be one of {list(FAMILIES.keys())}"
+        family_cols = FAMILIES[target_family]
+        family_classes = [LABELS[i] for i in family_cols]
+        num_family_classes = len(family_classes)
+        num_gate_classes = num_family_classes + 1  # Last class is __OTHER__ distractors
+
+        if samples_per_class <= 0:
+            default_samples = {
+                "glm": 4000,
+                "gemini": 3800,
+                "gpt": 3000,
+                "claude": 3000,
+            }
+            samples_per_class = default_samples.get(target_family, 3000)
+
         ckpt = Path(checkpoint_dir)
         meta_p = ckpt / "meta.json"
         if not meta_p.exists():
@@ -1212,7 +1332,7 @@ if modal is not None:
         num_classes = len(classes)
 
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(f"[Gemini Gate Worker] Initializing Qwen3-14B ({keep_layers} layers) on A100 GPU...")
+        print(f"[{target_family.upper()} Gate Worker] Initializing Qwen3-14B ({keep_layers} layers) on A100 GPU...")
         tok = AutoTokenizer.from_pretrained(backbone_name, trust_remote_code=True, use_fast=True)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
@@ -1233,7 +1353,7 @@ if modal is not None:
 
         adapter_dir = ckpt / "adapter"
         if adapter_dir.exists() and (adapter_dir / "adapter_config.json").exists():
-            print(f"[Gemini Gate Worker] Loading LoRA adapter from {adapter_dir}...")
+            print(f"[{target_family.upper()} Gate Worker] Loading LoRA adapter from {adapter_dir}...")
             peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir))
         else:
             peft_model = base_model
@@ -1261,216 +1381,67 @@ if modal is not None:
 
         model.eval()
 
-        # Step 1: Load and curate training dataset from /datasets
+        # Step 1: Load pool and train datasets from /datasets
         ds_root = Path("/datasets")
         pool_p = ds_root / "pool_120k.parquet"
         if not pool_p.exists():
             pool_p = ds_root / "nlm_pool_v5.parquet"
         df_pool = pd.read_parquet(pool_p)
         train_p = ds_root / "train.csv"
-        df_train = pd.read_csv(train_p) if train_p.exists() else pd.DataFrame()
+        df_train = pd.read_csv(train_p) if train_p.exists() else None
 
-        print(f"[Gemini Gate Worker] Loaded pool: {len(df_pool):,} rows, train: {len(df_train):,} rows.")
+        from namethatllm.trainer import train_family_gate
 
-        # Zero leakage quarantining
-        if eval_texts is not None and len(eval_texts) > 0:
-            bench_set = set(t.strip().lower() for t in eval_texts)
-            init_pool_len = len(df_pool)
-            df_pool = df_pool[~df_pool["text"].str.strip().str.lower().isin(bench_set)].copy()
-            if len(df_train) > 0:
-                df_train = df_train[~df_train["text"].str.strip().str.lower().isin(bench_set)].copy()
-            quarantined = init_pool_len - len(df_pool)
-            print(f"[Gemini Gate Worker] Quarantined {quarantined} benchmark overlap rows. Clean pool: {len(df_pool):,}.")
+        export_dir = Path(f"/checkpoints/export_{target_family}_gate_clean")
+        return train_family_gate(
+            model=model,
+            tok=tok,
+            df_pool=df_pool,
+            df_train=df_train,
+            target_family=target_family,
+            samples_per_class=samples_per_class,
+            negative_ratio=negative_ratio,
+            eval_texts=eval_texts,
+            eval_labels=eval_labels,
+            batch_size=batch_size,
+            max_len=max_len,
+            end_id=end_id,
+            device=device,
+            output_dir=export_dir,
+            checkpoints_volume=checkpoints_volume,
+        )
 
-        gemini_classes = [
-            "gemini-3.1-pro-preview",
-            "gemini-3.6-flash",
-            "gemini-3.7-flash",
-            "gemini-3.8-flash",
-        ]
-        gem_dfs = []
-        for c in gemini_classes:
-            sub_tr = df_train[df_train["model"] == c] if len(df_train) > 0 else pd.DataFrame()
-            sub_pool = df_pool[df_pool["model"] == c]
-            needed = samples_per_class
-            sampled_pool = sub_pool.sample(n=min(needed - len(sub_tr), len(sub_pool)), random_state=42)
-            c_df = pd.concat([sub_tr, sampled_pool], ignore_index=True)
-            gem_dfs.append(c_df)
-            print(f"  Gemini class {c}: {len(c_df)} samples ({len(sub_tr)} train, {len(c_df)-len(sub_tr)} pool)")
-
-        df_gem_all = pd.concat(gem_dfs, ignore_index=True)
-        total_gemini = len(df_gem_all)
-
-        # 10% negative distractor sampling
-        n_neg = int(total_gemini * negative_ratio)
-        df_non_gem = df_pool[~df_pool["model"].str.startswith("gemini")].copy()
-        other_fams = ["claude", "gpt", "glm", "qwen", "kimi"]
-        neg_dfs = []
-        n_per_fam = max(n_neg // len(other_fams), 1)
-        for fam in other_fams:
-            fam_sub = df_non_gem[df_non_gem["model"].str.startswith(fam)]
-            if len(fam_sub) > 0:
-                neg_dfs.append(fam_sub.sample(n=min(n_per_fam, len(fam_sub)), random_state=42))
-        df_neg_all = pd.concat(neg_dfs, ignore_index=True)
-        print(f"[Gemini Gate Worker] Sampled {len(df_neg_all)} negative distractors across {len(other_fams)} non-Gemini families.")
-
-        train_texts = df_gem_all["text"].tolist() + df_neg_all["text"].tolist()
-        gem_map = {name: i for i, name in enumerate(gemini_classes)}
-        train_labels = [gem_map[m] for m in df_gem_all["model"].tolist()] + [4] * len(df_neg_all)
-        print(f"[Gemini Gate Worker] Total training dataset: {len(train_texts):,} samples (5 classes: 4 Gemini + 1 Other).")
-
-        # Step 2: Extract Z_train representations using model.forward_features
-        print(f"[Gemini Gate Worker] Extracting Z_train on {len(train_texts)} samples on A100...")
-        ds_tr = TextSequenceDataset(train_texts, train_labels, None, tok, max_len=max_len, end_id=end_id)
-        loader_tr = DataLoader(ds_tr, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
-
-        Z_tr_list = []
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                for batch in loader_tr:
-                    mb_ids = batch["input_ids"].to(device)
-                    mb_mask = batch["attention_mask"].to(device)
-                    max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
-                    z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
-                    Z_tr_list.append(z_b.cpu().float().numpy())
-        Z_train = np.vstack(Z_tr_list)
-        y_train = np.array(train_labels, dtype=np.int64)
-        print(f"[Gemini Gate Worker] Extracted Z_train: shape={Z_train.shape}, dtype={Z_train.dtype}")
-
-        # Step 3: Extract Z_eval on benchmark samples
-        Z_eval = None
-        main_logits_eval = None
-        if eval_texts is not None and len(eval_texts) > 0:
-            print(f"[Gemini Gate Worker] Extracting Z_eval on {len(eval_texts)} benchmark samples...")
-            dummy_eval_y = [0] * len(eval_texts)
-            ds_ev = TextSequenceDataset(eval_texts, dummy_eval_y, None, tok, max_len=max_len, end_id=end_id)
-            loader_ev = DataLoader(ds_ev, batch_size=16, shuffle=False, collate_fn=collate_text_batch)
-            Z_ev_list = []
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    for batch in loader_ev:
-                        mb_ids = batch["input_ids"].to(device)
-                        mb_mask = batch["attention_mask"].to(device)
-                        max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
-                        z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
-                        Z_ev_list.append(z_b.cpu().float().numpy())
-            Z_eval = np.vstack(Z_ev_list)
-
-            # Compute Champion Plain Head logits on benchmark
-            W_p = model.plain_head.weight.detach().cpu().float().numpy()
-            b_p = model.plain_head.bias.detach().cpu().float().numpy()
-            main_logits_eval = Z_eval @ W_p.T + b_p
-
-        # Step 4: Fit Dual Ridge Head on Z_train
-        print("[Gemini Gate Worker] Fitting 5-class dual Ridge Head on Z_train...")
-        N_tr, D_feat = Z_train.shape
-        Y_onehot = np.zeros((N_tr, 5), dtype=np.float32)
-        for i, lab in enumerate(y_train):
-            Y_onehot[i, lab] = 1.0
-        # Label smoothing 0.05
-        Y_smooth = 0.95 * Y_onehot + (0.05 / 5.0)
-
-        mu_Z = Z_train.mean(axis=0, keepdims=True)
-        mu_Y = Y_smooth.mean(axis=0, keepdims=True)
-        Z_c = Z_train - mu_Z
-        Y_c = Y_smooth - mu_Y
-
-        K_mat = Z_c @ Z_c.T
-        scale_k = float(np.trace(K_mat) / N_tr)
-
-        best_w, best_b = None, None
-        best_gem_acc = 0.0
-        best_alpha = 10.0
-        best_gem_logits = None
-
-        y_ev_arr = np.array(eval_labels) if eval_labels is not None else None
-        # Benchmark Gemini true indices
-        gem_eval_mask = np.isin(y_ev_arr, [5, 6, 7, 8]) if y_ev_arr is not None else None
-        y_gem_true = (y_ev_arr[gem_eval_mask] - 5) if gem_eval_mask is not None else None
-
-        for alpha in [1.0, 5.0, 10.0, 20.0, 50.0]:
-            eff_alpha = alpha * scale_k
-            A_mat = np.linalg.solve(K_mat + eff_alpha * np.eye(N_tr, dtype=np.float32), Y_c)
-            W_head = Z_c.T @ A_mat
-            b_head = (mu_Y - mu_Z @ W_head).squeeze(0)
-
-            if Z_eval is not None and y_gem_true is not None:
-                logits_ev = Z_eval @ W_head + b_head
-                gem_pred = logits_ev[gem_eval_mask, :4].argmax(axis=1)
-                acc = float(balanced_accuracy_score(y_gem_true, gem_pred))
-                print(f"  [Ridge Sweep] alpha={alpha:4.1f} | Gemini Benchmark Balanced Acc: {acc*100:.2f}% (Baseline Champion: 57.0%, Old Spec: 49.5%)")
-                if acc > best_gem_acc:
-                    best_gem_acc = acc
-                    best_w = W_head
-                    best_b = b_head
-                    best_alpha = alpha
-                    best_gem_logits = logits_ev
-
-        print(f"[Gemini Gate Worker] Optimal Ridge Head selected: alpha={best_alpha:.1f} with Gemini Balanced Acc: {best_gem_acc*100:.2f}%")
-
-        # Step 5: Evaluate Full Pipeline on all 1,800 benchmark samples
-        pipe_results = {}
-        if main_logits_eval is not None and best_gem_logits is not None and y_ev_arr is not None:
-            P_main = sp_softmax(main_logits_eval, axis=1)
-            acc_plain_solo = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
-            print(f"[Gemini Gate Worker] Champion Plain Head Benchmark BAcc: {acc_plain_solo*100:.2f}%")
-
-            # Sweep gating blend weight
-            best_pipe_acc = 0.0
-            best_pipe_w = 0.0
-            gem_cols = [5, 6, 7, 8]
-            cand_mask = np.isin(P_main.argmax(axis=1), gem_cols) | (P_main[:, gem_cols].sum(axis=1) >= 0.10)
-
-            for gw in [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50]:
-                P_fused = P_main.copy()
-                spec_probs = sp_softmax(best_gem_logits[:, :4], axis=1)
-                for idx in np.flatnonzero(cand_mask):
-                    orig_mass = P_main[idx, gem_cols].sum()
-                    fused_gem = (1.0 - gw) * P_main[idx, gem_cols] + gw * spec_probs[idx]
-                    fused_gem = fused_gem / fused_gem.sum() * orig_mass
-                    P_fused[idx, gem_cols] = fused_gem
-
-                acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
-                P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
-                acc_gated_sk = float(balanced_accuracy_score(y_ev_arr, P_sk.argmax(axis=1)))
-                print(f"  [Gate Blend Sweep] gw={gw:.2f} | Gate Alone BAcc: {acc_gated*100:.2f}% | Gate + Sinkhorn BAcc: {acc_gated_sk*100:.2f}%")
-                if acc_gated_sk > best_pipe_acc:
-                    best_pipe_acc = acc_gated_sk
-                    best_pipe_w = gw
-
-            pipe_results = {
-                "plain_solo_bacc": acc_plain_solo,
-                "best_pipe_bacc": best_pipe_acc,
-                "best_gate_weight": best_pipe_w,
-                "lift_over_plain": best_pipe_acc - acc_plain_solo,
-            }
-
-        # Step 6: Save export_gemini_gate_clean checkpoint
-        export_dir = Path("/checkpoints/export_gemini_gate_clean")
-        export_dir.mkdir(parents=True, exist_ok=True)
-        head_dict = {
-            "plain.weight": torch.from_numpy(best_w.T).contiguous(),
-            "plain.bias": torch.from_numpy(best_b).contiguous(),
-        }
-        save_file(head_dict, str(export_dir / "heads.safetensors"))
-        meta_gem = {
-            "classes": gemini_classes + ["__OTHER__"],
-            "labels": gemini_classes + ["__OTHER__"],
-            "target_family": "gemini",
-            "alpha": float(best_alpha),
-            "gemini_acc": float(best_gem_acc),
-        }
-        (export_dir / "meta.json").write_text(json.dumps(meta_gem, indent=2), encoding="utf-8")
-        checkpoints_volume.commit()
-        print(f"[Gemini Gate Worker] Checkpoint saved to {export_dir} and committed to checkpoints volume.")
-
-        return {
-            "gemini_balanced_acc": best_gem_acc,
-            "best_alpha": best_alpha,
-            "pipe_results": pipe_results,
-            "spec_logits_gemini": best_gem_logits[:, :4].tolist() if best_gem_logits is not None else [],
-            "gemini_classes": gemini_classes,
-        }
+    @app.function(
+        gpu="A100-80GB:1",
+        timeout=1800,
+        image=trainer_image,
+        volumes={
+            "/checkpoints": checkpoints_volume,
+            "/datasets": datasets_volume,
+        },
+    )
+    def train_gemini_gate_worker(
+        checkpoint_dir: str = "/checkpoints/export_champion_qwen3_14b",
+        samples_per_class: int = 3800,
+        negative_ratio: float = 0.10,
+        eval_texts: list[str] | None = None,
+        eval_labels: list[int] | None = None,
+        eval_groups: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """Backward-compatible wrapper for train_family_gate_worker."""
+        res = train_family_gate_worker.local(
+            target_family="gemini",
+            checkpoint_dir=checkpoint_dir,
+            samples_per_class=samples_per_class,
+            negative_ratio=negative_ratio,
+            eval_texts=eval_texts,
+            eval_labels=eval_labels,
+            eval_groups=eval_groups,
+        )
+        res["gemini_balanced_acc"] = res.get("within_family_balanced_acc", 0.0)
+        res["spec_logits_gemini"] = res.get("spec_logits", [])
+        res["gemini_classes"] = res.get("spec_classes", [])
+        return res
 
     @app.local_entrypoint()
     def main(
@@ -1479,8 +1450,10 @@ if modal is not None:
         backbone: str = "Qwen/Qwen2.5-0.5B",
         eval_data: str = "local_data/clean_benchmark_1800_rows.parquet",
         save_preds: str = "local_data/clean_benchmark_1800_predictions.npz",
+        family: str = "glm",
+        samples_per_class: int = 0,
     ):
-        """Entrypoint for: modal run scripts/modal_trainer.py [--mode test|smoke|sync|run|eval] [--config ...] [--backbone ...] [--eval-data ...] [--save-preds ...]"""
+        """Entrypoint for: modal run scripts/modal_trainer.py [--mode test|smoke|sync|run|eval|train-family-gate] [--config ...] [--backbone ...] [--eval-data ...] [--save-preds ...] [--family glm|gpt|claude|gemini|all]"""
         if mode == "test":
             print("[Modal Launcher] Dispatching cloud test suite to Modal A100...")
             res = test_cloud_worker.remote()
@@ -1599,12 +1572,14 @@ if modal is not None:
             print(f"  Blended Head BAcc      : {res.get('acc_blended', 0.0)*100:.2f}%")
             print(f"  Sinkhorn Balanced BAcc : {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
             print(f"  Net Lift (Plain)       : {res.get('lift', 0.0)*100:+.2f}%")
-        elif mode == "train-gemini-gate":
+        elif mode in ["train-family-gate", "train-gemini-gate"]:
             import numpy as np
             import pandas as pd
             from namethatllm.config import LAB2I
 
-            print("[Modal Launcher] Launching A100-80GB Gemini Gate (Approach 1) Training...")
+            target_fam = "gemini" if mode == "train-gemini-gate" else family
+            fams_to_train = ["glm", "gpt", "claude"] if target_fam == "all" else [target_fam]
+
             eval_p = Path(eval_data)
             if not eval_p.exists():
                 raise FileNotFoundError(f"Evaluation benchmark not found at {eval_data}")
@@ -1614,36 +1589,43 @@ if modal is not None:
             groups = df_eval["prompt_canon"].tolist() if "prompt_canon" in df_eval.columns else None
 
             print(f"[Modal Launcher] Loaded {len(texts)} benchmark samples for zero-leakage training & evaluation.")
-            res = train_gemini_gate_worker.remote(
-                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
-                samples_per_class=3800,
-                negative_ratio=0.10,
-                eval_texts=texts,
-                eval_labels=labels,
-                eval_groups=groups,
-            )
-            print("\n" + "=" * 80)
-            print("[Modal Launcher] Gemini Gate (Approach 1) Training & Benchmark Results:")
-            print(f"  Gemini Within-Family BAcc : {res.get('gemini_balanced_acc', 0.0)*100:.2f}% (Baseline: 57.0%, Old Spec: 49.5%)")
-            print(f"  Best Ridge Alpha          : {res.get('best_alpha', 0.0)}")
-            pipe = res.get("pipe_results", {})
-            print(f"  Champion Plain Solo BAcc  : {pipe.get('plain_solo_bacc', 0.0)*100:.2f}%")
-            print(f"  Gated + Sinkhorn BAcc     : {pipe.get('best_pipe_bacc', 0.0)*100:.2f}%")
-            print(f"  Optimal Gate Weight       : {pipe.get('best_gate_weight', 0.0)}")
-            print(f"  Net Lift over Plain Solo  : {pipe.get('lift_over_plain', 0.0)*100:+.2f}%")
-            print("=" * 80 + "\n")
 
-            if save_preds and "spec_logits_gemini" in res:
-                out_p = Path(save_preds)
-                curr_data = {}
-                if out_p.exists():
-                    existing = np.load(out_p, allow_pickle=True)
-                    for k in existing.keys():
-                        curr_data[k] = existing[k]
-                curr_data["spec_logits_gemini"] = np.array(res["spec_logits_gemini"])
-                curr_data["spec_classes_gemini"] = np.array(res["gemini_classes"])
-                np.savez_compressed(out_p, **curr_data)
-                print(f"[Modal Launcher] Updated Gemini Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
+            for fam_name in fams_to_train:
+                print("\n" + "=" * 80)
+                print(f"[Modal Launcher] Launching A100-80GB {fam_name.upper()} Gate Training...")
+                print("=" * 80)
+                res = train_family_gate_worker.remote(
+                    target_family=fam_name,
+                    checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
+                    samples_per_class=samples_per_class,
+                    negative_ratio=0.10,
+                    eval_texts=texts,
+                    eval_labels=labels,
+                    eval_groups=groups,
+                )
+                print("\n" + "=" * 80)
+                print(f"[Modal Launcher] {fam_name.upper()} Gate Training & Benchmark Results:")
+                print(f"  {fam_name.upper()} Within-Family BAcc : {res.get('within_family_balanced_acc', 0.0)*100:.2f}% (Baseline: {res.get('plain_within_family_acc', 0.0)*100:.2f}%)")
+                print(f"  Within-Family Lift       : {res.get('delta_within_family', 0.0)*100:+.2f}%")
+                print(f"  Best Ridge Alpha         : {res.get('best_alpha', 0.0)}")
+                pipe = res.get("pipe_results", {})
+                print(f"  Champion Plain Solo BAcc : {pipe.get('plain_solo_bacc', 0.0)*100:.2f}%")
+                print(f"  Gated + Sinkhorn BAcc    : {pipe.get('best_pipe_bacc', 0.0)*100:.2f}%")
+                print(f"  Optimal Gate Weight      : {pipe.get('best_gate_weight', 0.0)}")
+                print(f"  Net Lift over Plain Solo : {pipe.get('lift_over_plain', 0.0)*100:+.2f}%")
+                print("=" * 80 + "\n")
+
+                if save_preds and "spec_logits" in res:
+                    out_p = Path(save_preds)
+                    curr_data = {}
+                    if out_p.exists():
+                        existing = np.load(out_p, allow_pickle=True)
+                        for k in existing.keys():
+                            curr_data[k] = existing[k]
+                    curr_data[f"spec_logits_{fam_name}"] = np.array(res["spec_logits"])
+                    curr_data[f"spec_classes_{fam_name}"] = np.array(res["spec_classes"])
+                    np.savez_compressed(out_p, **curr_data)
+                    print(f"[Modal Launcher] Updated {fam_name.upper()} Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
         else:
             print(f"[Modal Launcher] Launching A100-80GB cloud training with config: {config}")
             res = train_cloud_worker.remote(config_path=config)
@@ -1654,7 +1636,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Modal Cloud Launcher for NameThatLLM Training")
-    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval", "reexport", "push-dataset", "train-gemini-gate"], help="Command (run, smoke, test, sync, eval, reexport, push-dataset, train-gemini-gate)")
+    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval", "reexport", "push-dataset", "train-gemini-gate", "train-family-gate"], help="Command (run, smoke, test, sync, eval, reexport, push-dataset, train-gemini-gate, train-family-gate)")
+    parser.add_argument("--family", default="all", choices=["all", "glm", "gpt", "claude", "gemini"], help="Target family for gate training (glm, gpt, claude, gemini, all)")
+    parser.add_argument("--samples-per-class", type=int, default=0, help="Samples per family class (0 = default)")
     parser.add_argument("--config", default="configs/training_lora.json", help="Path to training config json")
     parser.add_argument("--backbone", default="Qwen/Qwen2.5-0.5B", help="Backbone model for smoke test")
     parser.add_argument("--eval-data", default="local_data/clean_benchmark_1800_rows.parquet", help="Path to evaluation parquet/csv")
@@ -1786,12 +1770,14 @@ if __name__ == "__main__":
             print(f"  Blended Head BAcc      : {res.get('acc_blended', 0.0)*100:.2f}%")
             print(f"  Sinkhorn Balanced BAcc : {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
             print(f"  Net Lift (Plain)       : {res.get('lift', 0.0)*100:+.2f}%")
-        elif args.cmd == "train-gemini-gate":
+        elif args.cmd in ["train-family-gate", "train-gemini-gate"]:
             import numpy as np
             import pandas as pd
             from namethatllm.config import LAB2I
 
-            print("[Modal Launcher] Launching A100-80GB Gemini Gate (Approach 1) Training...")
+            target_fam = "gemini" if args.cmd == "train-gemini-gate" else args.family
+            fams_to_train = ["glm", "gpt", "claude"] if target_fam == "all" else [target_fam]
+
             eval_path = args.eval_data or "local_data/clean_benchmark_1800_rows.parquet"
             if not Path(eval_path).exists():
                 raise FileNotFoundError(f"Evaluation benchmark not found at {eval_path}")
@@ -1801,35 +1787,42 @@ if __name__ == "__main__":
             groups = df_eval["prompt_canon"].tolist() if "prompt_canon" in df_eval.columns else None
 
             print(f"[Modal Launcher] Loaded {len(texts)} benchmark samples for zero-leakage training & evaluation.")
-            res = train_gemini_gate_worker.remote(
-                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
-                samples_per_class=3800,
-                negative_ratio=0.10,
-                eval_texts=texts,
-                eval_labels=labels,
-                eval_groups=groups,
-            )
-            print("\n" + "=" * 80)
-            print("[Modal Launcher] Gemini Gate (Approach 1) Training & Benchmark Results:")
-            print(f"  Gemini Within-Family BAcc : {res.get('gemini_balanced_acc', 0.0)*100:.2f}% (Baseline: 57.0%, Old Spec: 49.5%)")
-            print(f"  Best Ridge Alpha          : {res.get('best_alpha', 0.0)}")
-            pipe = res.get("pipe_results", {})
-            print(f"  Champion Plain Solo BAcc  : {pipe.get('plain_solo_bacc', 0.0)*100:.2f}%")
-            print(f"  Gated + Sinkhorn BAcc     : {pipe.get('best_pipe_bacc', 0.0)*100:.2f}%")
-            print(f"  Optimal Gate Weight       : {pipe.get('best_gate_weight', 0.0)}")
-            print(f"  Net Lift over Plain Solo  : {pipe.get('lift_over_plain', 0.0)*100:+.2f}%")
-            print("=" * 80 + "\n")
 
-            if args.save_preds and "spec_logits_gemini" in res:
-                out_p = Path(args.save_preds)
-                curr_data = {}
-                if out_p.exists():
-                    existing = np.load(out_p, allow_pickle=True)
-                    for k in existing.keys():
-                        curr_data[k] = existing[k]
-                curr_data["spec_logits_gemini"] = np.array(res["spec_logits_gemini"])
-                curr_data["spec_classes_gemini"] = np.array(res["gemini_classes"])
-                np.savez_compressed(out_p, **curr_data)
-                print(f"[Modal Launcher] Updated Gemini Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
+            for fam_name in fams_to_train:
+                print("\n" + "=" * 80)
+                print(f"[Modal Launcher] Launching A100-80GB {fam_name.upper()} Gate Training...")
+                print("=" * 80)
+                res = train_family_gate_worker.remote(
+                    target_family=fam_name,
+                    checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
+                    samples_per_class=args.samples_per_class,
+                    negative_ratio=0.10,
+                    eval_texts=texts,
+                    eval_labels=labels,
+                    eval_groups=groups,
+                )
+                print("\n" + "=" * 80)
+                print(f"[Modal Launcher] {fam_name.upper()} Gate Training & Benchmark Results:")
+                print(f"  {fam_name.upper()} Within-Family BAcc : {res.get('within_family_balanced_acc', 0.0)*100:.2f}% (Baseline: {res.get('plain_within_family_acc', 0.0)*100:.2f}%)")
+                print(f"  Within-Family Lift       : {res.get('delta_within_family', 0.0)*100:+.2f}%")
+                print(f"  Best Ridge Alpha         : {res.get('best_alpha', 0.0)}")
+                pipe = res.get("pipe_results", {})
+                print(f"  Champion Plain Solo BAcc : {pipe.get('plain_solo_bacc', 0.0)*100:.2f}%")
+                print(f"  Gated + Sinkhorn BAcc    : {pipe.get('best_pipe_bacc', 0.0)*100:.2f}%")
+                print(f"  Optimal Gate Weight      : {pipe.get('best_gate_weight', 0.0)}")
+                print(f"  Net Lift over Plain Solo : {pipe.get('lift_over_plain', 0.0)*100:+.2f}%")
+                print("=" * 80 + "\n")
+
+                if args.save_preds and "spec_logits" in res:
+                    out_p = Path(args.save_preds)
+                    curr_data = {}
+                    if out_p.exists():
+                        existing = np.load(out_p, allow_pickle=True)
+                        for k in existing.keys():
+                            curr_data[k] = existing[k]
+                    curr_data[f"spec_logits_{fam_name}"] = np.array(res["spec_logits"])
+                    curr_data[f"spec_classes_{fam_name}"] = np.array(res["spec_classes"])
+                    np.savez_compressed(out_p, **curr_data)
+                    print(f"[Modal Launcher] Updated {fam_name.upper()} Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
         else:
             train_cloud_worker.remote(config_path=args.config)

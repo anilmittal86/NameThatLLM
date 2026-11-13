@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "name": "qwen3_14b_feature_extraction",
+  "description": "Configurable Feature & Layer-by-Layer Embedding Extraction Engine for Kaggle Dataset Export",
+  "pipeline_mode": "export_embeddings",
+  "backbone": "Qwen/Qwen3-14B-Base",
+  "keep_layers": 27,
+  "layers": [2, 4, 6, 8, 12, 16, 20, 24],
+  "max_len": 384,
+  "end_id": 151643,
+  "export_embeddings": {
+    "enabled": true,
+    "target": "gemini",
+    "save_all_layers": true,
+    "output_dir": "export_embeddings",
+    "samples_per_class": 3800,
+    "negative_ratio": 0.10,
+    "batch_size": 16
+  }
+}
+
