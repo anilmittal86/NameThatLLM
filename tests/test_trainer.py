@@ -910,6 +910,135 @@ class TestTrainer(unittest.TestCase):
         self.assertEqual(head_dict_4["plain.weight"].shape, (4, D))
         self.assertEqual(head_dict_4["plain.bias"].shape, (4,))
 
+    def test_family_gate_pca_fold_in_equivalence(self):
+        from namethatllm.trainer import fit_family_mlp_head, fit_family_gate_head
+        from sklearn.decomposition import PCA
+
+        np.random.seed(42)
+        torch.manual_seed(42)
+        N, D, pca_dim, num_classes = 80, 256, 32, 4
+        Z_raw = np.random.randn(N, D).astype(np.float32)
+        y_tr = np.array([i % num_classes for i in range(N)])
+
+        # Step 3: PCA dimension reduction
+        pca = PCA(n_components=pca_dim, svd_solver="randomized", random_state=42)
+        Z_pca = pca.fit_transform(Z_raw).astype(np.float32)
+
+        # Step 4: Ridge regression on reduced dimensions
+        best_w_pca, best_b_pca, _, _, _ = fit_family_gate_head(
+            Z_train=Z_pca,
+            y_train=y_tr,
+            num_gate_classes=num_classes,
+            num_family_classes=num_classes,
+            device=torch.device("cpu"),
+        )
+        # Fold Ridge back to raw D dimensions
+        comp_64 = pca.components_.astype(np.float64)
+        mu_64 = pca.mean_.reshape(1, -1).astype(np.float64)
+        W_r_eff_64 = comp_64.T @ best_w_pca.astype(np.float64)
+        b_r_eff_64 = best_b_pca.astype(np.float64) - (mu_64 @ W_r_eff_64).squeeze(0)
+
+        # Verify Ridge mathematical equivalence: Z_raw @ W_folded + b_folded == Z_pca @ W_pca + b_pca
+        logits_pca = Z_pca @ best_w_pca + best_b_pca
+        logits_folded = Z_raw @ W_r_eff_64.astype(np.float32) + b_r_eff_64.astype(np.float32)
+        np.testing.assert_allclose(logits_folded, logits_pca, atol=1e-3)
+
+        # Step 5: MLP on reduced dimensions with zero-cost PCA fold-in
+        mlp_dict, best_acc, _ = fit_family_mlp_head(
+            Z_train=Z_pca,
+            y_train=y_tr,
+            num_gate_classes=num_classes,
+            num_family_classes=num_classes,
+            hidden_dim=32,
+            epochs=5,
+            device=torch.device("cpu"),
+            pca_components=pca.components_,
+            pca_mean=pca.mean_,
+            raw_Z_eval=Z_raw,
+        )
+
+        self.assertEqual(mlp_dict["mlp_w1"].shape, (32, D))
+        self.assertEqual(mlp_dict["mlp_b1"].shape, (32,))
+        self.assertEqual(mlp_dict["mlp_w2"].shape, (num_classes, 32))
+        self.assertEqual(mlp_dict["plain.weight"].shape, (num_classes, D))
+
+        # Verify folded MLP evaluates directly on raw Z_raw
+        w1, b1 = mlp_dict["mlp_w1"], mlp_dict["mlp_b1"]
+        ln_w, ln_b = mlp_dict["ln_weight"], mlp_dict["ln_bias"]
+        w2, b2 = mlp_dict["mlp_w2"], mlp_dict["mlp_b2"]
+
+        z_raw_t = torch.from_numpy(Z_raw).float()
+        h_folded = torch.nn.functional.gelu(z_raw_t @ w1.T + b1)
+        h_folded = torch.nn.functional.layer_norm(h_folded, (h_folded.shape[-1],), ln_w, ln_b)
+        logits_mlp_folded = (h_folded @ w2.T + b2).detach().numpy()
+        self.assertEqual(logits_mlp_folded.shape, (N, num_classes))
+
+    def test_train_family_gate_pca_flow_mock(self):
+        from namethatllm.trainer import train_family_gate
+        import pandas as pd
+        import tempfile
+        import json
+
+        class MockTok:
+            def __call__(self, text, **kwargs):
+                return {"input_ids": [1, 2, 3, 4]}
+
+            def encode(self, text, **kwargs):
+                return [1, 2, 3, 4]
+
+        class MockModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [2, 4]
+                self.plain_head = torch.nn.Linear(32, 18)
+
+            def forward_features(self, input_ids, attention_mask, drop_first_token=True, **kwargs):
+                B = input_ids.shape[0]
+                return torch.randn(B, 32)
+
+        gemini_classes = ["gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]
+        rows = []
+        for m in gemini_classes:
+            for i in range(15):
+                rows.append({"text": f"Sample prompt for {m} {i}", "model": m})
+        df_pool = pd.DataFrame(rows)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            res = train_family_gate(
+                model=MockModel(),
+                tok=MockTok(),
+                df_pool=df_pool,
+                df_train=None,
+                target_family="gemini",
+                samples_per_class=10,
+                negative_ratio=0.0,
+                eval_texts=["eval test 1", "eval test 2"],
+                eval_labels=[5, 6],
+                batch_size=4,
+                output_dir=tmp_dir,
+                head_type="mlp",
+                pca_dim=8,
+                hidden_dim=16,
+                mlp_epochs=2,
+                device=torch.device("cpu"),
+            )
+
+            self.assertEqual(res["target_family"], "gemini")
+            self.assertIn("ridge_acc", res)
+            self.assertIn("mlp_acc", res)
+            self.assertEqual(len(res["spec_classes"]), 4)
+
+            # Verify files were created
+            out_p = Path(tmp_dir)
+            self.assertTrue((out_p / "heads.safetensors").exists())
+            self.assertTrue((out_p / "meta.json").exists())
+
+            meta = json.loads((out_p / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["pca_dim"], 8)
+            self.assertEqual(meta["hidden_dim"], 16)
+            self.assertEqual(meta["target_family"], "gemini")
+            self.assertEqual(len(meta["classes"]), 4)
+
     def test_load_and_slice_champion_heads_for_specialist(self):
         from namethatllm.trainer import load_and_slice_champion_heads
         from safetensors.torch import save_file

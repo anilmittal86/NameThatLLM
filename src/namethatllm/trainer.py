@@ -1645,8 +1645,8 @@ def run_training_pipeline(
             df_pool=df_p,
             df_train=df_tr,
             target_family=target_family or "gemini",
-            samples_per_class=int(train_cfg.get("samples_per_class", 3800)),
-            negative_ratio=float(train_cfg.get("negative_ratio", 0.10)),
+            samples_per_class=int(train_cfg.get("samples_per_class", 3500)),
+            negative_ratio=float(train_cfg.get("negative_ratio", 0.0)),
             eval_texts=eval_texts,
             eval_labels=eval_labels,
             batch_size=int(train_cfg.get("batch_size", 32)),
@@ -1656,10 +1656,11 @@ def run_training_pipeline(
             output_dir=out_dir,
             checkpoints_volume=checkpoints_volume,
             head_type=train_cfg.get("head_type", "mlp"),
-            hidden_dim=int(train_cfg.get("hidden_dim", 256)),
+            pca_dim=int(train_cfg.get("pca_dim", 128)),
+            hidden_dim=int(train_cfg.get("hidden_dim", 128)),
             mlp_epochs=int(train_cfg.get("mlp_epochs", 20)),
-            mlp_lr=float(train_cfg.get("mlp_lr", 3e-4)),
-            mlp_dropout=float(train_cfg.get("mlp_dropout", 0.20)),
+            mlp_lr=float(train_cfg.get("mlp_lr", 2e-4)),
+            mlp_dropout=float(train_cfg.get("mlp_dropout", 0.25)),
             export_embeddings=exp_enabled,
             save_all_layers=exp_save_all,
             embeddings_output_dir=exp_out,
@@ -2249,10 +2250,13 @@ def fit_family_mlp_head(
     y_eval_true: np.ndarray | None = None,
     eval_mask: np.ndarray | None = None,
     device: torch.device | None = None,
+    pca_components: np.ndarray | None = None,
+    pca_mean: np.ndarray | None = None,
+    raw_Z_eval: np.ndarray | None = None,
 ) -> tuple[dict[str, torch.Tensor], float, np.ndarray | None]:
     """
-    Trains a regularized 2-Layer Non-Linear MLP Head on standardized intra-family residuals
-    with sibling margin penalties and folds both (mu_family, sd_family) into Layer 1 (W1*, b1*).
+    Trains a regularized 2-Layer Non-Linear MLP Head on (PCA-reduced or standardized) intra-family residuals
+    with sibling margin penalties and folds (PCA + centering / affine) into Layer 1 (W1*, b1*).
     """
     from sklearn.model_selection import StratifiedKFold
 
@@ -2261,16 +2265,20 @@ def fit_family_mlp_head(
 
     N_tr, D_feat = Z_train.shape
 
-    # 1. Compute intra-family centroid and per-feature standard deviation
-    fam_mask_tr = y_train < num_family_classes
-    if fam_mask_tr.sum() > 1:
-        mu_family = Z_train[fam_mask_tr].mean(axis=0, keepdims=True).astype(np.float32)
-        sd_family = Z_train[fam_mask_tr].std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
+    # 1. Intra-family centering/standardization (if not already PCA projected)
+    if pca_components is not None:
+        Z_tr_std = Z_train.astype(np.float32)
+        mu_family = None
+        sd_family = None
     else:
-        mu_family = Z_train.mean(axis=0, keepdims=True).astype(np.float32)
-        sd_family = Z_train.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
-
-    Z_tr_std = ((Z_train - mu_family) / sd_family).astype(np.float32)
+        fam_mask_tr = y_train < num_family_classes
+        if fam_mask_tr.sum() > 1:
+            mu_family = Z_train[fam_mask_tr].mean(axis=0, keepdims=True).astype(np.float32)
+            sd_family = Z_train[fam_mask_tr].std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
+        else:
+            mu_family = Z_train.mean(axis=0, keepdims=True).astype(np.float32)
+            sd_family = Z_train.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
+        Z_tr_std = ((Z_train - mu_family) / sd_family).astype(np.float32)
 
     # 2. Construct an internal 15% stratified validation split on Z_train to prevent benchmark overfitting
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -2285,12 +2293,13 @@ def fit_family_mlp_head(
     ds = torch.utils.data.TensorDataset(X_fit_t, y_fit_t)
     train_loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
+    mlp_in_drop = 0.10 if pca_components is not None else 0.50
     mlp = FamilyMLPHead(
         in_features=D_feat,
         hidden_dim=hidden_dim,
         num_classes=num_gate_classes,
         dropout=dropout,
-        in_dropout=0.50,
+        in_dropout=mlp_in_drop,
     ).to(device)
 
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=lr, weight_decay=weight_decay)
@@ -2348,26 +2357,40 @@ def fit_family_mlp_head(
         mlp.load_state_dict(best_state)
     mlp.eval()
 
-    # 3. Zero-Cost Affine Fold-In of (mu_family, sd_family) into fc1:
-    # ((Z - mu) / sd) @ W1.T + b1 = Z @ (W1 / sd).T + (b1 - (mu / sd) @ W1.T)
-    with torch.no_grad():
-        W1 = mlp.fc1.weight.detach().float()
-        b1 = mlp.fc1.bias.detach().float()
-        mu_t = torch.from_numpy(mu_family).to(device=W1.device, dtype=torch.float32)
-        sd_t = torch.from_numpy(sd_family).to(device=W1.device, dtype=torch.float32)
-        W1_folded = (W1 / sd_t).contiguous()
-        b1_folded = (b1 - ((mu_t / sd_t) @ W1.T).squeeze(0)).contiguous()
-        mlp.fc1.weight.copy_(W1_folded)
-        mlp.fc1.bias.copy_(b1_folded)
+    # 3. Zero-Cost Fold-In into fc1:
+    if pca_components is not None and pca_mean is not None:
+        # Fold PCA projection (pca_dim -> 40960) and mean subtraction into fc1:
+        # (Z - mu) @ V @ W1.T + b1 = Z @ (W1 @ V.T).T + (b1 - mu @ (W1 @ V.T).T)
+        W1_64 = mlp.fc1.weight.detach().cpu().numpy().astype(np.float64)  # (hidden_dim, pca_dim)
+        b1_64 = mlp.fc1.bias.detach().cpu().numpy().astype(np.float64)    # (hidden_dim,)
+        comp_64 = pca_components.astype(np.float64)                      # (pca_dim, 40960)
+        mu_64 = pca_mean.reshape(1, -1).astype(np.float64)              # (1, 40960)
+
+        W1_folded_64 = W1_64 @ comp_64                                   # (hidden_dim, 40960)
+        b1_folded_64 = b1_64 - (mu_64 @ W1_folded_64.T).squeeze(0)      # (hidden_dim,)
+
+        W1_folded = torch.from_numpy(W1_folded_64.astype(np.float32)).contiguous()
+        b1_folded = torch.from_numpy(b1_folded_64.astype(np.float32)).contiguous()
+    else:
+        with torch.no_grad():
+            W1 = mlp.fc1.weight.detach().float()
+            b1 = mlp.fc1.bias.detach().float()
+            mu_t = torch.from_numpy(mu_family).to(device=W1.device, dtype=torch.float32)
+            sd_t = torch.from_numpy(sd_family).to(device=W1.device, dtype=torch.float32)
+            W1_folded = (W1 / sd_t).contiguous()
+            b1_folded = (b1 - ((mu_t / sd_t) @ W1.T).squeeze(0)).contiguous()
 
     # 4. Evaluate folded MLP directly on raw uncentered Z_eval (verifying exact fast-path equivalence)
     best_eval_acc = best_val_acc
     best_eval_logits = None
-    if Z_eval is not None:
+    eval_target = raw_Z_eval if raw_Z_eval is not None else (Z_eval if pca_components is None else None)
+    if eval_target is not None:
         with torch.no_grad():
-            Z_ev_raw_t = torch.from_numpy(Z_eval).float().to(device)
-            best_eval_logits = mlp.forward_eval(Z_ev_raw_t).cpu().numpy()
-            del Z_ev_raw_t
+            Z_ev_raw_t = torch.from_numpy(eval_target).float().to(device)
+            h = F.gelu(Z_ev_raw_t @ W1_folded.to(device).T + b1_folded.to(device))
+            h = mlp.ln(h)
+            best_eval_logits = mlp.fc2(h).cpu().numpy()
+            del Z_ev_raw_t, h
         if y_eval_true is not None and eval_mask is not None and eval_mask.sum() > 0:
             fam_pred = best_eval_logits[eval_mask, :num_family_classes].argmax(axis=1)
             best_eval_acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
@@ -2384,15 +2407,30 @@ def fit_family_mlp_head(
         device=device,
     )
 
+    if pca_components is not None and pca_mean is not None:
+        comp_64 = pca_components.astype(np.float64)                      # (pca_dim, 40960)
+        mu_64 = pca_mean.reshape(1, -1).astype(np.float64)              # (1, 40960)
+        W_r_64 = W_ridge.astype(np.float64)                              # (pca_dim, num_classes)
+        b_r_64 = b_ridge.astype(np.float64)                              # (num_classes,)
+
+        W_r_eff_64 = comp_64.T @ W_r_64                                 # (40960, num_classes)
+        b_r_eff_64 = b_r_64 - (mu_64 @ W_r_eff_64).squeeze(0)          # (num_classes,)
+
+        plain_w = torch.from_numpy(W_r_eff_64.T.astype(np.float32)).contiguous()  # (num_classes, 40960)
+        plain_b = torch.from_numpy(b_r_eff_64.astype(np.float32)).contiguous()    # (num_classes,)
+    else:
+        plain_w = torch.from_numpy(W_ridge.T).to(torch.float32).contiguous()
+        plain_b = torch.from_numpy(b_ridge).to(torch.float32).contiguous()
+
     head_dict = {
-        "mlp_w1": mlp.fc1.weight.detach().cpu().to(torch.float32).contiguous(),
-        "mlp_b1": mlp.fc1.bias.detach().cpu().to(torch.float32).contiguous(),
+        "mlp_w1": W1_folded.cpu().to(torch.float32).contiguous(),
+        "mlp_b1": b1_folded.cpu().to(torch.float32).contiguous(),
         "ln_weight": mlp.ln.weight.detach().cpu().to(torch.float32).contiguous(),
         "ln_bias": mlp.ln.bias.detach().cpu().to(torch.float32).contiguous(),
         "mlp_w2": mlp.fc2.weight.detach().cpu().to(torch.float32).contiguous(),
         "mlp_b2": mlp.fc2.bias.detach().cpu().to(torch.float32).contiguous(),
-        "plain.weight": torch.from_numpy(W_ridge.T).to(torch.float32).contiguous(),
-        "plain.bias": torch.from_numpy(b_ridge).to(torch.float32).contiguous(),
+        "plain.weight": plain_w,
+        "plain.bias": plain_b,
     }
 
     del X_fit_t, y_fit_t, X_val_t, ds, mlp
@@ -2888,7 +2926,7 @@ def train_family_gate(
     df_train: pd.DataFrame | None,
     target_family: str,
     samples_per_class: int = 0,
-    negative_ratio: float = 0.10,
+    negative_ratio: float = 0.0,
     eval_texts: list[str] | None = None,
     eval_labels: list[int] | None = None,
     batch_size: int = 32,
@@ -2898,10 +2936,11 @@ def train_family_gate(
     output_dir: Path | str | None = None,
     checkpoints_volume: Any | None = None,
     head_type: str = "mlp",
-    hidden_dim: int = 256,
+    pca_dim: int = 128,
+    hidden_dim: int = 128,
     mlp_epochs: int = 20,
-    mlp_lr: float = 3e-4,
-    mlp_dropout: float = 0.20,
+    mlp_lr: float = 2e-4,
+    mlp_dropout: float = 0.25,
     export_embeddings: bool = False,
     save_all_layers: bool = False,
     embeddings_output_dir: Path | str | None = None,
@@ -3082,7 +3121,69 @@ def train_family_gate(
             checkpoints_volume=checkpoints_volume,
         )
 
-    # 5. Fit Head (Non-Linear MLP or Linear Ridge)
+    # -------------------------------------------------------------------------
+    # Step 2: Quality Inspection, Normalization Check & Outlier Statistics
+    # (No treatment applied; print basic statistics as requested)
+    # -------------------------------------------------------------------------
+    norms = np.linalg.norm(Z_train, axis=1)
+    q25, q50, q75 = np.percentile(norms, [25, 50, 75])
+    iqr = q75 - q25
+    norm_outliers_3iqr = int(((norms < q25 - 3.0 * iqr) | (norms > q75 + 3.0 * iqr)).sum())
+    norm_outliers_15iqr = int(((norms < q25 - 1.5 * iqr) | (norms > q75 + 1.5 * iqr)).sum())
+
+    is_l2_normed = bool(np.allclose(norms, 1.0, atol=0.05))
+    num_tapped = len(getattr(model, "layers", [2, 4, 6, 9, 13, 17, 22, 27]))
+    chunk_dim = Z_train.shape[1] // max(num_tapped, 1)
+    per_layer_stds = [float(Z_train[:, i * chunk_dim : (i + 1) * chunk_dim].std()) for i in range(num_tapped)]
+    is_layer_normed = all(0.5 <= s <= 2.0 for s in per_layer_stds)
+
+    fam_mask_stats = y_train < num_family_classes
+    if fam_mask_stats.sum() > 0:
+        mu_fam = Z_train[fam_mask_stats].mean(axis=0, keepdims=True)
+        dists = np.linalg.norm(Z_train[fam_mask_stats] - mu_fam, axis=1)
+        dq25, dq50, dq75 = np.percentile(dists, [25, 50, 75])
+        diqr = dq75 - dq25
+        dist_outliers_3iqr = int((dists > dq75 + 3.0 * diqr).sum())
+        dist_outliers_15iqr = int((dists > dq75 + 1.5 * diqr).sum())
+    else:
+        dists = np.zeros(len(Z_train))
+        dq50, diqr = 0.0, 0.0
+        dist_outliers_3iqr, dist_outliers_15iqr = 0, 0
+
+    print("\n" + "=" * 80)
+    print(f" [{target_family.upper()} Gate] Step 2: Quality Inspection, Normalization Check & Outlier Statistics:")
+    print(f"  - Total training samples: {len(Z_train):,} ({len(df_fam_all)} intra-family across {num_family_classes} classes)")
+    for i, c in enumerate(family_classes):
+        c_count = int((y_train == i).sum())
+        print(f"    * Class {i} ({c}): {c_count:,} samples")
+    print(f"  - Feature dimension: {Z_train.shape[1]:,} ({num_tapped} tapped layers x {chunk_dim}-dim LayerNormed)")
+    print(f"  - Normalization check: L2-normalized={is_l2_normed}, LayerNorm-normalized={is_layer_normed}")
+    print(f"    (Per-layer std range: [{min(per_layer_stds):.3f}, {max(per_layer_stds):.3f}], concatenated norm: ~{norms.mean():.1f})")
+    print(f"  - Sample L2 norm stats: mean={norms.mean():.2f}, std={norms.std():.2f}, min={norms.min():.2f}, max={norms.max():.2f}, median={q50:.2f}, IQR={iqr:.2f}")
+    print(f"  - Centroid distance stats: mean={dists.mean():.2f}, std={dists.std():.2f}, median={dq50:.2f}, IQR={diqr:.2f}")
+    print(f"  - Outliers by norm (Tukey > 1.5x IQR): {norm_outliers_15iqr} ({norm_outliers_15iqr / len(Z_train) * 100:.2f}%)")
+    print(f"  - Outliers by norm (Extreme > 3.0x IQR): {norm_outliers_3iqr} ({norm_outliers_3iqr / len(Z_train) * 100:.2f}%)")
+    print(f"  - Outliers by centroid dist (> 1.5x IQR): {dist_outliers_15iqr} ({dist_outliers_15iqr / max(len(dists), 1) * 100:.2f}%)")
+    print(f"  - Outliers by centroid dist (> 3.0x IQR): {dist_outliers_3iqr} ({dist_outliers_3iqr / max(len(dists), 1) * 100:.2f}%)")
+    print("  - Action: No outlier treatment applied as requested (all samples retained for training).")
+    print("=" * 80 + "\n")
+
+    # -------------------------------------------------------------------------
+    # Step 3: PCA Dimension Reduction
+    # -------------------------------------------------------------------------
+    pca = None
+    Z_tr_active = Z_train
+    Z_ev_active = Z_eval
+    if pca_dim > 0 and pca_dim < Z_train.shape[1]:
+        from sklearn.decomposition import PCA
+        print(f"[{target_family.upper()} Gate] Step 3: Performing PCA dimension reduction ({Z_train.shape[1]} -> {pca_dim})...")
+        pca = PCA(n_components=pca_dim, svd_solver="randomized", random_state=42)
+        Z_tr_active = pca.fit_transform(Z_train).astype(np.float32)
+        var_exp = float(np.sum(pca.explained_variance_ratio_)) * 100.0
+        print(f"[{target_family.upper()} Gate] Step 3 Complete: {pca_dim} components explain {var_exp:.2f}% of total intra-family variance.")
+        if Z_eval is not None:
+            Z_ev_active = pca.transform(Z_eval).astype(np.float32)
+
     y_ev_arr = np.array(eval_labels) if eval_labels is not None else None
     fam_eval_mask = np.isin(y_ev_arr, family_cols) if y_ev_arr is not None else None
     col_to_local = {c: i for i, c in enumerate(family_cols)}
@@ -3093,49 +3194,88 @@ def train_family_gate(
         plain_fam_pred = main_logits_eval[fam_eval_mask][:, family_cols].argmax(axis=1)
         acc_plain_within = float(balanced_accuracy_score(y_fam_true, plain_fam_pred))
 
-    # 5. Fit Head (Non-Linear MLP or Linear Ridge)
-    if head_type.lower() == "mlp":
-        print(f"[{target_family.upper()} Gate] Fitting {num_gate_classes}-class Non-Linear MLP Head (dim={hidden_dim}, epochs={mlp_epochs}, lr={mlp_lr})...")
-        mlp_head_dict, best_fam_acc, best_fam_logits = fit_family_mlp_head(
-            Z_train=Z_train,
-            y_train=y_train,
-            num_gate_classes=num_gate_classes,
-            num_family_classes=num_family_classes,
-            hidden_dim=hidden_dim,
-            epochs=mlp_epochs,
-            lr=mlp_lr,
-            dropout=mlp_dropout,
-            label_smoothing=0.05,
-            Z_eval=Z_eval,
-            y_eval_true=y_fam_true,
-            eval_mask=fam_eval_mask,
-            device=device,
-        )
-        best_alpha = 0.0
-        best_w = mlp_head_dict["plain.weight"].T.cpu().numpy()
-        best_b = mlp_head_dict["plain.bias"].cpu().numpy()
-        print(f"[{target_family.upper()} Gate] Non-Linear MLP Head trained with {target_family.upper()} Acc: {best_fam_acc*100:.2f}% (Lift: {(best_fam_acc - acc_plain_within)*100:+.2f}%)")
-    else:
-        print(f"[{target_family.upper()} Gate] Fitting {num_gate_classes}-class Ridge Head on Z_train...")
-        best_w, best_b, best_alpha, best_fam_acc, best_fam_logits = fit_family_gate_head(
-            Z_train=Z_train,
-            y_train=y_train,
-            num_gate_classes=num_gate_classes,
-            alphas=[0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0],
-            label_smoothing=0.05,
-            Z_eval=Z_eval,
-            y_eval_true=y_fam_true,
-            eval_mask=fam_eval_mask,
-            num_family_classes=num_family_classes,
-            device=device,
-        )
-        mlp_head_dict = {
-            "plain.weight": torch.from_numpy(best_w.T).contiguous(),
-            "plain.bias": torch.from_numpy(best_b).contiguous(),
-        }
-        print(f"[{target_family.upper()} Gate] Optimal Ridge Head selected: alpha={best_alpha:.2f} with {target_family.upper()} Acc: {best_fam_acc*100:.2f}% (Lift: {(best_fam_acc - acc_plain_within)*100:+.2f}%)")
+    # -------------------------------------------------------------------------
+    # Step 4: Train Linear Ridge Regression on Reduced Dimensions
+    # -------------------------------------------------------------------------
+    print(f"[{target_family.upper()} Gate] Step 4: Fitting {num_gate_classes}-class Linear Ridge Regression on {Z_tr_active.shape[1]}-dim features...")
+    best_w_pca, best_b_pca, ridge_alpha, ridge_acc, ridge_logits_ev = fit_family_gate_head(
+        Z_train=Z_tr_active,
+        y_train=y_train,
+        num_gate_classes=num_gate_classes,
+        alphas=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0],
+        label_smoothing=0.05,
+        Z_eval=Z_ev_active,
+        y_eval_true=y_fam_true,
+        eval_mask=fam_eval_mask,
+        num_family_classes=num_family_classes,
+        device=device,
+    )
+    print(f"[{target_family.upper()} Gate] Step 4 Complete: Optimal Ridge (alpha={ridge_alpha:.2f}) -> {target_family.upper()} Acc: {ridge_acc * 100:.2f}% (Lift: {(ridge_acc - acc_plain_within) * 100:+.2f}%)")
 
-    # 6. Evaluate Full Pipeline on all benchmark samples
+    # Fold Ridge weights back to 40,960 dims for zero-cost plain_head inference compatibility
+    if pca is not None:
+        comp_64 = pca.components_.astype(np.float64)                      # (pca_dim, 40960)
+        mu_64 = pca.mean_.reshape(1, -1).astype(np.float64)              # (1, 40960)
+        W_r_64 = best_w_pca.astype(np.float64)                           # (pca_dim, num_classes)
+        b_r_64 = best_b_pca.astype(np.float64)                           # (num_classes,)
+
+        W_r_eff_64 = comp_64.T @ W_r_64                                  # (40960, num_classes)
+        b_r_eff_64 = b_r_64 - (mu_64 @ W_r_eff_64).squeeze(0)           # (num_classes,)
+
+        best_w = W_r_eff_64.astype(np.float32)                           # (40960, num_classes)
+        best_b = b_r_eff_64.astype(np.float32)                           # (num_classes,)
+    else:
+        best_w = best_w_pca
+        best_b = best_b_pca
+
+    plain_w_tensor = torch.from_numpy(best_w.T).to(torch.float32).contiguous()
+    plain_b_tensor = torch.from_numpy(best_b).to(torch.float32).contiguous()
+
+    # -------------------------------------------------------------------------
+    # Step 5: Train Non-Linear MLP on Reduced Dimensions
+    # -------------------------------------------------------------------------
+    print(f"[{target_family.upper()} Gate] Step 5: Fitting {num_gate_classes}-class Non-Linear MLP on {Z_tr_active.shape[1]}-dim features (hidden_dim={hidden_dim}, epochs={mlp_epochs}, lr={mlp_lr})...")
+    mlp_head_dict, mlp_acc, mlp_logits_ev = fit_family_mlp_head(
+        Z_train=Z_tr_active,
+        y_train=y_train,
+        num_gate_classes=num_gate_classes,
+        num_family_classes=num_family_classes,
+        hidden_dim=hidden_dim,
+        epochs=mlp_epochs,
+        lr=mlp_lr,
+        dropout=mlp_dropout,
+        label_smoothing=0.05,
+        Z_eval=Z_ev_active,
+        y_eval_true=y_fam_true,
+        eval_mask=fam_eval_mask,
+        device=device,
+        pca_components=pca.components_ if pca is not None else None,
+        pca_mean=pca.mean_ if pca is not None else None,
+        raw_Z_eval=Z_eval,
+    )
+    print(f"[{target_family.upper()} Gate] Step 5 Complete: MLP Head -> {target_family.upper()} Acc: {mlp_acc * 100:.2f}% (Lift: {(mlp_acc - acc_plain_within) * 100:+.2f}%)")
+
+    # Select primary head based on head_type configuration (mlp vs ridge)
+    if head_type.lower() == "mlp":
+        best_fam_acc = mlp_acc
+        best_fam_logits = mlp_logits_ev
+        best_alpha = ridge_alpha
+        final_head_dict = mlp_head_dict
+        # Ensure plain.weight / plain.bias are populated with optimal folded Ridge fallback
+        final_head_dict["plain.weight"] = plain_w_tensor
+        final_head_dict["plain.bias"] = plain_b_tensor
+    else:
+        best_fam_acc = ridge_acc
+        best_fam_logits = ridge_logits_ev
+        best_alpha = ridge_alpha
+        final_head_dict = {
+            "plain.weight": plain_w_tensor,
+            "plain.bias": plain_b_tensor,
+        }
+
+    # -------------------------------------------------------------------------
+    # Step 6: Evaluate Full Pipeline & Gate Blend Sweep on benchmark samples
+    # -------------------------------------------------------------------------
     pipe_results = {}
     if main_logits_eval is not None and best_fam_logits is not None and y_ev_arr is not None:
         P_main = sp_softmax(main_logits_eval, axis=1)
@@ -3170,20 +3310,27 @@ def train_family_gate(
             "lift_over_plain": best_pipe_acc - acc_plain_solo,
         }
 
-    # 7. Save Checkpoint
+    # -------------------------------------------------------------------------
+    # Step 7: Save Checkpoint (heads.safetensors and meta.json)
+    # -------------------------------------------------------------------------
     if output_dir is not None:
         out_p = Path(output_dir)
         out_p.mkdir(parents=True, exist_ok=True)
-        save_file(mlp_head_dict, str(out_p / "heads.safetensors"))
+        save_file(final_head_dict, str(out_p / "heads.safetensors"))
         meta_fam = {
-            "classes": family_classes + ["__OTHER__"],
-            "labels": family_classes + ["__OTHER__"],
+            "classes": family_classes + (["__OTHER__"] if has_negatives else []),
+            "labels": family_classes + (["__OTHER__"] if has_negatives else []),
             "target_family": target_family,
             "head_type": head_type.lower(),
+            "pca_dim": pca_dim if pca is not None else None,
             "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
             "alpha": float(best_alpha),
+            "ridge_alpha": float(ridge_alpha),
+            "ridge_within_family_acc": float(ridge_acc),
+            "mlp_within_family_acc": float(mlp_acc),
             "within_family_acc": float(best_fam_acc),
             "plain_within_family_acc": float(acc_plain_within),
+            "lift_over_plain": float(best_fam_acc - acc_plain_within),
         }
         (out_p / "meta.json").write_text(json.dumps(meta_fam, indent=2), encoding="utf-8")
         if checkpoints_volume is not None and hasattr(checkpoints_volume, "commit"):
@@ -3196,6 +3343,8 @@ def train_family_gate(
         "plain_within_family_acc": float(acc_plain_within),
         "delta_within_family": float(best_fam_acc - acc_plain_within),
         "best_alpha": float(best_alpha),
+        "ridge_acc": float(ridge_acc),
+        "mlp_acc": float(mlp_acc),
         "pipe_results": pipe_results,
         "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
         "spec_classes": family_classes,
