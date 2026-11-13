@@ -269,6 +269,7 @@ class MultiLayerLoRAClassifier(nn.Module):
                 den_l = den.to(layer_dev)
                 h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
                 p_l = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
+                p_l = F.normalize(p_l, p=2, dim=-1, eps=1e-6)
                 all_layers_pooled.append(p_l.to(first_device))
 
         pooled_list = []
@@ -1261,7 +1262,12 @@ def run_training_pipeline(
         return final_out
 
     target_family = train_cfg.get("target_family")
-    is_specialist = bool(target_family and target_family in FAMILIES)
+    is_gate_or_export = bool(
+        train_cfg.get("pipeline_mode") in ("family_gate", "export_embeddings", "extract_features")
+        or train_cfg.get("mode") == "family_gate"
+        or train_cfg.get("gate_training")
+    )
+    is_specialist = bool(target_family and target_family in FAMILIES and not is_gate_or_export)
     if is_specialist:
         fam_cols = FAMILIES[target_family]
         active_labels = [LABELS[i] for i in fam_cols]
@@ -1508,6 +1514,12 @@ def run_training_pipeline(
             except Exception as e:
                 print(f"[Trainer] Note on loading adapter for extraction: {e}")
 
+        for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
+            if "export_champion" in str(cand) or "inhouse" in str(cand):
+                if load_and_slice_champion_heads(cand, model, fam_cols=None):
+                    print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
+                    break
+
         extract_and_export_embeddings(
             model=model,
             tok=tok,
@@ -1577,9 +1589,8 @@ def run_training_pipeline(
         head_loaded = False
         for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
             if "export_champion" in str(cand) or "inhouse" in str(cand):
-                fam_cols_to_slice = fam_cols if is_specialist else None
-                if load_and_slice_champion_heads(cand, model, fam_cols=fam_cols_to_slice):
-                    print(f"[Trainer] Successfully loaded champion plain head from {cand}")
+                if load_and_slice_champion_heads(cand, model, fam_cols=None):
+                    print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
                     head_loaded = True
                     break
 
@@ -2105,11 +2116,20 @@ def fit_family_gate_head(
         Y_onehot[i, lab] = 1.0
     Y_smooth = (1.0 - label_smoothing) * Y_onehot + (label_smoothing / float(num_gate_classes))
 
+    K_eval_classes = num_family_classes or (num_gate_classes - 1)
+
     # Move to PyTorch tensors on GPU for blazing-fast linear algebra
     Z_t = torch.from_numpy(Z_train).to(device, dtype=torch.float32)
     Y_t = torch.from_numpy(Y_smooth).to(device, dtype=torch.float32)
 
-    mu_Z = Z_t.mean(dim=0, keepdim=True)
+    # Compute mu_Z strictly on the intra-family training rows so the shared family mean cancels out
+    fam_mask = y_train < K_eval_classes
+    fam_mask_t = torch.from_numpy(fam_mask).to(device)
+    if fam_mask_t.sum() > 0:
+        mu_Z = Z_t[fam_mask_t].mean(dim=0, keepdim=True)
+    else:
+        mu_Z = Z_t.mean(dim=0, keepdim=True)
+
     mu_Y = Y_t.mean(dim=0, keepdim=True)
     Z_c = Z_t - mu_Z
     Y_c = Y_t - mu_Y
@@ -2128,7 +2148,6 @@ def fit_family_gate_head(
     best_acc = 0.0
     best_alpha = 1.0
     best_eval_logits = None
-    K_eval_classes = num_family_classes or (num_gate_classes - 1)
 
     for alpha in alphas:
         eff_alpha = alpha * scale
@@ -2143,6 +2162,12 @@ def fit_family_gate_head(
 
         W_np = W_head.cpu().numpy()
         b_np = b_head.cpu().numpy()
+
+        fam_logits_tr = (Z_train[fam_mask] @ W_np + b_np)[:, :K_eval_classes]
+        row_std = float(np.std(fam_logits_tr, axis=1).mean())
+        temp_scale = (3.2 / row_std) if row_std > 1e-4 else 1.0
+        W_np = (W_np * temp_scale).astype(np.float32)
+        b_np = (b_np * temp_scale).astype(np.float32)
 
         if Z_eval is not None and y_eval_true is not None and eval_mask is not None:
             logits_ev = Z_eval @ W_np + b_np
@@ -2175,17 +2200,19 @@ def fit_family_gate_head(
 class FamilyMLPHead(nn.Module):
     """
     2-Layer Non-Linear MLP Head for intra-family sister decoupling (Phase 3):
-    Linear(D -> hidden_dim) -> GELU -> LayerNorm(hidden_dim) -> Dropout(p) -> Linear(hidden_dim -> num_classes)
+    InputDropout(in_dropout) -> Linear(D -> hidden_dim) -> GELU -> LayerNorm(hidden_dim) -> Dropout(p) -> Linear(hidden_dim -> num_classes)
     """
 
     def __init__(
         self,
         in_features: int = 40960,
-        hidden_dim: int = 256,
+        hidden_dim: int = 128,
         num_classes: int = 5,
-        dropout: float = 0.20,
+        dropout: float = 0.25,
+        in_dropout: float = 0.50,
     ):
         super().__init__()
+        self.in_drop = nn.Dropout(in_dropout)
         self.fc1 = nn.Linear(in_features, hidden_dim)
         self.act = nn.GELU()
         self.ln = nn.LayerNorm(hidden_dim)
@@ -2193,7 +2220,7 @@ class FamilyMLPHead(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(x)
+        h = self.fc1(self.in_drop(x))
         h = self.act(h)
         h = self.ln(h)
         h = self.drop(h)
@@ -2211,11 +2238,11 @@ def fit_family_mlp_head(
     y_train: np.ndarray,
     num_gate_classes: int,
     num_family_classes: int,
-    hidden_dim: int = 256,
+    hidden_dim: int = 128,
     epochs: int = 20,
-    lr: float = 3e-4,
-    dropout: float = 0.20,
-    weight_decay: float = 0.01,
+    lr: float = 2e-4,
+    dropout: float = 0.25,
+    weight_decay: float = 0.05,
     batch_size: int = 64,
     label_smoothing: float = 0.05,
     Z_eval: np.ndarray | None = None,
@@ -2224,51 +2251,68 @@ def fit_family_mlp_head(
     device: torch.device | None = None,
 ) -> tuple[dict[str, torch.Tensor], float, np.ndarray | None]:
     """
-    Trains a 2-Layer Non-Linear MLP Head on Z_train with fixed centroid subtraction.
-    Performs zero-cost fold-in: b1* = b1 - mu_family @ W1.T
-    so that downstream inference evaluates raw Z without runtime centering.
-    Returns: (head_dict, best_eval_acc, best_eval_logits)
+    Trains a regularized 2-Layer Non-Linear MLP Head on standardized intra-family residuals
+    with sibling margin penalties and folds both (mu_family, sd_family) into Layer 1 (W1*, b1*).
     """
+    from sklearn.model_selection import StratifiedKFold
+
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     N_tr, D_feat = Z_train.shape
 
-    # 1. Fixed centroid calculation on intra-family training samples
-    fam_mask_tr = (y_train < num_family_classes)
-    if fam_mask_tr.sum() > 0:
-        mu_family = Z_train[fam_mask_tr].mean(axis=0, keepdims=True)
+    # 1. Compute intra-family centroid and per-feature standard deviation
+    fam_mask_tr = y_train < num_family_classes
+    if fam_mask_tr.sum() > 1:
+        mu_family = Z_train[fam_mask_tr].mean(axis=0, keepdims=True).astype(np.float32)
+        sd_family = Z_train[fam_mask_tr].std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
     else:
-        mu_family = np.zeros((1, D_feat), dtype=np.float32)
+        mu_family = Z_train.mean(axis=0, keepdims=True).astype(np.float32)
+        sd_family = Z_train.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
 
-    Z_tr_res = (Z_train - mu_family).astype(np.float32)
+    Z_tr_std = ((Z_train - mu_family) / sd_family).astype(np.float32)
 
-    # 2. PyTorch Dataset & DataLoader
-    X_t = torch.from_numpy(Z_tr_res).float()
-    y_t = torch.from_numpy(y_train).long()
-    ds = torch.utils.data.TensorDataset(X_t, y_t)
+    # 2. Construct an internal 15% stratified validation split on Z_train to prevent benchmark overfitting
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fit_idx, val_idx = next(skf.split(Z_tr_std, y_train))
+
+    X_fit_t = torch.from_numpy(Z_tr_std[fit_idx]).float()
+    y_fit_t = torch.from_numpy(y_train[fit_idx]).long()
+    X_val_t = torch.from_numpy(Z_tr_std[val_idx]).float().to(device)
+    y_val_np = y_train[val_idx]
+    val_fam_mask = y_val_np < num_family_classes
+
+    ds = torch.utils.data.TensorDataset(X_fit_t, y_fit_t)
     train_loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-    # 3. Model, Optimizer, Loss
     mlp = FamilyMLPHead(
         in_features=D_feat,
         hidden_dim=hidden_dim,
         num_classes=num_gate_classes,
         dropout=dropout,
+        in_dropout=0.50,
     ).to(device)
 
     optimizer = torch.optim.AdamW(mlp.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.05)
 
-    Z_ev_t = None
-    if Z_eval is not None:
-        Z_ev_res = (Z_eval - mu_family).astype(np.float32)
-        Z_ev_t = torch.from_numpy(Z_ev_res).float().to(device)
+    # Sibling margin mask for num_gate_classes (boost Gemini 3.7 <-> 3.8 or GPT-5.6 triad)
+    sib_mask = torch.zeros((num_gate_classes, num_gate_classes), dtype=torch.float32, device=device)
+    for i in range(num_family_classes):
+        for j in range(num_family_classes):
+            if i != j:
+                sib_mask[i, j] = 1.0
+    if num_family_classes == 4:  # Gemini: 3.7-flash (2) <-> 3.8-flash (3)
+        sib_mask[2, 3] = 1.6
+        sib_mask[3, 2] = 1.6
+    elif num_family_classes == 5:  # GPT: 5.6 triad (1, 2, 3)
+        for i in (1, 2, 3):
+            for j in (1, 2, 3):
+                if i != j:
+                    sib_mask[i, j] = 1.4
 
+    best_val_acc = -1.0
     best_state = None
-    best_acc = 0.0
-    best_eval_logits = None
 
     for ep in range(epochs):
         mlp.train()
@@ -2276,73 +2320,86 @@ def fit_family_mlp_head(
             b_x, b_y = b_x.to(device), b_y.to(device)
             optimizer.zero_grad()
             out = mlp(b_x)
-            loss = criterion(out, b_y)
+            margin_boost = sib_mask[b_y] * 0.35
+            loss = F.cross_entropy(out + margin_boost, b_y, label_smoothing=label_smoothing)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(mlp.parameters(), 1.0)
             optimizer.step()
         scheduler.step()
 
-        if Z_ev_t is not None and y_eval_true is not None and eval_mask is not None:
-            mlp.eval()
-            with torch.no_grad():
-                logits_ev = mlp.forward_eval(Z_ev_t).cpu().numpy()
-            fam_pred = logits_ev[eval_mask, :num_family_classes].argmax(axis=1)
-            acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
-            if acc > best_acc or best_state is None:
-                best_acc = acc
-                best_state = copy.deepcopy(mlp.state_dict())
-                best_eval_logits = logits_ev
+        mlp.eval()
+        with torch.no_grad():
+            val_logits = mlp.forward_eval(X_val_t).cpu().numpy()
+        if val_fam_mask.sum() > 0:
+            val_acc = float(
+                balanced_accuracy_score(
+                    y_val_np[val_fam_mask],
+                    val_logits[val_fam_mask, :num_family_classes].argmax(axis=1),
+                )
+            )
         else:
-            if best_state is None or ep == epochs - 1:
-                best_state = copy.deepcopy(mlp.state_dict())
-            if ep == epochs - 1:
-                mlp.eval()
-                with torch.no_grad():
-                    tr_preds = []
-                    for b_x, _ in train_loader:
-                        b_x = b_x.to(device)
-                        logits_tr = mlp.forward_eval(b_x)
-                        tr_preds.append(logits_tr[:, :num_family_classes].argmax(dim=1).cpu())
-                    all_tr_preds = torch.cat(tr_preds).numpy()
-                fam_tr_mask = (y_train < num_family_classes)
-                if fam_tr_mask.sum() > 0:
-                    best_acc = float(balanced_accuracy_score(y_train[fam_tr_mask], all_tr_preds[fam_tr_mask]))
+            val_acc = float(balanced_accuracy_score(y_val_np, val_logits.argmax(axis=1)))
+
+        if val_acc >= best_val_acc or best_state is None:
+            best_val_acc = val_acc
+            best_state = copy.deepcopy(mlp.state_dict())
 
     if best_state is not None:
         mlp.load_state_dict(best_state)
     mlp.eval()
 
-    # 4. Zero-Cost Centroid Fold-In:
-    # (Z - mu) @ W1.T + b1 = Z @ W1.T + (b1 - mu @ W1.T)
+    # 3. Zero-Cost Affine Fold-In of (mu_family, sd_family) into fc1:
+    # ((Z - mu) / sd) @ W1.T + b1 = Z @ (W1 / sd).T + (b1 - (mu / sd) @ W1.T)
     with torch.no_grad():
-        W1 = mlp.fc1.weight.detach()
-        b1 = mlp.fc1.bias.detach()
-        mu_t = torch.from_numpy(mu_family).to(device=W1.device, dtype=W1.dtype)
-        b1_folded = (b1 - (mu_t @ W1.T).squeeze(0)).contiguous()
+        W1 = mlp.fc1.weight.detach().float()
+        b1 = mlp.fc1.bias.detach().float()
+        mu_t = torch.from_numpy(mu_family).to(device=W1.device, dtype=torch.float32)
+        sd_t = torch.from_numpy(sd_family).to(device=W1.device, dtype=torch.float32)
+        W1_folded = (W1 / sd_t).contiguous()
+        b1_folded = (b1 - ((mu_t / sd_t) @ W1.T).squeeze(0)).contiguous()
+        mlp.fc1.weight.copy_(W1_folded)
         mlp.fc1.bias.copy_(b1_folded)
 
+    # 4. Evaluate folded MLP directly on raw uncentered Z_eval (verifying exact fast-path equivalence)
+    best_eval_acc = best_val_acc
+    best_eval_logits = None
+    if Z_eval is not None:
+        with torch.no_grad():
+            Z_ev_raw_t = torch.from_numpy(Z_eval).float().to(device)
+            best_eval_logits = mlp.forward_eval(Z_ev_raw_t).cpu().numpy()
+            del Z_ev_raw_t
+        if y_eval_true is not None and eval_mask is not None and eval_mask.sum() > 0:
+            fam_pred = best_eval_logits[eval_mask, :num_family_classes].argmax(axis=1)
+            best_eval_acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
+
+    # 5. Fit closed-form Ridge head for a valid linear fallback in plain.weight / plain.bias
+    W_ridge, b_ridge, _, _, _ = fit_family_gate_head(
+        Z_train=Z_train,
+        y_train=y_train,
+        num_gate_classes=num_gate_classes,
+        Z_eval=Z_eval,
+        y_eval_true=y_eval_true,
+        eval_mask=eval_mask,
+        num_family_classes=num_family_classes,
+        device=device,
+    )
+
     head_dict = {
-        "mlp_w1": mlp.fc1.weight.detach().cpu().to(torch.float32),
-        "mlp_b1": mlp.fc1.bias.detach().cpu().to(torch.float32),
-        "ln_weight": mlp.ln.weight.detach().cpu().to(torch.float32),
-        "ln_bias": mlp.ln.bias.detach().cpu().to(torch.float32),
-        "mlp_w2": mlp.fc2.weight.detach().cpu().to(torch.float32),
-        "mlp_b2": mlp.fc2.bias.detach().cpu().to(torch.float32),
+        "mlp_w1": mlp.fc1.weight.detach().cpu().to(torch.float32).contiguous(),
+        "mlp_b1": mlp.fc1.bias.detach().cpu().to(torch.float32).contiguous(),
+        "ln_weight": mlp.ln.weight.detach().cpu().to(torch.float32).contiguous(),
+        "ln_bias": mlp.ln.bias.detach().cpu().to(torch.float32).contiguous(),
+        "mlp_w2": mlp.fc2.weight.detach().cpu().to(torch.float32).contiguous(),
+        "mlp_b2": mlp.fc2.bias.detach().cpu().to(torch.float32).contiguous(),
+        "plain.weight": torch.from_numpy(W_ridge.T).to(torch.float32).contiguous(),
+        "plain.bias": torch.from_numpy(b_ridge).to(torch.float32).contiguous(),
     }
 
-    # Linear fallback approximation
-    with torch.no_grad():
-        W_eff = (head_dict["mlp_w2"] @ head_dict["mlp_w1"]).T
-        b_eff = head_dict["mlp_b2"] + head_dict["mlp_b1"] @ head_dict["mlp_w2"].T
-        head_dict["plain.weight"] = W_eff.T.contiguous()
-        head_dict["plain.bias"] = b_eff.contiguous()
-
-    del X_t, y_t, ds, mlp
-    if Z_ev_t is not None:
-        del Z_ev_t
+    del X_fit_t, y_fit_t, X_val_t, ds, mlp
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return head_dict, best_acc, best_eval_logits
+    return head_dict, best_eval_acc, best_eval_logits
 
 
 def find_compatible_champion_lora(
@@ -2441,10 +2498,9 @@ def load_and_slice_champion_heads(
     fam_cols: list[int] | None = None,
 ) -> bool:
     """
-    Loads champion plain head weights into model.plain_head.
-    If the checkpoint contains an 18-class head (e.g. [18, 40960]) and the model is
-    a specialist with num_classes == len(fam_cols) (e.g. [4, 40960]), slices the
-    exact target family classes to avoid tensor size mismatch errors.
+    Loads champion per-layer LayerNorms (model.norms) and plain_head weights into model.
+    If the checkpoint contains an 18-class head and model.plain_head has len(fam_cols) rows,
+    slices the target family classes; otherwise loads the full 18-class head.
     """
     if not Path(heads_path).exists():
         return False
@@ -2456,6 +2512,15 @@ def load_and_slice_champion_heads(
             h_sd = load_file(str(heads_path))
         else:
             h_sd = torch.load(str(heads_path), map_location="cpu")
+
+        # 1. Always load trained per-layer LayerNorm parameters
+        if hasattr(model, "norms") and model.norms is not None:
+            for i, norm in enumerate(model.norms):
+                wk, bk = f"norms.{i}.weight", f"norms.{i}.bias"
+                if wk in h_sd and norm.weight.shape == h_sd[wk].shape:
+                    norm.weight.data.copy_(h_sd[wk].to(norm.weight.device, dtype=norm.weight.dtype))
+                if bk in h_sd and hasattr(norm, "bias") and norm.bias is not None and norm.bias.shape == h_sd[bk].shape:
+                    norm.bias.data.copy_(h_sd[bk].to(norm.bias.device, dtype=norm.bias.dtype))
 
         if not hasattr(model, "plain_head") or model.plain_head is None:
             return False
@@ -2469,19 +2534,19 @@ def load_and_slice_champion_heads(
         tgt_w = model.plain_head.weight
         tgt_b = model.plain_head.bias
 
-        # Case A: Exact shape match
+        # Case A: Exact shape match (e.g., 18-class champion head into 18-class model)
         if tgt_w.shape == w_ckpt.shape and tgt_b.shape == b_ckpt.shape:
-            tgt_w.data.copy_(w_ckpt)
-            tgt_b.data.copy_(b_ckpt)
+            tgt_w.data.copy_(w_ckpt.to(tgt_w.device, dtype=tgt_w.dtype))
+            tgt_b.data.copy_(b_ckpt.to(tgt_b.device, dtype=tgt_b.dtype))
             return True
 
-        # Case B: Checkpoint is 18-class, model is a specialist (e.g. 4-class)
+        # Case B: Checkpoint is 18-class, model is a Stage 1/2 specialist (e.g., 4-class)
         if fam_cols is not None and w_ckpt.shape[0] >= max(fam_cols) + 1:
             sliced_w = w_ckpt[fam_cols]
             sliced_b = b_ckpt[fam_cols]
             if sliced_w.shape == tgt_w.shape and sliced_b.shape == tgt_b.shape:
-                tgt_w.data.copy_(sliced_w)
-                tgt_b.data.copy_(sliced_b)
+                tgt_w.data.copy_(sliced_w.to(tgt_w.device, dtype=tgt_w.dtype))
+                tgt_b.data.copy_(sliced_b.to(tgt_b.device, dtype=tgt_b.dtype))
                 return True
 
         return False
@@ -2646,16 +2711,18 @@ def extract_and_export_embeddings(
 
     # 1. Zero leakage quarantining against clean benchmark holdout
     if eval_texts is not None and len(eval_texts) > 0:
-        bench_set = set(t.strip().lower() for t in eval_texts)
+        bench_hashes = {_text_hash(t) for t in eval_texts}
         if df_pool is not None and len(df_pool) > 0:
             init_p = len(df_pool)
-            df_pool = df_pool[~df_pool["text"].str.strip().str.lower().isin(bench_set)].copy()
+            pool_hashes = [_text_hash(t) for t in df_pool["text"].fillna("")]
+            df_pool = df_pool[[h not in bench_hashes for h in pool_hashes]].copy()
             quar_p = init_p - len(df_pool)
             if quar_p > 0:
                 print(f"[Features Extraction] Quarantined {quar_p} pool samples matching benchmark.")
         if df_train is not None and len(df_train) > 0:
             init_t = len(df_train)
-            df_train = df_train[~df_train["text"].str.strip().str.lower().isin(bench_set)].copy()
+            tr_hashes = [_text_hash(t) for t in df_train["text"].fillna("")]
+            df_train = df_train[[h not in bench_hashes for h in tr_hashes]].copy()
             quar_t = init_t - len(df_train)
             if quar_t > 0:
                 print(f"[Features Extraction] Quarantined {quar_t} gold train samples matching benchmark.")
@@ -2718,10 +2785,30 @@ def extract_and_export_embeddings(
     train_texts = df_target_all["text"].tolist() + (df_neg_all["text"].tolist() if len(df_neg_all) > 0 else [])
     model_names = df_target_all["model"].tolist() + (["__OTHER__"] * len(df_neg_all) if len(df_neg_all) > 0 else [])
 
-    unique_models = sorted(list(set(model_names)))
-    lab_map = {m: i for i, m in enumerate(unique_models)}
+    if target_clean in FAMILIES:
+        ordered_models = [LABELS[i] for i in FAMILIES[target_clean]] + (["__OTHER__"] if len(df_neg_all) > 0 else [])
+    else:
+        ordered_models = list(LABELS) + (["__OTHER__"] if len(df_neg_all) > 0 else [])
+    lab_map = {m: i for i, m in enumerate(ordered_models)}
     train_labels = [lab_map[m] for m in model_names]
-    prompt_ids = df_target_all["prompt_id"].tolist() if "prompt_id" in df_target_all.columns else None
+
+    target_pids = (
+        df_target_all["prompt_id"].fillna("-1").astype(str).tolist()
+        if "prompt_id" in df_target_all.columns
+        else ["-1"] * len(df_target_all)
+    )
+    neg_pids = (
+        df_neg_all["prompt_id"].fillna("-1").astype(str).tolist()
+        if (len(df_neg_all) > 0 and "prompt_id" in df_neg_all.columns)
+        else ["-1"] * len(df_neg_all)
+    )
+    prompt_ids = target_pids + neg_pids
+
+    amp_dtype = (
+        torch.bfloat16
+        if (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8)
+        else torch.float16
+    )
 
     print(f"[Features Extraction] Extracting features on {len(train_texts):,} samples (batch_size={batch_size})...")
 
@@ -2732,7 +2819,7 @@ def extract_and_export_embeddings(
     Z_cat_list = []
     Z_layers_list = []
     with torch.no_grad():
-        with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+        with torch.amp.autocast(device.type, dtype=amp_dtype):
             for batch in loader_tr:
                 mb_ids = batch["input_ids"].to(device)
                 mb_mask = batch["attention_mask"].to(device)
@@ -2758,7 +2845,7 @@ def extract_and_export_embeddings(
         ev_cat_list = []
         ev_layers_list = []
         with torch.no_grad():
-            with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+            with torch.amp.autocast(device.type, dtype=amp_dtype):
                 for batch in loader_ev:
                     mb_ids = batch["input_ids"].to(device)
                     mb_mask = batch["attention_mask"].to(device)
@@ -2858,11 +2945,13 @@ def train_family_gate(
 
     # 1. Zero leakage quarantining
     if eval_texts is not None and len(eval_texts) > 0:
-        bench_set = set(t.strip().lower() for t in eval_texts)
+        bench_hashes = {_text_hash(t) for t in eval_texts}
         init_pool_len = len(df_pool)
-        df_pool = df_pool[~df_pool["text"].str.strip().str.lower().isin(bench_set)].copy()
+        pool_hashes = [_text_hash(t) for t in df_pool["text"].fillna("")]
+        df_pool = df_pool[[h not in bench_hashes for h in pool_hashes]].copy()
         if df_train is not None and len(df_train) > 0:
-            df_train = df_train[~df_train["text"].str.strip().str.lower().isin(bench_set)].copy()
+            tr_hashes = [_text_hash(t) for t in df_train["text"].fillna("")]
+            df_train = df_train[[h not in bench_hashes for h in tr_hashes]].copy()
         quarantined = init_pool_len - len(df_pool)
         print(f"[{target_family.upper()} Gate] Quarantined {quarantined} benchmark overlap rows. Clean pool: {len(df_pool):,}.")
 
@@ -2872,8 +2961,8 @@ def train_family_gate(
         sub_tr = df_train[df_train["model"] == c] if (df_train is not None and len(df_train) > 0) else pd.DataFrame()
         sub_pool = df_pool[df_pool["model"] == c]
         needed = samples_per_class
-        n_take = min(needed - len(sub_tr), len(sub_pool))
-        sampled_pool = sub_pool.sample(n=n_take, random_state=42)
+        n_take = max(min(needed - len(sub_tr), len(sub_pool)), 0)
+        sampled_pool = sub_pool.sample(n=n_take, random_state=42) if n_take > 0 else pd.DataFrame()
         c_df = pd.concat([sub_tr, sampled_pool], ignore_index=True)
         fam_dfs.append(c_df)
         print(f"  {target_family.upper()} class {c}: {len(c_df)} samples ({len(sub_tr)} train, {len(c_df)-len(sub_tr)} pool)")
@@ -2899,6 +2988,12 @@ def train_family_gate(
     train_labels = [fam_map[m] for m in df_fam_all["model"].tolist()] + [num_family_classes] * len(df_neg_all)
     print(f"[{target_family.upper()} Gate] Total training dataset: {len(train_texts):,} samples ({num_gate_classes} classes: {num_family_classes} {target_family.upper()} + 1 Other).")
 
+    amp_dtype = (
+        torch.bfloat16
+        if (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8)
+        else torch.float16
+    )
+
     # 3. Extract Z_train representations
     print(f"[{target_family.upper()} Gate] Extracting Z_train on {len(train_texts)} samples (batch_size={batch_size})...")
     ds_tr = TextSequenceDataset(train_texts, train_labels, None, tok, max_len=max_len, end_id=end_id)
@@ -2908,7 +3003,7 @@ def train_family_gate(
     Z_tr_layers_list = []
     need_layers = bool(export_embeddings or save_all_layers)
     with torch.no_grad():
-        with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+        with torch.amp.autocast(device.type, dtype=amp_dtype):
             for batch in loader_tr:
                 mb_ids = batch["input_ids"].to(device)
                 mb_mask = batch["attention_mask"].to(device)
@@ -2940,7 +3035,7 @@ def train_family_gate(
         Z_ev_list = []
         Z_ev_layers_list = []
         with torch.no_grad():
-            with torch.amp.autocast(device.type, dtype=torch.bfloat16):
+            with torch.amp.autocast(device.type, dtype=amp_dtype):
                 for batch in loader_ev:
                     mb_ids = batch["input_ids"].to(device)
                     mb_mask = batch["attention_mask"].to(device)

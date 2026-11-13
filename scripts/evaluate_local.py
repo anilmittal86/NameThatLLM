@@ -2110,11 +2110,11 @@ def evaluate_benchmark_dataset(
     # 6. Markdown Report Artifact
     md_content = f"""# Unleaked 1,800-Row Clean Benchmark Confusion Matrix & Analysis
 
-> **Model Evaluated**: Restored Champion Qwen3-14B Solo Plain Head (Commit `ae26404`, Public LB 0.596)  
-> **Evaluation Benchmark**: Unleaked 1,800-Sample Holdout (Strict 0% hash overlap with `train.csv` and `pool_120k.parquet`, 100 samples/class)  
-> **Plain Head Balanced Accuracy**: **{acc_p*100:.2f}%** ({int((y_true == pred_plain).sum())} / {len(y_true):,} correct)  
-> **Centered Head Balanced Accuracy**: **{acc_c*100:.2f}%** ({int((y_true == pred_centered).sum())} / {len(y_true):,} correct)  
-> **Plain + Sinkhorn Balanced Accuracy**: **{acc_p_sk*100:.2f}%** ({int((y_true == pred_p_sk).sum())} / {len(y_true):,} correct)  
+> **Model Evaluated**: Restored Champion Qwen3-14B Solo Plain Head (Commit `ae26404`, Public LB 0.596)
+> **Evaluation Benchmark**: Unleaked 1,800-Sample Holdout (Strict 0% hash overlap with `train.csv` and `pool_120k.parquet`, 100 samples/class)
+> **Plain Head Balanced Accuracy**: **{acc_p*100:.2f}%** ({int((y_true == pred_plain).sum())} / {len(y_true):,} correct)
+> **Centered Head Balanced Accuracy**: **{acc_c*100:.2f}%** ({int((y_true == pred_centered).sum())} / {len(y_true):,} correct)
+> **Plain + Sinkhorn Balanced Accuracy**: **{acc_p_sk*100:.2f}%** ({int((y_true == pred_p_sk).sum())} / {len(y_true):,} correct)
 > **Public Leaderboard Realism**: The benchmark accuracy of **{acc_p*100:.2f}%** provides an honest, unleaked baseline reflecting the 0.596 Public Leaderboard reality without training-set leakage.
 
 ---
@@ -2127,7 +2127,7 @@ def evaluate_benchmark_dataset(
 ### B. Champion Qwen3-14B Plain + Tuned Specialist Gates + Sinkhorn (Balanced Accuracy: 54.44%, +1.22% Lift)
 ![Tuned Specialist Gates Confusion Matrix](file:///C:/Users/anil/.gemini/antigravity/brain/3fc37c66-8b30-4f1c-9198-eabf6c04d89f/clean_benchmark_1800_tuned_gates_confusion_matrix.png)
 
-An interactive HTML heatmap with per-cell tooltips and sibling vs cross-family color highlighting is available at:  
+An interactive HTML heatmap with per-cell tooltips and sibling vs cross-family color highlighting is available at:
 [clean_benchmark_1800_confusion_matrix.html](file:///C:/Users/anil/.gemini/antigravity/brain/3fc37c66-8b30-4f1c-9198-eabf6c04d89f/clean_benchmark_1800_confusion_matrix.html)
 
 ---
