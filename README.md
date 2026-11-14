@@ -67,9 +67,6 @@ To understand the challenge, we ran a controlled experiment: **1,800 unleaked te
 - **Panel A (t-SNE Manifold):** Each dot is one text passage, colored by its authoring model family. Models that write similarly cluster together. Models that write differently drift apart.
 - **Panel B (Cosine Similarity Matrix):** The pairwise angular similarity between all 18 model centroids. Red = similar writing styles. Blue = distinct styles.
 
-<p align="center">
-  <img src="assets/empirical_latent_similarity_matrix.png" alt="Empirical Cosine Similarity Matrix Across 18 Frontier Models" width="750"/>
-</p>
 
 ### The Core Asymmetry
 
