@@ -245,6 +245,106 @@ def _solve_within_class_fisher_gpu(
     return W_ovr, W_pairs
 
 
+def _compute_layer_oof_scores(
+    Z_fam_c: np.ndarray,
+    y_fam: np.ndarray,
+    num_tapped_layers: int,
+    num_family_classes: int,
+    hard_sister_pair: tuple[int, int] | None = None,
+    prompt_ids: list[Any] | np.ndarray | None = None,
+    alpha: float = 5.0,
+    n_splits: int = 5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Computes 5-fold OOF Ridge probe scores s_l = 0.5 * family_oof_bacc + 0.5 * hard_pair_oof_acc
+    for each tapped layer block X_l in Z_fam_c.
+    Returns (layer_weights, oof_baccs, composite_scores).
+    """
+    N, D_total = Z_fam_c.shape
+    D_layer = D_total // max(num_tapped_layers, 1)
+
+    min_class_count = min(int((y_fam == c).sum()) for c in range(num_family_classes)) if num_family_classes > 0 else 0
+    if N < 5 or min_class_count < 2:
+        uniform_w = np.full(num_tapped_layers, 1.0 / max(num_tapped_layers, 1), dtype=np.float32)
+        ones_bacc = np.ones(num_tapped_layers, dtype=np.float32)
+        return uniform_w, ones_bacc, ones_bacc
+
+    n_splits_eff = max(min(n_splits, min_class_count), 2)
+    p_arr = np.asarray(prompt_ids) if prompt_ids is not None else None
+    use_groups = False
+    if p_arr is not None and len(p_arr) == N:
+        u_p = np.unique(p_arr)
+        if len(u_p) >= n_splits_eff and len(u_p) < 0.8 * N:
+            use_groups = True
+
+    if use_groups:
+        splitter = GroupKFold(n_splits=n_splits_eff).split(Z_fam_c[:, :D_layer], y_fam, groups=p_arr)
+    else:
+        splitter = StratifiedKFold(n_splits=n_splits_eff, shuffle=True, random_state=42).split(Z_fam_c[:, :D_layer], y_fam)
+    folds = list(splitter)
+
+    Y_oh = np.eye(num_family_classes, dtype=np.float32)[y_fam]
+    Y_oh = 0.95 * Y_oh + (0.05 / float(max(num_family_classes, 1)))
+
+    scores = []
+    bacc_list = []
+    for l_idx in range(num_tapped_layers):
+        s_col = l_idx * D_layer
+        e_col = (l_idx + 1) * D_layer
+        X_l = Z_fam_c[:, s_col:e_col]
+
+        oof_l = np.zeros((N, num_family_classes), dtype=np.float32)
+        for tr_idx, val_idx in folds:
+            X_tr, Y_tr = X_l[tr_idx], Y_oh[tr_idx]
+            X_val = X_l[val_idx]
+
+            mu_tr = X_tr.mean(axis=0, keepdims=True)
+            X_tr_c = X_tr - mu_tr
+            X_val_c = X_val - mu_tr
+
+            N_tr, D_l = X_tr_c.shape
+            scale = float(np.mean(np.sum(X_tr_c * X_tr_c, axis=1)))
+            eff_alpha = alpha * max(scale / 512.0, 1e-3)
+
+            if N_tr >= D_l:
+                Cov = X_tr_c.T @ X_tr_c
+                Cov.flat[:: D_l + 1] += eff_alpha
+                W_l = np.linalg.solve(Cov, X_tr_c.T @ (Y_tr - Y_tr.mean(axis=0, keepdims=True)))
+                b_l = Y_tr.mean(axis=0)
+            else:
+                K_mat = X_tr_c @ X_tr_c.T
+                K_mat.flat[:: N_tr + 1] += eff_alpha
+                A = np.linalg.solve(K_mat, Y_tr - Y_tr.mean(axis=0, keepdims=True))
+                W_l = X_tr_c.T @ A
+                b_l = Y_tr.mean(axis=0)
+
+            oof_l[val_idx] = X_val_c @ W_l + b_l
+
+        pred_labels = oof_l.argmax(axis=1)
+        fam_bacc = float(balanced_accuracy_score(y_fam, pred_labels))
+        bacc_list.append(fam_bacc)
+
+        if hard_sister_pair is not None:
+            s_a, s_b = hard_sister_pair
+            pair_mask = (y_fam == s_a) | (y_fam == s_b)
+            if pair_mask.sum() > 0 and len(np.unique(y_fam[pair_mask])) == 2:
+                pair_preds = np.where(oof_l[pair_mask, s_a] >= oof_l[pair_mask, s_b], s_a, s_b)
+                pair_acc = float(balanced_accuracy_score(y_fam[pair_mask], pair_preds))
+            else:
+                pair_acc = fam_bacc
+        else:
+            pair_acc = fam_bacc
+
+        s_l = 0.5 * fam_bacc + 0.5 * pair_acc
+        scores.append(s_l)
+
+    scores_arr = np.array(scores, dtype=np.float32)
+    shifted = (scores_arr - scores_arr.max()) * 12.0
+    exp_s = np.exp(shifted)
+    w_layers = exp_s / np.sum(exp_s)
+    return w_layers, np.array(bacc_list, dtype=np.float32), scores_arr
+
+
 def build_supervised_family_subspace(
     Z_train: np.ndarray,
     y_train: np.ndarray,
@@ -253,12 +353,18 @@ def build_supervised_family_subspace(
     subspace_dim: int | None = None,
     reg_ratio: float = 0.15,
     device: torch.device | None = None,
+    include_velocity: bool = True,
+    layer_weighting: bool = True,
+    hard_sister_pair: tuple[int, int] | None = None,
+    prompt_ids: list[Any] | np.ndarray | None = None,
     **kwargs: Any,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """
     Constructs a 100% Pure Supervised Fisher Subspace (Zero Unsupervised PCA):
-      1. Part 1: Per-Layer Multi-Scale Pairwise Sister + OVR Fisher directions across all 8 tapped layers.
-      2. Part 2: Inter-Layer Residual Velocity Fisher directions on Delta X^(l) = X^(l) - X^(l-1).
+      1. Part 1: Per-Layer Multi-Scale Pairwise Sister + OVR Fisher directions across all tapped layers,
+         optionally weighted by layer importance w_l = softmax(12 * s_l).
+      2. Part 2: Inter-Layer Residual Velocity Fisher directions on Delta X^(l) = X^(l) - X^(l-1),
+         optionally enabled via include_velocity.
       3. Part 3: Economic QR orthonormalization (filtering collinear directions via diag_r > 1e-3 * max).
       4. Part 4: Unit-variance coordinate whitening by intra-family training std.
     """
@@ -281,6 +387,30 @@ def build_supervised_family_subspace(
     mu_fam = Z_fam.mean(axis=0, keepdims=True).astype(np.float32)
     Z_fam_c = (Z_fam - mu_fam).astype(np.float32)
 
+    # Resolve default hard_sister_pair if None
+    if hard_sister_pair is None:
+        if num_family_classes == 4:
+            hard_sister_pair = (2, 3)
+        elif num_family_classes == 5:
+            hard_sister_pair = (1, 2)
+        elif num_family_classes == 2:
+            hard_sister_pair = (0, 1)
+
+    # Compute Layer-Probing Importance Weights if layer_weighting is enabled
+    if layer_weighting:
+        w_layers, oof_baccs, comp_scores = _compute_layer_oof_scores(
+            Z_fam_c=Z_fam_c,
+            y_fam=y_fam,
+            num_tapped_layers=num_tapped_layers,
+            num_family_classes=num_family_classes,
+            hard_sister_pair=hard_sister_pair,
+            prompt_ids=prompt_ids,
+        )
+    else:
+        w_layers = np.full(num_tapped_layers, 1.0 / max(num_tapped_layers, 1), dtype=np.float32)
+        oof_baccs = np.zeros(num_tapped_layers, dtype=np.float32)
+        comp_scores = np.zeros(num_tapped_layers, dtype=np.float32)
+
     basis_rows: list[np.ndarray] = []
     layer_fisher_norms: dict[int, float] = {}
 
@@ -290,6 +420,8 @@ def build_supervised_family_subspace(
         e_col = (l_idx + 1) * D_layer
         X_l = Z_fam_c[:, s_col:e_col]
 
+        alpha_l = float(np.sqrt(float(num_tapped_layers) * float(w_layers[l_idx])))
+
         W_ovr, W_pairs = _solve_within_class_fisher_gpu(
             X_l, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio,
             reg_scales=(0.03, 0.12, 0.45), device=device
@@ -297,26 +429,30 @@ def build_supervised_family_subspace(
         stacked_dirs = np.vstack([W_ovr, W_pairs]) if len(W_pairs) > 0 else W_ovr
         for row in stacked_dirs:
             full_vec = np.zeros(D_total, dtype=np.float32)
-            full_vec[s_col:e_col] = row
+            full_vec[s_col:e_col] = row * alpha_l
             basis_rows.append(full_vec)
 
         layer_fisher_norms[l_idx] = float(np.linalg.norm(W_pairs)) if len(W_pairs) > 0 else 0.0
 
     # Part 2: Inter-Layer Residual Velocity Fisher Directions: Delta X^(l) = X^(l) - X^(l-1)
-    for l_idx in range(1, num_tapped_layers):
-        s_prev, e_prev = (l_idx - 1) * D_layer, l_idx * D_layer
-        s_curr, e_curr = l_idx * D_layer, (l_idx + 1) * D_layer
-        Delta_X = Z_fam_c[:, s_curr:e_curr] - Z_fam_c[:, s_prev:e_prev]
+    if include_velocity:
+        for l_idx in range(1, num_tapped_layers):
+            s_prev, e_prev = (l_idx - 1) * D_layer, l_idx * D_layer
+            s_curr, e_curr = l_idx * D_layer, (l_idx + 1) * D_layer
+            Delta_X = Z_fam_c[:, s_curr:e_curr] - Z_fam_c[:, s_prev:e_prev]
 
-        _, W_vel_pairs = _solve_within_class_fisher_gpu(
-            Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5,
-            reg_scales=(0.05, 0.20, 0.60), device=device
-        )
-        for row in W_vel_pairs:
-            full_vec = np.zeros(D_total, dtype=np.float32)
-            full_vec[s_curr:e_curr] = row / np.sqrt(2.0)
-            full_vec[s_prev:e_prev] = -row / np.sqrt(2.0)
-            basis_rows.append(full_vec)
+            w_avg = 0.5 * (float(w_layers[l_idx]) + float(w_layers[l_idx - 1]))
+            alpha_vel = float(np.sqrt(float(num_tapped_layers) * w_avg))
+
+            _, W_vel_pairs = _solve_within_class_fisher_gpu(
+                Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5,
+                reg_scales=(0.05, 0.20, 0.60), device=device
+            )
+            for row in W_vel_pairs:
+                full_vec = np.zeros(D_total, dtype=np.float32)
+                full_vec[s_curr:e_curr] = (row / np.sqrt(2.0)) * alpha_vel
+                full_vec[s_prev:e_prev] = (-row / np.sqrt(2.0)) * alpha_vel
+                basis_rows.append(full_vec)
 
     W_sup = np.vstack(basis_rows)  # (D_sup, 40960)
 
@@ -340,6 +476,11 @@ def build_supervised_family_subspace(
         "total_subspace_dim": int(V_basis.shape[0]),
         "subspace_dim": int(V_basis.shape[0]),
         "layer_fisher_norms": layer_fisher_norms,
+        "layer_scalar_weights": [float(w) for w in w_layers],
+        "per_layer_oof_bacc": [float(b) for b in oof_baccs],
+        "layer_composite_scores": [float(s) for s in comp_scores],
+        "include_velocity": include_velocity,
+        "layer_weighting": layer_weighting,
     }
     return C_eff, mu_fam, diagnostics
 

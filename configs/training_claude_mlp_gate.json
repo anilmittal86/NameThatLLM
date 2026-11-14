@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "name": "qwen3_14b_claude_supervised_mlp_gate",
+  "description": "Phase 3 Supervised Layer-Probed Subspace + MLP/Ridge Gate for Claude Sister Decoupling (claude-3.5-sonnet, claude-3.5-haiku, claude-3.7-sonnet)",
+  "pipeline_mode": "family_gate",
+  "backbone": "Qwen/Qwen3-14B-Base",
+  "keep_layers": 27,
+  "layers": [2, 4, 6, 9, 13, 17, 22, 27],
+  "max_len": 384,
+  "end_id": 151643,
+  "target_family": "claude",
+  "head_type": "mlp",
+  "gate_weight": 0.40,
+  "use_supervised_subspace": true,
+  "hidden_dim": 256,
+  "mlp_epochs": 30,
+  "mlp_lr": 0.0003,
+  "mlp_dropout": 0.25,
+  "samples_per_class": 3000,
+  "negative_ratio": 0.10,
+  "batch_size": 8,
+  "output_dir": "export_claude_gate_mlp",
+  "export_embeddings": {
+    "enabled": true,
+    "save_all_layers": true,
+    "save_multiview": true,
+    "output_dir": "export_embeddings_claude"
+  }
+}

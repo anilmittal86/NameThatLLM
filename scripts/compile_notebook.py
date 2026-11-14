@@ -19,6 +19,7 @@ SUBMISSION_MODULES = [
     "neural_extractor.py",
     "postprocess.py",
     "ablation.py",
+    "experiment_logger.py",
     "pipeline.py",
 ]
 
@@ -29,6 +30,7 @@ TRAINING_MODULES = [
     "postprocess.py",
     "ablation.py",
     "layer_probing.py",
+    "experiment_logger.py",
     "trainer.py",
 ]
 

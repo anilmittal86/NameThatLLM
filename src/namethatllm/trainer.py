@@ -1248,7 +1248,7 @@ def run_training_pipeline(
 
     # Preserve existing 18-class in-house champion checkpoint if present in input_dir
     working_champ = Path("/kaggle/working/export_champion_qwen3_14b")
-    if input_dir.exists() and not working_champ.exists():
+    if not is_gate_or_export and input_dir.exists() and not working_champ.exists():
         for cand in input_dir.rglob("export_champion_qwen3_14b"):
             if cand.is_dir() and (cand / "heads.safetensors").exists():
                 try:
@@ -1466,16 +1466,22 @@ def run_training_pipeline(
     )
     base_model = get_peft_model(base_model, lora_cfg)
 
-    if hasattr(base_model, "gradient_checkpointing_enable"):
-        try:
-            base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except TypeError:
-            base_model.gradient_checkpointing_enable()
-    for mod in base_model.modules():
-        if hasattr(mod, "gradient_checkpointing"):
-            mod.gradient_checkpointing = True
+    if not is_gate_or_export:
+        if hasattr(base_model, "gradient_checkpointing_enable"):
+            try:
+                base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                base_model.gradient_checkpointing_enable()
+        for mod in base_model.modules():
+            if hasattr(mod, "gradient_checkpointing"):
+                mod.gradient_checkpointing = True
+    else:
+        # Evaluation / feature extraction mode: disable grad checkpointing for ~25% speedup on 2x T4
+        base_model.eval()
 
     model = MultiLayerLoRAClassifier(base_model, hidden_size=base_cfg.hidden_size, layers=layers, num_classes=num_classes)
+    if is_gate_or_export:
+        model.eval()
     # If device_map was used, keep classification heads and layer norms on the main device (device / cuda:0)
     # to avoid unnecessary PCI-e device thrashing while preserving device_map on the backbone.
     if hasattr(base_model, "hf_device_map") and len(getattr(base_model, "hf_device_map", {})) > 1:
@@ -2352,8 +2358,10 @@ def fit_family_mlp_head(
             sd_family = Z_train.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
         Z_tr_std = ((Z_train - mu_family) / sd_family).astype(np.float32)
 
-    # 2. Construct an internal 15% stratified validation split on Z_train to prevent benchmark overfitting
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # 2. Construct an internal stratified validation split on Z_train to prevent benchmark overfitting
+    min_c = min(int((y_train == c).sum()) for c in range(num_gate_classes)) if num_gate_classes > 0 else 5
+    n_splits_eff = max(min(5, min_c), 2)
+    skf = StratifiedKFold(n_splits=n_splits_eff, shuffle=True, random_state=42)
     fit_idx, val_idx = next(skf.split(Z_tr_std, y_train))
 
     X_fit_t = torch.from_numpy(Z_tr_std[fit_idx]).float()
@@ -2892,6 +2900,12 @@ def extract_and_export_embeddings(
     if device is None:
         device = next(model.parameters()).device
 
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if vram_gb < 18.0 and batch_size > 8:
+            print(f"[Features Extraction] Kaggle T4/P100 ({vram_gb:.1f} GiB) detected: clamping batch_size from {batch_size} to 8.")
+            batch_size = 8
+
     target_clean = target.lower().strip()
     print("\n==========================================================================================")
     print(f" [Features Extraction] Target: '{target_clean}' | Save All Layers: {save_all_layers} | Multiview: {save_multiview} | Max Len: {max_len}")
@@ -3184,6 +3198,11 @@ def train_family_gate_from_dataset(
     run_probing_sweep: bool = False,
     checkpoints_volume: Any | None = None,
     gate_weight: float = 0.40,
+    select_layers: list[int] | str | None = None,
+    include_velocity: bool = True,
+    layer_weighting: bool = True,
+    use_multiview: bool = False,
+    hard_sister_pair: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """
     Offline high-throughput entrypoint to train and evaluate any family gate directly from disk
@@ -3216,6 +3235,12 @@ def train_family_gate_from_dataset(
     feat_sd = load_file(str(ds_p / "features_concat.safetensors"))
     Z_train = feat_sd["features_concat"].cpu().float().numpy()
 
+    # Load all-layers tensor if present
+    Z_train_layers = None
+    if (ds_p / "features_by_layer.safetensors").exists():
+        feat_l_sd = load_file(str(ds_p / "features_by_layer.safetensors"))
+        Z_train_layers = feat_l_sd["features_by_layer"].cpu().float().numpy()
+
     df_meta = pd.read_parquet(ds_p / "metadata.parquet")
     model_names = df_meta["model"].tolist()
     prompt_ids = df_meta["prompt_id"].tolist() if "prompt_id" in df_meta.columns else None
@@ -3226,29 +3251,75 @@ def train_family_gate_from_dataset(
     fam_map = {name: i for i, name in enumerate(family_classes)}
     y_train = np.array([fam_map.get(m, num_family_classes if has_negatives else 0) for m in model_names], dtype=np.int64)
 
+    # Resolve default hard sister pair
+    eff_hard_pair = hard_sister_pair
+    if eff_hard_pair is None:
+        if num_family_classes == 4:
+            eff_hard_pair = (2, 3)
+        elif num_family_classes == 5:
+            eff_hard_pair = (1, 2)
+        elif num_family_classes == 2:
+            eff_hard_pair = (0, 1)
+
     # Optional Layer Probing Sweep if features_by_layer exists
-    if run_probing_sweep and (ds_p / "features_by_layer.safetensors").exists():
+    if run_probing_sweep and Z_train_layers is not None:
         from namethatllm.layer_probing import run_all_layers_probe_sweep
-        feat_l_sd = load_file(str(ds_p / "features_by_layer.safetensors"))
-        Z_train_layers = feat_l_sd["features_by_layer"].cpu().float().numpy()
         rep_path = Path(output_dir) / "layer_probe_report.json" if output_dir else ds_p / "layer_probe_report.json"
         run_all_layers_probe_sweep(
             features_by_layer=Z_train_layers,
             labels=y_train,
             prompt_ids=prompt_ids,
-            family_cols=list(range(num_family_classes)),
-            target_family=target_family,
+            hard_sister_pair=eff_hard_pair or (2, 3),
+            num_family_classes=num_family_classes,
             output_json=rep_path,
             device=device,
         )
 
+    # Handle select_layers (e.g. "auto_top8" or [4, 6, 9, 13, 17, 20, 24, 27])
+    chosen_layers = None
+    if select_layers is not None and Z_train_layers is not None:
+        if select_layers == "auto_top8":
+            from namethatllm.layer_probing import run_all_layers_probe_sweep
+            rep_path = Path(output_dir) / "layer_probe_report.json" if output_dir else ds_p / "layer_probe_report.json"
+            probe_rep = run_all_layers_probe_sweep(
+                features_by_layer=Z_train_layers,
+                labels=y_train,
+                prompt_ids=prompt_ids,
+                hard_sister_pair=eff_hard_pair or (2, 3),
+                num_family_classes=num_family_classes,
+                output_json=rep_path,
+                device=device,
+            )
+            chosen_layers = probe_rep["top_8_layers"]
+        else:
+            chosen_layers = list(select_layers)
+
+        print(f"[{target_family.upper()} Gate] Slicing select_layers={chosen_layers} from features_by_layer...")
+        Z_train_sel = Z_train_layers[:, chosen_layers, :]
+        m_l = Z_train_sel.mean(axis=-1, keepdims=True)
+        s_l = Z_train_sel.std(axis=-1, keepdims=True) + 1e-5
+        Z_train_sel = (Z_train_sel - m_l) / s_l
+        Z_train = Z_train_sel.reshape(Z_train_sel.shape[0], -1).astype(np.float32)
+
     # Load holdout benchmark features if available
     Z_eval, y_ev_arr, main_logits_eval = None, None, None
+    Z_ev_layers = None
     if (ds_p / "benchmark_features_concat.safetensors").exists() and (ds_p / "benchmark_metadata.parquet").exists():
         bench_sd = load_file(str(ds_p / "benchmark_features_concat.safetensors"))
         Z_eval = bench_sd["benchmark_features_concat"].cpu().float().numpy()
         df_bench = pd.read_parquet(ds_p / "benchmark_metadata.parquet")
         y_ev_arr = df_bench["label"].to_numpy()
+
+    if (ds_p / "benchmark_features_by_layer.safetensors").exists():
+        bench_l_sd = load_file(str(ds_p / "benchmark_features_by_layer.safetensors"))
+        Z_ev_layers = bench_l_sd["benchmark_features_by_layer"].cpu().float().numpy()
+
+    if chosen_layers is not None and Z_ev_layers is not None:
+        Z_ev_sel = Z_ev_layers[:, chosen_layers, :]
+        m_ev = Z_ev_sel.mean(axis=-1, keepdims=True)
+        s_ev = Z_ev_sel.std(axis=-1, keepdims=True) + 1e-5
+        Z_ev_sel = (Z_ev_sel - m_ev) / s_ev
+        Z_eval = Z_ev_sel.reshape(Z_ev_sel.shape[0], -1).astype(np.float32)
 
     if (ds_p / "benchmark_champion_logits.safetensors").exists():
         champ_ev_sd = load_file(str(ds_p / "benchmark_champion_logits.safetensors"))
@@ -3269,6 +3340,9 @@ def train_family_gate_from_dataset(
             num_family_classes=num_family_classes,
             subspace_dim=subspace_dim,
             num_tapped_layers=num_tapped,
+            include_velocity=include_velocity,
+            layer_weighting=layer_weighting,
+            hard_sister_pair=eff_hard_pair,
             prompt_ids=prompt_ids,
             device=device,
         )
@@ -3277,6 +3351,50 @@ def train_family_gate_from_dataset(
     else:
         Z_tr_active = Z_train
         Z_ev_active = Z_eval
+
+    if use_multiview:
+        from namethatllm.layer_probing import engineer_multiview_features
+        ht_tr, std_tr = None, None
+        if (ds_p / "champion_logits.safetensors").exists():
+            c_sd = load_file(str(ds_p / "champion_logits.safetensors"))
+            if "head_tail_cos" in c_sd:
+                ht_tr = c_sd["head_tail_cos"].cpu().float().numpy()
+            if "token_std_norms" in c_sd:
+                std_tr = c_sd["token_std_norms"].cpu().float().numpy()
+
+        mv_tr = engineer_multiview_features(
+            features_concat=Z_train,
+            features_by_layer=Z_train_layers,
+            head_tail_cos=ht_tr,
+            token_std_norms=std_tr,
+            num_tapped_layers=num_tapped,
+        )
+        mv_mean = mv_tr.mean(axis=0, keepdims=True)
+        mv_std = mv_tr.std(axis=0, keepdims=True) + 1e-5
+        mv_tr_norm = (mv_tr - mv_mean) / mv_std
+        Z_tr_active = np.hstack([Z_tr_active, mv_tr_norm]).astype(np.float32)
+
+        if Z_eval is not None:
+            ht_ev, std_ev = None, None
+            if (ds_p / "benchmark_champion_logits.safetensors").exists():
+                b_sd = load_file(str(ds_p / "benchmark_champion_logits.safetensors"))
+                if "head_tail_cos" in b_sd:
+                    ht_ev = b_sd["head_tail_cos"].cpu().float().numpy()
+                if "token_std_norms" in b_sd:
+                    std_ev = b_sd["token_std_norms"].cpu().float().numpy()
+            mv_ev = engineer_multiview_features(
+                features_concat=Z_eval,
+                features_by_layer=Z_ev_layers,
+                head_tail_cos=ht_ev,
+                token_std_norms=std_ev,
+                num_tapped_layers=num_tapped,
+            )
+            mv_ev_norm = (mv_ev - mv_mean) / mv_std
+            Z_ev_active = np.hstack([Z_ev_active, mv_ev_norm]).astype(np.float32)
+
+        # Multi-view features are non-linearly derived and cannot be folded into linear 40,960 projection
+        pca_components = None
+        pca_mean = None
 
     fam_eval_mask = np.isin(y_ev_arr, family_cols) if y_ev_arr is not None else None
     col_to_local = {c: i for i, c in enumerate(family_cols)}
@@ -3338,9 +3456,26 @@ def train_family_gate_from_dataset(
         raw_Z_eval=Z_eval,
     )
 
+    # Hybrid 0.65 MLP + 0.35 Ridge logits if both available
+    hybrid_logits_ev = None
+    if mlp_logits_ev is not None and ridge_logits_ev is not None:
+        hybrid_logits_ev = 0.65 * mlp_logits_ev + 0.35 * ridge_logits_ev
+
     if head_type.lower() == "mlp":
         best_fam_acc = mlp_acc
         best_fam_logits = mlp_logits_ev
+        best_alpha = ridge_alpha
+        final_head_dict = mlp_head_dict
+        final_head_dict["plain.weight"] = plain_w_tensor
+        final_head_dict["plain.bias"] = plain_b_tensor
+    elif head_type.lower() in ("hybrid", "hybrid_65mlp_35ridge"):
+        if hybrid_logits_ev is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
+            fam_hyb_pred = hybrid_logits_ev[fam_eval_mask, :num_family_classes].argmax(axis=1)
+            hybrid_acc = float(balanced_accuracy_score(y_fam_true, fam_hyb_pred))
+        else:
+            hybrid_acc = mlp_acc
+        best_fam_acc = hybrid_acc
+        best_fam_logits = hybrid_logits_ev if hybrid_logits_ev is not None else mlp_logits_ev
         best_alpha = ridge_alpha
         final_head_dict = mlp_head_dict
         final_head_dict["plain.weight"] = plain_w_tensor
@@ -3354,7 +3489,17 @@ def train_family_gate_from_dataset(
             "plain.bias": plain_b_tensor,
         }
 
-    # Step 6: Logit Blending
+    # Evaluate hardest sister pair accuracy
+    hard_pair_eval_acc = float(best_fam_acc)
+    if y_fam_true is not None and best_fam_logits is not None and eff_hard_pair is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
+        s_a, s_b = eff_hard_pair
+        pair_mask_ev = (y_fam_true == s_a) | (y_fam_true == s_b)
+        if pair_mask_ev.sum() > 0 and len(np.unique(y_fam_true[pair_mask_ev])) == 2:
+            fam_logits = best_fam_logits[fam_eval_mask, :num_family_classes]
+            spec_pair_preds = np.where(fam_logits[pair_mask_ev, s_a] >= fam_logits[pair_mask_ev, s_b], s_a, s_b)
+            hard_pair_eval_acc = float(balanced_accuracy_score(y_fam_true[pair_mask_ev], spec_pair_preds))
+
+    # Step 6: Logit Blending Sweep
     default_gw = float(gate_weight)
     best_pipe_w = default_gw
     pipe_results = {}
@@ -3362,6 +3507,10 @@ def train_family_gate_from_dataset(
         P_main = sp_softmax(main_logits_eval, axis=1)
         acc_plain_solo = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
         best_pipe_acc = 0.0
+        best_raw_bacc = 0.0
+        best_sk_bacc = 0.0
+        default_raw_bacc = 0.0
+        default_sk_bacc = 0.0
         cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
         spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
 
@@ -3380,14 +3529,25 @@ def train_family_gate_from_dataset(
             acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
             P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
             acc_gated_sk = float(balanced_accuracy_score(y_ev_arr, P_sk.argmax(axis=1)))
+
+            if abs(gw - default_gw) < 1e-4:
+                default_raw_bacc = acc_gated
+                default_sk_bacc = acc_gated_sk
+
             if acc_gated_sk > best_pipe_acc:
                 best_pipe_acc = acc_gated_sk
                 best_pipe_w = gw
+                best_raw_bacc = acc_gated
+                best_sk_bacc = acc_gated_sk
 
         pipe_results = {
             "plain_solo_bacc": acc_plain_solo,
             "best_pipe_bacc": best_pipe_acc,
             "best_gate_weight": best_pipe_w,
+            "best_raw_bacc": best_raw_bacc,
+            "best_sinkhorn_bacc": best_sk_bacc,
+            "default_raw_bacc": default_raw_bacc,
+            "default_sinkhorn_bacc": default_sk_bacc,
             "lift_over_plain": best_pipe_acc - acc_plain_solo,
         }
 
@@ -3395,7 +3555,6 @@ def train_family_gate_from_dataset(
     if output_dir is not None:
         out_p = Path(output_dir)
         out_p.mkdir(parents=True, exist_ok=True)
-        # Check if existing checkpoint in dataset_dir has norms.*
         norms_src = ds_p / "heads.safetensors"
         if norms_src.exists():
             try:
@@ -3416,13 +3575,14 @@ def train_family_gate_from_dataset(
             "use_supervised_subspace": use_supervised_subspace,
             "subspace_dim": int(pca_components.shape[0]) if pca_components is not None else None,
             "pca_dim": None,
-            "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
+            "hidden_dim": hidden_dim if "mlp" in head_type.lower() or "hybrid" in head_type.lower() else None,
             "alpha": float(best_alpha),
             "ridge_alpha": float(ridge_alpha),
             "ridge_within_family_acc": float(ridge_acc),
             "mlp_within_family_acc": float(mlp_acc),
             "within_family_acc": float(best_fam_acc),
             "plain_within_family_acc": float(acc_plain_within),
+            "hard_pair_eval_acc": float(hard_pair_eval_acc),
             "lift_over_plain": float(best_fam_acc - acc_plain_within),
         }
         (out_p / "meta.json").write_text(json.dumps(meta_fam, indent=2), encoding="utf-8")
@@ -3435,9 +3595,11 @@ def train_family_gate_from_dataset(
         "within_family_balanced_acc": float(best_fam_acc),
         "plain_within_family_acc": float(acc_plain_within),
         "delta_within_family": float(best_fam_acc - acc_plain_within),
+        "hard_pair_eval_acc": float(hard_pair_eval_acc),
         "best_alpha": float(best_alpha),
         "ridge_acc": float(ridge_acc),
         "mlp_acc": float(mlp_acc),
+        "subspace_dim": int(pca_components.shape[0]) if pca_components is not None else 0,
         "pipe_results": pipe_results,
         "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
         "spec_classes": family_classes,
@@ -3473,6 +3635,9 @@ def train_family_gate(
     embeddings_output_dir: Path | str | None = None,
     gate_weight: float = 0.40,
     train_cfg: dict[str, Any] | None = None,
+    include_velocity: bool = True,
+    layer_weighting: bool = True,
+    hard_sister_pair: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """
     End-to-end family gate training pipeline (HB-WRH):
@@ -3513,8 +3678,8 @@ def train_family_gate(
 
     if torch.cuda.is_available():
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        if vram_gb < 16.0 and batch_size > 8:
-            print(f"[{target_family.upper()} Gate] Low VRAM ({vram_gb:.1f} GiB) detected: clamping extraction batch_size from {batch_size} to 8.")
+        if vram_gb < 18.0 and batch_size > 8:
+            print(f"[{target_family.upper()} Gate] Kaggle T4/P100 ({vram_gb:.1f} GiB) detected: clamping extraction batch_size from {batch_size} to 8.")
             batch_size = 8
 
     # 1. Zero leakage quarantining
@@ -3795,6 +3960,9 @@ def train_family_gate(
             num_tapped_layers=len(getattr(model, "layers", [2, 4, 6, 9, 13, 17, 22, 27])),
             subspace_dim=subspace_dim,
             device=device,
+            include_velocity=include_velocity,
+            layer_weighting=layer_weighting,
+            hard_sister_pair=hard_sister_pair,
             prompt_ids=prompt_ids,
         )
         Z_tr_active = ((Z_train - subspace_mean) @ subspace_components.T).astype(np.float32)
@@ -3940,6 +4108,25 @@ def train_family_gate(
             "lift_over_plain": best_pipe_acc - acc_plain_solo,
         }
 
+    # Evaluate hardest sister pair accuracy
+    hard_pair_eval_acc = float(best_fam_acc)
+    pair_check = hard_sister_pair
+    if pair_check is None:
+        if num_family_classes == 4:
+            pair_check = (2, 3)
+        elif num_family_classes == 5:
+            pair_check = (1, 2)
+        elif num_family_classes == 2:
+            pair_check = (0, 1)
+
+    if y_fam_true is not None and best_fam_logits is not None and pair_check is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
+        s_a, s_b = pair_check
+        pair_mask_ev = (y_fam_true == s_a) | (y_fam_true == s_b)
+        if pair_mask_ev.sum() > 0 and len(np.unique(y_fam_true[pair_mask_ev])) == 2:
+            fam_logits = best_fam_logits[fam_eval_mask, :num_family_classes]
+            spec_pair_preds = np.where(fam_logits[pair_mask_ev, s_a] >= fam_logits[pair_mask_ev, s_b], s_a, s_b)
+            hard_pair_eval_acc = float(balanced_accuracy_score(y_fam_true[pair_mask_ev], spec_pair_preds))
+
     # -------------------------------------------------------------------------
     # Step 7: Save Checkpoint with Self-Contained norms.* (Bug 1.2 Fix)
     # -------------------------------------------------------------------------
@@ -3969,6 +4156,7 @@ def train_family_gate(
             "mlp_within_family_acc": float(mlp_acc),
             "within_family_acc": float(best_fam_acc),
             "plain_within_family_acc": float(acc_plain_within),
+            "hard_pair_eval_acc": float(hard_pair_eval_acc),
             "lift_over_plain": float(best_fam_acc - acc_plain_within),
         }
         (out_p / "meta.json").write_text(json.dumps(meta_fam, indent=2), encoding="utf-8")
@@ -3981,9 +4169,11 @@ def train_family_gate(
         "within_family_balanced_acc": float(best_fam_acc),
         "plain_within_family_acc": float(acc_plain_within),
         "delta_within_family": float(best_fam_acc - acc_plain_within),
+        "hard_pair_eval_acc": float(hard_pair_eval_acc),
         "best_alpha": float(best_alpha),
         "ridge_acc": float(ridge_acc),
         "mlp_acc": float(mlp_acc),
+        "subspace_dim": int(pca_components.shape[0]) if pca_components is not None else 0,
         "pipe_results": pipe_results,
         "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
         "spec_classes": family_classes,
@@ -3997,16 +4187,27 @@ if __name__ == "__main__":
     parser.add_argument("--from-embeddings-dir", type=str, default=None, help="Offline training from exported embeddings bundle")
     parser.add_argument("--target-family", type=str, default="gemini", help="Target family for gate training")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
-    parser.add_argument("--head-type", type=str, default="mlp", choices=["mlp", "ridge"])
+    parser.add_argument("--head-type", type=str, default="mlp", choices=["mlp", "ridge", "hybrid"])
+    parser.add_argument("--select-layers", type=str, default=None, help="'auto_top8' or comma-separated layer indices")
+    parser.add_argument("--use-multiview", action="store_true", help="Add engineered multi-view features")
+    parser.add_argument("--no-velocity", action="store_true", help="Disable inter-layer velocity directions")
+    parser.add_argument("--no-layer-weighting", action="store_true", help="Disable layer-probing importance weighting")
     args = parser.parse_args()
 
     if args.from_embeddings_dir:
         out_p = Path(args.output_dir) if args.output_dir else Path(f"export_{args.target_family}_gate_{args.head_type}")
+        sel_l = args.select_layers
+        if sel_l is not None and sel_l != "auto_top8":
+            sel_l = [int(x.strip()) for x in sel_l.split(",") if x.strip()]
         train_family_gate_from_dataset(
             dataset_dir=Path(args.from_embeddings_dir),
             target_family=args.target_family,
             output_dir=out_p,
             head_type=args.head_type,
+            select_layers=sel_l,
+            use_multiview=args.use_multiview,
+            include_velocity=not args.no_velocity,
+            layer_weighting=not args.no_layer_weighting,
         )
     elif args.config:
         with open(args.config, "r", encoding="utf-8") as f:
