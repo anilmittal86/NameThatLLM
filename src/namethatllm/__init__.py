@@ -22,6 +22,12 @@ from .config import (
     softmax,
     validate_production_assets,
 )
+from .layer_probing import (
+    LayerScalarMix,
+    LayerScalarMixWithHead,
+    fit_trace_scaled_ridge_probe,
+    run_all_layers_probe_sweep,
+)
 from .lexical_engine import (
     FUNCTION_WORDS,
     STOP_WORDS,
@@ -61,12 +67,16 @@ from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
 from .trainer import (
     MultiLayerLoRAClassifier,
     PromptGroupBatchSampler,
+    build_supervised_family_subspace,
     compute_grouped_inference_logits,
     compute_two_stage_loss,
     evaluate_stage2_oof_cv,
     export_compatible_checkpoint,
+    extract_and_export_embeddings,
     fit_ridge_heads,
     run_training_pipeline,
+    train_family_gate,
+    train_family_gate_from_dataset,
 )
 from .wpca_gaussian import (
     ExactAuthorPosterior,
@@ -86,6 +96,8 @@ __all__ = [
     "STOP_WORDS",
     "ExactAuthorPosterior",
     "K",
+    "LayerScalarMix",
+    "LayerScalarMixWithHead",
     "MultiLayerLoRAClassifier",
     "PromptGroupBatchSampler",
     "UniversalLoRATrunkLoader",
@@ -101,6 +113,7 @@ __all__ = [
     "auto_align_and_verify_head",
     "blend_main_and_complementary",
     "build_orthographic_penalty_matrix",
+    "build_supervised_family_subspace",
     "build_unseen_holdout_dataset",
     "calibrate_model_lp",
     "compute_centered_logits",
@@ -109,6 +122,7 @@ __all__ = [
     "compute_two_stage_loss",
     "evaluate_stage2_oof_cv",
     "export_compatible_checkpoint",
+    "extract_and_export_embeddings",
     "extract_deberta_checkpoint",
     "extract_handwriting_and_orthographic_features",
     "extract_handwriting_features",
@@ -116,6 +130,7 @@ __all__ = [
     "fit_joint_spectral_bank",
     "fit_ridge_heads",
     "fit_shared_gaussian_lowram",
+    "fit_trace_scaled_ridge_probe",
     "forward_and_pool_batch",
     "function_text",
     "generate_submission",
@@ -129,6 +144,7 @@ __all__ = [
     "resolve_all_pool_files",
     "resolve_dataset_paths",
     "resolve_head_tensors",
+    "run_all_layers_probe_sweep",
     "run_lexical_engine",
     "run_submission_pipeline",
     "run_training_pipeline",
@@ -137,6 +153,8 @@ __all__ = [
     "sinkhorn_balancing",
     "softmax",
     "split_oversized_clusters_dist",
+    "train_family_gate",
+    "train_family_gate_from_dataset",
     "transform_lowram",
     "validate_production_assets",
 ]

@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "name": "qwen3_14b_all_family_gates",
+  "description": "Sequential Phase 3 Supervised Subspace Family Gates + Embedding Export for Gemini, GPT, GLM, and Claude",
+  "pipeline_mode": "family_gate",
+  "backbone": "Qwen/Qwen3-14B-Base",
+  "keep_layers": 27,
+  "layers": [2, 4, 6, 9, 13, 17, 22, 27],
+  "max_len": 384,
+  "end_id": 151643,
+  "head_type": "mlp",
+  "use_supervised_subspace": true,
+  "pca_dim": 256,
+  "hidden_dim": 256,
+  "mlp_epochs": 30,
+  "mlp_lr": 0.0003,
+  "mlp_dropout": 0.25,
+  "negative_ratio": 0.10,
+  "batch_size": 16,
+  "specialist_jobs": [
+    {
+      "target_family": "gemini",
+      "samples_per_class": 3800,
+      "output_dir": "export_gemini_gate_mlp",
+      "export_embeddings": { "enabled": true, "save_all_layers": true, "output_dir": "export_embeddings_gemini" }
+    },
+    {
+      "target_family": "gpt",
+      "samples_per_class": 3000,
+      "output_dir": "export_gpt_gate_mlp",
+      "export_embeddings": { "enabled": true, "save_all_layers": true, "output_dir": "export_embeddings_gpt" }
+    },
+    {
+      "target_family": "glm",
+      "samples_per_class": 4000,
+      "output_dir": "export_glm_gate_mlp",
+      "export_embeddings": { "enabled": true, "save_all_layers": true, "output_dir": "export_embeddings_glm" }
+    },
+    {
+      "target_family": "claude",
+      "samples_per_class": 3000,
+      "output_dir": "export_claude_gate_mlp",
+      "export_embeddings": { "enabled": true, "save_all_layers": true, "output_dir": "export_embeddings_claude" }
+    }
+  ]
+}

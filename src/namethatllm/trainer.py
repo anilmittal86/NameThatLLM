@@ -227,7 +227,8 @@ class MultiLayerLoRAClassifier(nn.Module):
         drop_first_token: bool = True,
         return_by_layer: bool = False,
         extract_all_layers: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_multiview: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """
         Extracts pooled multi-layer representations with causal attention-sink masking.
 
@@ -242,8 +243,13 @@ class MultiLayerLoRAClassifier(nn.Module):
         Parameters:
         -----------
         return_by_layer: If True, returns (Z_cat, Z_layers).
-        extract_all_layers: If True, Z_layers stacks all backbone hidden states [B, num_all_layers, hidden_size].
+        extract_all_layers: If True, Z_layers stacks all backbone hidden states [B, num_all_layers, hidden_size]
+                            in safe FP16 range [-65000, 65000] without destructive unit L2-normalization.
                             If False, Z_layers stacks the configured tapped layers [B, len(self.layers), hidden_size].
+        return_multiview: If True, returns (Z_cat, Z_layers, mv_dict) where mv_dict contains:
+                          - head_tail_cos: [B, 8] cosine similarity between first & second half of sequence
+                          - token_std_norms: [B, 8] L2 norm of token-level standard deviation per tapped layer
+                          - layer_norms: [B, num_all_layers] raw activation norm magnitude if extract_all_layers=True
         """
         m = attention_mask.clone().float()
         if drop_first_token and m.shape[1] > 1:
@@ -261,6 +267,7 @@ class MultiLayerLoRAClassifier(nn.Module):
         hidden_states = getattr(outputs, "hidden_states", outputs)
 
         all_layers_pooled = []
+        layer_norms_list = []
         if extract_all_layers:
             for l_idx in range(len(hidden_states)):
                 h = hidden_states[l_idx].float()
@@ -269,10 +276,29 @@ class MultiLayerLoRAClassifier(nn.Module):
                 den_l = den.to(layer_dev)
                 h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
                 p_l = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
-                p_l = F.normalize(p_l, p=2, dim=-1, eps=1e-6)
+                p_l = torch.clamp(p_l, min=-65000.0, max=65000.0)
+                l_norm = torch.norm(p_l, p=2, dim=-1)
                 all_layers_pooled.append(p_l.to(first_device))
+                layer_norms_list.append(l_norm.to(first_device))
 
         pooled_list = []
+        head_tail_cos_list = []
+        token_std_norms_list = []
+
+        # Vectorized head/tail masks for structural views
+        if return_multiview:
+            cum_m = torch.cumsum(m, dim=1) * m
+            mid = (den / 2.0).ceil()
+            m_head = (cum_m > 0) & (cum_m <= mid)
+            m_tail = cum_m > mid
+            # Fallback for single-token active sequences
+            single_tok = den <= 1.0
+            if single_tok.any():
+                m_head = torch.where(single_tok, m.bool(), m_head)
+                m_tail = torch.where(single_tok, m.bool(), m_tail)
+            den_head = m_head.sum(dim=1, keepdim=True).clamp(min=1e-5)
+            den_tail = m_tail.sum(dim=1, keepdim=True).clamp(min=1e-5)
+
         for idx, l in enumerate(self.layers):
             h = hidden_states[l].float()
             layer_dev = h.device
@@ -285,7 +311,39 @@ class MultiLayerLoRAClassifier(nn.Module):
             normed = norm(pooled.to(norm_dev))
             pooled_list.append(normed.to(first_device))
 
+            if return_multiview:
+                m_head_l = m_head.to(layer_dev).unsqueeze(-1).float()
+                m_tail_l = m_tail.to(layer_dev).unsqueeze(-1).float()
+                den_head_l = den_head.to(layer_dev)
+                den_tail_l = den_tail.to(layer_dev)
+
+                hp = (h * m_head_l).sum(dim=1) / den_head_l
+                tp = (h * m_tail_l).sum(dim=1) / den_tail_l
+                cos_drift = F.cosine_similarity(hp, tp, dim=-1, eps=1e-6)
+                head_tail_cos_list.append(cos_drift.to(first_device))
+
+                mean_un = pooled
+                diff = (h - mean_un.unsqueeze(1)) * m_l.unsqueeze(-1)
+                var_pool = (diff ** 2).sum(dim=1) / den_l
+                std_pool = torch.sqrt(var_pool + 1e-5)
+                std_norm = torch.norm(std_pool, p=2, dim=-1)
+                token_std_norms_list.append(std_norm.to(first_device))
+
         Z_cat = torch.cat(pooled_list, dim=-1)
+
+        if return_multiview:
+            if extract_all_layers:
+                Z_layers = torch.stack(all_layers_pooled, dim=1)
+            else:
+                Z_layers = torch.stack(pooled_list, dim=1)
+            mv_dict = {
+                "head_tail_cos": torch.stack(head_tail_cos_list, dim=1),
+                "token_std_norms": torch.stack(token_std_norms_list, dim=1),
+            }
+            if extract_all_layers and layer_norms_list:
+                mv_dict["layer_norms"] = torch.stack(layer_norms_list, dim=1)
+            return Z_cat, Z_layers, mv_dict
+
         if return_by_layer:
             if extract_all_layers:
                 Z_layers = torch.stack(all_layers_pooled, dim=1)
@@ -1261,6 +1319,23 @@ def run_training_pipeline(
                 torch.cuda.empty_cache()
         return final_out
 
+    from_emb_dir = train_cfg.get("from_embeddings_dir")
+    if from_emb_dir:
+        print(f"[Trainer] Fast offline dataset gate training mode triggered from: {from_emb_dir}")
+        res = train_family_gate_from_dataset(
+            dataset_dir=Path(from_emb_dir),
+            target_family=train_cfg.get("target_family", "gemini"),
+            output_dir=out_dir,
+            head_type=train_cfg.get("head_type", "mlp"),
+            subspace_dim=int(train_cfg.get("pca_dim", 256)),
+            hidden_dim=int(train_cfg.get("hidden_dim", 256)),
+            mlp_epochs=int(train_cfg.get("mlp_epochs", 30)),
+            mlp_lr=float(train_cfg.get("mlp_lr", 3e-4)),
+            device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+            checkpoints_volume=checkpoints_volume,
+        )
+        return out_dir
+
     target_family = train_cfg.get("target_family")
     is_gate_or_export = bool(
         train_cfg.get("pipeline_mode") in ("family_gate", "export_embeddings", "extract_features")
@@ -1463,16 +1538,25 @@ def run_training_pipeline(
             exp_cfg = {}
         target = exp_cfg.get("target") or train_cfg.get("embeddings_target") or target_family or "gemini"
         save_all = bool(exp_cfg.get("save_all_layers", train_cfg.get("save_all_layers", False)))
+        save_mv = bool(exp_cfg.get("save_multiview", train_cfg.get("save_multiview", False)))
         emb_out = exp_cfg.get("output_dir") or train_cfg.get("embeddings_output_dir") or out_dir
+        samples_per_cls = int(exp_cfg.get("samples_per_class", train_cfg.get("samples_per_class", 0)))
+        neg_ratio = float(exp_cfg.get("negative_ratio", train_cfg.get("negative_ratio", 0.10)))
+        ext_bs = int(exp_cfg.get("batch_size", train_cfg.get("batch_size", 16)))
+        ext_max_len = int(exp_cfg.get("max_len", train_cfg.get("max_len", max_len)))
+        ds_title = exp_cfg.get("dataset_title", train_cfg.get("dataset_title"))
+        ds_slug = exp_cfg.get("dataset_slug", train_cfg.get("dataset_slug"))
 
         pool_list = all_pools if all_pools else ([pool_file] if pool_file else [])
         dfs = []
         for p in pool_list:
             try:
                 if str(p).endswith(".parquet"):
-                    df_one = pd.read_parquet(p, columns=["text", "model"])
+                    df_one = pd.read_parquet(p)
                 else:
-                    df_one = pd.read_csv(p, usecols=["text", "model"])
+                    df_one = pd.read_csv(p)
+                keep_cols = [c for c in ["text", "model", "prompt_id"] if c in df_one.columns]
+                df_one = df_one[keep_cols]
                 dfs.append(df_one)
             except Exception:
                 pass
@@ -1527,15 +1611,18 @@ def run_training_pipeline(
             df_train=df_tr,
             target=target,
             save_all_layers=save_all,
+            save_multiview=save_mv,
             output_dir=emb_out,
-            samples_per_class=int(train_cfg.get("samples_per_class", 0)),
-            negative_ratio=float(train_cfg.get("negative_ratio", 0.10)),
+            samples_per_class=samples_per_cls,
+            negative_ratio=neg_ratio,
             eval_texts=eval_texts,
             eval_labels=eval_labels,
-            batch_size=int(train_cfg.get("batch_size", 16)),
-            max_len=int(train_cfg.get("max_len", 384)),
+            batch_size=ext_bs,
+            max_len=ext_max_len,
             end_id=end_id,
             device=device,
+            dataset_title=ds_title,
+            dataset_slug=ds_slug,
             checkpoints_volume=checkpoints_volume,
         )
         return Path(emb_out)
@@ -1599,9 +1686,11 @@ def run_training_pipeline(
         for p in pool_list:
             try:
                 if str(p).endswith(".parquet"):
-                    df_one = pd.read_parquet(p, columns=["text", "model"])
+                    df_one = pd.read_parquet(p)
                 else:
-                    df_one = pd.read_csv(p, usecols=["text", "model"])
+                    df_one = pd.read_csv(p)
+                keep_cols = [c for c in ["text", "model", "prompt_id"] if c in df_one.columns]
+                df_one = df_one[keep_cols]
                 dfs.append(df_one)
             except Exception:
                 pass
@@ -1645,8 +1734,8 @@ def run_training_pipeline(
             df_pool=df_p,
             df_train=df_tr,
             target_family=target_family or "gemini",
-            samples_per_class=int(train_cfg.get("samples_per_class", 3500)),
-            negative_ratio=float(train_cfg.get("negative_ratio", 0.0)),
+            samples_per_class=int(train_cfg.get("samples_per_class", 3800)),
+            negative_ratio=float(train_cfg.get("negative_ratio", 0.10)),
             eval_texts=eval_texts,
             eval_labels=eval_labels,
             batch_size=int(train_cfg.get("batch_size", 32)),
@@ -1656,10 +1745,11 @@ def run_training_pipeline(
             output_dir=out_dir,
             checkpoints_volume=checkpoints_volume,
             head_type=train_cfg.get("head_type", "mlp"),
-            pca_dim=int(train_cfg.get("pca_dim", 128)),
-            hidden_dim=int(train_cfg.get("hidden_dim", 128)),
-            mlp_epochs=int(train_cfg.get("mlp_epochs", 20)),
-            mlp_lr=float(train_cfg.get("mlp_lr", 2e-4)),
+            use_supervised_subspace=bool(train_cfg.get("use_supervised_subspace", True)),
+            pca_dim=int(train_cfg.get("pca_dim", 256)),
+            hidden_dim=int(train_cfg.get("hidden_dim", 256)),
+            mlp_epochs=int(train_cfg.get("mlp_epochs", 30)),
+            mlp_lr=float(train_cfg.get("mlp_lr", 3e-4)),
             mlp_dropout=float(train_cfg.get("mlp_dropout", 0.25)),
             export_embeddings=exp_enabled,
             save_all_layers=exp_save_all,
@@ -2100,102 +2190,247 @@ def fit_family_gate_head(
     eval_mask: np.ndarray | None = None,
     num_family_classes: int | None = None,
     device: torch.device | None = None,
+    prompt_ids: list[Any] | np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float, float, np.ndarray | None]:
     """
     Fits an L2-regularized Plain Ridge Head for intra-family gating using GPU-accelerated PyTorch solve.
-    Returns: (best_W, best_b, best_alpha, best_eval_acc, best_eval_logits)
+    Selects best_alpha strictly using 5-fold cross-validation on Z_train to eliminate benchmark leakage,
+    refits on 100% of Z_train with best_alpha, and evaluates once on Z_eval for unbiased holdout reporting.
+
+    Returns: (best_W, best_b, best_alpha, eval_or_oof_acc, eval_logits)
     """
+    from sklearn.model_selection import GroupKFold, StratifiedKFold
+
     if alphas is None:
-        alphas = [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+        alphas = [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     N_tr, D_feat = Z_train.shape
-    Y_onehot = np.zeros((N_tr, num_gate_classes), dtype=np.float32)
-    for i, lab in enumerate(y_train):
-        Y_onehot[i, lab] = 1.0
-    Y_smooth = (1.0 - label_smoothing) * Y_onehot + (label_smoothing / float(num_gate_classes))
-
     K_eval_classes = num_family_classes if num_family_classes is not None else num_gate_classes
+    fam_mask_all = y_train < K_eval_classes
 
-    # Move to PyTorch tensors on GPU for blazing-fast linear algebra
-    Z_t = torch.from_numpy(Z_train).to(device, dtype=torch.float32)
-    Y_t = torch.from_numpy(Y_smooth).to(device, dtype=torch.float32)
+    def _solve_ridge_split(X_sub: np.ndarray, y_sub: np.ndarray, alpha_val: float) -> tuple[np.ndarray, np.ndarray]:
+        N_s, D_s = X_sub.shape
+        Y_oh = np.zeros((N_s, num_gate_classes), dtype=np.float32)
+        for i_s, lab_s in enumerate(y_sub):
+            if 0 <= lab_s < num_gate_classes:
+                Y_oh[i_s, lab_s] = 1.0
+        Y_sm = (1.0 - label_smoothing) * Y_oh + (label_smoothing / float(num_gate_classes))
 
-    # Compute mu_Z strictly on the intra-family training rows so the shared family mean cancels out
-    fam_mask = y_train < K_eval_classes
-    fam_mask_t = torch.from_numpy(fam_mask).to(device)
-    if fam_mask_t.sum() > 0:
-        mu_Z = Z_t[fam_mask_t].mean(dim=0, keepdim=True)
+        X_t_sub = torch.from_numpy(X_sub).to(device, dtype=torch.float32)
+        Y_t_sub = torch.from_numpy(Y_sm).to(device, dtype=torch.float32)
+
+        sub_fam_m = torch.from_numpy(y_sub < K_eval_classes).to(device)
+        if sub_fam_m.sum() > 0:
+            mu_X_s = X_t_sub[sub_fam_m].mean(dim=0, keepdim=True)
+        else:
+            mu_X_s = X_t_sub.mean(dim=0, keepdim=True)
+        mu_Y_s = Y_t_sub.mean(dim=0, keepdim=True)
+
+        X_c_s = X_t_sub - mu_X_s
+        Y_c_s = Y_t_sub - mu_Y_s
+
+        scale_s = float(torch.sum(X_c_s ** 2).item() / max(N_s, 1))
+        eff_a = max(alpha_val * scale_s, 1e-6)
+
+        if N_s >= D_s:
+            Cov_s = X_c_s.T @ X_c_s
+            reg_s = eff_a * torch.eye(D_s, device=device, dtype=torch.float32)
+            W_s = torch.linalg.solve(Cov_s + reg_s, X_c_s.T @ Y_c_s)
+        else:
+            K_s = X_c_s @ X_c_s.T
+            reg_s = eff_a * torch.eye(N_s, device=device, dtype=torch.float32)
+            A_s = torch.linalg.solve(K_s + reg_s, Y_c_s)
+            W_s = X_c_s.T @ A_s
+
+        b_s = (mu_Y_s - mu_X_s @ W_s).squeeze(0)
+        W_np_s = W_s.cpu().numpy()
+        b_np_s = b_s.cpu().numpy()
+
+        fam_logits_s = (X_sub[y_sub < K_eval_classes] @ W_np_s + b_np_s)[:, :K_eval_classes]
+        row_std_s = float(np.std(fam_logits_s, axis=1).mean()) if len(fam_logits_s) > 0 else 1.0
+        temp_scale_s = (3.2 / row_std_s) if row_std_s > 1e-4 else 1.0
+        W_np_s = (W_np_s * temp_scale_s).astype(np.float32)
+        b_np_s = (b_np_s * temp_scale_s).astype(np.float32)
+
+        del X_t_sub, Y_t_sub, X_c_s, Y_c_s, W_s, b_s
+        return W_np_s, b_np_s
+
+    # 1. Select best_alpha strictly via 5-fold CV on (Z_train, y_train)
+    pids_arr = np.asarray(prompt_ids) if prompt_ids is not None else None
+    unique_groups = len(set(prompt_ids)) if prompt_ids is not None else 0
+    if pids_arr is not None and unique_groups >= 5:
+        gkf = GroupKFold(n_splits=5)
+        splits = list(gkf.split(Z_train, y_train, groups=pids_arr))
     else:
-        mu_Z = Z_t.mean(dim=0, keepdim=True)
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        splits = list(skf.split(Z_train, y_train))
 
-    mu_Y = Y_t.mean(dim=0, keepdim=True)
-    Z_c = Z_t - mu_Z
-    Y_c = Y_t - mu_Y
-
-    # trace(Z_c @ Z_c.T) is simply the sum of squares ||Z_c||_F^2!
-    scale = float(torch.sum(Z_c ** 2).item() / N_tr)
-
-    use_primal = (N_tr >= D_feat)
-    if use_primal:
-        Cov = Z_c.T @ Z_c
-        Zt_Y = Z_c.T @ Y_c
-    else:
-        K_mat = Z_c @ Z_c.T
-
-    best_w, best_b = None, None
-    best_acc = 0.0
-    best_alpha = 1.0
-    best_eval_logits = None
+    best_alpha = alphas[0]
+    best_oof_bacc = -1.0
 
     for alpha in alphas:
-        eff_alpha = alpha * scale
-        if use_primal:
-            reg = eff_alpha * torch.eye(D_feat, device=device, dtype=torch.float32)
-            W_head = torch.linalg.solve(Cov + reg, Zt_Y)
+        oof_logits = np.zeros((N_tr, num_gate_classes), dtype=np.float32)
+        for tr_idx, val_idx in splits:
+            W_fold, b_fold = _solve_ridge_split(Z_train[tr_idx], y_train[tr_idx], alpha)
+            oof_logits[val_idx] = Z_train[val_idx] @ W_fold + b_fold
+
+        if fam_mask_all.sum() > 0:
+            oof_preds = oof_logits[fam_mask_all, :K_eval_classes].argmax(axis=1)
+            oof_acc = float(balanced_accuracy_score(y_train[fam_mask_all], oof_preds))
         else:
-            reg = eff_alpha * torch.eye(N_tr, device=device, dtype=torch.float32)
-            A_mat = torch.linalg.solve(K_mat + reg, Y_c)
-            W_head = Z_c.T @ A_mat
-        b_head = (mu_Y - mu_Z @ W_head).squeeze(0)
+            oof_acc = float(balanced_accuracy_score(y_train, oof_logits.argmax(axis=1)))
 
-        W_np = W_head.cpu().numpy()
-        b_np = b_head.cpu().numpy()
+        if oof_acc > best_oof_bacc:
+            best_oof_bacc = oof_acc
+            best_alpha = alpha
 
-        fam_logits_tr = (Z_train[fam_mask] @ W_np + b_np)[:, :K_eval_classes]
-        row_std = float(np.std(fam_logits_tr, axis=1).mean())
-        temp_scale = (3.2 / row_std) if row_std > 1e-4 else 1.0
-        W_np = (W_np * temp_scale).astype(np.float32)
-        b_np = (b_np * temp_scale).astype(np.float32)
+    # 2. Refit on 100% of (Z_train, y_train) using best_alpha
+    best_w, best_b = _solve_ridge_split(Z_train, y_train, best_alpha)
 
-        if Z_eval is not None and y_eval_true is not None and eval_mask is not None:
-            logits_ev = Z_eval @ W_np + b_np
-            fam_pred = logits_ev[eval_mask, :K_eval_classes].argmax(axis=1)
-            acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
-            if acc > best_acc or best_w is None:
-                best_acc = acc
-                best_w = W_np
-                best_b = b_np
-                best_alpha = alpha
-                best_eval_logits = logits_ev
-        else:
-            if best_w is None:
-                best_w = W_np
-                best_b = b_np
-                best_alpha = alpha
-
-    # Clean up GPU memory
-    del Z_t, Y_t, Z_c, Y_c
-    if use_primal:
-        del Cov, Zt_Y
+    # 3. Evaluate once on Z_eval if provided for unbiased holdout reporting
+    best_eval_logits = None
+    if Z_eval is not None and y_eval_true is not None and eval_mask is not None and eval_mask.sum() > 0:
+        best_eval_logits = Z_eval @ best_w + best_b
+        fam_pred = best_eval_logits[eval_mask, :K_eval_classes].argmax(axis=1)
+        best_acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
     else:
-        del K_mat
+        best_acc = best_oof_bacc
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     return best_w, best_b, best_alpha, best_acc, best_eval_logits
+
+
+def build_supervised_family_subspace(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    num_family_classes: int,
+    family_classes: list[str],
+    subspace_dim: int = 256,
+    num_tapped_layers: int = 8,
+    alphas: list[float] | None = None,
+    prompt_ids: list[Any] | None = None,
+    device: torch.device | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """
+    Builds a Supervised Discriminative + Layer-Probed Subspace for intra-family sister decoupling (Task 2):
+    1. Strict Intra-Family Fitting:
+       Compute the subspace strictly on intra-family training rows (fam_mask = y_train < num_family_classes)
+       so out-of-family distractors (__OTHER__) do not hijack the basis.
+    2. Part 1 — Per-Layer Ridge Probe Directions (transformer-heads style):
+       Partition Z_train ([N, 40960]) into 8 tapped layer blocks Z^(l) in R^{N x 5120}.
+       Fit an L2-regularized Ridge probe on each layer block Z^(l) independently and log each layer's 5-fold OOF accuracy.
+       Collect per-layer weight vectors W^(l) embedded into the full 40,960-dim space plus explicit pairwise sibling contrast vectors.
+    3. Part 2 — Orthogonalized Intra-Family PCA Directions:
+       Project out Part 1 directions from intra-family residuals, extract remaining subspace_dim - d_sup components via SVD/PCA,
+       and orthonormalize via QR decomposition to form orthonormal projection matrix V in R^{subspace_dim x 40960}.
+    4. Feature Whitening & Zero-Cost Fold-In:
+       Standardize projected components: C_eff = diag(sd_proj)^{-1} @ V in R^{subspace_dim x 40960}.
+
+    Returns:
+    --------
+    C_eff : np.ndarray [subspace_dim, 40960]
+    mu_fam : np.ndarray [1, 40960]
+    report : dict with layer-by-layer probing diagnostic table
+    """
+    fam_mask = y_train < num_family_classes
+    if fam_mask.sum() == 0:
+        fam_mask = np.ones(len(y_train), dtype=bool)
+
+    Z_fam = Z_train[fam_mask]
+    y_fam = y_train[fam_mask]
+    mu_fam = Z_fam.mean(axis=0, keepdims=True)
+    Z_fam_c = Z_fam - mu_fam
+
+    N_fam, D_feat = Z_fam.shape
+    chunk_dim = D_feat // max(num_tapped_layers, 1)
+    if alphas is None:
+        alphas = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
+
+    pids_fam = [prompt_ids[i] for i in np.flatnonzero(fam_mask)] if prompt_ids is not None else None
+
+    sup_directions = []
+    layer_probe_table = []
+
+    print("\n" + "=" * 88)
+    print(f" [Supervised Subspace] Part 1: Per-Layer Ridge Probing across {num_tapped_layers} Layers (D_chunk={chunk_dim})...")
+    print("=" * 88)
+
+    for l_idx in range(num_tapped_layers):
+        X_l = Z_fam_c[:, l_idx * chunk_dim : (l_idx + 1) * chunk_dim]
+        W_l, b_l, a_l, l_acc, _ = fit_family_gate_head(
+            Z_train=X_l,
+            y_train=y_fam,
+            num_gate_classes=num_family_classes,
+            alphas=alphas,
+            num_family_classes=num_family_classes,
+            device=device,
+            prompt_ids=pids_fam,
+        )
+        layer_probe_table.append({
+            "layer_idx": l_idx,
+            "oof_acc": round(l_acc, 4),
+            "best_alpha": a_l,
+        })
+        print(f"  Layer {l_idx:02d} (dim [{l_idx*chunk_dim}:{(l_idx+1)*chunk_dim}]) | 5-Fold OOF BAcc: {l_acc * 100:6.2f}% | Alpha: {a_l}")
+
+        # Embed per-class weight vectors into full D_feat space
+        for c_idx in range(num_family_classes):
+            full_w = np.zeros(D_feat, dtype=np.float32)
+            full_w[l_idx * chunk_dim : (l_idx + 1) * chunk_dim] = W_l[:, c_idx]
+            norm_w = np.linalg.norm(full_w)
+            if norm_w > 1e-6:
+                sup_directions.append(full_w / norm_w)
+
+        # Pairwise sibling contrast vectors: w_{k+1} - w_{k}
+        for k in range(num_family_classes - 1):
+            diff_w = np.zeros(D_feat, dtype=np.float32)
+            diff_w[l_idx * chunk_dim : (l_idx + 1) * chunk_dim] = W_l[:, k + 1] - W_l[:, k]
+            norm_diff = np.linalg.norm(diff_w)
+            if norm_diff > 1e-6:
+                sup_directions.append(diff_w / norm_diff)
+
+    D_mat = np.column_stack(sup_directions)
+    Q_sup, _ = np.linalg.qr(D_mat)
+    d_sup = Q_sup.shape[1]
+    print(f" [Supervised Subspace] Extracted {d_sup} orthonormal supervised discriminative directions.")
+
+    # Project out Part 1 directions from intra-family residuals
+    Z_proj_sup = Z_fam_c @ Q_sup
+    Z_resid = Z_fam_c - Z_proj_sup @ Q_sup.T
+
+    k_rem = subspace_dim - d_sup
+    if k_rem > 0:
+        from sklearn.decomposition import PCA
+        n_comp_pca = min(k_rem, N_fam - 1, D_feat)
+        pca_rem = PCA(n_components=n_comp_pca, svd_solver="randomized", random_state=42)
+        pca_rem.fit(Z_resid)
+        V_rem = pca_rem.components_.T
+        M = np.hstack([Q_sup, V_rem])
+        Q_full, _ = np.linalg.qr(M)
+        V = Q_full[:, :subspace_dim].T
+    else:
+        V = Q_sup[:, :subspace_dim].T
+
+    # Feature Whitening on intra-family training set
+    Z_proj_fam = (Z_fam - mu_fam) @ V.T
+    sd_proj = Z_proj_fam.std(axis=0, keepdims=True).clip(min=1e-4)
+    C_eff = (1.0 / sd_proj.T) * V
+    print(f" [Supervised Subspace] Whitened subspace basis C_eff constructed: shape={list(C_eff.shape)}")
+    print("=" * 88 + "\n")
+
+    report = {
+        "num_family_classes": num_family_classes,
+        "family_classes": family_classes,
+        "subspace_dim": subspace_dim,
+        "d_supervised": d_sup,
+        "layer_probe_table": layer_probe_table,
+    }
+    return C_eff.astype(np.float32), mu_fam.astype(np.float32), report
 
 
 class FamilyMLPHead(nn.Module):
@@ -2422,9 +2657,23 @@ def fit_family_mlp_head(
         plain_w = torch.from_numpy(W_ridge.T).to(torch.float32).contiguous()
         plain_b = torch.from_numpy(b_ridge).to(torch.float32).contiguous()
 
+    # Ensembled Logit Fold-In (0.65 MLP + 0.35 Folded Ridge)
+    if eval_target is not None and best_eval_logits is not None:
+        ridge_ev_logits = eval_target @ plain_w.cpu().numpy().T + plain_b.cpu().numpy()
+        blend_logits = 0.65 * best_eval_logits + 0.35 * ridge_ev_logits
+        if y_eval_true is not None and eval_mask is not None and eval_mask.sum() > 0:
+            blend_pred = blend_logits[eval_mask, :num_family_classes].argmax(axis=1)
+            blend_acc = float(balanced_accuracy_score(y_eval_true, blend_pred))
+            if blend_acc >= best_eval_acc:
+                print(f"  [Folded Ensemble] 0.65 MLP + 0.35 Ridge lift: {best_eval_acc * 100:.2f}% -> {blend_acc * 100:.2f}%")
+                best_eval_acc = blend_acc
+                best_eval_logits = blend_logits
+
     head_dict = {
         "mlp_w1": W1_folded.cpu().to(torch.float32).contiguous(),
         "mlp_b1": b1_folded.cpu().to(torch.float32).contiguous(),
+        "unfolded_w1": mlp.fc1.weight.detach().cpu().to(torch.float32).contiguous(),
+        "unfolded_b1": mlp.fc1.bias.detach().cpu().to(torch.float32).contiguous(),
         "ln_weight": mlp.ln.weight.detach().cpu().to(torch.float32).contiguous(),
         "ln_bias": mlp.ln.bias.detach().cpu().to(torch.float32).contiguous(),
         "mlp_w2": mlp.fc2.weight.detach().cpu().to(torch.float32).contiguous(),
@@ -2610,15 +2859,27 @@ def save_extracted_features_bundle(
     dataset_title: str | None = None,
     dataset_slug: str | None = None,
     checkpoints_volume: Any | None = None,
+    champion_logits_plain: np.ndarray | None = None,
+    champion_logits_centered: np.ndarray | None = None,
+    head_tail_cos: np.ndarray | None = None,
+    token_std_norms: np.ndarray | None = None,
+    layer_norms: np.ndarray | None = None,
+    eval_champion_logits_plain: np.ndarray | None = None,
+    eval_champion_logits_centered: np.ndarray | None = None,
+    eval_head_tail_cos: np.ndarray | None = None,
+    eval_token_std_norms: np.ndarray | None = None,
+    eval_layer_norms: np.ndarray | None = None,
 ) -> Path:
     """
     Saves extracted features and metadata in Kaggle Dataset format:
     1. features_concat.safetensors: FP16 tensor [N, D]
     2. features_by_layer.safetensors: FP16 tensor [N, L, hidden_size] (if provided)
-    3. metadata.parquet: [id, model, label, prompt_id, text_hash, char_len]
-    4. benchmark_features_concat.safetensors & benchmark_metadata.parquet (if eval provided)
-    5. dataset-metadata.json: For instant 1-click `kaggle datasets create`
-    6. features_summary.json: Human-readable inspection stats
+    3. champion_logits.safetensors: logits_plain, logits_centered, head_tail_cos, token_std_norms (if provided)
+    4. layer_norms.safetensors: raw layer activation norms [N, L] (if provided)
+    5. metadata.parquet: [id, model, label, prompt_id, text_hash, char_len]
+    6. benchmark_* counterparts if evaluation samples provided
+    7. dataset-metadata.json: For instant 1-click `kaggle datasets create`
+    8. features_summary.json: Human-readable inspection stats
     """
     from safetensors.torch import save_file
 
@@ -2641,6 +2902,23 @@ def save_extracted_features_bundle(
         sz_layer_mb = (out_p / "features_by_layer.safetensors").stat().st_size / (1024**2)
         print(f"  Saved features_by_layer.safetensors: shape={list(feat_layers_t.shape)}, size={sz_layer_mb:.1f} MB")
 
+    # 2b. Save champion logits & structural multiview features if provided
+    champ_dict = {}
+    if champion_logits_plain is not None:
+        champ_dict["logits_plain"] = torch.from_numpy(champion_logits_plain).to(torch.float32)
+    if champion_logits_centered is not None:
+        champ_dict["logits_centered"] = torch.from_numpy(champion_logits_centered).to(torch.float32)
+    if head_tail_cos is not None:
+        champ_dict["head_tail_cos"] = torch.from_numpy(head_tail_cos).to(torch.float32)
+    if token_std_norms is not None:
+        champ_dict["token_std_norms"] = torch.from_numpy(token_std_norms).to(torch.float32)
+    if champ_dict:
+        save_file(champ_dict, str(out_p / "champion_logits.safetensors"))
+        print(f"  Saved champion_logits.safetensors: keys={list(champ_dict.keys())}")
+
+    if layer_norms is not None:
+        save_file({"layer_norms": torch.from_numpy(layer_norms).to(torch.float32)}, str(out_p / "layer_norms.safetensors"))
+
     # 3. Save training metadata parquet
     meta_df = pd.DataFrame({
         "id": np.arange(len(texts), dtype=np.int64),
@@ -2660,6 +2938,22 @@ def save_extracted_features_bundle(
         if eval_features_by_layer is not None:
             ev_layer_t = torch.from_numpy(eval_features_by_layer).to(torch.float16)
             save_file({"benchmark_features_by_layer": ev_layer_t}, str(out_p / "benchmark_features_by_layer.safetensors"))
+
+        eval_champ_dict = {}
+        if eval_champion_logits_plain is not None:
+            eval_champ_dict["logits_plain"] = torch.from_numpy(eval_champion_logits_plain).to(torch.float32)
+        if eval_champion_logits_centered is not None:
+            eval_champ_dict["logits_centered"] = torch.from_numpy(eval_champion_logits_centered).to(torch.float32)
+        if eval_head_tail_cos is not None:
+            eval_champ_dict["head_tail_cos"] = torch.from_numpy(eval_head_tail_cos).to(torch.float32)
+        if eval_token_std_norms is not None:
+            eval_champ_dict["token_std_norms"] = torch.from_numpy(eval_token_std_norms).to(torch.float32)
+        if eval_champ_dict:
+            save_file(eval_champ_dict, str(out_p / "benchmark_champion_logits.safetensors"))
+            print(f"  Saved benchmark_champion_logits.safetensors: keys={list(eval_champ_dict.keys())}")
+
+        if eval_layer_norms is not None:
+            save_file({"layer_norms": torch.from_numpy(eval_layer_norms).to(torch.float32)}, str(out_p / "benchmark_layer_norms.safetensors"))
 
         eval_models = eval_model_names if eval_model_names is not None else [
             LABELS[i] if i < len(LABELS) else f"class_{i}" for i in (eval_labels if eval_labels is not None else [0] * len(eval_texts))
@@ -2720,6 +3014,7 @@ def extract_and_export_embeddings(
     df_train: pd.DataFrame | None = None,
     target: str = "gemini",
     save_all_layers: bool = False,
+    save_multiview: bool = False,
     output_dir: Path | str = "export_embeddings",
     samples_per_class: int = 0,
     negative_ratio: float = 0.10,
@@ -2744,7 +3039,7 @@ def extract_and_export_embeddings(
 
     target_clean = target.lower().strip()
     print("\n==========================================================================================")
-    print(f" [Features Extraction] Target: '{target_clean}' | Save All Layers: {save_all_layers} | Max Len: {max_len}")
+    print(f" [Features Extraction] Target: '{target_clean}' | Save All Layers: {save_all_layers} | Multiview: {save_multiview} | Max Len: {max_len}")
     print("==========================================================================================")
 
     # 1. Zero leakage quarantining against clean benchmark holdout
@@ -2848,6 +3143,9 @@ def extract_and_export_embeddings(
         else torch.float16
     )
 
+    has_plain = hasattr(model, "plain_head") and model.plain_head is not None
+    has_centered = hasattr(model, "centered_head") and model.centered_head is not None
+
     print(f"[Features Extraction] Extracting features on {len(train_texts):,} samples (batch_size={batch_size})...")
 
     # 3. Extract Train Features
@@ -2856,25 +3154,58 @@ def extract_and_export_embeddings(
 
     Z_cat_list = []
     Z_layers_list = []
+    cos_drift_list = []
+    std_norms_list = []
+    layer_norms_list = []
+    logits_p_list = []
+    logits_c_list = []
+
     with torch.no_grad():
         with torch.amp.autocast(device.type, dtype=amp_dtype):
             for batch in loader_tr:
                 mb_ids = batch["input_ids"].to(device)
                 mb_mask = batch["attention_mask"].to(device)
                 max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
-                z_b, z_l = model.forward_features(
-                    mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
-                    return_by_layer=True, extract_all_layers=save_all_layers,
-                )
+                if save_multiview:
+                    z_b, z_l, mv_d = model.forward_features(
+                        mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                        return_by_layer=True, extract_all_layers=save_all_layers, return_multiview=True
+                    )
+                    cos_drift_list.append(mv_d["head_tail_cos"].cpu().float().numpy())
+                    std_norms_list.append(mv_d["token_std_norms"].cpu().float().numpy())
+                    if "layer_norms" in mv_d:
+                        layer_norms_list.append(mv_d["layer_norms"].cpu().float().numpy())
+                else:
+                    z_b, z_l = model.forward_features(
+                        mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                        return_by_layer=True, extract_all_layers=save_all_layers, return_multiview=False
+                    )
                 Z_cat_list.append(z_b.cpu().float().numpy())
                 Z_layers_list.append(z_l.cpu().to(torch.float16).numpy())
+                if has_plain:
+                    lp = model.predict_plain(z_b)
+                    logits_p_list.append(lp.cpu().float().numpy())
+                if has_centered:
+                    lc = model.predict_centered(z_b)
+                    logits_c_list.append(lc.cpu().float().numpy())
 
     features_concat = np.vstack(Z_cat_list)
     features_by_layer = np.vstack(Z_layers_list)
+    champ_p = np.vstack(logits_p_list) if logits_p_list else None
+    champ_c = np.vstack(logits_c_list) if logits_c_list else None
+    ht_cos = np.vstack(cos_drift_list) if cos_drift_list else None
+    t_std = np.vstack(std_norms_list) if std_norms_list else None
+    l_norms = np.vstack(layer_norms_list) if layer_norms_list else None
 
     # 4. Extract Benchmark Features if provided
     eval_cat = None
     eval_layers = None
+    eval_champ_p = None
+    eval_champ_c = None
+    eval_ht_cos = None
+    eval_t_std = None
+    eval_l_norms = None
+
     if eval_texts is not None and len(eval_texts) > 0:
         print(f"[Features Extraction] Extracting benchmark features on {len(eval_texts)} holdout samples...")
         dummy_y = [0] * len(eval_texts)
@@ -2882,20 +3213,48 @@ def extract_and_export_embeddings(
         loader_ev = DataLoader(ds_ev, batch_size=batch_size, shuffle=False, collate_fn=collate_text_batch)
         ev_cat_list = []
         ev_layers_list = []
+        ev_cos_list = []
+        ev_std_list = []
+        ev_ln_list = []
+        ev_lp_list = []
+        ev_lc_list = []
+
         with torch.no_grad():
             with torch.amp.autocast(device.type, dtype=amp_dtype):
                 for batch in loader_ev:
                     mb_ids = batch["input_ids"].to(device)
                     mb_mask = batch["attention_mask"].to(device)
                     max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
-                    z_b, z_l = model.forward_features(
-                        mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
-                        return_by_layer=True, extract_all_layers=save_all_layers,
-                    )
+                    if save_multiview:
+                        z_b, z_l, mv_d = model.forward_features(
+                            mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                            return_by_layer=True, extract_all_layers=save_all_layers, return_multiview=True
+                        )
+                        ev_cos_list.append(mv_d["head_tail_cos"].cpu().float().numpy())
+                        ev_std_list.append(mv_d["token_std_norms"].cpu().float().numpy())
+                        if "layer_norms" in mv_d:
+                            ev_ln_list.append(mv_d["layer_norms"].cpu().float().numpy())
+                    else:
+                        z_b, z_l = model.forward_features(
+                            mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
+                            return_by_layer=True, extract_all_layers=save_all_layers, return_multiview=False
+                        )
                     ev_cat_list.append(z_b.cpu().float().numpy())
                     ev_layers_list.append(z_l.cpu().to(torch.float16).numpy())
+                    if has_plain:
+                        lp = model.predict_plain(z_b)
+                        ev_lp_list.append(lp.cpu().float().numpy())
+                    if has_centered:
+                        lc = model.predict_centered(z_b)
+                        ev_lc_list.append(lc.cpu().float().numpy())
+
         eval_cat = np.vstack(ev_cat_list)
         eval_layers = np.vstack(ev_layers_list)
+        eval_champ_p = np.vstack(ev_lp_list) if ev_lp_list else None
+        eval_champ_c = np.vstack(ev_lc_list) if ev_lc_list else None
+        eval_ht_cos = np.vstack(ev_cos_list) if ev_cos_list else None
+        eval_t_std = np.vstack(ev_std_list) if ev_std_list else None
+        eval_l_norms = np.vstack(ev_ln_list) if ev_ln_list else None
 
     # 5. Save features bundle
     out_dir_path = save_extracted_features_bundle(
@@ -2915,8 +3274,295 @@ def extract_and_export_embeddings(
         dataset_title=dataset_title,
         dataset_slug=dataset_slug,
         checkpoints_volume=checkpoints_volume,
+        champion_logits_plain=champ_p,
+        champion_logits_centered=champ_c,
+        head_tail_cos=ht_cos,
+        token_std_norms=t_std,
+        layer_norms=l_norms,
+        eval_champion_logits_plain=eval_champ_p,
+        eval_champion_logits_centered=eval_champ_c,
+        eval_head_tail_cos=eval_ht_cos,
+        eval_token_std_norms=eval_t_std,
+        eval_layer_norms=eval_l_norms,
     )
     return out_dir_path
+
+
+def train_family_gate_from_dataset(
+    dataset_dir: Path | str,
+    target_family: str = "gemini",
+    output_dir: Path | str | None = None,
+    head_type: str = "mlp",
+    use_supervised_subspace: bool = True,
+    pca_dim: int = 256,
+    subspace_dim: int | None = None,
+    hidden_dim: int = 256,
+    mlp_epochs: int = 30,
+    mlp_lr: float = 3e-4,
+    mlp_dropout: float = 0.25,
+    device: torch.device | None = None,
+    run_probing_sweep: bool = False,
+    checkpoints_volume: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Offline high-throughput entrypoint to train and evaluate any family gate directly from disk
+    using pre-extracted features (.safetensors + .parquet) in seconds without loading 14B models.
+    """
+    from safetensors.torch import load_file, save_file
+    from scipy.special import softmax as sp_softmax
+    from namethatllm.postprocess import sinkhorn_balancing
+
+    if subspace_dim is not None:
+        pca_dim = subspace_dim
+
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    ds_p = Path(dataset_dir)
+    assert (ds_p / "features_concat.safetensors").exists(), f"features_concat.safetensors not found in {ds_p}"
+    assert (ds_p / "metadata.parquet").exists(), f"metadata.parquet not found in {ds_p}"
+
+    target_family = target_family.lower().strip()
+    assert target_family in FAMILIES, f"Unknown family {target_family}. Must be one of {list(FAMILIES.keys())}"
+    family_cols = FAMILIES[target_family]
+    family_classes = [LABELS[i] for i in family_cols]
+    num_family_classes = len(family_classes)
+
+    print("\n" + "=" * 88)
+    print(f" [Offline Dataset Gate Training] Loading pre-extracted features from {ds_p} for '{target_family.upper()}'...")
+    print("=" * 88)
+
+    feat_sd = load_file(str(ds_p / "features_concat.safetensors"))
+    Z_train = feat_sd["features_concat"].cpu().float().numpy()
+
+    df_meta = pd.read_parquet(ds_p / "metadata.parquet")
+    model_names = df_meta["model"].tolist()
+    prompt_ids = df_meta["prompt_id"].tolist() if "prompt_id" in df_meta.columns else None
+
+    has_negatives = any(m == "__OTHER__" for m in model_names)
+    num_gate_classes = num_family_classes + (1 if has_negatives else 0)
+
+    fam_map = {name: i for i, name in enumerate(family_classes)}
+    y_train = np.array([fam_map.get(m, num_family_classes if has_negatives else 0) for m in model_names], dtype=np.int64)
+
+    # Optional Layer Probing Sweep if features_by_layer exists
+    if run_probing_sweep and (ds_p / "features_by_layer.safetensors").exists():
+        from namethatllm.layer_probing import run_all_layers_probe_sweep
+        feat_l_sd = load_file(str(ds_p / "features_by_layer.safetensors"))
+        Z_train_layers = feat_l_sd["features_by_layer"].cpu().float().numpy()
+        rep_path = Path(output_dir) / "layer_probe_report.json" if output_dir else ds_p / "layer_probe_report.json"
+        run_all_layers_probe_sweep(
+            features_by_layer=Z_train_layers,
+            labels=y_train,
+            prompt_ids=prompt_ids,
+            family_cols=list(range(num_family_classes)),
+            target_family=target_family,
+            output_json=rep_path,
+            device=device,
+        )
+
+    # Load holdout benchmark features if available
+    Z_eval, y_ev_arr, main_logits_eval = None, None, None
+    if (ds_p / "benchmark_features_concat.safetensors").exists() and (ds_p / "benchmark_metadata.parquet").exists():
+        bench_sd = load_file(str(ds_p / "benchmark_features_concat.safetensors"))
+        Z_eval = bench_sd["benchmark_features_concat"].cpu().float().numpy()
+        df_bench = pd.read_parquet(ds_p / "benchmark_metadata.parquet")
+        y_ev_arr = df_bench["label"].to_numpy()
+
+    if (ds_p / "benchmark_champion_logits.safetensors").exists():
+        champ_ev_sd = load_file(str(ds_p / "benchmark_champion_logits.safetensors"))
+        main_logits_eval = champ_ev_sd["logits_plain"].cpu().float().numpy()
+    elif (ds_p / "champion_logits.safetensors").exists() and Z_eval is not None:
+        champ_sd = load_file(str(ds_p / "champion_logits.safetensors"))
+        if len(champ_sd["logits_plain"]) == len(Z_eval):
+            main_logits_eval = champ_sd["logits_plain"].cpu().float().numpy()
+
+    # Step 3: Supervised Subspace / PCA Dimension Reduction
+    num_tapped = 8
+    pca_components = None
+    pca_mean = None
+    if use_supervised_subspace and pca_dim > 0 and pca_dim < Z_train.shape[1]:
+        pca_components, pca_mean, sub_report = build_supervised_family_subspace(
+            Z_train=Z_train,
+            y_train=y_train,
+            num_family_classes=num_family_classes,
+            family_classes=family_classes,
+            subspace_dim=pca_dim,
+            num_tapped_layers=num_tapped,
+            prompt_ids=prompt_ids,
+            device=device,
+        )
+        Z_tr_active = ((Z_train - pca_mean) @ pca_components.T).astype(np.float32)
+        Z_ev_active = ((Z_eval - pca_mean) @ pca_components.T).astype(np.float32) if Z_eval is not None else None
+    elif pca_dim > 0 and pca_dim < Z_train.shape[1]:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=pca_dim, svd_solver="randomized", random_state=42)
+        Z_tr_active = pca.fit_transform(Z_train).astype(np.float32)
+        pca_components = pca.components_
+        pca_mean = pca.mean_
+        Z_ev_active = pca.transform(Z_eval).astype(np.float32) if Z_eval is not None else None
+    else:
+        Z_tr_active = Z_train
+        Z_ev_active = Z_eval
+
+    fam_eval_mask = np.isin(y_ev_arr, family_cols) if y_ev_arr is not None else None
+    col_to_local = {c: i for i, c in enumerate(family_cols)}
+    y_fam_true = np.array([col_to_local[v] for v in y_ev_arr[fam_eval_mask]]) if fam_eval_mask is not None else None
+
+    acc_plain_within = 0.0
+    if main_logits_eval is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
+        plain_fam_pred = main_logits_eval[fam_eval_mask][:, family_cols].argmax(axis=1)
+        acc_plain_within = float(balanced_accuracy_score(y_fam_true, plain_fam_pred))
+
+    # Step 4: Ridge Head
+    best_w_pca, best_b_pca, ridge_alpha, ridge_acc, ridge_logits_ev = fit_family_gate_head(
+        Z_train=Z_tr_active,
+        y_train=y_train,
+        num_gate_classes=num_gate_classes,
+        alphas=[0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0],
+        label_smoothing=0.05,
+        Z_eval=Z_ev_active,
+        y_eval_true=y_fam_true,
+        eval_mask=fam_eval_mask,
+        num_family_classes=num_family_classes,
+        device=device,
+        prompt_ids=prompt_ids,
+    )
+
+    if pca_components is not None:
+        comp_64 = pca_components.astype(np.float64)
+        mu_64 = pca_mean.reshape(1, -1).astype(np.float64)
+        W_r_64 = best_w_pca.astype(np.float64)
+        b_r_64 = best_b_pca.astype(np.float64)
+        W_r_eff_64 = comp_64.T @ W_r_64
+        b_r_eff_64 = b_r_64 - (mu_64 @ W_r_eff_64).squeeze(0)
+        best_w = W_r_eff_64.astype(np.float32)
+        best_b = b_r_eff_64.astype(np.float32)
+    else:
+        best_w = best_w_pca
+        best_b = best_b_pca
+
+    plain_w_tensor = torch.from_numpy(best_w.T).to(torch.float32).contiguous()
+    plain_b_tensor = torch.from_numpy(best_b).to(torch.float32).contiguous()
+
+    # Step 5: MLP Head
+    mlp_head_dict, mlp_acc, mlp_logits_ev = fit_family_mlp_head(
+        Z_train=Z_tr_active,
+        y_train=y_train,
+        num_gate_classes=num_gate_classes,
+        num_family_classes=num_family_classes,
+        hidden_dim=hidden_dim,
+        epochs=mlp_epochs,
+        lr=mlp_lr,
+        dropout=mlp_dropout,
+        label_smoothing=0.05,
+        Z_eval=Z_ev_active,
+        y_eval_true=y_fam_true,
+        eval_mask=fam_eval_mask,
+        device=device,
+        pca_components=pca_components,
+        pca_mean=pca_mean,
+        raw_Z_eval=Z_eval,
+    )
+
+    if head_type.lower() == "mlp":
+        best_fam_acc = mlp_acc
+        best_fam_logits = mlp_logits_ev
+        best_alpha = ridge_alpha
+        final_head_dict = mlp_head_dict
+        final_head_dict["plain.weight"] = plain_w_tensor
+        final_head_dict["plain.bias"] = plain_b_tensor
+    else:
+        best_fam_acc = ridge_acc
+        best_fam_logits = ridge_logits_ev
+        best_alpha = ridge_alpha
+        final_head_dict = {
+            "plain.weight": plain_w_tensor,
+            "plain.bias": plain_b_tensor,
+        }
+
+    # Step 6: Logit Blending
+    pipe_results = {}
+    if main_logits_eval is not None and best_fam_logits is not None and y_ev_arr is not None:
+        P_main = sp_softmax(main_logits_eval, axis=1)
+        acc_plain_solo = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
+        best_pipe_acc = 0.0
+        best_pipe_w = 0.0
+        cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
+        spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
+
+        for gw in [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50]:
+            P_fused = P_main.copy()
+            for idx in np.flatnonzero(cand_mask):
+                orig_mass = float(P_main[idx, family_cols].sum())
+                if orig_mass > 1e-6:
+                    main_cond = np.clip(P_main[idx, family_cols] / orig_mass, 1e-7, 1.0)
+                    spec_cond = np.clip(spec_probs[idx], 1e-7, 1.0)
+                    fused_cond = np.exp((1.0 - gw) * np.log(main_cond) + gw * np.log(spec_cond))
+                    fused_cond /= fused_cond.sum()
+                    P_fused[idx, family_cols] = fused_cond * orig_mass
+
+            acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
+            P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
+            acc_gated_sk = float(balanced_accuracy_score(y_ev_arr, P_sk.argmax(axis=1)))
+            if acc_gated_sk > best_pipe_acc:
+                best_pipe_acc = acc_gated_sk
+                best_pipe_w = gw
+
+        pipe_results = {
+            "plain_solo_bacc": acc_plain_solo,
+            "best_pipe_bacc": best_pipe_acc,
+            "best_gate_weight": best_pipe_w,
+            "lift_over_plain": best_pipe_acc - acc_plain_solo,
+        }
+
+    # Step 7: Checkpoint saving
+    if output_dir is not None:
+        out_p = Path(output_dir)
+        out_p.mkdir(parents=True, exist_ok=True)
+        # Check if existing checkpoint in dataset_dir has norms.*
+        norms_src = ds_p / "heads.safetensors"
+        if norms_src.exists():
+            try:
+                src_sd = load_file(str(norms_src))
+                for k, v in src_sd.items():
+                    if k.startswith("norms."):
+                        final_head_dict[k] = v
+            except Exception:
+                pass
+        save_file(final_head_dict, str(out_p / "heads.safetensors"))
+        meta_fam = {
+            "classes": family_classes + (["__OTHER__"] if has_negatives else []),
+            "labels": family_classes + (["__OTHER__"] if has_negatives else []),
+            "target_family": target_family,
+            "head_type": head_type.lower(),
+            "pca_dim": pca_dim,
+            "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
+            "alpha": float(best_alpha),
+            "ridge_alpha": float(ridge_alpha),
+            "ridge_within_family_acc": float(ridge_acc),
+            "mlp_within_family_acc": float(mlp_acc),
+            "within_family_acc": float(best_fam_acc),
+            "plain_within_family_acc": float(acc_plain_within),
+            "lift_over_plain": float(best_fam_acc - acc_plain_within),
+        }
+        (out_p / "meta.json").write_text(json.dumps(meta_fam, indent=2), encoding="utf-8")
+        if checkpoints_volume is not None and hasattr(checkpoints_volume, "commit"):
+            checkpoints_volume.commit()
+        print(f"[{target_family.upper()} Gate] Checkpoint successfully saved to {out_p}.")
+
+    return {
+        "target_family": target_family,
+        "within_family_balanced_acc": float(best_fam_acc),
+        "plain_within_family_acc": float(acc_plain_within),
+        "delta_within_family": float(best_fam_acc - acc_plain_within),
+        "best_alpha": float(best_alpha),
+        "ridge_acc": float(ridge_acc),
+        "mlp_acc": float(mlp_acc),
+        "pipe_results": pipe_results,
+        "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
+        "spec_classes": family_classes,
+    }
 
 
 def train_family_gate(
@@ -2936,6 +3582,7 @@ def train_family_gate(
     output_dir: Path | str | None = None,
     checkpoints_volume: Any | None = None,
     head_type: str = "mlp",
+    use_supervised_subspace: bool = True,
     pca_dim: int = 128,
     hidden_dim: int = 128,
     mlp_epochs: int = 20,
@@ -2948,14 +3595,16 @@ def train_family_gate(
     """
     End-to-end family gate training pipeline (HB-WRH):
     1. Quarantines benchmark overlap to guarantee 0% leakage.
-    2. Curates balanced class samples + 10% negative distractors.
+    2. Curates balanced class samples + negative distractors.
     3. Extracts Z_train and Z_eval on model forward_features.
-    4. Solves closed-form L2 Ridge with trace-scaled regularization across alpha sweep.
-    5. Evaluates within-family accuracy & sweeps blending weights into champion plain head.
-    6. Saves heads.safetensors and meta.json if output_dir provided.
+    4. Fits Supervised Discriminative Subspace or PCA.
+    5. Solves closed-form L2 Ridge & Non-Linear MLP with exact zero-cost fold-in.
+    6. Evaluates within-family accuracy & sweeps log-linear conditional probability gate blend.
+    7. Saves self-contained heads.safetensors (including norms.*) and meta.json.
     """
     from safetensors.torch import save_file
     from scipy.special import softmax as sp_softmax
+    from namethatllm.postprocess import sinkhorn_balancing
 
     if device is None:
         device = next(model.parameters()).device
@@ -3169,16 +3818,33 @@ def train_family_gate(
     print("=" * 80 + "\n")
 
     # -------------------------------------------------------------------------
-    # Step 3: PCA Dimension Reduction
+    # Step 3: Subspace / PCA Dimension Reduction
     # -------------------------------------------------------------------------
-    pca = None
+    pca_components = None
+    pca_mean = None
     Z_tr_active = Z_train
     Z_ev_active = Z_eval
-    if pca_dim > 0 and pca_dim < Z_train.shape[1]:
+    if use_supervised_subspace and pca_dim > 0 and pca_dim < Z_train.shape[1]:
+        print(f"[{target_family.upper()} Gate] Step 3: Building Supervised Discriminative Subspace ({Z_train.shape[1]} -> {pca_dim})...")
+        pca_components, pca_mean, sub_report = build_supervised_family_subspace(
+            Z_train=Z_train,
+            y_train=y_train,
+            num_family_classes=num_family_classes,
+            family_classes=family_classes,
+            subspace_dim=pca_dim,
+            num_tapped_layers=num_tapped,
+            device=device,
+        )
+        Z_tr_active = ((Z_train - pca_mean) @ pca_components.T).astype(np.float32)
+        if Z_eval is not None:
+            Z_ev_active = ((Z_eval - pca_mean) @ pca_components.T).astype(np.float32)
+    elif pca_dim > 0 and pca_dim < Z_train.shape[1]:
         from sklearn.decomposition import PCA
         print(f"[{target_family.upper()} Gate] Step 3: Performing PCA dimension reduction ({Z_train.shape[1]} -> {pca_dim})...")
         pca = PCA(n_components=pca_dim, svd_solver="randomized", random_state=42)
         Z_tr_active = pca.fit_transform(Z_train).astype(np.float32)
+        pca_components = pca.components_
+        pca_mean = pca.mean_
         var_exp = float(np.sum(pca.explained_variance_ratio_)) * 100.0
         print(f"[{target_family.upper()} Gate] Step 3 Complete: {pca_dim} components explain {var_exp:.2f}% of total intra-family variance.")
         if Z_eval is not None:
@@ -3213,9 +3879,9 @@ def train_family_gate(
     print(f"[{target_family.upper()} Gate] Step 4 Complete: Optimal Ridge (alpha={ridge_alpha:.2f}) -> {target_family.upper()} Acc: {ridge_acc * 100:.2f}% (Lift: {(ridge_acc - acc_plain_within) * 100:+.2f}%)")
 
     # Fold Ridge weights back to 40,960 dims for zero-cost plain_head inference compatibility
-    if pca is not None:
-        comp_64 = pca.components_.astype(np.float64)                      # (pca_dim, 40960)
-        mu_64 = pca.mean_.reshape(1, -1).astype(np.float64)              # (1, 40960)
+    if pca_components is not None:
+        comp_64 = pca_components.astype(np.float64)                      # (pca_dim, 40960)
+        mu_64 = pca_mean.reshape(1, -1).astype(np.float64)              # (1, 40960)
         W_r_64 = best_w_pca.astype(np.float64)                           # (pca_dim, num_classes)
         b_r_64 = best_b_pca.astype(np.float64)                           # (num_classes,)
 
@@ -3249,8 +3915,8 @@ def train_family_gate(
         y_eval_true=y_fam_true,
         eval_mask=fam_eval_mask,
         device=device,
-        pca_components=pca.components_ if pca is not None else None,
-        pca_mean=pca.mean_ if pca is not None else None,
+        pca_components=pca_components,
+        pca_mean=pca_mean,
         raw_Z_eval=Z_eval,
     )
     print(f"[{target_family.upper()} Gate] Step 5 Complete: MLP Head -> {target_family.upper()} Acc: {mlp_acc * 100:.2f}% (Lift: {(mlp_acc - acc_plain_within) * 100:+.2f}%)")
@@ -3274,7 +3940,7 @@ def train_family_gate(
         }
 
     # -------------------------------------------------------------------------
-    # Step 6: Evaluate Full Pipeline & Gate Blend Sweep on benchmark samples
+    # Step 6: Evaluate Full Pipeline & Gate Blend Sweep on benchmark samples (Bug 1.3 Fix)
     # -------------------------------------------------------------------------
     pipe_results = {}
     if main_logits_eval is not None and best_fam_logits is not None and y_ev_arr is not None:
@@ -3285,15 +3951,19 @@ def train_family_gate(
         best_pipe_acc = 0.0
         best_pipe_w = 0.0
         cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
+        spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
 
         for gw in [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50]:
             P_fused = P_main.copy()
-            spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
             for idx in np.flatnonzero(cand_mask):
-                orig_mass = P_main[idx, family_cols].sum()
-                fused_fam = (1.0 - gw) * P_main[idx, family_cols] + gw * spec_probs[idx]
-                fused_fam = fused_fam / fused_fam.sum() * orig_mass
-                P_fused[idx, family_cols] = fused_fam
+                orig_mass = float(P_main[idx, family_cols].sum())
+                if orig_mass > 1e-6:
+                    main_cond = np.clip(P_main[idx, family_cols] / orig_mass, 1e-7, 1.0)
+                    spec_cond = np.clip(spec_probs[idx], 1e-7, 1.0)
+                    # Log-linear geometric pooling in conditional probability space
+                    fused_cond = np.exp((1.0 - gw) * np.log(main_cond) + gw * np.log(spec_cond))
+                    fused_cond /= fused_cond.sum()
+                    P_fused[idx, family_cols] = fused_cond * orig_mass
 
             acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
             P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
@@ -3311,18 +3981,24 @@ def train_family_gate(
         }
 
     # -------------------------------------------------------------------------
-    # Step 7: Save Checkpoint (heads.safetensors and meta.json)
+    # Step 7: Save Checkpoint with Self-Contained norms.* (Bug 1.2 Fix)
     # -------------------------------------------------------------------------
     if output_dir is not None:
         out_p = Path(output_dir)
         out_p.mkdir(parents=True, exist_ok=True)
+        if hasattr(model, "norms") and model.norms is not None:
+            for i, norm in enumerate(model.norms):
+                final_head_dict[f"norms.{i}.weight"] = norm.weight.detach().cpu().to(torch.float32).contiguous()
+                if hasattr(norm, "bias") and norm.bias is not None:
+                    final_head_dict[f"norms.{i}.bias"] = norm.bias.detach().cpu().to(torch.float32).contiguous()
         save_file(final_head_dict, str(out_p / "heads.safetensors"))
         meta_fam = {
             "classes": family_classes + (["__OTHER__"] if has_negatives else []),
             "labels": family_classes + (["__OTHER__"] if has_negatives else []),
             "target_family": target_family,
             "head_type": head_type.lower(),
-            "pca_dim": pca_dim if pca is not None else None,
+            "use_supervised_subspace": use_supervised_subspace,
+            "pca_dim": pca_dim if pca_components is not None else None,
             "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
             "alpha": float(best_alpha),
             "ridge_alpha": float(ridge_alpha),
@@ -3349,3 +4025,27 @@ def train_family_gate(
         "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
         "spec_classes": family_classes,
     }
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="NameThatLLM Training & Gate Pipeline")
+    parser.add_argument("--config", type=str, default=None, help="Path to config JSON")
+    parser.add_argument("--from-embeddings-dir", type=str, default=None, help="Offline training from exported embeddings bundle")
+    parser.add_argument("--target-family", type=str, default="gemini", help="Target family for gate training")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
+    parser.add_argument("--head-type", type=str, default="mlp", choices=["mlp", "ridge"])
+    args = parser.parse_args()
+
+    if args.from_embeddings_dir:
+        out_p = Path(args.output_dir) if args.output_dir else Path(f"export_{args.target_family}_gate_{args.head_type}")
+        train_family_gate_from_dataset(
+            dataset_dir=Path(args.from_embeddings_dir),
+            target_family=args.target_family,
+            output_dir=out_p,
+            head_type=args.head_type,
+        )
+    elif args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        run_training_pipeline(cfg)

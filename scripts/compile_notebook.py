@@ -15,6 +15,7 @@ SUBMISSION_MODULES = [
     "lexical_engine.py",
     "wpca_gaussian.py",
     "spectral_bank.py",
+    "layer_probing.py",
     "neural_extractor.py",
     "postprocess.py",
     "ablation.py",
@@ -27,6 +28,7 @@ TRAINING_MODULES = [
     "neural_extractor.py",
     "postprocess.py",
     "ablation.py",
+    "layer_probing.py",
     "trainer.py",
 ]
 
