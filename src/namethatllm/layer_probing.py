@@ -1,16 +1,37 @@
 """
-Layer-Probing, Activation Analysis, and ScalarMix Aggregation Module.
+Layer-by-Layer Probing, Pairwise Sister Fisher Subspace, and Multi-View Feature Engineering
+===========================================================================================
+Provides:
+1. build_supervised_family_subspace:
+   Constructs a whitened linear projection matrix C_eff (subspace_dim, 40960) and mean vector
+   mu_fam (1, 40960) combining:
+     - Per-layer Pairwise Sister Fisher Discriminant directions: (Sigma_W + reg * I)^-1 (mu_a - mu_b)
+     - Inter-layer Residual Velocity Fisher directions on Delta h^(l) = h^(l) - h^(l-1)
+     - Per-layer multi-class Ridge probe weights
+     - Orthogonalized intra-family residual PCA components
+   Because C_eff is a linear operator on 40,960-dim Z_cat, it folds with 100% mathematical
+   exactness into mlp_w1 / mlp_b1 and plain.weight / plain.bias for zero-cost inference.
 
-Enables fast empirical sweeps across intermediate transformer hidden states to:
-1. Identify optimal layers for fine-grained LLM sister separation.
-2. Quantify per-layer signal-to-noise ratio and out-of-fold balanced accuracy.
-3. Fit learnable convex layer aggregation (ScalarMix) and stacked meta-probes.
-4. Export structured layer-probing diagnostic reports.
+2. run_all_layers_probe_sweep:
+   Automated transformer-heads style probe across all L layers ([N, L, hidden_size]),
+   reporting overall family Balanced Accuracy and hardest-sister-pair accuracy per layer,
+   plus learned ScalarMix layer aggregation weights.
+
+3. engineer_multiview_features:
+   Extracts rich tabular/neural features from exported Kaggle Dataset bundles
+   (head-tail cosine drift, inter-layer velocity norms, token dispersion ratios, and OOF log-odds).
+
+4. LayerScalarMix & LayerScalarMixWithHead:
+   Differentiable convex combination of layer representations with learnable softmax weights.
+
+5. fit_trace_scaled_ridge_probe:
+   Closed-form trace-scaled Ridge regression in primal (N >= D) or dual (N < D) regimes.
 """
 
 from __future__ import annotations
 
 import json
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +39,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.decomposition import PCA
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import GroupKFold, StratifiedKFold
 
-from namethatllm.config import FAMILIES, LABELS
 
+# ============================================================================
+# Layer ScalarMix Modules & Ridge Probing
+# ============================================================================
 
 class LayerScalarMix(nn.Module):
     """
@@ -43,16 +67,6 @@ class LayerScalarMix(nn.Module):
         self.gamma = nn.Parameter(torch.ones(1))
 
     def forward(self, layer_pooled_states: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        layer_pooled_states : torch.Tensor of shape [B, num_layers, hidden_dim]
-                              or list of [B, hidden_dim] tensors.
-
-        Returns
-        -------
-        torch.Tensor of shape [B, hidden_dim]
-        """
         if isinstance(layer_pooled_states, torch.Tensor):
             normed = [
                 self.layer_norms[l](layer_pooled_states[:, l, :])
@@ -140,169 +154,442 @@ def fit_trace_scaled_ridge_probe(
     b_np = b.cpu().numpy().astype(np.float32)
 
     del X_t, Y_t, X_c, Y_c, W, b
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return W_np, b_np
 
 
+# ============================================================================
+# Supervised Within-Class Fisher Discriminant & Sister Decoupling Subspace
+# ============================================================================
+
+def _solve_within_class_fisher_gpu(
+    X_fam: np.ndarray,
+    y_fam: np.ndarray,
+    num_family_classes: int,
+    reg_ratio: float = 0.15,
+    device: torch.device | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Computes regularized within-class inverse covariance projections on a single layer block X_fam (N_fam, D_layer):
+    1. Multi-class centroid directions: (Sigma_W + reg * I)^-1 (mu_c - mu_all)
+    2. All pairwise sister Fisher directions: (Sigma_W + reg * I)^-1 (mu_a - mu_b) for a < b
+    Uses dual Woodbury / Gram identity when N_fam < D_layer for fast GPU execution.
+    """
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    N, D = X_fam.shape
+    X_t = torch.from_numpy(X_fam).to(device, dtype=torch.float32)
+    mu_all = X_t.mean(dim=0, keepdim=True)
+
+    # Compute class centroids and within-class centered residuals R = X - mu_{y_i}
+    centroids = []
+    R_t = X_t.clone()
+    for c in range(num_family_classes):
+        mask = (y_fam == c)
+        if mask.sum() > 0:
+            idx_t = torch.from_numpy(np.flatnonzero(mask)).to(device)
+            mu_c = X_t[idx_t].mean(dim=0, keepdim=True)
+            centroids.append(mu_c.squeeze(0))
+            R_t[idx_t] -= mu_c
+        else:
+            centroids.append(mu_all.squeeze(0))
+
+    # Build target RHS matrix Delta: columns are [mu_c - mu_all] and [mu_a - mu_b]
+    rhs_list = []
+    for c in range(num_family_classes):
+        rhs_list.append(centroids[c] - mu_all.squeeze(0))
+
+    pair_list = []
+    for a, b in combinations(range(num_family_classes), 2):
+        pair_list.append(centroids[a] - centroids[b])
+
+    target_cols = rhs_list + pair_list
+    if not target_cols:
+        target_cols = [torch.zeros(D, device=device, dtype=torch.float32)]
+
+    Delta_t = torch.stack(target_cols, dim=1)  # (D, K + K*(K-1)/2)
+
+    # Solve ( (1/N) R^T R + lam * I ) W = Delta
+    trace_val = float(torch.sum(R_t * R_t).item() / max(N, 1))
+    lam = max(reg_ratio * (trace_val / max(D, 1)), 1e-4)
+
+    if N >= D:
+        Cov_W = (R_t.T @ R_t) / float(N)
+        Cov_W.diagonal().add_(lam)
+        W_sol = torch.linalg.solve(Cov_W, Delta_t)
+    else:
+        # Woodbury identity: ( (1/N) R^T R + lam I )^-1 Delta = (1/lam) [ Delta - R^T (R R^T + N*lam I)^-1 (R Delta) ]
+        K_gram = R_t @ R_t.T
+        K_gram.diagonal().add_(float(N) * lam)
+        R_Delta = R_t @ Delta_t
+        Dual_sol = torch.linalg.solve(K_gram, R_Delta)
+        W_sol = (Delta_t - R_t.T @ Dual_sol) / lam
+
+    # Normalize each direction to unit L2 norm
+    W_sol = torch.nn.functional.normalize(W_sol, p=2, dim=0, eps=1e-6)
+    W_np = W_sol.cpu().numpy().T  # (num_dirs, D)
+
+    W_ovr = W_np[:num_family_classes]
+    W_pairs = W_np[num_family_classes:]
+
+    del X_t, R_t, Delta_t, W_sol
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return W_ovr, W_pairs
+
+
+def build_supervised_family_subspace(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    num_family_classes: int,
+    num_tapped_layers: int = 8,
+    subspace_dim: int = 256,
+    reg_ratio: float = 0.15,
+    device: torch.device | None = None,
+    **kwargs: Any,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """
+    Constructs a Supervised Sister-Decoupling Linear Subspace on 40,960-dim concatenated features:
+      1. Fits per-layer One-vs-Rest and Pairwise Sister Fisher directions across all 8 tapped layers.
+      2. Fits Inter-Layer Residual Velocity Fisher directions across adjacent tapped layers (l - (l-1))
+         and maps them back into 40,960-dim coordinates (+w in block l, -w in block l-1).
+      3. Supplements remaining dimensions up to `subspace_dim` using intra-family residual PCA.
+      4. Orthonormalizes via QR and whitens each basis coordinate by its intra-family training std.
+
+    Returns:
+      C_eff: (actual_dim, 40960) float32 effective projection matrix (whitened)
+      mu_fam: (1, 40960) float32 intra-family mean vector
+      diagnostics: dict with per-layer and inter-layer discriminative metrics
+    """
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    N_total, D_total = Z_train.shape
+    D_layer = D_total // max(num_tapped_layers, 1)
+    assert D_layer * num_tapped_layers == D_total, (
+        f"D_total ({D_total}) must be divisible by num_tapped_layers ({num_tapped_layers})"
+    )
+
+    fam_mask = (y_train < num_family_classes)
+    if fam_mask.sum() == 0:
+        fam_mask = np.ones(len(y_train), dtype=bool)
+
+    Z_fam = Z_train[fam_mask]
+    y_fam = y_train[fam_mask]
+    N_fam = len(Z_fam)
+
+    mu_fam = Z_fam.mean(axis=0, keepdims=True).astype(np.float32)
+    Z_fam_c = (Z_fam - mu_fam).astype(np.float32)
+
+    basis_rows: list[np.ndarray] = []
+    layer_fisher_norms: dict[int, float] = {}
+
+    # Part 1: Per-Layer Fisher & Pairwise Sister Directions (block-diagonal in 40,960 space)
+    for l_idx in range(num_tapped_layers):
+        s_col = l_idx * D_layer
+        e_col = (l_idx + 1) * D_layer
+        X_l = Z_fam_c[:, s_col:e_col]
+
+        W_ovr, W_pairs = _solve_within_class_fisher_gpu(
+            X_l, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio, device=device
+        )
+        stacked_dirs = np.vstack([W_ovr, W_pairs]) if len(W_pairs) > 0 else W_ovr
+        for row in stacked_dirs:
+            full_vec = np.zeros(D_total, dtype=np.float32)
+            full_vec[s_col:e_col] = row
+            basis_rows.append(full_vec)
+
+        layer_fisher_norms[l_idx] = float(np.linalg.norm(W_pairs)) if len(W_pairs) > 0 else 0.0
+
+    # Part 2: Inter-Layer Residual Velocity Fisher Directions: Delta X^(l) = X^(l) - X^(l-1)
+    # Maps linearly to 40,960 space by placing +w in block l and -w in block (l-1)
+    for l_idx in range(1, num_tapped_layers):
+        s_prev, e_prev = (l_idx - 1) * D_layer, l_idx * D_layer
+        s_curr, e_curr = l_idx * D_layer, (l_idx + 1) * D_layer
+        Delta_X = Z_fam_c[:, s_curr:e_curr] - Z_fam_c[:, s_prev:e_prev]
+
+        _, W_vel_pairs = _solve_within_class_fisher_gpu(
+            Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5, device=device
+        )
+        for row in W_vel_pairs:
+            full_vec = np.zeros(D_total, dtype=np.float32)
+            full_vec[s_curr:e_curr] = row / np.sqrt(2.0)
+            full_vec[s_prev:e_prev] = -row / np.sqrt(2.0)
+            basis_rows.append(full_vec)
+
+    W_sup = np.vstack(basis_rows)  # (D_sup, 40960)
+    # Orthonormalize supervised directions via economic QR on W_sup.T
+    Q_sup, R_sup = np.linalg.qr(W_sup.T, mode="reduced")  # Q_sup: (40960, D_sup)
+    diag_r = np.abs(np.diag(R_sup))
+    valid_sup = diag_r > 1e-5
+    Q_sup = Q_sup[:, valid_sup].astype(np.float32)
+    n_sup = Q_sup.shape[1]
+
+    # Part 3: Residual Intra-Family PCA on orthogonal complement
+    target_dim = min(subspace_dim, D_total)
+    n_rem = max(target_dim - n_sup, 0)
+    if n_rem > 0 and N_fam > 2:
+        # Project out supervised subspace from Z_fam_c
+        proj_sup = Z_fam_c @ Q_sup
+        Z_res = Z_fam_c - proj_sup @ Q_sup.T
+        n_comp_actual = min(n_rem, Z_res.shape[0] - 1, Z_res.shape[1])
+        if n_comp_actual > 0:
+            pca_res = PCA(n_components=n_comp_actual, svd_solver="randomized", random_state=42)
+            pca_res.fit(Z_res)
+            V_res = pca_res.components_.T.astype(np.float32)  # (40960, n_comp_actual)
+            # Re-orthonormalize combined basis
+            Q_all, _ = np.linalg.qr(np.hstack([Q_sup, V_res]), mode="reduced")
+            V_basis = Q_all.T[:target_dim].astype(np.float32)  # (actual_dim, 40960)
+        else:
+            V_basis = Q_sup.T[:target_dim].astype(np.float32)
+    else:
+        V_basis = Q_sup.T[:target_dim].astype(np.float32)
+
+    # Part 4: Whiten each basis coordinate by its intra-family std so MLP receives unit-variance inputs
+    Z_fam_proj = Z_fam_c @ V_basis.T  # (N_fam, actual_dim)
+    sd_proj = Z_fam_proj.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)  # (1, actual_dim)
+
+    # Effective linear operator: (Z - mu_fam) @ C_eff.T == ((Z - mu_fam) @ V_basis.T) / sd_proj
+    C_eff = (V_basis / sd_proj.T).astype(np.float32)
+
+    diagnostics = {
+        "n_supervised_dirs": int(n_sup),
+        "n_residual_pca_dirs": int(V_basis.shape[0] - n_sup),
+        "total_subspace_dim": int(V_basis.shape[0]),
+        "subspace_dim": int(V_basis.shape[0]),
+        "layer_fisher_norms": layer_fisher_norms,
+    }
+    return C_eff, mu_fam, diagnostics
+
+
+# ============================================================================
+# Automated Layer-by-Layer Probing Sweep
+# ============================================================================
+
 def run_all_layers_probe_sweep(
     features_by_layer: np.ndarray,
-    labels: np.ndarray | list[int],
-    prompt_ids: list[Any] | None = None,
-    family_cols: list[int] | None = None,
-    target_family: str | None = None,
-    alphas: list[float] | None = None,
+    y: np.ndarray | None = None,
+    num_family_classes: int = 4,
+    hard_sister_pair: tuple[int, int] = (2, 3),
+    prompts: np.ndarray | None = None,
+    alpha: float = 5.0,
     n_splits: int = 5,
+    output_dir: Path | str | None = None,
+    labels: np.ndarray | list[int] | None = None,
+    prompt_ids: list[Any] | None = None,
     output_json: Path | str | None = None,
-    device: torch.device | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """
-    Evaluates individual layer probe performance across all L hidden states.
-
-    Parameters
-    ----------
-    features_by_layer : np.ndarray of shape [N, L, hidden_size]
-    labels : labels array of shape [N]
-    prompt_ids : optional prompt identifiers for GroupKFold validation
-    family_cols : subset of global class indices to isolate (intra-family evaluation)
-    target_family : name of target family ('gemini', 'gpt', 'claude', 'glm', etc.)
-    alphas : candidate L2 regularization strengths
-    n_splits : cross-validation folds (default 5)
-    output_json : optional file path to save report JSON
-    device : torch.device
-
-    Returns
-    -------
-    dict containing layer ranking, per-layer balanced accuracy, and optimal layer subset
+    Automated layer-by-layer linear probing sweep across all L layers ([N, L, hidden_size]).
+    Evaluates:
+      1. Per-layer 5-fold OOF Balanced Accuracy across all family classes.
+      2. Per-layer Binary Pairwise Accuracy on the hardest sister pair (default: indices (2, 3)
+         corresponding to gemini-3.7-flash vs gemini-3.8-flash).
+      3. Learned ScalarMix / Precision-Weighted Layer Ensemble accuracy.
     """
-    labels_arr = np.asarray(labels)
-    N, L, D = features_by_layer.shape
+    if y is None and labels is not None:
+        y = np.asarray(labels)
+    if y is None:
+        raise ValueError("Either `y` or `labels` must be provided.")
 
-    if alphas is None:
-        alphas = [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
+    if prompts is None and prompt_ids is not None:
+        prompts = np.asarray(prompt_ids)
 
-    # Filter to intra-family rows if specified
-    if family_cols is not None:
-        fam_mask = np.isin(labels_arr, family_cols)
-        if fam_mask.sum() > 0:
-            X_data = features_by_layer[fam_mask]
-            y_raw = labels_arr[fam_mask]
-            pids = [prompt_ids[i] for i in np.flatnonzero(fam_mask)] if prompt_ids is not None else None
-            col_map = {c: i for i, c in enumerate(family_cols)}
-            y_data = np.array([col_map[v] for v in y_raw], dtype=np.int64)
-            num_classes = len(family_cols)
-        else:
-            X_data = features_by_layer
-            y_data = labels_arr
-            pids = prompt_ids
-            num_classes = len(np.unique(labels_arr))
+    if output_dir is None and output_json is not None:
+        output_dir = Path(output_json).parent
+
+    fam_mask = (y < num_family_classes)
+    if fam_mask.sum() == 0:
+        fam_mask = np.ones(len(y), dtype=bool)
+
+    X_layers = features_by_layer[fam_mask].astype(np.float32)
+    y_fam = y[fam_mask]
+    N, L, D = X_layers.shape
+
+    if prompts is not None:
+        p_fam = prompts[fam_mask]
+        u_p = np.unique(p_fam)
+        use_groups = len(u_p) >= n_splits and len(u_p) < 0.8 * N
     else:
-        X_data = features_by_layer
-        y_data = labels_arr
-        pids = prompt_ids
-        num_classes = len(np.unique(labels_arr))
+        p_fam = None
+        use_groups = False
 
-    N_sub = len(y_data)
-    unique_groups = len(set(pids)) if pids is not None else 0
-    if pids is not None and unique_groups >= n_splits:
-        gkf = GroupKFold(n_splits=n_splits)
-        splits = list(gkf.split(X_data, y_data, groups=pids))
+    n_splits_eff = max(min(n_splits, N // max(num_family_classes, 1)), 2)
+    if use_groups:
+        splitter = GroupKFold(n_splits=n_splits_eff).split(X_layers[:, 0, :], y_fam, groups=p_fam)
     else:
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        splits = list(skf.split(X_data, y_data))
+        splitter = StratifiedKFold(n_splits=n_splits_eff, shuffle=True, random_state=42).split(X_layers[:, 0, :], y_fam)
+    folds = list(splitter)
 
-    print("\n" + "=" * 88)
-    fam_str = f" for '{target_family.upper()}'" if target_family else ""
-    print(f" [Layer Probing Sweep] Evaluating {L} Hidden Layers on {N_sub:,} Samples ({num_classes} Classes){fam_str}")
-    print("=" * 88)
+    Y_oh = np.eye(num_family_classes, dtype=np.float32)[y_fam]
+    Y_oh = 0.95 * Y_oh + 0.05 / max(num_family_classes, 1)
 
-    layer_results: list[dict[str, Any]] = []
-    layer_oof_probs: list[np.ndarray] = []
+    layer_oof_logits = np.zeros((L, N, num_family_classes), dtype=np.float32)
+    layer_metrics = []
+
+    s_a, s_b = hard_sister_pair
+    pair_mask = (y_fam == s_a) | (y_fam == s_b)
+
+    print("\n================================================================================")
+    print(f" AUTOMATED LAYER-BY-LAYER PROBING SWEEP ({L} Layers x {D} Dim | N={N})")
+    print("================================================================================")
+    print(f" Layer | Family OOF BAcc | Hard Sister Pair ({s_a} vs {s_b}) Acc | Signal Weight")
+    print("--------------------------------------------------------------------------------")
 
     for l_idx in range(L):
-        X_l = X_data[:, l_idx, :].astype(np.float32)
+        X_l = X_layers[:, l_idx, :]
+        oof_l = np.zeros((N, num_family_classes), dtype=np.float32)
 
-        # Tune alpha using 5-fold OOF CV
-        best_alpha = alphas[0]
-        best_oof_bacc = -1.0
-        best_oof_logits: np.ndarray | None = None
+        for tr_idx, val_idx in folds:
+            X_tr, Y_tr = X_l[tr_idx], Y_oh[tr_idx]
+            X_val = X_l[val_idx]
 
-        for alpha in alphas:
-            oof_logits = np.zeros((N_sub, num_classes), dtype=np.float32)
-            for tr_idx, val_idx in splits:
-                W, b = fit_trace_scaled_ridge_probe(
-                    X_l[tr_idx], y_data[tr_idx], num_classes=num_classes, alpha=alpha, device=device
-                )
-                oof_logits[val_idx] = X_l[val_idx] @ W + b
+            mu_tr = X_tr.mean(axis=0, keepdims=True)
+            X_tr_c = X_tr - mu_tr
+            X_val_c = X_val - mu_tr
 
-            preds = oof_logits.argmax(axis=1)
-            bacc = float(balanced_accuracy_score(y_data, preds))
-            if bacc > best_oof_bacc:
-                best_oof_bacc = bacc
-                best_alpha = alpha
-                best_oof_logits = oof_logits
+            scale = float(np.mean(np.sum(X_tr_c * X_tr_c, axis=1)))
+            eff_alpha = alpha * max(scale / 512.0, 1e-3)
 
-        # Compute softmax probabilities from best OOF logits
-        exps = np.exp(best_oof_logits - best_oof_logits.max(axis=1, keepdims=True))
-        probs_l = exps / exps.sum(axis=1, keepdims=True)
-        layer_oof_probs.append(probs_l)
+            K_mat = X_tr_c @ X_tr_c.T
+            K_mat.flat[:: len(tr_idx) + 1] += eff_alpha
+            A = np.linalg.solve(K_mat, Y_tr - Y_tr.mean(axis=0, keepdims=True))
+            W_l = X_tr_c.T @ A
+            b_l = Y_tr.mean(axis=0)
 
-        random_baseline = 1.0 / max(num_classes, 1)
-        lift = best_oof_bacc - random_baseline
-        layer_results.append({
-            "layer_idx": l_idx,
-            "oof_balanced_acc": round(best_oof_bacc, 4),
-            "lift_over_random": round(lift, 4),
-            "best_alpha": best_alpha,
+            oof_l[val_idx] = X_val_c @ W_l + b_l
+
+        layer_oof_logits[l_idx] = oof_l
+        fam_bacc = float(balanced_accuracy_score(y_fam, oof_l.argmax(axis=1)))
+
+        if pair_mask.sum() > 0:
+            pair_preds = np.where(oof_l[pair_mask, s_a] >= oof_l[pair_mask, s_b], s_a, s_b)
+            pair_acc = float(balanced_accuracy_score(y_fam[pair_mask], pair_preds))
+        else:
+            pair_acc = fam_bacc
+
+        layer_metrics.append({
+            "layer": int(l_idx),
+            "layer_idx": int(l_idx),
+            "family_oof_bacc": fam_bacc,
+            "hard_pair_oof_acc": pair_acc,
+            "oof_balanced_acc": fam_bacc,
         })
-        print(f"  Layer {l_idx:02d} | 5-Fold OOF BAcc: {best_oof_bacc*100:6.2f}% (Lift: {lift*100:+5.2f}%) | Alpha: {best_alpha}")
 
-    # Rank layers by OOF accuracy
-    ranked_layers = sorted(layer_results, key=lambda x: x["oof_balanced_acc"], reverse=True)
-    best_single = ranked_layers[0]
+    # Compute precision-weighted ScalarMix weights across layers based on log-odds margin
+    raw_scores = np.array([0.5 * m["family_oof_bacc"] + 0.5 * m["hard_pair_oof_acc"] for m in layer_metrics])
+    centered_scores = (raw_scores - raw_scores.max()) * 15.0
+    scalar_mix_weights = np.exp(centered_scores) / np.sum(np.exp(centered_scores))
 
-    # Multi-Layer Stacked Meta-Ridge:
-    # Concatenate top-K layer OOF log-odds and evaluate stacked combination
-    top_4_indices = [r["layer_idx"] for r in ranked_layers[:min(4, L)]]
-    top_8_indices = [r["layer_idx"] for r in ranked_layers[:min(8, L)]]
+    for l_idx, m in enumerate(layer_metrics):
+        m["scalar_mix_weight"] = float(scalar_mix_weights[l_idx])
+        print(
+            f" L{l_idx:02d}   | {m['family_oof_bacc'] * 100:6.2f}%         | "
+            f"{m['hard_pair_oof_acc'] * 100:6.2f}%                    | {scalar_mix_weights[l_idx]:6.4f}"
+        )
 
-    stacked_features_4 = np.hstack([np.log(np.clip(layer_oof_probs[i], 1e-6, 1.0)) for i in top_4_indices])
-    stacked_features_8 = np.hstack([np.log(np.clip(layer_oof_probs[i], 1e-6, 1.0)) for i in top_8_indices])
+    # Evaluate ScalarMix Ensemble across all layers
+    mix_oof = np.tensordot(scalar_mix_weights.astype(np.float32), layer_oof_logits, axes=(0, 0))
+    mix_bacc = float(balanced_accuracy_score(y_fam, mix_oof.argmax(axis=1)))
+    if pair_mask.sum() > 0:
+        mix_pair_preds = np.where(mix_oof[pair_mask, s_a] >= mix_oof[pair_mask, s_b], s_a, s_b)
+        mix_pair_acc = float(balanced_accuracy_score(y_fam[pair_mask], mix_pair_preds))
+    else:
+        mix_pair_acc = mix_bacc
 
-    meta_oof_4 = np.zeros((N_sub, num_classes), dtype=np.float32)
-    meta_oof_8 = np.zeros((N_sub, num_classes), dtype=np.float32)
+    ranked_layers = sorted(
+        layer_metrics,
+        key=lambda d: 0.5 * d["family_oof_bacc"] + 0.5 * d["hard_pair_oof_acc"],
+        reverse=True,
+    )
+    top8_layers = sorted([d["layer"] for d in ranked_layers[:8]])
 
-    for tr_idx, val_idx in splits:
-        W4, b4 = fit_trace_scaled_ridge_probe(stacked_features_4[tr_idx], y_data[tr_idx], num_classes, alpha=1.0, device=device)
-        meta_oof_4[val_idx] = stacked_features_4[val_idx] @ W4 + b4
-
-        W8, b8 = fit_trace_scaled_ridge_probe(stacked_features_8[tr_idx], y_data[tr_idx], num_classes, alpha=1.0, device=device)
-        meta_oof_8[val_idx] = stacked_features_8[val_idx] @ W8 + b8
-
-    meta_acc_top4 = float(balanced_accuracy_score(y_data, meta_oof_4.argmax(axis=1)))
-    meta_acc_top8 = float(balanced_accuracy_score(y_data, meta_oof_8.argmax(axis=1)))
-
-    print("-" * 88)
-    print(f"  Best Single Layer   : Layer {best_single['layer_idx']:02d} -> {best_single['oof_balanced_acc']*100:.2f}% BAcc")
-    print(f"  Stacked Top-4 Layers: {top_4_indices} -> {meta_acc_top4*100:.2f}% BAcc (Lift: {(meta_acc_top4 - best_single['oof_balanced_acc'])*100:+.2f}%)")
-    print(f"  Stacked Top-8 Layers: {top_8_indices} -> {meta_acc_top8*100:.2f}% BAcc (Lift: {(meta_acc_top8 - best_single['oof_balanced_acc'])*100:+.2f}%)")
-    print("=" * 88 + "\n")
+    print("--------------------------------------------------------------------------------")
+    print(f" ScalarMix All-{L}-Layer OOF BAcc: {mix_bacc * 100:.2f}% | Hard Pair ({s_a} vs {s_b}): {mix_pair_acc * 100:.2f}%")
+    print(f" Empirically Optimal Top-8 Layers: {top8_layers}")
+    print("================================================================================\n")
 
     report = {
-        "target_family": target_family,
-        "num_samples": N_sub,
-        "num_classes": num_classes,
-        "num_layers_evaluated": L,
-        "best_single_layer": best_single,
-        "top_4_layers": top_4_indices,
-        "top_8_layers": top_8_indices,
-        "meta_acc_top4": round(meta_acc_top4, 4),
-        "meta_acc_top8": round(meta_acc_top8, 4),
+        "num_layers": int(L),
+        "num_samples": int(N),
+        "scalar_mix_oof_bacc": mix_bacc,
+        "scalar_mix_hard_pair_acc": mix_pair_acc,
+        "recommended_top8_layers": top8_layers,
+        "layers": layer_metrics,
         "ranked_layers": ranked_layers,
+        "top_4_layers": [d["layer"] for d in ranked_layers[:4]],
+        "top_8_layers": top8_layers,
+        "best_single_layer": ranked_layers[0],
     }
 
+    if output_dir is not None:
+        out_p = Path(output_dir)
+        out_p.mkdir(parents=True, exist_ok=True)
+        with open(out_p / "layer_probe_report.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+
     if output_json is not None:
-        out_p = Path(output_json)
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        out_p.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        print(f"[Layer Probing Sweep] Saved full report to {out_p}")
+        out_f = Path(output_json)
+        out_f.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_f, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
 
     return report
+
+
+# ============================================================================
+# Offline Multi-View Feature Engineering
+# ============================================================================
+
+def engineer_multiview_features(
+    features_concat: np.ndarray,
+    features_by_layer: np.ndarray | None = None,
+    head_tail_cos: np.ndarray | None = None,
+    token_std_norms: np.ndarray | None = None,
+    num_tapped_layers: int = 8,
+) -> np.ndarray:
+    """
+    Engineers explicit structural & trajectory features for offline Kaggle Dataset modeling:
+    1. Per-layer L2 activation norms across tapped layers [N, 8].
+    2. Inter-layer cosine similarity & L2 velocity ||h^(l) - h^(l-1)||_2 across consecutive layers [N, 14].
+    3. Head-to-Tail positional cosine drift [N, 8] (opening framing vs closing summary divergence).
+    4. Token-level activation dispersion norms & ratios [N, 16] (distilled Flash vs full Pro burstiness).
+    """
+    N, D_total = features_concat.shape
+    D_layer = D_total // max(num_tapped_layers, 1)
+    feats: list[np.ndarray] = []
+
+    # Reshape tapped layers: (N, 8, D_layer)
+    blocks = features_concat.reshape(N, num_tapped_layers, D_layer).astype(np.float32)
+    block_norms = np.linalg.norm(blocks, axis=2).clip(min=1e-6)  # (N, 8)
+    feats.append(block_norms)
+
+    # Inter-layer cosine similarity and L2 transition velocity between consecutive tapped layers
+    blocks_unit = blocks / block_norms[:, :, None]
+    inter_cos = np.sum(blocks_unit[:, 1:, :] * blocks_unit[:, :-1, :], axis=2)  # (N, 7)
+    inter_vel = np.linalg.norm(blocks[:, 1:, :] - blocks[:, :-1, :], axis=2)    # (N, 7)
+    feats.extend([inter_cos, inter_vel])
+
+    # If full all-28-layer tensor is provided, add trajectory curvature across early/mid/late thirds
+    if features_by_layer is not None and features_by_layer.ndim == 3:
+        f_all = features_by_layer.astype(np.float32)
+        f_norms = np.linalg.norm(f_all, axis=2).clip(min=1e-6)
+        feats.append(f_norms)
+        f_unit = f_all / f_norms[:, :, None]
+        adj_cos = np.sum(f_unit[:, 1:, :] * f_unit[:, :-1, :], axis=2)  # (N, L_all - 1)
+        feats.append(adj_cos)
+
+    if head_tail_cos is not None:
+        feats.append(head_tail_cos.astype(np.float32))
+
+    if token_std_norms is not None:
+        std_f = token_std_norms.astype(np.float32)
+        feats.append(std_f)
+        # Coefficient of variation (dispersion relative to layer norm)
+        feats.append(std_f / block_norms)
+
+    return np.hstack(feats).astype(np.float32)

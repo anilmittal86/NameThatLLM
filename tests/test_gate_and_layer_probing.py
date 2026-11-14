@@ -345,3 +345,88 @@ class TestGateAndLayerProbing:
             assert "mlp_b1" in saved_heads
             assert "plain.weight" in saved_heads
             assert "plain.bias" in saved_heads
+
+    def test_solve_within_class_fisher_gpu(self):
+        from namethatllm.layer_probing import _solve_within_class_fisher_gpu
+
+        # Test both N >= D and N < D
+        for N, D in [(60, 16), (20, 64)]:
+            X = np.random.randn(N, D).astype(np.float32)
+            y = np.array([i % 4 for i in range(N)], dtype=np.int64)
+            W_ovr, W_pairs = _solve_within_class_fisher_gpu(X, y, num_family_classes=4, reg_ratio=0.15)
+            assert W_ovr.shape == (4, D)
+            assert W_pairs.shape == (6, D)  # 4 * 3 / 2 = 6 pairs
+            # Check unit L2 norm
+            ovr_norms = np.linalg.norm(W_ovr, axis=1)
+            pair_norms = np.linalg.norm(W_pairs, axis=1)
+            np.testing.assert_allclose(ovr_norms, 1.0, atol=1e-4)
+            np.testing.assert_allclose(pair_norms, 1.0, atol=1e-4)
+
+    def test_engineer_multiview_features(self):
+        from namethatllm.layer_probing import engineer_multiview_features
+
+        N = 30
+        num_tapped = 8
+        D_layer = 16
+        D_total = num_tapped * D_layer
+
+        feat_cat = np.random.randn(N, D_total).astype(np.float32)
+        feat_by_layer = np.random.randn(N, 12, D_layer).astype(np.float32)
+        ht_cos = np.random.randn(N, num_tapped).astype(np.float32)
+        t_std = np.abs(np.random.randn(N, num_tapped)).astype(np.float32)
+
+        engineered = engineer_multiview_features(
+            features_concat=feat_cat,
+            features_by_layer=feat_by_layer,
+            head_tail_cos=ht_cos,
+            token_std_norms=t_std,
+            num_tapped_layers=num_tapped,
+        )
+
+        assert engineered.shape[0] == N
+        assert engineered.ndim == 2
+        assert not np.isnan(engineered).any()
+
+    def test_forward_features_multiview_quad_tuple(self):
+        """
+        Verify MultiLayerLoRAClassifier.forward_features with return_by_layer=True and
+        return_multiview=True returns the expected 4-tuple (Z_cat, Z_layers, ht_cos_t, std_norm_t).
+        """
+        class MockBackbone(nn.Module):
+            def __init__(self, hidden_size=64, num_layers=6):
+                super().__init__()
+                self.hidden_size = hidden_size
+                self.num_layers = num_layers
+
+            def forward(self, input_ids, attention_mask, **kwargs):
+                B, S = input_ids.shape
+                states = [torch.randn(B, S, self.hidden_size) for _ in range(self.num_layers)]
+                return type("Outputs", (), {"hidden_states": states})()
+
+        model = MultiLayerLoRAClassifier(
+            backbone=MockBackbone(hidden_size=32, num_layers=6),
+            layers=[1, 3, 5],
+            hidden_size=32,
+            num_classes=4,
+        )
+
+        B, S = 4, 16
+        input_ids = torch.randint(1, 1000, (B, S))
+        attention_mask = torch.ones((B, S))
+
+        res = model.forward_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            drop_first_token=True,
+            return_by_layer=True,
+            extract_all_layers=True,
+            return_multiview=True,
+        )
+
+        assert isinstance(res, tuple)
+        assert len(res) == 4
+        Z_cat, Z_layers, ht_cos, std_norm = res
+        assert Z_cat.shape == (B, 32 * 3)
+        assert Z_layers.shape == (B, 6, 32)
+        assert ht_cos.shape == (B, 3)
+        assert std_norm.shape == (B, 3)

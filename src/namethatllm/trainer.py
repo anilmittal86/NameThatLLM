@@ -228,34 +228,21 @@ class MultiLayerLoRAClassifier(nn.Module):
         return_by_layer: bool = False,
         extract_all_layers: bool = False,
         return_multiview: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Extracts pooled multi-layer representations with causal attention-sink masking.
-
-        Why Attention-Sink Masking (drop_first_token) Matters:
-        ------------------------------------------------------
-        In causal LLMs (Qwen, Llama), the first token (token index 0, e.g. BOS or leading word)
-        acts as an 'attention sink' where the softmax mechanism dumps massive attention logits
-        regardless of whether token 0 carries semantic meaning. If token 0 is included in
-        mean pooling across the sequence length, it injects noise that masks subtle stylistic
-        differences. Setting m[:, 0] = 0.0 cleans the representation.
-
-        Parameters:
-        -----------
-        return_by_layer: If True, returns (Z_cat, Z_layers).
-        extract_all_layers: If True, Z_layers stacks all backbone hidden states [B, num_all_layers, hidden_size]
-                            in safe FP16 range [-65000, 65000] without destructive unit L2-normalization.
-                            If False, Z_layers stacks the configured tapped layers [B, len(self.layers), hidden_size].
-        return_multiview: If True, returns (Z_cat, Z_layers, mv_dict) where mv_dict contains:
-                          - head_tail_cos: [B, 8] cosine similarity between first & second half of sequence
-                          - token_std_norms: [B, 8] L2 norm of token-level standard deviation per tapped layer
-                          - layer_norms: [B, num_all_layers] raw activation norm magnitude if extract_all_layers=True
-        """
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         m = attention_mask.clone().float()
         if drop_first_token and m.shape[1] > 1:
-            m[:, 0] = 0.0  # Zero out attention sink token
+            m[:, 0] = 0.0  # Zero out BOS attention sink token
         den = m.sum(dim=1, keepdim=True).clamp(min=1e-5)
         first_device = input_ids.device
+
+        # Build positional masks for Head (first half of active tokens) and Tail (second half of active tokens)
+        if return_multiview:
+            seq_idx = torch.cumsum(m, dim=1)
+            half_len = (den * 0.5).clamp(min=1.0)
+            m_head = m * (seq_idx <= half_len).float()
+            m_tail = m * (seq_idx > half_len).float()
+            den_head = m_head.sum(dim=1, keepdim=True).clamp(min=1e-5)
+            den_tail = m_tail.sum(dim=1, keepdim=True).clamp(min=1e-5)
 
         try:
             outputs = self.backbone(
@@ -267,7 +254,6 @@ class MultiLayerLoRAClassifier(nn.Module):
         hidden_states = getattr(outputs, "hidden_states", outputs)
 
         all_layers_pooled = []
-        layer_norms_list = []
         if extract_all_layers:
             for l_idx in range(len(hidden_states)):
                 h = hidden_states[l_idx].float()
@@ -276,28 +262,13 @@ class MultiLayerLoRAClassifier(nn.Module):
                 den_l = den.to(layer_dev)
                 h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
                 p_l = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
+                # Clamp to safe FP16 range without destroying layer norm magnitude
                 p_l = torch.clamp(p_l, min=-65000.0, max=65000.0)
-                l_norm = torch.norm(p_l, p=2, dim=-1)
                 all_layers_pooled.append(p_l.to(first_device))
-                layer_norms_list.append(l_norm.to(first_device))
 
         pooled_list = []
         head_tail_cos_list = []
-        token_std_norms_list = []
-
-        # Vectorized head/tail masks for structural views
-        if return_multiview:
-            cum_m = torch.cumsum(m, dim=1) * m
-            mid = (den / 2.0).ceil()
-            m_head = (cum_m > 0) & (cum_m <= mid)
-            m_tail = cum_m > mid
-            # Fallback for single-token active sequences
-            single_tok = den <= 1.0
-            if single_tok.any():
-                m_head = torch.where(single_tok, m.bool(), m_head)
-                m_tail = torch.where(single_tok, m.bool(), m_tail)
-            den_head = m_head.sum(dim=1, keepdim=True).clamp(min=1e-5)
-            den_tail = m_tail.sum(dim=1, keepdim=True).clamp(min=1e-5)
+        token_std_norm_list = []
 
         for idx, l in enumerate(self.layers):
             h = hidden_states[l].float()
@@ -306,49 +277,34 @@ class MultiLayerLoRAClassifier(nn.Module):
             den_l = den.to(layer_dev)
             h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
             pooled = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
+
+            if return_multiview:
+                mh_l = m_head.to(layer_dev).unsqueeze(-1)
+                mt_l = m_tail.to(layer_dev).unsqueeze(-1)
+                p_head = (h * mh_l).sum(dim=1) / den_head.to(layer_dev)
+                p_tail = (h * mt_l).sum(dim=1) / den_tail.to(layer_dev)
+                ht_cos = F.cosine_similarity(p_head, p_tail, dim=-1, eps=1e-6)
+                head_tail_cos_list.append(ht_cos.to(first_device))
+
+                # Token-level activation standard deviation across active tokens
+                diff_sq = ((h - pooled.unsqueeze(1)) ** 2) * m_l.unsqueeze(-1)
+                tok_std = torch.sqrt((diff_sq.sum(dim=1) / den_l).clamp(min=1e-6))
+                std_norm = torch.norm(tok_std, p=2, dim=-1)
+                token_std_norm_list.append(std_norm.to(first_device))
+
             norm = self.norms[idx]
             norm_dev = next(norm.parameters()).device
             normed = norm(pooled.to(norm_dev))
             pooled_list.append(normed.to(first_device))
 
-            if return_multiview:
-                m_head_l = m_head.to(layer_dev).unsqueeze(-1).float()
-                m_tail_l = m_tail.to(layer_dev).unsqueeze(-1).float()
-                den_head_l = den_head.to(layer_dev)
-                den_tail_l = den_tail.to(layer_dev)
-
-                hp = (h * m_head_l).sum(dim=1) / den_head_l
-                tp = (h * m_tail_l).sum(dim=1) / den_tail_l
-                cos_drift = F.cosine_similarity(hp, tp, dim=-1, eps=1e-6)
-                head_tail_cos_list.append(cos_drift.to(first_device))
-
-                mean_un = pooled
-                diff = (h - mean_un.unsqueeze(1)) * m_l.unsqueeze(-1)
-                var_pool = (diff ** 2).sum(dim=1) / den_l
-                std_pool = torch.sqrt(var_pool + 1e-5)
-                std_norm = torch.norm(std_pool, p=2, dim=-1)
-                token_std_norms_list.append(std_norm.to(first_device))
-
         Z_cat = torch.cat(pooled_list, dim=-1)
 
-        if return_multiview:
-            if extract_all_layers:
-                Z_layers = torch.stack(all_layers_pooled, dim=1)
-            else:
-                Z_layers = torch.stack(pooled_list, dim=1)
-            mv_dict = {
-                "head_tail_cos": torch.stack(head_tail_cos_list, dim=1),
-                "token_std_norms": torch.stack(token_std_norms_list, dim=1),
-            }
-            if extract_all_layers and layer_norms_list:
-                mv_dict["layer_norms"] = torch.stack(layer_norms_list, dim=1)
-            return Z_cat, Z_layers, mv_dict
-
         if return_by_layer:
-            if extract_all_layers:
-                Z_layers = torch.stack(all_layers_pooled, dim=1)
-            else:
-                Z_layers = torch.stack(pooled_list, dim=1)
+            Z_layers = torch.stack(all_layers_pooled if extract_all_layers else pooled_list, dim=1)
+            if return_multiview:
+                ht_cos_t = torch.stack(head_tail_cos_list, dim=1)      # [B, 8]
+                std_norm_t = torch.stack(token_std_norm_list, dim=1)  # [B, 8]
+                return Z_cat, Z_layers, ht_cos_t, std_norm_t
             return Z_cat, Z_layers
 
         return Z_cat
@@ -2305,132 +2261,11 @@ def fit_family_gate_head(
     return best_w, best_b, best_alpha, best_acc, best_eval_logits
 
 
-def build_supervised_family_subspace(
-    Z_train: np.ndarray,
-    y_train: np.ndarray,
-    num_family_classes: int,
-    family_classes: list[str],
-    subspace_dim: int = 256,
-    num_tapped_layers: int = 8,
-    alphas: list[float] | None = None,
-    prompt_ids: list[Any] | None = None,
-    device: torch.device | None = None,
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """
-    Builds a Supervised Discriminative + Layer-Probed Subspace for intra-family sister decoupling (Task 2):
-    1. Strict Intra-Family Fitting:
-       Compute the subspace strictly on intra-family training rows (fam_mask = y_train < num_family_classes)
-       so out-of-family distractors (__OTHER__) do not hijack the basis.
-    2. Part 1 — Per-Layer Ridge Probe Directions (transformer-heads style):
-       Partition Z_train ([N, 40960]) into 8 tapped layer blocks Z^(l) in R^{N x 5120}.
-       Fit an L2-regularized Ridge probe on each layer block Z^(l) independently and log each layer's 5-fold OOF accuracy.
-       Collect per-layer weight vectors W^(l) embedded into the full 40,960-dim space plus explicit pairwise sibling contrast vectors.
-    3. Part 2 — Orthogonalized Intra-Family PCA Directions:
-       Project out Part 1 directions from intra-family residuals, extract remaining subspace_dim - d_sup components via SVD/PCA,
-       and orthonormalize via QR decomposition to form orthonormal projection matrix V in R^{subspace_dim x 40960}.
-    4. Feature Whitening & Zero-Cost Fold-In:
-       Standardize projected components: C_eff = diag(sd_proj)^{-1} @ V in R^{subspace_dim x 40960}.
-
-    Returns:
-    --------
-    C_eff : np.ndarray [subspace_dim, 40960]
-    mu_fam : np.ndarray [1, 40960]
-    report : dict with layer-by-layer probing diagnostic table
-    """
-    fam_mask = y_train < num_family_classes
-    if fam_mask.sum() == 0:
-        fam_mask = np.ones(len(y_train), dtype=bool)
-
-    Z_fam = Z_train[fam_mask]
-    y_fam = y_train[fam_mask]
-    mu_fam = Z_fam.mean(axis=0, keepdims=True)
-    Z_fam_c = Z_fam - mu_fam
-
-    N_fam, D_feat = Z_fam.shape
-    chunk_dim = D_feat // max(num_tapped_layers, 1)
-    if alphas is None:
-        alphas = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
-
-    pids_fam = [prompt_ids[i] for i in np.flatnonzero(fam_mask)] if prompt_ids is not None else None
-
-    sup_directions = []
-    layer_probe_table = []
-
-    print("\n" + "=" * 88)
-    print(f" [Supervised Subspace] Part 1: Per-Layer Ridge Probing across {num_tapped_layers} Layers (D_chunk={chunk_dim})...")
-    print("=" * 88)
-
-    for l_idx in range(num_tapped_layers):
-        X_l = Z_fam_c[:, l_idx * chunk_dim : (l_idx + 1) * chunk_dim]
-        W_l, b_l, a_l, l_acc, _ = fit_family_gate_head(
-            Z_train=X_l,
-            y_train=y_fam,
-            num_gate_classes=num_family_classes,
-            alphas=alphas,
-            num_family_classes=num_family_classes,
-            device=device,
-            prompt_ids=pids_fam,
-        )
-        layer_probe_table.append({
-            "layer_idx": l_idx,
-            "oof_acc": round(l_acc, 4),
-            "best_alpha": a_l,
-        })
-        print(f"  Layer {l_idx:02d} (dim [{l_idx*chunk_dim}:{(l_idx+1)*chunk_dim}]) | 5-Fold OOF BAcc: {l_acc * 100:6.2f}% | Alpha: {a_l}")
-
-        # Embed per-class weight vectors into full D_feat space
-        for c_idx in range(num_family_classes):
-            full_w = np.zeros(D_feat, dtype=np.float32)
-            full_w[l_idx * chunk_dim : (l_idx + 1) * chunk_dim] = W_l[:, c_idx]
-            norm_w = np.linalg.norm(full_w)
-            if norm_w > 1e-6:
-                sup_directions.append(full_w / norm_w)
-
-        # Pairwise sibling contrast vectors: w_{k+1} - w_{k}
-        for k in range(num_family_classes - 1):
-            diff_w = np.zeros(D_feat, dtype=np.float32)
-            diff_w[l_idx * chunk_dim : (l_idx + 1) * chunk_dim] = W_l[:, k + 1] - W_l[:, k]
-            norm_diff = np.linalg.norm(diff_w)
-            if norm_diff > 1e-6:
-                sup_directions.append(diff_w / norm_diff)
-
-    D_mat = np.column_stack(sup_directions)
-    Q_sup, _ = np.linalg.qr(D_mat)
-    d_sup = Q_sup.shape[1]
-    print(f" [Supervised Subspace] Extracted {d_sup} orthonormal supervised discriminative directions.")
-
-    # Project out Part 1 directions from intra-family residuals
-    Z_proj_sup = Z_fam_c @ Q_sup
-    Z_resid = Z_fam_c - Z_proj_sup @ Q_sup.T
-
-    k_rem = subspace_dim - d_sup
-    if k_rem > 0:
-        from sklearn.decomposition import PCA
-        n_comp_pca = min(k_rem, N_fam - 1, D_feat)
-        pca_rem = PCA(n_components=n_comp_pca, svd_solver="randomized", random_state=42)
-        pca_rem.fit(Z_resid)
-        V_rem = pca_rem.components_.T
-        M = np.hstack([Q_sup, V_rem])
-        Q_full, _ = np.linalg.qr(M)
-        V = Q_full[:, :subspace_dim].T
-    else:
-        V = Q_sup[:, :subspace_dim].T
-
-    # Feature Whitening on intra-family training set
-    Z_proj_fam = (Z_fam - mu_fam) @ V.T
-    sd_proj = Z_proj_fam.std(axis=0, keepdims=True).clip(min=1e-4)
-    C_eff = (1.0 / sd_proj.T) * V
-    print(f" [Supervised Subspace] Whitened subspace basis C_eff constructed: shape={list(C_eff.shape)}")
-    print("=" * 88 + "\n")
-
-    report = {
-        "num_family_classes": num_family_classes,
-        "family_classes": family_classes,
-        "subspace_dim": subspace_dim,
-        "d_supervised": d_sup,
-        "layer_probe_table": layer_probe_table,
-    }
-    return C_eff.astype(np.float32), mu_fam.astype(np.float32), report
+from .layer_probing import (
+    build_supervised_family_subspace,
+    engineer_multiview_features,
+    run_all_layers_probe_sweep,
+)
 
 
 class FamilyMLPHead(nn.Module):
@@ -3167,14 +3002,18 @@ def extract_and_export_embeddings(
                 mb_mask = batch["attention_mask"].to(device)
                 max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
                 if save_multiview:
-                    z_b, z_l, mv_d = model.forward_features(
+                    res = model.forward_features(
                         mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
                         return_by_layer=True, extract_all_layers=save_all_layers, return_multiview=True
                     )
-                    cos_drift_list.append(mv_d["head_tail_cos"].cpu().float().numpy())
-                    std_norms_list.append(mv_d["token_std_norms"].cpu().float().numpy())
-                    if "layer_norms" in mv_d:
-                        layer_norms_list.append(mv_d["layer_norms"].cpu().float().numpy())
+                    if len(res) == 4:
+                        z_b, z_l, ht_cos_t, std_norm_t = res
+                        cos_drift_list.append(ht_cos_t.cpu().float().numpy())
+                        std_norms_list.append(std_norm_t.cpu().float().numpy())
+                    else:
+                        z_b, z_l, mv_d = res
+                        cos_drift_list.append(mv_d["head_tail_cos"].cpu().float().numpy())
+                        std_norms_list.append(mv_d["token_std_norms"].cpu().float().numpy())
                 else:
                     z_b, z_l = model.forward_features(
                         mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
@@ -3226,14 +3065,18 @@ def extract_and_export_embeddings(
                     mb_mask = batch["attention_mask"].to(device)
                     max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
                     if save_multiview:
-                        z_b, z_l, mv_d = model.forward_features(
+                        res = model.forward_features(
                             mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
                             return_by_layer=True, extract_all_layers=save_all_layers, return_multiview=True
                         )
-                        ev_cos_list.append(mv_d["head_tail_cos"].cpu().float().numpy())
-                        ev_std_list.append(mv_d["token_std_norms"].cpu().float().numpy())
-                        if "layer_norms" in mv_d:
-                            ev_ln_list.append(mv_d["layer_norms"].cpu().float().numpy())
+                        if len(res) == 4:
+                            z_b, z_l, ht_cos_t, std_norm_t = res
+                            ev_cos_list.append(ht_cos_t.cpu().float().numpy())
+                            ev_std_list.append(std_norm_t.cpu().float().numpy())
+                        else:
+                            z_b, z_l, mv_d = res
+                            ev_cos_list.append(mv_d["head_tail_cos"].cpu().float().numpy())
+                            ev_std_list.append(mv_d["token_std_norms"].cpu().float().numpy())
                     else:
                         z_b, z_l = model.forward_features(
                             mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
@@ -3820,35 +3663,44 @@ def train_family_gate(
     # -------------------------------------------------------------------------
     # Step 3: Subspace / PCA Dimension Reduction
     # -------------------------------------------------------------------------
-    pca_components = None
-    pca_mean = None
+    from .layer_probing import build_supervised_family_subspace, run_all_layers_probe_sweep
+
+    if Z_train_layers is not None:
+        hard_pair = (2, 3) if target_family == "gemini" else ((1, 2) if target_family == "gpt" else (0, 1))
+        run_all_layers_probe_sweep(
+            features_by_layer=Z_train_layers,
+            y=y_train,
+            num_family_classes=num_family_classes,
+            hard_sister_pair=hard_pair,
+            output_dir=output_dir,
+        )
+
+    subspace_components = None
+    subspace_mean = None
     Z_tr_active = Z_train
     Z_ev_active = Z_eval
-    if use_supervised_subspace and pca_dim > 0 and pca_dim < Z_train.shape[1]:
-        print(f"[{target_family.upper()} Gate] Step 3: Building Supervised Discriminative Subspace ({Z_train.shape[1]} -> {pca_dim})...")
-        pca_components, pca_mean, sub_report = build_supervised_family_subspace(
+
+    if pca_dim > 0 and pca_dim < Z_train.shape[1]:
+        print(f"[{target_family.upper()} Gate] Step 3: Building Supervised Sister-Decoupling Subspace ({Z_train.shape[1]} -> {pca_dim})...")
+        subspace_components, subspace_mean, sub_diag = build_supervised_family_subspace(
             Z_train=Z_train,
             y_train=y_train,
             num_family_classes=num_family_classes,
-            family_classes=family_classes,
+            num_tapped_layers=len(getattr(model, "layers", [2, 4, 6, 9, 13, 17, 22, 27])),
             subspace_dim=pca_dim,
-            num_tapped_layers=num_tapped,
             device=device,
         )
-        Z_tr_active = ((Z_train - pca_mean) @ pca_components.T).astype(np.float32)
+        Z_tr_active = ((Z_train - subspace_mean) @ subspace_components.T).astype(np.float32)
         if Z_eval is not None:
-            Z_ev_active = ((Z_eval - pca_mean) @ pca_components.T).astype(np.float32)
-    elif pca_dim > 0 and pca_dim < Z_train.shape[1]:
-        from sklearn.decomposition import PCA
-        print(f"[{target_family.upper()} Gate] Step 3: Performing PCA dimension reduction ({Z_train.shape[1]} -> {pca_dim})...")
-        pca = PCA(n_components=pca_dim, svd_solver="randomized", random_state=42)
-        Z_tr_active = pca.fit_transform(Z_train).astype(np.float32)
-        pca_components = pca.components_
-        pca_mean = pca.mean_
-        var_exp = float(np.sum(pca.explained_variance_ratio_)) * 100.0
-        print(f"[{target_family.upper()} Gate] Step 3 Complete: {pca_dim} components explain {var_exp:.2f}% of total intra-family variance.")
-        if Z_eval is not None:
-            Z_ev_active = pca.transform(Z_eval).astype(np.float32)
+            Z_ev_active = ((Z_eval - subspace_mean) @ subspace_components.T).astype(np.float32)
+        print(
+            f"[{target_family.upper()} Gate] Step 3 Complete: {sub_diag['total_subspace_dim']} whitened dims "
+            f"({sub_diag['n_supervised_dirs']} Per-Layer & Inter-Layer Sister Fisher dirs + "
+            f"{sub_diag['n_residual_pca_dirs']} Orthogonal Residual PCA dirs)."
+        )
+
+    pca_components = subspace_components
+    pca_mean = subspace_mean
 
     y_ev_arr = np.array(eval_labels) if eval_labels is not None else None
     fam_eval_mask = np.isin(y_ev_arr, family_cols) if y_ev_arr is not None else None

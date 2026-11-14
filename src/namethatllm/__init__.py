@@ -25,6 +25,7 @@ from .config import (
 from .layer_probing import (
     LayerScalarMix,
     LayerScalarMixWithHead,
+    engineer_multiview_features,
     fit_trace_scaled_ridge_probe,
     run_all_layers_probe_sweep,
 )
@@ -120,6 +121,7 @@ __all__ = [
     "compute_family_centered_logits",
     "compute_grouped_inference_logits",
     "compute_two_stage_loss",
+    "engineer_multiview_features",
     "evaluate_stage2_oof_cv",
     "export_compatible_checkpoint",
     "extract_and_export_embeddings",
