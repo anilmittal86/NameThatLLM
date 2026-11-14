@@ -87,7 +87,7 @@ The production codebase solves this through **Within-Prompt Covariance Analysis 
 Beyond prompt semantic entanglement, empirical investigation into the 40,960-dimensional latent representations ($Z$) extracted from the Champion Qwen3-14B trunk reveals a dramatic **geometric asymmetry** in the attribution problem:
 
 <p align="center">
-  <img src="assets/analysis_of_prompts_different_ai_models_infographic.png" alt="Analysis of Prompts from Different AI models: Latent Manifold and Cosine Similarity" width="950"/>
+  <img src="assets/analysis_of_prompts_different_ai_models_infographic.jpg" alt="Analysis of Prompts from Different AI models: Latent Manifold and Cosine Similarity" width="950"/>
 </p>
 
 #### 1. Empirical Latent Geometry Across the 18 Models

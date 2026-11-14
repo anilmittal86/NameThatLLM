@@ -1222,6 +1222,8 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                         b2 = torch.as_tensor(heads_spec["mlp_b2"], dtype=torch.float32)
                                                         ln_w = torch.as_tensor(heads_spec["ln_weight"], dtype=torch.float32) if "ln_weight" in heads_spec else None
                                                         ln_b = torch.as_tensor(heads_spec["ln_bias"], dtype=torch.float32) if "ln_bias" in heads_spec else None
+                                                        pw = torch.as_tensor(heads_spec["plain.weight"], dtype=torch.float32).to(dev) if "plain.weight" in heads_spec else None
+                                                        pb = torch.as_tensor(heads_spec["plain.bias"], dtype=torch.float32).to(dev) if "plain.bias" in heads_spec else None
                                                         dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                                                         w1, b1, w2, b2 = w1.to(dev), b1.to(dev), w2.to(dev), b2.to(dev)
                                                         if ln_w is not None and ln_b is not None:
@@ -1233,7 +1235,15 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                                 h = torch.nn.functional.gelu(z_t @ w1.T + b1)
                                                                 if ln_w is not None and ln_b is not None:
                                                                     h = torch.nn.functional.layer_norm(h, (h.shape[-1],), ln_w, ln_b)
-                                                                out = (h @ w2.T + b2)[:, :K_fam].cpu().numpy().astype(np.float32)
+                                                                mlp_out = (h @ w2.T + b2)[:, :K_fam]
+                                                                if pw is not None and pb is not None and pw.shape[0] >= K_fam:
+                                                                    ridge_out = z_t @ pw[:K_fam].T + pb[:K_fam]
+                                                                    out_t = 0.65 * mlp_out + 0.35 * ridge_out
+                                                                    row_std = out_t.std(dim=1, keepdim=True).mean().clamp(min=1e-4)
+                                                                    out_t = out_t * (3.2 / row_std)
+                                                                else:
+                                                                    out_t = mlp_out
+                                                                out = out_t.cpu().numpy().astype(np.float32)
                                                                 del z_t, h
                                                             return out
 

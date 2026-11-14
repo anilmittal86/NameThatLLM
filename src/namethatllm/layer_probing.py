@@ -163,6 +163,27 @@ def fit_trace_scaled_ridge_probe(
 # Supervised Within-Class Fisher Discriminant & Sister Decoupling Subspace
 # ============================================================================
 
+def _solve_woodbury_direction(
+    R_sub: torch.Tensor,
+    Delta_sub: torch.Tensor,
+    reg_scale: float,
+) -> torch.Tensor:
+    N_s, D_s = R_sub.shape
+    trace_val = float(torch.sum(R_sub * R_sub).item() / max(N_s, 1))
+    lam = max(reg_scale * (trace_val / max(D_s, 1)), 1e-4)
+    if N_s >= D_s:
+        Cov_W = (R_sub.T @ R_sub) / float(max(N_s, 1))
+        Cov_W.diagonal().add_(lam)
+        W_sol = torch.linalg.solve(Cov_W, Delta_sub)
+    else:
+        K_gram = R_sub @ R_sub.T
+        K_gram.diagonal().add_(float(max(N_s, 1)) * lam)
+        R_Delta = R_sub @ Delta_sub
+        Dual_sol = torch.linalg.solve(K_gram, R_Delta)
+        W_sol = (Delta_sub - R_sub.T @ Dual_sol) / lam
+    return torch.nn.functional.normalize(W_sol, p=2, dim=0, eps=1e-6)
+
+
 def _solve_within_class_fisher_gpu(
     X_fam: np.ndarray,
     y_fam: np.ndarray,
@@ -173,7 +194,7 @@ def _solve_within_class_fisher_gpu(
     """
     Computes regularized within-class inverse covariance projections on a single layer block X_fam (N_fam, D_layer):
     1. Multi-class centroid directions: (Sigma_W + reg * I)^-1 (mu_c - mu_all)
-    2. All pairwise sister Fisher directions: (Sigma_W + reg * I)^-1 (mu_a - mu_b) for a < b
+    2. Pairwise sister Fisher directions evaluated on pair-specific residuals at 2 regularization scales.
     Uses dual Woodbury / Gram identity when N_fam < D_layer for fast GPU execution.
     """
     if device is None:
@@ -196,45 +217,30 @@ def _solve_within_class_fisher_gpu(
         else:
             centroids.append(mu_all.squeeze(0))
 
-    # Build target RHS matrix Delta: columns are [mu_c - mu_all] and [mu_a - mu_b]
-    rhs_list = []
-    for c in range(num_family_classes):
-        rhs_list.append(centroids[c] - mu_all.squeeze(0))
+    # 1. Multi-class OVR directions on pooled family residuals
+    rhs_list = [centroids[c] - mu_all.squeeze(0) for c in range(num_family_classes)]
+    Delta_ovr = torch.stack(rhs_list, dim=1) if rhs_list else torch.zeros((D, 1), device=device, dtype=torch.float32)
+    W_ovr_t = _solve_woodbury_direction(R_t, Delta_ovr, reg_scale=reg_ratio)
+    W_ovr = W_ovr_t.cpu().numpy().T  # (K, D)
 
-    pair_list = []
+    # 2. Pairwise Sister Fisher directions using pair-specific within-class covariance at 2 regularization scales
+    pair_dirs = []
     for a, b in combinations(range(num_family_classes), 2):
-        pair_list.append(centroids[a] - centroids[b])
+        delta_ab = (centroids[a] - centroids[b]).unsqueeze(1)  # (D, 1)
+        mask_ab = (y_fam == a) | (y_fam == b)
+        if mask_ab.sum() >= 4:
+            idx_ab = torch.from_numpy(np.flatnonzero(mask_ab)).to(device)
+            R_ab = R_t[idx_ab]
+        else:
+            R_ab = R_t
+        w_ab_hi = _solve_woodbury_direction(R_ab, delta_ab, reg_scale=reg_ratio)
+        w_ab_lo = _solve_woodbury_direction(R_ab, delta_ab, reg_scale=reg_ratio * 0.25)
+        pair_dirs.append(w_ab_hi.squeeze(1).cpu().numpy())
+        pair_dirs.append(w_ab_lo.squeeze(1).cpu().numpy())
 
-    target_cols = rhs_list + pair_list
-    if not target_cols:
-        target_cols = [torch.zeros(D, device=device, dtype=torch.float32)]
+    W_pairs = np.vstack(pair_dirs).astype(np.float32) if pair_dirs else np.zeros((0, D), dtype=np.float32)
 
-    Delta_t = torch.stack(target_cols, dim=1)  # (D, K + K*(K-1)/2)
-
-    # Solve ( (1/N) R^T R + lam * I ) W = Delta
-    trace_val = float(torch.sum(R_t * R_t).item() / max(N, 1))
-    lam = max(reg_ratio * (trace_val / max(D, 1)), 1e-4)
-
-    if N >= D:
-        Cov_W = (R_t.T @ R_t) / float(N)
-        Cov_W.diagonal().add_(lam)
-        W_sol = torch.linalg.solve(Cov_W, Delta_t)
-    else:
-        # Woodbury identity: ( (1/N) R^T R + lam I )^-1 Delta = (1/lam) [ Delta - R^T (R R^T + N*lam I)^-1 (R Delta) ]
-        K_gram = R_t @ R_t.T
-        K_gram.diagonal().add_(float(N) * lam)
-        R_Delta = R_t @ Delta_t
-        Dual_sol = torch.linalg.solve(K_gram, R_Delta)
-        W_sol = (Delta_t - R_t.T @ Dual_sol) / lam
-
-    # Normalize each direction to unit L2 norm
-    W_sol = torch.nn.functional.normalize(W_sol, p=2, dim=0, eps=1e-6)
-    W_np = W_sol.cpu().numpy().T  # (num_dirs, D)
-
-    W_ovr = W_np[:num_family_classes]
-    W_pairs = W_np[num_family_classes:]
-
-    del X_t, R_t, Delta_t, W_sol
+    del X_t, R_t, Delta_ovr, W_ovr_t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -324,7 +330,8 @@ def build_supervised_family_subspace(
     # Orthonormalize supervised directions via economic QR on W_sup.T
     Q_sup, R_sup = np.linalg.qr(W_sup.T, mode="reduced")  # Q_sup: (40960, D_sup)
     diag_r = np.abs(np.diag(R_sup))
-    valid_sup = diag_r > 1e-5
+    r_thr = max(float(diag_r.max()) * 1e-3, 1e-4) if len(diag_r) > 0 else 1e-4
+    valid_sup = diag_r > r_thr
     Q_sup = Q_sup[:, valid_sup].astype(np.float32)
     n_sup = Q_sup.shape[1]
 

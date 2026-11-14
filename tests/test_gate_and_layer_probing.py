@@ -359,7 +359,7 @@ class TestGateAndLayerProbing:
             y = np.array([i % 4 for i in range(N)], dtype=np.int64)
             W_ovr, W_pairs = _solve_within_class_fisher_gpu(X, y, num_family_classes=4, reg_ratio=0.15)
             assert W_ovr.shape == (4, D)
-            assert W_pairs.shape == (6, D)  # 4 * 3 / 2 = 6 pairs
+            assert W_pairs.shape == (12, D)  # 6 pairs * 2 regularization scales = 12 directions
             # Check unit L2 norm
             ovr_norms = np.linalg.norm(W_ovr, axis=1)
             pair_norms = np.linalg.norm(W_pairs, axis=1)

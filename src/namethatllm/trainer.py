@@ -3565,6 +3565,9 @@ def train_family_gate(
     train_texts = df_fam_all["text"].tolist() + (df_neg_all["text"].tolist() if len(df_neg_all) > 0 else [])
     fam_map = {name: i for i, name in enumerate(family_classes)}
     train_labels = [fam_map[m] for m in df_fam_all["model"].tolist()] + ([num_family_classes] * len(df_neg_all) if len(df_neg_all) > 0 else [])
+    fam_pids = df_fam_all["prompt_id"].tolist() if "prompt_id" in df_fam_all.columns else [f"fam_{i}" for i in range(len(df_fam_all))]
+    neg_pids = df_neg_all["prompt_id"].tolist() if "prompt_id" in df_neg_all.columns else [f"neg_{i}" for i in range(len(df_neg_all))]
+    prompt_ids = fam_pids + neg_pids
     other_str = " + 1 Other" if len(df_neg_all) > 0 else ""
     print(f"[{target_family.upper()} Gate] Total training dataset: {len(train_texts):,} samples ({num_gate_classes} classes: {num_family_classes} {target_family.upper()}{other_str}).")
 
@@ -3581,6 +3584,8 @@ def train_family_gate(
 
     Z_tr_list = []
     Z_tr_layers_list = []
+    tr_cos_list = []
+    tr_std_list = []
     need_layers = bool(export_embeddings or save_all_layers)
     with torch.no_grad():
         with torch.amp.autocast(device.type, dtype=amp_dtype):
@@ -3589,16 +3594,25 @@ def train_family_gate(
                 mb_mask = batch["attention_mask"].to(device)
                 max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
                 if need_layers:
-                    z_b, z_l = model.forward_features(
+                    res = model.forward_features(
                         mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
                         return_by_layer=True, extract_all_layers=save_all_layers,
+                        return_multiview=True,
                     )
+                    if isinstance(res, tuple) and len(res) == 4:
+                        z_b, z_l, ht_cos_t, std_norm_t = res
+                        tr_cos_list.append(ht_cos_t.cpu().to(torch.float16).numpy())
+                        tr_std_list.append(std_norm_t.cpu().to(torch.float16).numpy())
+                    elif isinstance(res, tuple) and len(res) == 2:
+                        z_b, z_l = res
                     Z_tr_layers_list.append(z_l.cpu().to(torch.float16).numpy())
                 else:
                     z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
                 Z_tr_list.append(z_b.cpu().float().numpy())
     Z_train = np.vstack(Z_tr_list)
     Z_train_layers = np.vstack(Z_tr_layers_list) if Z_tr_layers_list else None
+    head_tail_cos_tr = np.concatenate(tr_cos_list, axis=0) if tr_cos_list else None
+    token_std_tr = np.concatenate(tr_std_list, axis=0) if tr_std_list else None
     y_train = np.array(train_labels, dtype=np.int64)
     print(f"[{target_family.upper()} Gate] Extracted Z_train: shape={Z_train.shape}, dtype={Z_train.dtype}" +
           (f", layers_shape={Z_train_layers.shape}" if Z_train_layers is not None else ""))
@@ -3606,7 +3620,12 @@ def train_family_gate(
     # 4. Extract Z_eval on benchmark samples
     Z_eval = None
     Z_eval_layers = None
+    head_tail_cos_ev = None
+    token_std_ev = None
     main_logits_eval = None
+    main_logits_train = None
+    centered_logits_train = None
+    centered_logits_eval = None
     if eval_texts is not None and len(eval_texts) > 0:
         print(f"[{target_family.upper()} Gate] Extracting Z_eval on {len(eval_texts)} benchmark samples...")
         dummy_eval_y = [0] * len(eval_texts)
@@ -3614,6 +3633,8 @@ def train_family_gate(
         loader_ev = DataLoader(ds_ev, batch_size=batch_size, shuffle=False, collate_fn=collate_text_batch)
         Z_ev_list = []
         Z_ev_layers_list = []
+        ev_cos_list = []
+        ev_std_list = []
         with torch.no_grad():
             with torch.amp.autocast(device.type, dtype=amp_dtype):
                 for batch in loader_ev:
@@ -3621,21 +3642,39 @@ def train_family_gate(
                     mb_mask = batch["attention_mask"].to(device)
                     max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
                     if need_layers:
-                        z_b, z_l = model.forward_features(
+                        res = model.forward_features(
                             mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
                             return_by_layer=True, extract_all_layers=save_all_layers,
+                            return_multiview=True,
                         )
+                        if isinstance(res, tuple) and len(res) == 4:
+                            z_b, z_l, ht_cos_t, std_norm_t = res
+                            ev_cos_list.append(ht_cos_t.cpu().to(torch.float16).numpy())
+                            ev_std_list.append(std_norm_t.cpu().to(torch.float16).numpy())
+                        elif isinstance(res, tuple) and len(res) == 2:
+                            z_b, z_l = res
                         Z_ev_layers_list.append(z_l.cpu().to(torch.float16).numpy())
                     else:
                         z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
                     Z_ev_list.append(z_b.cpu().float().numpy())
         Z_eval = np.vstack(Z_ev_list)
         Z_eval_layers = np.vstack(Z_ev_layers_list) if Z_ev_layers_list else None
+        head_tail_cos_ev = np.concatenate(ev_cos_list, axis=0) if ev_cos_list else None
+        token_std_ev = np.concatenate(ev_std_list, axis=0) if ev_std_list else None
 
-        if hasattr(model, "plain_head"):
-            W_p = model.plain_head.weight.detach().cpu().float().numpy()
-            b_p = model.plain_head.bias.detach().cpu().float().numpy()
+    if hasattr(model, "plain_head") and model.plain_head is not None:
+        W_p = model.plain_head.weight.detach().cpu().float().numpy()
+        b_p = model.plain_head.bias.detach().cpu().float().numpy()
+        main_logits_train = Z_train @ W_p.T + b_p
+        if Z_eval is not None:
             main_logits_eval = Z_eval @ W_p.T + b_p
+
+    if hasattr(model, "centered_head") and model.centered_head is not None:
+        W_c = model.centered_head.weight.detach().cpu().float().numpy()
+        b_c = model.centered_head.bias.detach().cpu().float().numpy()
+        centered_logits_train = Z_train @ W_c.T + b_c
+        if Z_eval is not None:
+            centered_logits_eval = Z_eval @ W_c.T + b_c
 
     # Optional: Export Extracted Features Dataset for Kaggle / Local
     if export_embeddings:
@@ -3648,14 +3687,30 @@ def train_family_gate(
             texts=train_texts,
             labels=train_labels,
             model_names=df_fam_all["model"].tolist() + ["__OTHER__"] * len(df_neg_all),
+            prompt_ids=prompt_ids,
+            champion_logits_plain=main_logits_train,
+            champion_logits_centered=centered_logits_train,
+            head_tail_cos=head_tail_cos_tr,
+            token_std_norms=token_std_tr,
             eval_features_concat=Z_eval,
             eval_features_by_layer=Z_eval_layers,
             eval_texts=eval_texts,
             eval_labels=eval_labels,
+            eval_champion_logits_plain=main_logits_eval,
+            eval_champion_logits_centered=centered_logits_eval,
+            eval_head_tail_cos=head_tail_cos_ev,
+            eval_token_std_norms=token_std_ev,
             dataset_title=f"NTL {target_family.upper()} Extracted Features (Qwen3-14B)",
             dataset_slug=f"ntl-{target_family.lower()}-features-qwen3-14b",
             checkpoints_volume=checkpoints_volume,
         )
+        if hasattr(model, "norms") and model.norms is not None:
+            norms_dict = {}
+            for i, norm in enumerate(model.norms):
+                norms_dict[f"norms.{i}.weight"] = norm.weight.detach().cpu().to(torch.float32).contiguous()
+                if hasattr(norm, "bias") and norm.bias is not None:
+                    norms_dict[f"norms.{i}.bias"] = norm.bias.detach().cpu().to(torch.float32).contiguous()
+            save_file(norms_dict, str(emb_dir / "heads.safetensors"))
 
     # -------------------------------------------------------------------------
     # Step 2: Quality Inspection, Normalization Check & Outlier Statistics
@@ -3717,6 +3772,7 @@ def train_family_gate(
             num_family_classes=num_family_classes,
             hard_sister_pair=hard_pair,
             output_dir=output_dir,
+            prompts=np.asarray(prompt_ids) if prompt_ids is not None else None,
         )
 
     subspace_components = None
@@ -3733,6 +3789,7 @@ def train_family_gate(
             num_tapped_layers=len(getattr(model, "layers", [2, 4, 6, 9, 13, 17, 22, 27])),
             subspace_dim=pca_dim,
             device=device,
+            prompt_ids=prompt_ids,
         )
         Z_tr_active = ((Z_train - subspace_mean) @ subspace_components.T).astype(np.float32)
         if Z_eval is not None:
@@ -3771,6 +3828,7 @@ def train_family_gate(
         eval_mask=fam_eval_mask,
         num_family_classes=num_family_classes,
         device=device,
+        prompt_ids=prompt_ids,
     )
     print(f"[{target_family.upper()} Gate] Step 4 Complete: Optimal Ridge (alpha={ridge_alpha:.2f}) -> {target_family.upper()} Acc: {ridge_acc * 100:.2f}% (Lift: {(ridge_acc - acc_plain_within) * 100:+.2f}%)")
 
