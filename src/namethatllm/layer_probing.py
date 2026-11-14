@@ -39,7 +39,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.decomposition import PCA
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import GroupKFold, StratifiedKFold
 
@@ -189,13 +188,14 @@ def _solve_within_class_fisher_gpu(
     y_fam: np.ndarray,
     num_family_classes: int,
     reg_ratio: float = 0.15,
+    reg_scales: tuple[float, ...] = (0.03, 0.12, 0.45),
     device: torch.device | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Computes regularized within-class inverse covariance projections on a single layer block X_fam (N_fam, D_layer):
-    1. Multi-class centroid directions: (Sigma_W + reg * I)^-1 (mu_c - mu_all)
-    2. Pairwise sister Fisher directions evaluated on pair-specific residuals at 2 regularization scales.
-    Uses dual Woodbury / Gram identity when N_fam < D_layer for fast GPU execution.
+    100% Pure Supervised Multi-Scale Fisher Solver (Zero PCA):
+    1. Solves multi-class OVR Fisher directions on pooled intra-family residuals.
+    2. Solves pairwise sister Fisher directions on pair-specific residuals R_ab
+       across multiple spectral regularization scales (reg_scales).
     """
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -204,7 +204,6 @@ def _solve_within_class_fisher_gpu(
     X_t = torch.from_numpy(X_fam).to(device, dtype=torch.float32)
     mu_all = X_t.mean(dim=0, keepdim=True)
 
-    # Compute class centroids and within-class centered residuals R = X - mu_{y_i}
     centroids = []
     R_t = X_t.clone()
     for c in range(num_family_classes):
@@ -217,13 +216,13 @@ def _solve_within_class_fisher_gpu(
         else:
             centroids.append(mu_all.squeeze(0))
 
-    # 1. Multi-class OVR directions on pooled family residuals
+    # 1. Multi-class OVR Fisher directions
     rhs_list = [centroids[c] - mu_all.squeeze(0) for c in range(num_family_classes)]
     Delta_ovr = torch.stack(rhs_list, dim=1) if rhs_list else torch.zeros((D, 1), device=device, dtype=torch.float32)
     W_ovr_t = _solve_woodbury_direction(R_t, Delta_ovr, reg_scale=reg_ratio)
     W_ovr = W_ovr_t.cpu().numpy().T  # (K, D)
 
-    # 2. Pairwise Sister Fisher directions using pair-specific within-class covariance at 2 regularization scales
+    # 2. Pairwise Sister Fisher directions on pair-specific covariance across reg_scales
     pair_dirs = []
     for a, b in combinations(range(num_family_classes), 2):
         delta_ab = (centroids[a] - centroids[b]).unsqueeze(1)  # (D, 1)
@@ -233,10 +232,9 @@ def _solve_within_class_fisher_gpu(
             R_ab = R_t[idx_ab]
         else:
             R_ab = R_t
-        w_ab_hi = _solve_woodbury_direction(R_ab, delta_ab, reg_scale=reg_ratio)
-        w_ab_lo = _solve_woodbury_direction(R_ab, delta_ab, reg_scale=reg_ratio * 0.25)
-        pair_dirs.append(w_ab_hi.squeeze(1).cpu().numpy())
-        pair_dirs.append(w_ab_lo.squeeze(1).cpu().numpy())
+        for r_scale in reg_scales:
+            w_ab = _solve_woodbury_direction(R_ab, delta_ab, reg_scale=r_scale)
+            pair_dirs.append(w_ab.squeeze(1).cpu().numpy())
 
     W_pairs = np.vstack(pair_dirs).astype(np.float32) if pair_dirs else np.zeros((0, D), dtype=np.float32)
 
@@ -252,23 +250,17 @@ def build_supervised_family_subspace(
     y_train: np.ndarray,
     num_family_classes: int,
     num_tapped_layers: int = 8,
-    subspace_dim: int = 256,
+    subspace_dim: int | None = None,
     reg_ratio: float = 0.15,
     device: torch.device | None = None,
     **kwargs: Any,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """
-    Constructs a Supervised Sister-Decoupling Linear Subspace on 40,960-dim concatenated features:
-      1. Fits per-layer One-vs-Rest and Pairwise Sister Fisher directions across all 8 tapped layers.
-      2. Fits Inter-Layer Residual Velocity Fisher directions across adjacent tapped layers (l - (l-1))
-         and maps them back into 40,960-dim coordinates (+w in block l, -w in block l-1).
-      3. Supplements remaining dimensions up to `subspace_dim` using intra-family residual PCA.
-      4. Orthonormalizes via QR and whitens each basis coordinate by its intra-family training std.
-
-    Returns:
-      C_eff: (actual_dim, 40960) float32 effective projection matrix (whitened)
-      mu_fam: (1, 40960) float32 intra-family mean vector
-      diagnostics: dict with per-layer and inter-layer discriminative metrics
+    Constructs a 100% Pure Supervised Fisher Subspace (Zero Unsupervised PCA):
+      1. Part 1: Per-Layer Multi-Scale Pairwise Sister + OVR Fisher directions across all 8 tapped layers.
+      2. Part 2: Inter-Layer Residual Velocity Fisher directions on Delta X^(l) = X^(l) - X^(l-1).
+      3. Part 3: Economic QR orthonormalization (filtering collinear directions via diag_r > 1e-3 * max).
+      4. Part 4: Unit-variance coordinate whitening by intra-family training std.
     """
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -285,7 +277,6 @@ def build_supervised_family_subspace(
 
     Z_fam = Z_train[fam_mask]
     y_fam = y_train[fam_mask]
-    N_fam = len(Z_fam)
 
     mu_fam = Z_fam.mean(axis=0, keepdims=True).astype(np.float32)
     Z_fam_c = (Z_fam - mu_fam).astype(np.float32)
@@ -293,14 +284,15 @@ def build_supervised_family_subspace(
     basis_rows: list[np.ndarray] = []
     layer_fisher_norms: dict[int, float] = {}
 
-    # Part 1: Per-Layer Fisher & Pairwise Sister Directions (block-diagonal in 40,960 space)
+    # Part 1: Per-Layer Multi-Scale Fisher Directions
     for l_idx in range(num_tapped_layers):
         s_col = l_idx * D_layer
         e_col = (l_idx + 1) * D_layer
         X_l = Z_fam_c[:, s_col:e_col]
 
         W_ovr, W_pairs = _solve_within_class_fisher_gpu(
-            X_l, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio, device=device
+            X_l, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio,
+            reg_scales=(0.03, 0.12, 0.45), device=device
         )
         stacked_dirs = np.vstack([W_ovr, W_pairs]) if len(W_pairs) > 0 else W_ovr
         for row in stacked_dirs:
@@ -311,14 +303,14 @@ def build_supervised_family_subspace(
         layer_fisher_norms[l_idx] = float(np.linalg.norm(W_pairs)) if len(W_pairs) > 0 else 0.0
 
     # Part 2: Inter-Layer Residual Velocity Fisher Directions: Delta X^(l) = X^(l) - X^(l-1)
-    # Maps linearly to 40,960 space by placing +w in block l and -w in block (l-1)
     for l_idx in range(1, num_tapped_layers):
         s_prev, e_prev = (l_idx - 1) * D_layer, l_idx * D_layer
         s_curr, e_curr = l_idx * D_layer, (l_idx + 1) * D_layer
         Delta_X = Z_fam_c[:, s_curr:e_curr] - Z_fam_c[:, s_prev:e_prev]
 
         _, W_vel_pairs = _solve_within_class_fisher_gpu(
-            Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5, device=device
+            Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5,
+            reg_scales=(0.05, 0.20, 0.60), device=device
         )
         for row in W_vel_pairs:
             full_vec = np.zeros(D_total, dtype=np.float32)
@@ -327,44 +319,24 @@ def build_supervised_family_subspace(
             basis_rows.append(full_vec)
 
     W_sup = np.vstack(basis_rows)  # (D_sup, 40960)
-    # Orthonormalize supervised directions via economic QR on W_sup.T
-    Q_sup, R_sup = np.linalg.qr(W_sup.T, mode="reduced")  # Q_sup: (40960, D_sup)
+
+    # Part 3: Orthonormalize pure Fisher directions via reduced QR (rejecting float32 noise)
+    Q_sup, R_sup = np.linalg.qr(W_sup.T, mode="reduced")
     diag_r = np.abs(np.diag(R_sup))
     r_thr = max(float(diag_r.max()) * 1e-3, 1e-4) if len(diag_r) > 0 else 1e-4
     valid_sup = diag_r > r_thr
-    Q_sup = Q_sup[:, valid_sup].astype(np.float32)
-    n_sup = Q_sup.shape[1]
+    V_basis = Q_sup[:, valid_sup].T.astype(np.float32)  # (D_fisher, 40960)
+    if subspace_dim is not None and subspace_dim > 0 and V_basis.shape[0] > subspace_dim:
+        V_basis = V_basis[:subspace_dim]
 
-    # Part 3: Residual Intra-Family PCA on orthogonal complement
-    target_dim = min(subspace_dim, D_total)
-    n_rem = max(target_dim - n_sup, 0)
-    if n_rem > 0 and N_fam > 2:
-        # Project out supervised subspace from Z_fam_c
-        proj_sup = Z_fam_c @ Q_sup
-        Z_res = Z_fam_c - proj_sup @ Q_sup.T
-        n_comp_actual = min(n_rem, Z_res.shape[0] - 1, Z_res.shape[1])
-        if n_comp_actual > 0:
-            pca_res = PCA(n_components=n_comp_actual, svd_solver="randomized", random_state=42)
-            pca_res.fit(Z_res)
-            V_res = pca_res.components_.T.astype(np.float32)  # (40960, n_comp_actual)
-            # Re-orthonormalize combined basis
-            Q_all, _ = np.linalg.qr(np.hstack([Q_sup, V_res]), mode="reduced")
-            V_basis = Q_all.T[:target_dim].astype(np.float32)  # (actual_dim, 40960)
-        else:
-            V_basis = Q_sup.T[:target_dim].astype(np.float32)
-    else:
-        V_basis = Q_sup.T[:target_dim].astype(np.float32)
-
-    # Part 4: Whiten each basis coordinate by its intra-family std so MLP receives unit-variance inputs
-    Z_fam_proj = Z_fam_c @ V_basis.T  # (N_fam, actual_dim)
-    sd_proj = Z_fam_proj.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)  # (1, actual_dim)
-
-    # Effective linear operator: (Z - mu_fam) @ C_eff.T == ((Z - mu_fam) @ V_basis.T) / sd_proj
+    # Part 4: Whiten each Fisher coordinate by its intra-family training std
+    Z_fam_proj = Z_fam_c @ V_basis.T  # (N_fam, D_fisher)
+    sd_proj = Z_fam_proj.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
     C_eff = (V_basis / sd_proj.T).astype(np.float32)
 
     diagnostics = {
-        "n_supervised_dirs": int(n_sup),
-        "n_residual_pca_dirs": int(V_basis.shape[0] - n_sup),
+        "n_supervised_dirs": int(V_basis.shape[0]),
+        "n_residual_pca_dirs": 0,
         "total_subspace_dim": int(V_basis.shape[0]),
         "subspace_dim": int(V_basis.shape[0]),
         "layer_fisher_norms": layer_fisher_norms,

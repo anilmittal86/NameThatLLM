@@ -1222,12 +1222,12 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                         b2 = torch.as_tensor(heads_spec["mlp_b2"], dtype=torch.float32)
                                                         ln_w = torch.as_tensor(heads_spec["ln_weight"], dtype=torch.float32) if "ln_weight" in heads_spec else None
                                                         ln_b = torch.as_tensor(heads_spec["ln_bias"], dtype=torch.float32) if "ln_bias" in heads_spec else None
-                                                        pw = torch.as_tensor(heads_spec["plain.weight"], dtype=torch.float32).to(dev) if "plain.weight" in heads_spec else None
-                                                        pb = torch.as_tensor(heads_spec["plain.bias"], dtype=torch.float32).to(dev) if "plain.bias" in heads_spec else None
                                                         dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                                                         w1, b1, w2, b2 = w1.to(dev), b1.to(dev), w2.to(dev), b2.to(dev)
                                                         if ln_w is not None and ln_b is not None:
                                                             ln_w, ln_b = ln_w.to(dev), ln_b.to(dev)
+                                                        pw = torch.as_tensor(heads_spec["plain.weight"], dtype=torch.float32).to(dev) if "plain.weight" in heads_spec else None
+                                                        pb = torch.as_tensor(heads_spec["plain.bias"], dtype=torch.float32).to(dev) if "plain.bias" in heads_spec else None
 
                                                         def _eval_mlp_gate(z_arr):
                                                             with torch.no_grad():

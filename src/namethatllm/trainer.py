@@ -1283,7 +1283,7 @@ def run_training_pipeline(
             target_family=train_cfg.get("target_family", "gemini"),
             output_dir=out_dir,
             head_type=train_cfg.get("head_type", "mlp"),
-            subspace_dim=int(train_cfg.get("pca_dim", 256)),
+            subspace_dim=train_cfg.get("subspace_dim", train_cfg.get("pca_dim", None)),
             hidden_dim=int(train_cfg.get("hidden_dim", 256)),
             mlp_epochs=int(train_cfg.get("mlp_epochs", 30)),
             mlp_lr=float(train_cfg.get("mlp_lr", 3e-4)),
@@ -1702,7 +1702,7 @@ def run_training_pipeline(
             checkpoints_volume=checkpoints_volume,
             head_type=train_cfg.get("head_type", "mlp"),
             use_supervised_subspace=bool(train_cfg.get("use_supervised_subspace", True)),
-            pca_dim=int(train_cfg.get("pca_dim", 256)),
+            subspace_dim=train_cfg.get("subspace_dim", train_cfg.get("pca_dim", None)),
             hidden_dim=int(train_cfg.get("hidden_dim", 256)),
             mlp_epochs=int(train_cfg.get("mlp_epochs", 30)),
             mlp_lr=float(train_cfg.get("mlp_lr", 3e-4)),
@@ -3174,8 +3174,8 @@ def train_family_gate_from_dataset(
     output_dir: Path | str | None = None,
     head_type: str = "mlp",
     use_supervised_subspace: bool = True,
-    pca_dim: int = 256,
     subspace_dim: int | None = None,
+    pca_dim: int | None = None,
     hidden_dim: int = 256,
     mlp_epochs: int = 30,
     mlp_lr: float = 3e-4,
@@ -3193,8 +3193,8 @@ def train_family_gate_from_dataset(
     from scipy.special import softmax as sp_softmax
     from namethatllm.postprocess import sinkhorn_balancing
 
-    if subspace_dim is not None:
-        pca_dim = subspace_dim
+    if subspace_dim is None and pca_dim is not None:
+        subspace_dim = pca_dim
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -3258,30 +3258,22 @@ def train_family_gate_from_dataset(
         if len(champ_sd["logits_plain"]) == len(Z_eval):
             main_logits_eval = champ_sd["logits_plain"].cpu().float().numpy()
 
-    # Step 3: Supervised Subspace / PCA Dimension Reduction
+    # Step 3: 100% Pure Supervised Fisher Subspace (Zero PCA)
     num_tapped = 8
     pca_components = None
     pca_mean = None
-    if use_supervised_subspace and pca_dim > 0 and pca_dim < Z_train.shape[1]:
+    if use_supervised_subspace:
         pca_components, pca_mean, sub_report = build_supervised_family_subspace(
             Z_train=Z_train,
             y_train=y_train,
             num_family_classes=num_family_classes,
-            family_classes=family_classes,
-            subspace_dim=pca_dim,
+            subspace_dim=subspace_dim,
             num_tapped_layers=num_tapped,
             prompt_ids=prompt_ids,
             device=device,
         )
         Z_tr_active = ((Z_train - pca_mean) @ pca_components.T).astype(np.float32)
         Z_ev_active = ((Z_eval - pca_mean) @ pca_components.T).astype(np.float32) if Z_eval is not None else None
-    elif pca_dim > 0 and pca_dim < Z_train.shape[1]:
-        from sklearn.decomposition import PCA
-        pca = PCA(n_components=pca_dim, svd_solver="randomized", random_state=42)
-        Z_tr_active = pca.fit_transform(Z_train).astype(np.float32)
-        pca_components = pca.components_
-        pca_mean = pca.mean_
-        Z_ev_active = pca.transform(Z_eval).astype(np.float32) if Z_eval is not None else None
     else:
         Z_tr_active = Z_train
         Z_ev_active = Z_eval
@@ -3421,7 +3413,9 @@ def train_family_gate_from_dataset(
             "head_type": head_type.lower(),
             "default_gate_weight": default_gw,
             "best_sweep_gate_weight": float(best_pipe_w),
-            "pca_dim": pca_dim,
+            "use_supervised_subspace": use_supervised_subspace,
+            "subspace_dim": int(pca_components.shape[0]) if pca_components is not None else None,
+            "pca_dim": None,
             "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
             "alpha": float(best_alpha),
             "ridge_alpha": float(ridge_alpha),
@@ -3468,7 +3462,8 @@ def train_family_gate(
     checkpoints_volume: Any | None = None,
     head_type: str = "mlp",
     use_supervised_subspace: bool = True,
-    pca_dim: int = 128,
+    subspace_dim: int | None = None,
+    pca_dim: int | None = None,
     hidden_dim: int = 128,
     mlp_epochs: int = 20,
     mlp_lr: float = 2e-4,
@@ -3484,7 +3479,7 @@ def train_family_gate(
     1. Quarantines benchmark overlap to guarantee 0% leakage.
     2. Curates balanced class samples + negative distractors.
     3. Extracts Z_train and Z_eval on model forward_features.
-    4. Fits Supervised Discriminative Subspace or PCA.
+    4. Fits 100% Pure Supervised Fisher Subspace (Zero PCA).
     5. Solves closed-form L2 Ridge & Non-Linear MLP with exact zero-cost fold-in.
     6. Evaluates within-family accuracy & sweeps log-linear conditional probability gate blend.
     7. Saves self-contained heads.safetensors (including norms.*) and meta.json.
@@ -3492,6 +3487,9 @@ def train_family_gate(
     from safetensors.torch import save_file
     from scipy.special import softmax as sp_softmax
     from namethatllm.postprocess import sinkhorn_balancing
+
+    if subspace_dim is None and pca_dim is not None:
+        subspace_dim = pca_dim
 
     if device is None:
         device = next(model.parameters()).device
@@ -3565,8 +3563,16 @@ def train_family_gate(
     train_texts = df_fam_all["text"].tolist() + (df_neg_all["text"].tolist() if len(df_neg_all) > 0 else [])
     fam_map = {name: i for i, name in enumerate(family_classes)}
     train_labels = [fam_map[m] for m in df_fam_all["model"].tolist()] + ([num_family_classes] * len(df_neg_all) if len(df_neg_all) > 0 else [])
-    fam_pids = df_fam_all["prompt_id"].tolist() if "prompt_id" in df_fam_all.columns else [f"fam_{i}" for i in range(len(df_fam_all))]
-    neg_pids = df_neg_all["prompt_id"].tolist() if "prompt_id" in df_neg_all.columns else [f"neg_{i}" for i in range(len(df_neg_all))]
+    fam_pids = (
+        df_fam_all["prompt_id"].fillna("-1").astype(str).tolist()
+        if "prompt_id" in df_fam_all.columns
+        else [f"pool_{i}" for i in range(len(df_fam_all))]
+    )
+    neg_pids = (
+        df_neg_all["prompt_id"].fillna("-1").astype(str).tolist()
+        if (len(df_neg_all) > 0 and "prompt_id" in df_neg_all.columns)
+        else [f"neg_{i}" for i in range(len(df_neg_all))]
+    )
     prompt_ids = fam_pids + neg_pids
     other_str = " + 1 Other" if len(df_neg_all) > 0 else ""
     print(f"[{target_family.upper()} Gate] Total training dataset: {len(train_texts):,} samples ({num_gate_classes} classes: {num_family_classes} {target_family.upper()}{other_str}).")
@@ -3780,14 +3786,14 @@ def train_family_gate(
     Z_tr_active = Z_train
     Z_ev_active = Z_eval
 
-    if pca_dim > 0 and pca_dim < Z_train.shape[1]:
-        print(f"[{target_family.upper()} Gate] Step 3: Building Supervised Sister-Decoupling Subspace ({Z_train.shape[1]} -> {pca_dim})...")
+    if use_supervised_subspace:
+        print(f"[{target_family.upper()} Gate] Step 3: Building 100% Pure Supervised Sister-Decoupling Subspace (Zero PCA)...")
         subspace_components, subspace_mean, sub_diag = build_supervised_family_subspace(
             Z_train=Z_train,
             y_train=y_train,
             num_family_classes=num_family_classes,
             num_tapped_layers=len(getattr(model, "layers", [2, 4, 6, 9, 13, 17, 22, 27])),
-            subspace_dim=pca_dim,
+            subspace_dim=subspace_dim,
             device=device,
             prompt_ids=prompt_ids,
         )
@@ -3796,8 +3802,7 @@ def train_family_gate(
             Z_ev_active = ((Z_eval - subspace_mean) @ subspace_components.T).astype(np.float32)
         print(
             f"[{target_family.upper()} Gate] Step 3 Complete: {sub_diag['total_subspace_dim']} whitened dims "
-            f"({sub_diag['n_supervised_dirs']} Per-Layer & Inter-Layer Sister Fisher dirs + "
-            f"{sub_diag['n_residual_pca_dirs']} Orthogonal Residual PCA dirs)."
+            f"({sub_diag['n_supervised_dirs']} Per-Layer & Inter-Layer Sister Fisher dirs)."
         )
 
     pca_components = subspace_components
@@ -3955,7 +3960,8 @@ def train_family_gate(
             "default_gate_weight": default_gw,
             "best_sweep_gate_weight": float(best_pipe_w),
             "use_supervised_subspace": use_supervised_subspace,
-            "pca_dim": pca_dim if pca_components is not None else None,
+            "subspace_dim": int(pca_components.shape[0]) if pca_components is not None else None,
+            "pca_dim": None,
             "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
             "alpha": float(best_alpha),
             "ridge_alpha": float(ridge_alpha),

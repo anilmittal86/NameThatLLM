@@ -12,7 +12,6 @@
   "head_type": "mlp",
   "gate_weight": 0.40,
   "use_supervised_subspace": true,
-  "pca_dim": 256,
   "hidden_dim": 256,
   "mlp_epochs": 30,
   "mlp_lr": 0.0003,
