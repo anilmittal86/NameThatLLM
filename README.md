@@ -155,44 +155,6 @@ The production system is a **two-tier, memory-isolated ensemble** that combines 
   <img src="assets/inference_pipeline_architecture.jpg" alt="Inference Pipeline Architecture" width="750"/>
 </p>
 
-```
-                          [ 4,000 Mystery Passages (test.csv) ]
-                                            │
-        ┌───────────────────────────────────┴───────────────────────────────────┐
-        ▼                                                                       ▼
-┌──────────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
-│  MODULE 1: SUBPROCESS MULTI-POOL LEXICAL     │        │  MODULE 2: 4-TRUNK NEURAL EXTRACTORS         │
-│  - Multi-Pool Discovery (78k+ unique texts)  │        │  - Base Trunks: Q3-14B, Q2.5-14B, Q3-8B, Deb │
-│  - Output 1: 4-View LinearSVC (C=0.50)       │        │  - Dynamic bfloat16 Overflow Rescue          │
-│  - Output 2: 5-View BPE + SGD + Style Twins  │        │  - Reversible LoRA & Snapshot Isolation      │
-│  - Dedicated 26-Feature Handwriting Model    │        │  - Non-Colliding Checkpoint Multi-LoRA Loops │
-│  - Pure Sparse Matrices (100% Non-Zero Fast) │        │  - Live Checkpoint Accuracy Gate (>= 0.50)   │
-│  - Discrete Structural Rule Flags (N, 4)     │        │  - In-House LoRA24 Passed Gate (73.19% BAcc) │
-└──────────────────────┬───────────────────────┘        └──────────────────────┬───────────────────────┘
-                       │                                                       │
-                       └───────────────────────┬───────────────────────────────┘
-                                               ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  MODULE 3: WITHIN-PROMPT wPCA & EXACT 2^18 BITMASK DP + 384-DIM JOINT SPECTRAL BANK                  │
-│  - 1,620-Row Balanced Training Set (90 prompts x 18 classes, full-rank covariance)                   │
-│  - Prompt-Centered Within-Class Covariance S_e with Ledoit-Wolf Shrinkage Floors                     │
-│  - ExactAuthorPosterior: Exact forward-backward dynamic programming over 2^18 author subsets         │
-│  - Crash-Proof Cluster Splitting: Guaranteed cluster size 2 <= s <= 14 <= 18                         │
-│  - Unsupervised 384-Dim Joint Spectral Bank: Top-64 components per checkpoint with Prior Scaling     │
-│  - Validated Out-of-Fold Balanced Accuracy: 0.6441                                                   │
-└──────────────────────────────────────────────┬───────────────────────────────────────────────────────┘
-                                               ▼
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  MODULE 4: TWO-TIER CONVEX FUSION, SPECIALIST GATE & UNIFIED POSTPROCESSING                          │
-│  - Two-Tier Convex Fusion: P_mix = 0.85 * R_main + 0.15 * P_comp                                     │
-│  - Vectorized Claude Specialist Gate with exact marginal mass preservation                          │
-│  - Typographic Curly-Quote Shield (Rule 1 Active; Rules 2-4 & Continuous HW ablated in config):      │
-│      * Typographic curly quote penalty (-1.0 on Claude & GLM): log P += rule_flags @ W_pen           │
-│  - Official 300-step multiplicative Sinkhorn-Knopp column mass balancing (column sums = N / 18)      │
-│  - Output: /kaggle/working/submission.parquet                                                        │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
-
 ---
 
 ## 6. Step-by-Step Accuracy Lift: Building to 0.622
