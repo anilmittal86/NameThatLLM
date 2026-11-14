@@ -209,7 +209,12 @@ def run_sweep(
                 "delta_vs_baseline_bacc": delta_lift,
                 "notes": f"{notes} (gw={gw_best:.2f})",
             }
-            ledger.add_entry(record)
+            arts = []
+            if (tmp_run_out / "meta.json").exists():
+                arts.append(tmp_run_out / "meta.json")
+            if (tmp_run_out / "layer_probe_report.json").exists():
+                arts.append(tmp_run_out / "layer_probe_report.json")
+            ledger.add_entry(record, artifacts=arts)
             sweep_results.append((record, tmp_run_out))
 
             # Identify best foldable checkpoint (EXP-01 through EXP-04)

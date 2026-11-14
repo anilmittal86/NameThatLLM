@@ -5,6 +5,7 @@ Tests for ExperimentLedger, Layer-Probing Importance Weights, and Gate Experimen
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import numpy as np
@@ -61,7 +62,20 @@ def test_experiment_ledger_creation_and_logging(tmp_path: Path):
     res1 = ledger.add_entry(entry1)
 
     assert md_file.exists()
+    assert (tmp_path / "experiment_ledger.db").exists()
     assert abs(res1["delta_vs_baseline_bacc"] - (0.845 - 0.835)) < 1e-5
+
+    # Verify SQLite data integrity directly
+    with sqlite3.connect(tmp_path / "experiment_ledger.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*), target_family, subspace_dim FROM experiments WHERE exp_id = 'EXP-01'")
+        row = cursor.fetchone()
+        assert row[0] == 1
+        assert row[1] == "gemini"
+        assert row[2] == 24
+
+        cursor.execute("SELECT COUNT(*) FROM experiments")
+        assert cursor.fetchone()[0] == 2
 
     df = ledger.get_dataframe()
     assert len(df) == 2
@@ -76,6 +90,35 @@ def test_experiment_ledger_creation_and_logging(tmp_path: Path):
     ledger.export_copy(copy_dir)
     assert (copy_dir / "experiment_ledger.csv").exists()
     assert (copy_dir / "experiment_ledger.md").exists()
+    assert (copy_dir / "experiment_ledger.db").exists()
+
+
+def test_experiment_ledger_mlflow_wandb_safe_execution(tmp_path: Path):
+    ledger = ExperimentLedger(ledger_dir=tmp_path, use_mlflow=True, use_wandb=True)
+    entry = {
+        "exp_id": "EXP-MOCK",
+        "phase": "P1_test",
+        "target_family": "gemini",
+        "feature_set": "F1_fisher",
+        "subspace_dim": 12,
+        "head_type": "mlp",
+        "gate_weight": 0.40,
+        "oof_family_bacc": 0.80,
+        "holdout_family_bacc": 0.78,
+        "hard_sister_acc": 0.75,
+        "holdout_18cls_raw_bacc": 0.82,
+        "holdout_18cls_sinkhorn_bacc": 0.85,
+        "notes": "Testing mock MLflow & W&B execution safety",
+    }
+    dummy_art = tmp_path / "meta.json"
+    dummy_art.write_text("{\"status\": \"ok\"}", encoding="utf-8")
+
+    res = ledger.add_entry(entry, artifacts=[dummy_art])
+    assert res["exp_id"] == "EXP-MOCK"
+
+    df = ledger.get_dataframe()
+    assert len(df) == 1
+    assert df.iloc[0]["exp_id"] == "EXP-MOCK"
 
 
 def test_build_supervised_family_subspace_weights_and_velocity():
@@ -192,6 +235,7 @@ def test_run_gate_experiments_sweep(tmp_path: Path):
     assert (out_dir / "meta.json").exists()
     assert (out_dir / "experiment_ledger.csv").exists()
     assert (out_dir / "experiment_ledger.md").exists()
+    assert (out_dir / "experiment_ledger.db").exists()
 
     meta = json.loads((out_dir / "meta.json").read_text(encoding="utf-8"))
     assert "hard_pair_eval_acc" in meta
