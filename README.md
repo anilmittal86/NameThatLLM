@@ -60,12 +60,16 @@ Random guessing yields $1/18 = 5.56\%$. Our system reaches **62.2%** — an $11.
 To understand the challenge, we ran a controlled experiment: **1,800 unleaked text completions** (100 per model) were generated against **identical prompts** and passed through our frozen Qwen3-14B backbone to extract 40,960-dimensional stylistic hidden states. The result reveals a striking asymmetry in attribution difficulty:
 
 <p align="center">
-  <img src="assets/analysis_of_prompts_different_ai_models.png" alt="Analysis of Prompts from Different AI Models: t-SNE Manifold and Cosine Similarity Matrix" width="850"/>
+  <img src="assets/analysis_of_prompts_different_ai_models_infographic.png" alt="Analysis of Prompts from Different AI Models: t-SNE Manifold and Cosine Similarity Matrix" width="850"/>
 </p>
 
 **What you're seeing:**
 - **Panel A (t-SNE Manifold):** Each dot is one text passage, colored by its authoring model family. Models that write similarly cluster together. Models that write differently drift apart.
 - **Panel B (Cosine Similarity Matrix):** The pairwise angular similarity between all 18 model centroids. Red = similar writing styles. Blue = distinct styles.
+
+<p align="center">
+  <img src="assets/empirical_latent_similarity_matrix.png" alt="Empirical Cosine Similarity Matrix Across 18 Frontier Models" width="750"/>
+</p>
 
 ### The Core Asymmetry
 
@@ -84,7 +88,7 @@ Telling Claude from Gemini is easy — they live on opposite sides of the manifo
 Beyond the raw geometry, we measured **six concrete writing habits** across all 18 models and used hierarchical clustering to reconstruct their stylistic family tree:
 
 <p align="center">
-  <img src="assets/llm_stylistic_fingerprints_infographic.png" alt="LLM Stylistic DNA Radar Chart and Phylogenetic Distillation Tree" width="850"/>
+  <img src="assets/llm_stylistic_fingerprints_infographic.jpg" alt="LLM Stylistic DNA Radar Chart and Phylogenetic Distillation Tree" width="850"/>
 </p>
 
 **How to read this:**
@@ -115,7 +119,7 @@ The dendrogram reveals that GLM models branch directly into the Claude subtree a
 The real battleground is **within** families — separating models that share the same pretraining backbone but differ only in fine-tuning or scale. We zoomed into the Gemini family and mapped every model's per-class accuracy shift:
 
 <p align="center">
-  <img src="assets/sister_decoupling_and_confusion_geometry.png" alt="Gemini Sister Sub-Space Geometry and 18-Model Accuracy Shift Dumbbell Chart" width="850"/>
+  <img src="assets/sister_decoupling_and_confusion_geometry.jpg" alt="Gemini Sister Sub-Space Geometry and 18-Model Accuracy Shift Dumbbell Chart" width="850"/>
 </p>
 
 **How to read this:**
@@ -365,4 +369,3 @@ python -m modal volume get ntl-checkpoints export_champion_qwen3_14b ./checkpoin
 
 - [**TRAINING.md**](TRAINING.md): Deep-dive into Two-Stage LoRA training, multi-layer interior pooling, prompt-mean centering, Modal A100 benchmarks, and family specialists.
 - [**TUTORIAL.md**](TUTORIAL.md): Comprehensive technical masterclass on wPCA, exact $2^{18}$ dynamic programming, Sinkhorn-Knopp mass balancing, and pairwise error mitigation.
-- [**v76_confusion_matrix.md**](v76_confusion_matrix.md): 18-class pairwise confusion matrix analysis with sibling error breakdowns and mitigation roadmap.
