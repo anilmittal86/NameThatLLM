@@ -1710,6 +1710,8 @@ def run_training_pipeline(
             export_embeddings=exp_enabled,
             save_all_layers=exp_save_all,
             embeddings_output_dir=exp_out,
+            gate_weight=float(train_cfg.get("gate_weight", 0.40)),
+            train_cfg=train_cfg,
         )
         print(f"[Trainer] Phase 3 Family Gate Training Complete: {gate_res}")
         return out_dir
@@ -3146,6 +3148,7 @@ def train_family_gate_from_dataset(
     device: torch.device | None = None,
     run_probing_sweep: bool = False,
     checkpoints_volume: Any | None = None,
+    gate_weight: float = 0.40,
 ) -> dict[str, Any]:
     """
     Offline high-throughput entrypoint to train and evaluate any family gate directly from disk
@@ -3325,16 +3328,19 @@ def train_family_gate_from_dataset(
         }
 
     # Step 6: Logit Blending
+    default_gw = float(gate_weight)
+    best_pipe_w = default_gw
     pipe_results = {}
     if main_logits_eval is not None and best_fam_logits is not None and y_ev_arr is not None:
         P_main = sp_softmax(main_logits_eval, axis=1)
         acc_plain_solo = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
         best_pipe_acc = 0.0
-        best_pipe_w = 0.0
         cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
         spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
 
-        for gw in [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50]:
+        sweep_weights = sorted(set([0.10, 0.20, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60, default_gw]))
+
+        for gw in sweep_weights:
             P_fused = P_main.copy()
             for idx in np.flatnonzero(cand_mask):
                 orig_mass = float(P_main[idx, family_cols].sum())
@@ -3379,6 +3385,8 @@ def train_family_gate_from_dataset(
             "labels": family_classes + (["__OTHER__"] if has_negatives else []),
             "target_family": target_family,
             "head_type": head_type.lower(),
+            "default_gate_weight": default_gw,
+            "best_sweep_gate_weight": float(best_pipe_w),
             "pca_dim": pca_dim,
             "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,
             "alpha": float(best_alpha),
@@ -3434,6 +3442,8 @@ def train_family_gate(
     export_embeddings: bool = False,
     save_all_layers: bool = False,
     embeddings_output_dir: Path | str | None = None,
+    gate_weight: float = 0.40,
+    train_cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     End-to-end family gate training pipeline (HB-WRH):
@@ -3794,6 +3804,8 @@ def train_family_gate(
     # -------------------------------------------------------------------------
     # Step 6: Evaluate Full Pipeline & Gate Blend Sweep on benchmark samples (Bug 1.3 Fix)
     # -------------------------------------------------------------------------
+    default_gw = float(train_cfg.get("gate_weight", gate_weight)) if isinstance(train_cfg, dict) else float(gate_weight)
+    best_pipe_w = default_gw
     pipe_results = {}
     if main_logits_eval is not None and best_fam_logits is not None and y_ev_arr is not None:
         P_main = sp_softmax(main_logits_eval, axis=1)
@@ -3801,11 +3813,12 @@ def train_family_gate(
         print(f"[{target_family.upper()} Gate] Champion Plain Head Benchmark BAcc: {acc_plain_solo*100:.2f}%")
 
         best_pipe_acc = 0.0
-        best_pipe_w = 0.0
         cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
         spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
 
-        for gw in [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50]:
+        sweep_weights = sorted(set([0.10, 0.20, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60, default_gw]))
+
+        for gw in sweep_weights:
             P_fused = P_main.copy()
             for idx in np.flatnonzero(cand_mask):
                 orig_mass = float(P_main[idx, family_cols].sum())
@@ -3849,6 +3862,8 @@ def train_family_gate(
             "labels": family_classes + (["__OTHER__"] if has_negatives else []),
             "target_family": target_family,
             "head_type": head_type.lower(),
+            "default_gate_weight": default_gw,
+            "best_sweep_gate_weight": float(best_pipe_w),
             "use_supervised_subspace": use_supervised_subspace,
             "pca_dim": pca_dim if pca_components is not None else None,
             "hidden_dim": hidden_dim if head_type.lower() == "mlp" else None,

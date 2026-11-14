@@ -333,6 +333,10 @@ class TestGateAndLayerProbing:
 
             assert (gate_out_dir / "heads.safetensors").exists()
             assert (gate_out_dir / "meta.json").exists()
+            meta_json = json.loads((gate_out_dir / "meta.json").read_text(encoding="utf-8"))
+            assert "default_gate_weight" in meta_json
+            assert meta_json["default_gate_weight"] == 0.40
+            assert "best_sweep_gate_weight" in meta_json
             assert result["target_family"] == "gemini"
             assert "within_family_balanced_acc" in result
 
