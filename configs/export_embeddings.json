@@ -14,7 +14,7 @@
     "save_all_layers": true,
     "save_multiview": true,
     "output_dir": "export_embeddings_all_18classes",
-    "samples_per_class": 3800,
+    "samples_per_class": 2000,
     "negative_ratio": 0.0,
     "batch_size": 16
   }

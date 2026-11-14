@@ -434,3 +434,71 @@ class TestGateAndLayerProbing:
         assert Z_layers.shape == (B, 6, 32)
         assert ht_cos.shape == (B, 3)
         assert std_norm.shape == (B, 3)
+
+    def test_mlp_temperature_calibration_and_ensemble(self):
+        """Verify fit_family_mlp_head calibrates output logits to row_std ≈ 3.2."""
+        from namethatllm.trainer import fit_family_mlp_head
+
+        N = 60
+        D = 32
+        K_gate = 4
+        K_fam = 4
+        Z_train = np.random.randn(N, D).astype(np.float32)
+        y_train = np.array([i % K_fam for i in range(N)], dtype=np.int64)
+        Z_eval = np.random.randn(20, D).astype(np.float32)
+        y_eval_true = np.array([i % K_fam for i in range(20)], dtype=np.int64)
+        eval_mask = np.ones(20, dtype=bool)
+
+        head_dict, acc, eval_logits = fit_family_mlp_head(
+            Z_train=Z_train,
+            y_train=y_train,
+            num_gate_classes=K_gate,
+            num_family_classes=K_fam,
+            hidden_dim=16,
+            epochs=5,
+            lr=1e-3,
+            Z_eval=Z_eval,
+            y_eval_true=y_eval_true,
+            eval_mask=eval_mask,
+            device=torch.device("cpu"),
+            raw_Z_eval=Z_eval,
+        )
+
+        assert eval_logits is not None
+        fam_logits = eval_logits[:, :K_fam]
+        row_std = float(np.std(fam_logits, axis=1).mean())
+        assert abs(row_std - 3.2) < 0.6  # Temperature-calibrated around 3.2
+
+    def test_confidence_scaled_linear_conditional_blending(self):
+        """Verify confidence-scaled normalized conditional linear blending in postprocess."""
+        from namethatllm.postprocess import apply_family_specialist_lora_gate, apply_claude_specialist_gate
+        from namethatllm.config import FAMILIES
+
+        N = 4
+        P_mix = np.full((N, 18), 1.0 / 18.0, dtype=np.float64)
+        # Row 0: high gemini mass (0.80)
+        gem_cols = FAMILIES["gemini"]
+        P_mix[0, gem_cols] = 0.80 / len(gem_cols)
+        # Row 1: low gemini mass (0.20)
+        P_mix[1, gem_cols] = 0.20 / len(gem_cols)
+        R_main = P_mix.copy()
+
+        spec_logits = np.zeros((N, len(gem_cols)), dtype=np.float64)
+        spec_logits[:, 0] = 5.0  # Strongly favor first gemini class
+
+        P_fused = apply_family_specialist_lora_gate(
+            P_mix=P_mix,
+            R_main=R_main,
+            spec_logits=spec_logits,
+            family_cols=gem_cols,
+            gate_weight=0.40,
+        )
+
+        # Total mass conserved exactly
+        np.testing.assert_allclose(P_fused[:, gem_cols].sum(axis=1), P_mix[:, gem_cols].sum(axis=1), atol=1e-7)
+        # Row 0 had 0.80 mass (>= 0.50) -> full gw_eff = 0.40
+        # Row 1 had 0.20 mass (< 0.50) -> gw_eff = 0.40 * (0.20 / 0.50) = 0.16
+        first_col = gem_cols[0]
+        norm_r0 = P_fused[0, first_col] / P_fused[0, gem_cols].sum()
+        norm_r1 = P_fused[1, first_col] / P_fused[1, gem_cols].sum()
+        assert norm_r0 > norm_r1  # Stronger shift on high-confidence row

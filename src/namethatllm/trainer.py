@@ -2429,6 +2429,18 @@ def fit_family_mlp_head(
         mlp.load_state_dict(best_state)
     mlp.eval()
 
+    # Temperature-scale mlp.fc2.weight and mlp.fc2.bias on intra-family training set to row_std = 3.2
+    with torch.no_grad():
+        fam_mask = y_train < num_family_classes
+        if fam_mask.sum() > 0:
+            X_fam_t = torch.from_numpy(Z_tr_std[fam_mask]).float().to(device)
+            fam_logits_tr = mlp.forward_eval(X_fam_t).cpu().numpy()[:, :num_family_classes]
+            row_std = float(np.std(fam_logits_tr, axis=1).mean())
+            temp_scale = (3.2 / row_std) if row_std > 1e-4 else 1.0
+            mlp.fc2.weight.data.mul_(temp_scale)
+            mlp.fc2.bias.data.mul_(temp_scale)
+            del X_fam_t
+
     # 3. Zero-Cost Fold-In into fc1:
     if pca_components is not None and pca_mean is not None:
         # Fold PCA projection (pca_dim -> 40960) and mean subtraction into fc1:
@@ -2498,6 +2510,12 @@ def fit_family_mlp_head(
     if eval_target is not None and best_eval_logits is not None:
         ridge_ev_logits = eval_target @ plain_w.cpu().numpy().T + plain_b.cpu().numpy()
         blend_logits = 0.65 * best_eval_logits + 0.35 * ridge_ev_logits
+        # Re-normalize ensembled intra-family logits to row_std = 3.2 before sp_softmax
+        blend_fam = blend_logits[:, :num_family_classes]
+        row_std_b = float(np.std(blend_fam, axis=1).mean()) if len(blend_fam) > 0 else 1.0
+        temp_scale_b = (3.2 / row_std_b) if row_std_b > 1e-4 else 1.0
+        blend_logits = (blend_logits * temp_scale_b).astype(np.float32)
+
         if y_eval_true is not None and eval_mask is not None and eval_mask.sum() > 0:
             blend_pred = blend_logits[eval_mask, :num_family_classes].argmax(axis=1)
             blend_acc = float(balanced_accuracy_score(y_eval_true, blend_pred))
@@ -2985,6 +3003,23 @@ def extract_and_export_embeddings(
 
     print(f"[Features Extraction] Extracting features on {len(train_texts):,} samples (batch_size={batch_size})...")
 
+    # Disk Space Safety Guard
+    out_p = Path(output_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+    if save_all_layers:
+        try:
+            _, _, free_bytes = shutil.disk_usage(out_p)
+            est_all_layers_bytes = len(train_texts) * 28 * 5120 * 2  # FP16 = 2 bytes per element
+            if est_all_layers_bytes > 0.80 * free_bytes:
+                print(
+                    f"\n[WARNING][Disk Safety Guard] Estimated 28-layer tensor size ({est_all_layers_bytes / (1024**3):.2f} GB) "
+                    f"exceeds 80% of available free disk space ({free_bytes / (1024**3):.2f} GB) in {out_p}."
+                )
+                print("  -> Automatically falling back to saving 8 tapped layers in features_by_layer.safetensors ([N, 8, 5120]) to prevent OSError: No space left on device.\n")
+                save_all_layers = False
+        except Exception as e:
+            print(f"[Features Extraction] Note: Could not query disk usage ({e}); proceeding with requested save_all_layers={save_all_layers}.")
+
     # 3. Extract Train Features
     ds_tr = TextSequenceDataset(train_texts, train_labels, None, tok, max_len=max_len, end_id=end_id)
     loader_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=False, collate_fn=collate_text_batch)
@@ -3345,11 +3380,10 @@ def train_family_gate_from_dataset(
             for idx in np.flatnonzero(cand_mask):
                 orig_mass = float(P_main[idx, family_cols].sum())
                 if orig_mass > 1e-6:
-                    main_cond = np.clip(P_main[idx, family_cols] / orig_mass, 1e-7, 1.0)
-                    spec_cond = np.clip(spec_probs[idx], 1e-7, 1.0)
-                    fused_cond = np.exp((1.0 - gw) * np.log(main_cond) + gw * np.log(spec_cond))
-                    fused_cond /= fused_cond.sum()
-                    P_fused[idx, family_cols] = fused_cond * orig_mass
+                    gw_eff = gw * min(orig_mass / 0.50, 1.0)
+                    main_norm = P_main[idx, family_cols] / orig_mass
+                    fused_fam = (1.0 - gw_eff) * main_norm + gw_eff * spec_probs[idx]
+                    P_fused[idx, family_cols] = fused_fam * orig_mass
 
             acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
             P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
@@ -3823,12 +3857,10 @@ def train_family_gate(
             for idx in np.flatnonzero(cand_mask):
                 orig_mass = float(P_main[idx, family_cols].sum())
                 if orig_mass > 1e-6:
-                    main_cond = np.clip(P_main[idx, family_cols] / orig_mass, 1e-7, 1.0)
-                    spec_cond = np.clip(spec_probs[idx], 1e-7, 1.0)
-                    # Log-linear geometric pooling in conditional probability space
-                    fused_cond = np.exp((1.0 - gw) * np.log(main_cond) + gw * np.log(spec_cond))
-                    fused_cond /= fused_cond.sum()
-                    P_fused[idx, family_cols] = fused_cond * orig_mass
+                    gw_eff = gw * min(orig_mass / 0.50, 1.0)
+                    main_norm = P_main[idx, family_cols] / orig_mass
+                    fused_fam = (1.0 - gw_eff) * main_norm + gw_eff * spec_probs[idx]
+                    P_fused[idx, family_cols] = fused_fam * orig_mass
 
             acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
             P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)

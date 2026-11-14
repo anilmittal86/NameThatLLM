@@ -519,6 +519,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
     family_spec_logits_te: dict[str, np.ndarray] = {}
     family_spec_logits_unseen: dict[str, np.ndarray] = {}
     family_spec_classes: dict[str, list] = {}
+    family_spec_gate_weights: dict[str, float] = {}
 
     # Read configuration hierarchies from configs/production_ensemble.json early
     main_cfg = cfg.get("main_stack", {})
@@ -675,6 +676,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
     family_spec_logits_te: dict[str, np.ndarray] = {}
     family_spec_logits_unseen: dict[str, np.ndarray] = {}
     family_spec_classes: dict[str, list] = {}
+    family_spec_gate_weights: dict[str, float] = {}
     claude_spec_logits_unseen: np.ndarray | None = None
     P_spectral = None
     P_spectral_unseen = None
@@ -1211,6 +1213,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                     meta_spec = read_checkpoint_meta(spec_p, default_keep=27, default_layers=[], default_max_len=447)
                                                     fam_classes = meta_spec.get("classes", meta_spec.get("labels", []))
                                                     K_fam = len(FAMILIES[fam_nm])
+                                                    family_spec_gate_weights[fam_nm] = float(meta_spec.get("default_gate_weight", 0.40))
 
                                                     if "mlp_w1" in heads_spec:
                                                         w1 = torch.as_tensor(heads_spec["mlp_w1"], dtype=torch.float32)
@@ -1302,6 +1305,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                         family_spec_logits_te[fam_name] = te_l
                         family_spec_logits_unseen[fam_name] = u_l
                         family_spec_classes[fam_name] = cls_l
+                        family_spec_gate_weights[fam_name] = float(read_checkpoint_meta(spec_p).get("default_gate_weight", 0.40))
 
             trunk1.free_memory()
             del trunk1
@@ -1746,7 +1750,8 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
     # -------------------------------------------------------------------------
     # STAGE 3A: Claude Specialist Gate (Vectorized Head)
     # -------------------------------------------------------------------------
-    gate_weight = post_cfg.get("claude_specialist_weight", 0.15)
+    claude_default_gw = family_spec_gate_weights.get("claude", 0.40)
+    gate_weight = float(post_cfg.get("claude_specialist_weight", claude_default_gw))
     P_mix = apply_claude_specialist_gate(
         P_mix=P_mix,
         R_main=R_main,
@@ -1760,10 +1765,11 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
     # -------------------------------------------------------------------------
     # STAGE 3B: Deep Neural Family-Specialist LoRA Gates (GPT, Gemini, GLM)
     # -------------------------------------------------------------------------
-    for fam_k, default_w in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
+    for fam_k in ["gpt", "gemini", "glm"]:
         spec_te_logits = family_spec_logits_te.get(fam_k)
         if spec_te_logits is not None:
             spec_cls = family_spec_classes.get(fam_k)
+            default_w = family_spec_gate_weights.get(fam_k, 0.40)
             w_gate = float(post_cfg.get(f"{fam_k}_specialist_weight", default_w))
             P_mix = apply_family_specialist_lora_gate(
                 P_mix=P_mix,

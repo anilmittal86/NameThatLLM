@@ -281,7 +281,7 @@ def apply_claude_specialist_gate(
     claude_classes: list | None = None,
     labels: list = LABELS,
     claude_cols: list = FAMILIES["claude"],
-    gate_weight: float = 0.15,
+    gate_weight: float = 0.40,
     weight: float | None = None,
 ) -> np.ndarray:
     """
@@ -304,13 +304,16 @@ def apply_claude_specialist_gate(
             c_idx = [src_c.index(labels[c]) for c in claude_cols]
             P_claude_head = P_claude_head[:, c_idx]
 
-    claude_mask = np.isin(R_main.argmax(axis=1), claude_cols)
+    fam_mass = P_out[:, claude_cols].sum(axis=1)
+    claude_mask = np.isin(R_main.argmax(axis=1), claude_cols) | (fam_mass >= 0.10)
     if claude_mask.any():
-        rows = np.flatnonzero(claude_mask)
-        sub_mix = P_out[np.ix_(rows, claude_cols)]
-        tot_mass = sub_mix.sum(axis=1, keepdims=True)
-        blended = (1.0 - gate_weight) * sub_mix + gate_weight * (tot_mass * P_claude_head[rows])
-        P_out[np.ix_(rows, claude_cols)] = blended
+        for idx in np.flatnonzero(claude_mask):
+            orig_mass = float(P_out[idx, claude_cols].sum())
+            if orig_mass > 1e-6:
+                gw_eff = float(gate_weight) * min(orig_mass / 0.50, 1.0)
+                main_norm = P_out[idx, claude_cols] / orig_mass
+                fused_fam = (1.0 - gw_eff) * main_norm + gw_eff * P_claude_head[idx]
+                P_out[idx, claude_cols] = fused_fam * orig_mass
 
     return P_out
 
@@ -322,7 +325,7 @@ def apply_family_specialist_lora_gate(
     spec_classes: list | None = None,
     labels: list = LABELS,
     family_cols: list = FAMILIES["gemini"],
-    gate_weight: float = 0.65,
+    gate_weight: float = 0.40,
 ) -> np.ndarray:
     """
     Refines intra-family predictions using fine-tuned Qwen3-14B Family-Specialist LoRAs
@@ -346,17 +349,16 @@ def apply_family_specialist_lora_gate(
 
     fam_mass = P_out[:, family_cols].sum(axis=1)
     has_signal = np.ptp(spec_arr, axis=1) > 1e-6
-    fam_mask = (np.isin(R_main.argmax(axis=1), family_cols) | (fam_mass >= 0.35)) & has_signal
+    fam_mask = (np.isin(R_main.argmax(axis=1), family_cols) | (fam_mass >= 0.10)) & has_signal
 
     if fam_mask.any():
-        rows = np.flatnonzero(fam_mask)
-        sub_mix = np.clip(P_out[np.ix_(rows, family_cols)], 1e-12, 1.0)
-        tot_mass = sub_mix.sum(axis=1, keepdims=True)
-        base_rel = sub_mix / tot_mass
-
-        log_rel = (1.0 - float(gate_weight)) * np.log(base_rel) + float(gate_weight) * np.log(np.clip(P_spec[rows], 1e-12, 1.0))
-        blended_rel = softmax(log_rel, axis=1)
-        P_out[np.ix_(rows, family_cols)] = tot_mass * blended_rel
+        for idx in np.flatnonzero(fam_mask):
+            orig_mass = float(P_out[idx, family_cols].sum())
+            if orig_mass > 1e-6:
+                gw_eff = float(gate_weight) * min(orig_mass / 0.50, 1.0)
+                main_norm = P_out[idx, family_cols] / orig_mass
+                fused_fam = (1.0 - gw_eff) * main_norm + gw_eff * P_spec[idx]
+                P_out[idx, family_cols] = fused_fam * orig_mass
 
     return P_out
 
