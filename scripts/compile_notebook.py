@@ -115,6 +115,8 @@ def compile_training_notebook(config_path: Path, output_path: Path) -> Path:
         raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
         if mod == "config.py":
             raw = f"TRAINING_CONFIG = {cfg_data!r}\n\n" + raw
+        elif mod == "trainer.py":
+            raw = re.sub(r'if __name__ == ["\']__main__["\'][\s\S]*$', '', raw).strip() + "\n"
         ast.parse(raw, filename=mod)
         cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
 

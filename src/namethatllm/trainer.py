@@ -4593,7 +4593,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-multiview", action="store_true", help="Add engineered multi-view features")
     parser.add_argument("--no-velocity", action="store_true", help="Disable inter-layer velocity directions")
     parser.add_argument("--no-layer-weighting", action="store_true", help="Disable layer-probing importance weighting")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     if args.from_embeddings_dir:
         out_p = Path(args.output_dir) if args.output_dir else Path(f"export_{args.target_family}_gate_{args.head_type}")
