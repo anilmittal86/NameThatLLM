@@ -254,12 +254,18 @@ def _compute_layer_oof_scores(
     prompt_ids: list[Any] | np.ndarray | None = None,
     alpha: float = 5.0,
     n_splits: int = 5,
+    device: torch.device | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Computes 5-fold OOF Ridge probe scores s_l = 0.5 * family_oof_bacc + 0.5 * hard_pair_oof_acc
     for each tapped layer block X_l in Z_fam_c.
     Returns (layer_weights, oof_baccs, composite_scores).
     """
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+
     N, D_total = Z_fam_c.shape
     D_layer = D_total // max(num_tapped_layers, 1)
 
@@ -295,30 +301,34 @@ def _compute_layer_oof_scores(
 
         oof_l = np.zeros((N, num_family_classes), dtype=np.float32)
         for tr_idx, val_idx in folds:
-            X_tr, Y_tr = X_l[tr_idx], Y_oh[tr_idx]
-            X_val = X_l[val_idx]
+            X_tr_t = torch.from_numpy(X_l[tr_idx]).float().to(device)
+            Y_tr_t = torch.from_numpy(Y_oh[tr_idx]).float().to(device)
+            X_val_t = torch.from_numpy(X_l[val_idx]).float().to(device)
 
-            mu_tr = X_tr.mean(axis=0, keepdims=True)
-            X_tr_c = X_tr - mu_tr
-            X_val_c = X_val - mu_tr
+            mu_tr = X_tr_t.mean(dim=0, keepdim=True)
+            X_tr_c = X_tr_t - mu_tr
+            X_val_c = X_val_t - mu_tr
 
             N_tr, D_l = X_tr_c.shape
-            scale = float(np.mean(np.sum(X_tr_c * X_tr_c, axis=1)))
-            eff_alpha = alpha * max(scale / 512.0, 1e-3)
+            scale = float((X_tr_c * X_tr_c).sum(dim=1).mean().item())
+            eff_alpha = float(alpha * max(scale / 512.0, 1e-3))
+            Y_tr_c = Y_tr_t - Y_tr_t.mean(dim=0, keepdim=True)
 
             if N_tr >= D_l:
                 Cov = X_tr_c.T @ X_tr_c
-                Cov.flat[:: D_l + 1] += eff_alpha
-                W_l = np.linalg.solve(Cov, X_tr_c.T @ (Y_tr - Y_tr.mean(axis=0, keepdims=True)))
-                b_l = Y_tr.mean(axis=0)
+                Cov.diagonal().add_(eff_alpha)
+                W_l = torch.linalg.solve(Cov, X_tr_c.T @ Y_tr_c)
+                b_l = Y_tr_t.mean(dim=0)
             else:
                 K_mat = X_tr_c @ X_tr_c.T
-                K_mat.flat[:: N_tr + 1] += eff_alpha
-                A = np.linalg.solve(K_mat, Y_tr - Y_tr.mean(axis=0, keepdims=True))
+                K_mat.diagonal().add_(eff_alpha)
+                A = torch.linalg.solve(K_mat, Y_tr_c)
                 W_l = X_tr_c.T @ A
-                b_l = Y_tr.mean(axis=0)
+                b_l = Y_tr_t.mean(dim=0)
 
-            oof_l[val_idx] = X_val_c @ W_l + b_l
+            oof_val = X_val_c @ W_l + b_l
+            oof_l[val_idx] = oof_val.cpu().numpy()
+            del X_tr_t, Y_tr_t, X_val_t, X_tr_c, X_val_c, W_l, b_l
 
         pred_labels = oof_l.argmax(axis=1)
         fam_bacc = float(balanced_accuracy_score(y_fam, pred_labels))
@@ -541,11 +551,22 @@ def run_all_layers_probe_sweep(
 
     if prompts is not None:
         p_fam = prompts[fam_mask]
-        u_p = np.unique(p_fam)
-        use_groups = len(u_p) >= n_splits and len(u_p) < 0.8 * N
+        p_str = np.asarray([str(p) for p in p_fam])
+        valid_grp_mask = ~((p_str == "-1") | np.char.startswith(p_str, "pool_") | np.char.startswith(p_str, "neg_"))
+        if valid_grp_mask.sum() > 0:
+            u_p, counts = np.unique(p_str[valid_grp_mask], return_counts=True)
+            use_groups = int((counts > 1).sum()) >= 5
+        else:
+            use_groups = False
     else:
         p_fam = None
         use_groups = False
+
+    device = kwargs.get("device")
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
 
     n_splits_eff = max(min(n_splits, N // max(num_family_classes, 1)), 2)
     if use_groups:
@@ -570,27 +591,38 @@ def run_all_layers_probe_sweep(
     print("--------------------------------------------------------------------------------")
 
     for l_idx in range(L):
-        X_l = X_layers[:, l_idx, :].astype(np.float32)
+        X_l = X_layers[:, l_idx, :]
         oof_l = np.zeros((N, num_family_classes), dtype=np.float32)
 
         for tr_idx, val_idx in folds:
-            X_tr, Y_tr = X_l[tr_idx], Y_oh[tr_idx]
-            X_val = X_l[val_idx]
+            X_tr_t = torch.from_numpy(X_l[tr_idx]).float().to(device)
+            Y_tr_t = torch.from_numpy(Y_oh[tr_idx]).float().to(device)
+            X_val_t = torch.from_numpy(X_l[val_idx]).float().to(device)
 
-            mu_tr = X_tr.mean(axis=0, keepdims=True)
-            X_tr_c = X_tr - mu_tr
-            X_val_c = X_val - mu_tr
+            mu_tr = X_tr_t.mean(dim=0, keepdim=True)
+            X_tr_c = X_tr_t - mu_tr
+            X_val_c = X_val_t - mu_tr
 
-            scale = float(np.mean(np.sum(X_tr_c * X_tr_c, axis=1)))
-            eff_alpha = alpha * max(scale / 512.0, 1e-3)
+            N_tr, D_l = X_tr_c.shape
+            scale = float((X_tr_c * X_tr_c).sum(dim=1).mean().item())
+            eff_alpha = float(alpha * max(scale / 512.0, 1e-3))
+            Y_tr_c = Y_tr_t - Y_tr_t.mean(dim=0, keepdim=True)
 
-            K_mat = X_tr_c @ X_tr_c.T
-            K_mat.flat[:: len(tr_idx) + 1] += eff_alpha
-            A = np.linalg.solve(K_mat, Y_tr - Y_tr.mean(axis=0, keepdims=True))
-            W_l = X_tr_c.T @ A
-            b_l = Y_tr.mean(axis=0)
+            if N_tr >= D_l:
+                Cov = X_tr_c.T @ X_tr_c
+                Cov.diagonal().add_(eff_alpha)
+                W_l = torch.linalg.solve(Cov, X_tr_c.T @ Y_tr_c)
+                b_l = Y_tr_t.mean(dim=0)
+            else:
+                K_mat = X_tr_c @ X_tr_c.T
+                K_mat.diagonal().add_(eff_alpha)
+                A = torch.linalg.solve(K_mat, Y_tr_c)
+                W_l = X_tr_c.T @ A
+                b_l = Y_tr_t.mean(dim=0)
 
-            oof_l[val_idx] = X_val_c @ W_l + b_l
+            oof_val = X_val_c @ W_l + b_l
+            oof_l[val_idx] = oof_val.cpu().numpy()
+            del X_tr_t, Y_tr_t, X_val_t, X_tr_c, X_val_c, W_l, b_l
 
         layer_oof_logits[l_idx] = oof_l
         fam_bacc = float(balanced_accuracy_score(y_fam, oof_l.argmax(axis=1)))
@@ -608,17 +640,23 @@ def run_all_layers_probe_sweep(
             "hard_pair_oof_acc": pair_acc,
             "oof_balanced_acc": fam_bacc,
         })
+        print(
+            f" L{l_idx:02d}   | {fam_bacc * 100:6.2f}%         | {pair_acc * 100:6.2f}%                    | (solving...)",
+            flush=True,
+        )
 
     # Compute precision-weighted ScalarMix weights across layers based on log-odds margin
     raw_scores = np.array([0.5 * m["family_oof_bacc"] + 0.5 * m["hard_pair_oof_acc"] for m in layer_metrics])
     centered_scores = (raw_scores - raw_scores.max()) * 15.0
     scalar_mix_weights = np.exp(centered_scores) / np.sum(np.exp(centered_scores))
 
+    print("\n--- Final Layer Probing Weights ---", flush=True)
     for l_idx, m in enumerate(layer_metrics):
         m["scalar_mix_weight"] = float(scalar_mix_weights[l_idx])
         print(
             f" L{l_idx:02d}   | {m['family_oof_bacc'] * 100:6.2f}%         | "
-            f"{m['hard_pair_oof_acc'] * 100:6.2f}%                    | {scalar_mix_weights[l_idx]:6.4f}"
+            f"{m['hard_pair_oof_acc'] * 100:6.2f}%                    | {scalar_mix_weights[l_idx]:6.4f}",
+            flush=True,
         )
 
     # Evaluate ScalarMix Ensemble across all layers

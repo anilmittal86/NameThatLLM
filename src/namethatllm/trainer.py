@@ -260,10 +260,8 @@ class MultiLayerLoRAClassifier(nn.Module):
                 layer_dev = h.device
                 m_l = m.to(layer_dev)
                 den_l = den.to(layer_dev)
-                h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
                 p_l = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
-                # Clamp to safe FP16 range without destroying layer norm magnitude
-                p_l = torch.clamp(p_l, min=-65000.0, max=65000.0)
+                p_l = torch.nan_to_num(p_l, nan=0.0, posinf=65000.0, neginf=-65000.0).clamp(min=-65000.0, max=65000.0)
                 all_layers_pooled.append(p_l.to(first_device))
 
         pooled_list = []
@@ -275,8 +273,8 @@ class MultiLayerLoRAClassifier(nn.Module):
             layer_dev = h.device
             m_l = m.to(layer_dev)
             den_l = den.to(layer_dev)
-            h = torch.nan_to_num(h, nan=0.0, posinf=1e4, neginf=-1e4)
             pooled = (h * m_l.unsqueeze(-1)).sum(dim=1) / den_l
+            pooled = torch.nan_to_num(pooled, nan=0.0, posinf=65000.0, neginf=-65000.0).clamp(min=-65000.0, max=65000.0)
 
             if return_multiview:
                 mh_l = m_head.to(layer_dev).unsqueeze(-1)
@@ -820,6 +818,74 @@ def fit_ridge_heads(
     b_c = W_c_tilde[:, -1]
 
     return W_p, b_p, W_c, b_c
+
+
+def _stabilize_fp16_backbone(mod: nn.Module) -> None:
+    """
+    Prevents float16 overflow (>65,504 -> Inf -> NaN) in Qwen2.5/Qwen3 14B on Turing T4 GPUs
+    without increasing weight VRAM:
+      1. In every MLP block (gate_proj, up_proj, down_proj), computes the SwiGLU product
+         `inter = act_fn(gate_proj(x).float()) * up_proj(x).float()` in FP32, scales `inter`
+         into safe FP16 range `[-16384, 16384]` via per-token factor `s`, runs `down_proj(inter / s)`
+         in FP16, and rescales by `s` in FP32. Since `down_proj` has bias=None, `s * down_proj(inter / s)`
+         is mathematically exact with zero clipping distortion.
+      2. Clamps DecoderLayer residual stream outputs to safe FP16 range `[-65000.0, 65000.0]`
+         and upcasts RMSNorm variance calculation to FP32.
+    """
+    import types
+
+    for _, sub in mod.named_modules():
+        # 1. Upcast RMSNorm calculation to FP32
+        cls_name = sub.__class__.__name__.lower()
+        if "rmsnorm" in cls_name and not getattr(sub, "_fp32_norm_patched", False):
+            orig_norm_fwd = sub.forward
+
+            def _safe_rms_fwd(self_norm, x, _orig=orig_norm_fwd):
+                x_clean = torch.nan_to_num(x.float(), nan=0.0, posinf=65000.0, neginf=-65000.0)
+                variance = x_clean.pow(2).mean(-1, keepdim=True)
+                x_normed = x_clean * torch.rsqrt(variance + getattr(self_norm, "variance_epsilon", 1e-6))
+                w = self_norm.weight
+                return (w.float() * x_normed).to(x.dtype)
+
+            sub.forward = types.MethodType(_safe_rms_fwd, sub)
+            sub._fp32_norm_patched = True
+
+        # 2. Dynamic range scaling for SwiGLU MLP (gate_proj, up_proj, down_proj)
+        if (
+            hasattr(sub, "gate_proj")
+            and hasattr(sub, "up_proj")
+            and hasattr(sub, "down_proj")
+            and hasattr(sub, "act_fn")
+            and not getattr(sub, "_fp32_mlp_patched", False)
+        ):
+            def _safe_mlp_fwd(self_mlp, x):
+                in_dtype = x.dtype
+                x_safe = torch.nan_to_num(x, nan=0.0, posinf=65000.0, neginf=-65000.0)
+                gate_f = self_mlp.act_fn(self_mlp.gate_proj(x_safe).float())
+                up_f = self_mlp.up_proj(x_safe).float()
+                inter_f = gate_f * up_f
+                # Per-token dynamic scale factor so down_proj input never exceeds 16,384 in FP16
+                max_val = inter_f.abs().amax(dim=-1, keepdim=True).clamp(min=1.0)
+                scale = (max_val / 16384.0).clamp(min=1.0)
+                inter_scaled = (inter_f / scale).to(in_dtype)
+                down_out = self_mlp.down_proj(inter_scaled).float() * scale
+                return torch.clamp(down_out, min=-65000.0, max=65000.0).to(in_dtype)
+
+            sub.forward = types.MethodType(_safe_mlp_fwd, sub)
+            sub._fp32_mlp_patched = True
+
+        # 3. Clamp DecoderLayer output tuple / tensor so residual stream cannot overflow FP16
+        if "decoderlayer" in cls_name and not getattr(sub, "_fp16_clamp_hooked", False):
+            def _clamp_layer_out(module, inputs, output):
+                if isinstance(output, torch.Tensor):
+                    return torch.nan_to_num(output, nan=0.0, posinf=65000.0, neginf=-65000.0).clamp(-65000.0, 65000.0)
+                if isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], torch.Tensor):
+                    h0 = torch.nan_to_num(output[0], nan=0.0, posinf=65000.0, neginf=-65000.0).clamp(-65000.0, 65000.0)
+                    return (h0,) + output[1:]
+                return output
+
+            sub.register_forward_hook(_clamp_layer_out)
+            sub._fp16_clamp_hooked = True
 
 
 def compute_grouped_inference_logits(
@@ -1557,8 +1623,19 @@ def run_training_pipeline(
                 adapter_sd = load_file(str(adapter_file))
                 set_peft_model_state_dict(base_model, adapter_sd)
                 print(f"[Trainer] Loaded champion LoRA weights from {adapter_found} for extraction.")
+                if hasattr(base_model, "merge_and_unload"):
+                    try:
+                        base_model = base_model.merge_and_unload()
+                        model.backbone = base_model
+                        print("[Trainer] Successfully merged and unloaded champion LoRA weights into base model.")
+                    except Exception as e:
+                        print(f"[Trainer] Note on merge_and_unload: {e}")
             except Exception as e:
                 print(f"[Trainer] Note on loading adapter for extraction: {e}")
+
+        if compute_dtype == torch.float16:
+            _stabilize_fp16_backbone(model.backbone)
+            print("[Trainer] Stabilized FP16 backbone with FP32 SwiGLU scaling and residual hooks.")
 
         head_loaded = False
         if adapter_found is not None:
@@ -1645,6 +1722,13 @@ def run_training_pipeline(
 
                 set_peft_model_state_dict(base_model, adapter_sd)
                 print(f"[Trainer] Successfully loaded champion LoRA weights from {adapter_found}")
+                if hasattr(base_model, "merge_and_unload"):
+                    try:
+                        base_model = base_model.merge_and_unload()
+                        model.backbone = base_model
+                        print("[Trainer] Successfully merged and unloaded champion LoRA weights into base model.")
+                    except Exception as e:
+                        print(f"[Trainer] Note on merge_and_unload: {e}")
             except Exception as e:
                 print(f"[Trainer] Error loading champion adapter weights: {e}")
                 if not is_smoke:
@@ -1655,6 +1739,10 @@ def run_training_pipeline(
                 found_all = list(input_dir.rglob("adapter_model.safetensors"))
                 if found_all:
                     raise RuntimeError(f"Discovered adapters on disk but none were compatible with {backbone_name} (r={lora_r_val}): {found_all}")
+
+        if compute_dtype == torch.float16:
+            _stabilize_fp16_backbone(model.backbone)
+            print("[Trainer] Stabilized FP16 backbone with FP32 SwiGLU scaling and residual hooks.")
 
         head_loaded = False
         if adapter_found is not None:
@@ -3101,7 +3189,7 @@ def extract_and_export_embeddings(
     logits_c_list = []
 
     with torch.no_grad():
-        with torch.amp.autocast(device.type, dtype=amp_dtype):
+        with torch.amp.autocast(device.type, enabled=(amp_dtype == torch.bfloat16), dtype=amp_dtype):
             for batch in loader_tr:
                 mb_ids = batch["input_ids"].to(device)
                 mb_mask = batch["attention_mask"].to(device)
@@ -3124,6 +3212,21 @@ def extract_and_export_embeddings(
                         mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True,
                         return_by_layer=True, extract_all_layers=save_all_layers, return_multiview=False
                     )
+
+                if len(Z_cat_list) == 0:
+                    d_chunk = max(z_b.shape[1] // max(len(model.layers), 1), 1)
+                    chunk_stds = [float(z_b[:, i * d_chunk : (i + 1) * d_chunk].std().item()) for i in range(len(model.layers))]
+                    layer_stds = [float(z_l[:, i, :].std().item()) for i in range(z_l.shape[1])] if (save_all_layers and z_l is not None and z_l.ndim == 3) else chunk_stds
+                    dead_layers = [i for i, s in enumerate(layer_stds) if s < 1e-6 or not math.isfinite(s)]
+                    print(
+                        f"[Sanity Check Batch 0] Active layers: {len(layer_stds) - len(dead_layers)}/{len(layer_stds)} | "
+                        f"Layer std range: [{min(layer_stds):.4f}, {max(layer_stds):.4f}] | "
+                        f"Tapped {len(model.layers)}-layer std range: [{min(chunk_stds):.4f}, {max(chunk_stds):.4f}]",
+                        flush=True,
+                    )
+                    if dead_layers:
+                        raise RuntimeError(f"Batch 0 Sanity Check FAILED: Layers {dead_layers} have zero/NaN activations!")
+
                 Z_cat_list.append(z_b.cpu().float().numpy())
                 Z_layers_list.append(z_l.cpu().to(torch.float16).numpy())
                 if has_plain:
@@ -3164,7 +3267,7 @@ def extract_and_export_embeddings(
         ev_lc_list = []
 
         with torch.no_grad():
-            with torch.amp.autocast(device.type, dtype=amp_dtype):
+            with torch.amp.autocast(device.type, enabled=(amp_dtype == torch.bfloat16), dtype=amp_dtype):
                 for batch in loader_ev:
                     mb_ids = batch["input_ids"].to(device)
                     mb_mask = batch["attention_mask"].to(device)
@@ -3881,7 +3984,7 @@ def train_family_gate(
         except Exception:
             pass
     with torch.no_grad():
-        with torch.amp.autocast(device.type, dtype=amp_dtype):
+        with torch.amp.autocast(device.type, enabled=(amp_dtype == torch.bfloat16), dtype=amp_dtype):
             for batch in loader_tr:
                 mb_ids = batch["input_ids"].to(device)
                 mb_mask = batch["attention_mask"].to(device)
@@ -3901,6 +4004,21 @@ def train_family_gate(
                     Z_tr_layers_list.append(z_l.cpu().to(torch.float16).numpy())
                 else:
                     z_b = model.forward_features(mb_ids[:, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+
+                if len(Z_tr_list) == 0:
+                    d_chunk = max(z_b.shape[1] // max(len(model.layers), 1), 1)
+                    chunk_stds = [float(z_b[:, i * d_chunk : (i + 1) * d_chunk].std().item()) for i in range(len(model.layers))]
+                    layer_stds = [float(z_l[:, i, :].std().item()) for i in range(z_l.shape[1])] if (need_layers and z_l is not None and z_l.ndim == 3) else chunk_stds
+                    dead_layers = [i for i, s in enumerate(layer_stds) if s < 1e-6 or not math.isfinite(s)]
+                    print(
+                        f"[Sanity Check Batch 0] Active layers: {len(layer_stds) - len(dead_layers)}/{len(layer_stds)} | "
+                        f"Layer std range: [{min(layer_stds):.4f}, {max(layer_stds):.4f}] | "
+                        f"Tapped {len(model.layers)}-layer std range: [{min(chunk_stds):.4f}, {max(chunk_stds):.4f}]",
+                        flush=True,
+                    )
+                    if dead_layers:
+                        raise RuntimeError(f"Batch 0 Sanity Check FAILED: Layers {dead_layers} have zero/NaN activations!")
+
                 Z_tr_list.append(z_b.cpu().float().numpy())
     Z_train = np.vstack(Z_tr_list)
     Z_train_layers = np.vstack(Z_tr_layers_list) if Z_tr_layers_list else None
@@ -3929,7 +4047,7 @@ def train_family_gate(
         ev_cos_list = []
         ev_std_list = []
         with torch.no_grad():
-            with torch.amp.autocast(device.type, dtype=amp_dtype):
+            with torch.amp.autocast(device.type, enabled=(amp_dtype == torch.bfloat16), dtype=amp_dtype):
                 for batch in loader_ev:
                     mb_ids = batch["input_ids"].to(device)
                     mb_mask = batch["attention_mask"].to(device)

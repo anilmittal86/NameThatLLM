@@ -31,6 +31,7 @@ from namethatllm.layer_probing import (
 from namethatllm.trainer import (
     FamilyMLPHead,
     MultiLayerLoRAClassifier,
+    _stabilize_fp16_backbone,
     build_supervised_family_subspace,
     fit_family_mlp_head,
     save_extracted_features_bundle,
@@ -556,4 +557,47 @@ class TestGateAndLayerProbing:
 
         # High-accuracy layer directions vs noisy layer directions
         assert vars_w.max() > 1.1 * vars_w.min()
+
+    def test_stabilize_fp16_backbone_swiglu_overflow(self):
+        """
+        Verifies that _stabilize_fp16_backbone prevents float16 SwiGLU product overflow
+        (>65,504 -> Inf -> NaN) on large inputs (x = 500.0) without distortion.
+        """
+        class MockMLP(nn.Module):
+            def __init__(self, d_in=64, d_hid=128):
+                super().__init__()
+                self.gate_proj = nn.Linear(d_in, d_hid, bias=False)
+                self.up_proj = nn.Linear(d_in, d_hid, bias=False)
+                self.down_proj = nn.Linear(d_hid, d_in, bias=False)
+                self.act_fn = nn.SiLU()
+
+            def forward(self, x):
+                return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+        torch.manual_seed(42)
+        mlp_fp32 = MockMLP(64, 128).float()
+        mlp_fp16 = MockMLP(64, 128).half()
+        mlp_fp16.load_state_dict({k: v.half() for k, v in mlp_fp32.state_dict().items()})
+
+        # Large inputs: x = 500.0 makes gate * up ~ 250,000, which overflows float16 (> 65,504)
+        x_large_fp32 = torch.full((2, 10, 64), 500.0, dtype=torch.float32)
+        x_large_fp16 = torch.full((2, 10, 64), 500.0, dtype=torch.float16)
+
+        # 1. Unpatched float16 overflows to Inf/NaN
+        out_unpatched_fp16 = mlp_fp16(x_large_fp16)
+        assert torch.isinf(out_unpatched_fp16).any() or torch.isnan(out_unpatched_fp16).any()
+
+        # 2. Patch with _stabilize_fp16_backbone
+        _stabilize_fp16_backbone(mlp_fp16)
+        out_patched_fp16 = mlp_fp16(x_large_fp16)
+
+        # Output must be completely finite and non-zero
+        assert torch.isfinite(out_patched_fp16).all()
+        assert (out_patched_fp16 != 0.0).any()
+
+        # 3. Output matches float32 reference (clamped to [-65000, 65000]) with high cosine fidelity
+        out_ref_fp32 = mlp_fp32(x_large_fp32).clamp(-65000.0, 65000.0)
+        cos_sim = F.cosine_similarity(out_patched_fp16.float().flatten(), out_ref_fp32.flatten(), dim=0)
+        assert cos_sim.item() > 0.95
+
 
