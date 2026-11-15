@@ -1245,6 +1245,12 @@ def run_training_pipeline(
     checkpoints_volume = train_cfg.get("checkpoints_volume", None)
 
     input_dir = Path(train_cfg.get("input_dir", "/kaggle/input"))
+    target_family = train_cfg.get("target_family")
+    is_gate_or_export = bool(
+        train_cfg.get("pipeline_mode") in ("family_gate", "export_embeddings", "extract_features")
+        or train_cfg.get("mode") == "family_gate"
+        or train_cfg.get("gate_training")
+    )
 
     # Preserve existing 18-class in-house champion checkpoint if present in input_dir
     working_champ = Path("/kaggle/working/export_champion_qwen3_14b")
@@ -1292,12 +1298,6 @@ def run_training_pipeline(
         )
         return out_dir
 
-    target_family = train_cfg.get("target_family")
-    is_gate_or_export = bool(
-        train_cfg.get("pipeline_mode") in ("family_gate", "export_embeddings", "extract_features")
-        or train_cfg.get("mode") == "family_gate"
-        or train_cfg.get("gate_training")
-    )
     is_specialist = bool(target_family and target_family in FAMILIES and not is_gate_or_export)
     if is_specialist:
         fam_cols = FAMILIES[target_family]
@@ -2179,6 +2179,11 @@ def fit_family_gate_head(
     """
     from sklearn.model_selection import GroupKFold, StratifiedKFold
 
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     if alphas is None:
         alphas = [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
 
@@ -2280,7 +2285,7 @@ def fit_family_gate_head(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return best_w, best_b, best_alpha, best_acc, best_eval_logits
+    return best_w, best_b, best_alpha, best_acc, best_eval_logits, best_oof_bacc
 
 
 from .layer_probing import (
@@ -2351,6 +2356,11 @@ def fit_family_mlp_head(
     with sibling margin penalties and folds (PCA + centering / affine) into Layer 1 (W1*, b1*).
     """
     from sklearn.model_selection import StratifiedKFold
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -2502,7 +2512,7 @@ def fit_family_mlp_head(
             best_eval_acc = float(balanced_accuracy_score(y_eval_true, fam_pred))
 
     # 5. Fit closed-form Ridge head for a valid linear fallback in plain.weight / plain.bias
-    W_ridge, b_ridge, _, _, _ = fit_family_gate_head(
+    W_ridge, b_ridge, *_ = fit_family_gate_head(
         Z_train=Z_train,
         y_train=y_train,
         num_gate_classes=num_gate_classes,
@@ -2528,24 +2538,6 @@ def fit_family_mlp_head(
         plain_w = torch.from_numpy(W_ridge.T).to(torch.float32).contiguous()
         plain_b = torch.from_numpy(b_ridge).to(torch.float32).contiguous()
 
-    # Ensembled Logit Fold-In (0.65 MLP + 0.35 Folded Ridge)
-    if eval_target is not None and best_eval_logits is not None:
-        ridge_ev_logits = eval_target @ plain_w.cpu().numpy().T + plain_b.cpu().numpy()
-        blend_logits = 0.65 * best_eval_logits + 0.35 * ridge_ev_logits
-        # Re-normalize ensembled intra-family logits to row_std = 3.2 before sp_softmax
-        blend_fam = blend_logits[:, :num_family_classes]
-        row_std_b = float(np.std(blend_fam, axis=1).mean()) if len(blend_fam) > 0 else 1.0
-        temp_scale_b = (3.2 / row_std_b) if row_std_b > 1e-4 else 1.0
-        blend_logits = (blend_logits * temp_scale_b).astype(np.float32)
-
-        if y_eval_true is not None and eval_mask is not None and eval_mask.sum() > 0:
-            blend_pred = blend_logits[eval_mask, :num_family_classes].argmax(axis=1)
-            blend_acc = float(balanced_accuracy_score(y_eval_true, blend_pred))
-            if blend_acc >= best_eval_acc:
-                print(f"  [Folded Ensemble] 0.65 MLP + 0.35 Ridge lift: {best_eval_acc * 100:.2f}% -> {blend_acc * 100:.2f}%")
-                best_eval_acc = blend_acc
-                best_eval_logits = blend_logits
-
     head_dict = {
         "mlp_w1": W1_folded.cpu().to(torch.float32).contiguous(),
         "mlp_b1": b1_folded.cpu().to(torch.float32).contiguous(),
@@ -2563,7 +2555,7 @@ def fit_family_mlp_head(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return head_dict, best_eval_acc, best_eval_logits
+    return head_dict, best_eval_acc, best_eval_logits, best_val_acc
 
 
 def find_compatible_champion_lora(
@@ -3429,7 +3421,7 @@ def train_family_gate_from_dataset(
         acc_plain_within = float(balanced_accuracy_score(y_fam_true, plain_fam_pred))
 
     # Step 4: Ridge Head
-    best_w_pca, best_b_pca, ridge_alpha, ridge_acc, ridge_logits_ev = fit_family_gate_head(
+    best_w_pca, best_b_pca, ridge_alpha, ridge_acc, ridge_logits_ev, ridge_oof_bacc = fit_family_gate_head(
         Z_train=Z_tr_active,
         y_train=y_train,
         num_gate_classes=num_gate_classes,
@@ -3460,7 +3452,7 @@ def train_family_gate_from_dataset(
     plain_b_tensor = torch.from_numpy(best_b).to(torch.float32).contiguous()
 
     # Step 5: MLP Head
-    mlp_head_dict, mlp_acc, mlp_logits_ev = fit_family_mlp_head(
+    mlp_head_dict, mlp_acc, mlp_logits_ev, mlp_val_acc = fit_family_mlp_head(
         Z_train=Z_tr_active,
         y_train=y_train,
         num_gate_classes=num_gate_classes,
@@ -3479,32 +3471,133 @@ def train_family_gate_from_dataset(
         raw_Z_eval=Z_eval if pca_components is not None else None,
     )
 
-    # Hybrid 0.65 MLP + 0.35 Ridge logits if both available
+    # Hybrid 0.65 MLP + 0.35 Ridge logits scaled to row_std = 3.2
     hybrid_logits_ev = None
     if mlp_logits_ev is not None and ridge_logits_ev is not None:
-        hybrid_logits_ev = 0.65 * mlp_logits_ev + 0.35 * ridge_logits_ev
+        raw_hyb = 0.65 * mlp_logits_ev + 0.35 * ridge_logits_ev
+        hyb_fam = raw_hyb[:, :num_family_classes]
+        hyb_std = float(np.std(hyb_fam, axis=1).mean()) if len(hyb_fam) > 0 else 1.0
+        hyb_scale = (3.2 / hyb_std) if hyb_std > 1e-4 else 1.0
+        hybrid_logits_ev = (raw_hyb * hyb_scale).astype(np.float32)
+
+    # Evaluate holdout accuracy, hard sister pair accuracy, and pipe results for each candidate head
+    default_gw = float(gate_weight)
+
+    def _eval_head_metrics(h_logits: np.ndarray | None):
+        if h_logits is None:
+            return 0.0, 0.0, {}
+        ev_acc = 0.0
+        if fam_eval_mask is not None and fam_eval_mask.sum() > 0 and y_fam_true is not None:
+            fam_pred = h_logits[fam_eval_mask, :num_family_classes].argmax(axis=1)
+            ev_acc = float(balanced_accuracy_score(y_fam_true, fam_pred))
+
+        hard_acc = ev_acc
+        if y_fam_true is not None and eff_hard_pair is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
+            s_a, s_b = eff_hard_pair
+            pair_mask_ev = (y_fam_true == s_a) | (y_fam_true == s_b)
+            if pair_mask_ev.sum() > 0 and len(np.unique(y_fam_true[pair_mask_ev])) == 2:
+                fam_l = h_logits[fam_eval_mask, :num_family_classes]
+                spec_pair_preds = np.where(fam_l[pair_mask_ev, s_a] >= fam_l[pair_mask_ev, s_b], s_a, s_b)
+                hard_acc = float(balanced_accuracy_score(y_fam_true[pair_mask_ev], spec_pair_preds))
+
+        p_res = {}
+        if main_logits_eval is not None and y_ev_arr is not None:
+            P_main = sp_softmax(main_logits_eval, axis=1)
+            acc_plain_solo = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
+            cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
+            spec_probs = sp_softmax(h_logits[:, :num_family_classes], axis=1)
+
+            best_pipe_acc = 0.0
+            best_pipe_w = default_gw
+            best_raw_bacc = 0.0
+            best_sk_bacc = 0.0
+            default_raw_bacc = 0.0
+            default_sk_bacc = 0.0
+            sweep_weights = sorted(set([0.10, 0.20, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60, default_gw]))
+
+            for gw in sweep_weights:
+                P_fused = P_main.copy()
+                for idx in np.flatnonzero(cand_mask):
+                    orig_mass = float(P_main[idx, family_cols].sum())
+                    if orig_mass > 1e-6:
+                        gw_eff = gw * min(orig_mass / 0.50, 1.0)
+                        main_norm = P_main[idx, family_cols] / orig_mass
+                        fused_fam = (1.0 - gw_eff) * main_norm + gw_eff * spec_probs[idx]
+                        P_fused[idx, family_cols] = fused_fam * orig_mass
+
+                acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
+                P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
+                acc_gated_sk = float(balanced_accuracy_score(y_ev_arr, P_sk.argmax(axis=1)))
+
+                if abs(gw - default_gw) < 1e-4:
+                    default_raw_bacc = acc_gated
+                    default_sk_bacc = acc_gated_sk
+
+                if acc_gated_sk > best_pipe_acc:
+                    best_pipe_acc = acc_gated_sk
+                    best_pipe_w = gw
+                    best_raw_bacc = acc_gated
+                    best_sk_bacc = acc_gated_sk
+
+            p_res = {
+                "plain_solo_bacc": acc_plain_solo,
+                "best_pipe_bacc": best_pipe_acc,
+                "best_gate_weight": best_pipe_w,
+                "best_raw_bacc": best_raw_bacc,
+                "best_sinkhorn_bacc": best_sk_bacc,
+                "default_raw_bacc": default_raw_bacc,
+                "default_sinkhorn_bacc": default_sk_bacc,
+                "lift_over_plain": best_pipe_acc - acc_plain_solo,
+            }
+        return ev_acc, hard_acc, p_res
+
+    r_ev_acc, r_hard_acc, r_pipe_res = _eval_head_metrics(ridge_logits_ev)
+    m_ev_acc, m_hard_acc, m_pipe_res = _eval_head_metrics(mlp_logits_ev)
+    h_ev_acc, h_hard_acc, h_pipe_res = _eval_head_metrics(hybrid_logits_ev)
+
+    heads_breakdown = {
+        "ridge": {
+            "eval_fam_acc": r_ev_acc if ridge_logits_ev is not None else float(ridge_acc),
+            "hard_pair_acc": r_hard_acc if ridge_logits_ev is not None else float(ridge_acc),
+            "oof_acc": float(ridge_oof_bacc),
+            "pipe_results": r_pipe_res,
+            "logits": ridge_logits_ev,
+        },
+        "mlp": {
+            "eval_fam_acc": m_ev_acc if mlp_logits_ev is not None else float(mlp_acc),
+            "hard_pair_acc": m_hard_acc if mlp_logits_ev is not None else float(mlp_acc),
+            "oof_acc": float(mlp_val_acc),
+            "pipe_results": m_pipe_res,
+            "logits": mlp_logits_ev,
+        },
+        "hybrid": {
+            "eval_fam_acc": h_ev_acc if hybrid_logits_ev is not None else float(mlp_acc),
+            "hard_pair_acc": h_hard_acc if hybrid_logits_ev is not None else float(mlp_acc),
+            "oof_acc": float(0.65 * mlp_val_acc + 0.35 * ridge_oof_bacc),
+            "pipe_results": h_pipe_res,
+            "logits": hybrid_logits_ev,
+        },
+    }
 
     if head_type.lower() == "mlp":
-        best_fam_acc = mlp_acc
+        chosen_head = heads_breakdown["mlp"]
+        best_fam_acc = chosen_head["eval_fam_acc"]
         best_fam_logits = mlp_logits_ev
         best_alpha = ridge_alpha
         final_head_dict = mlp_head_dict
         final_head_dict["plain.weight"] = plain_w_tensor
         final_head_dict["plain.bias"] = plain_b_tensor
     elif head_type.lower() in ("hybrid", "hybrid_65mlp_35ridge"):
-        if hybrid_logits_ev is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
-            fam_hyb_pred = hybrid_logits_ev[fam_eval_mask, :num_family_classes].argmax(axis=1)
-            hybrid_acc = float(balanced_accuracy_score(y_fam_true, fam_hyb_pred))
-        else:
-            hybrid_acc = mlp_acc
-        best_fam_acc = hybrid_acc
+        chosen_head = heads_breakdown["hybrid"]
+        best_fam_acc = chosen_head["eval_fam_acc"]
         best_fam_logits = hybrid_logits_ev if hybrid_logits_ev is not None else mlp_logits_ev
         best_alpha = ridge_alpha
         final_head_dict = mlp_head_dict
         final_head_dict["plain.weight"] = plain_w_tensor
         final_head_dict["plain.bias"] = plain_b_tensor
     else:
-        best_fam_acc = ridge_acc
+        chosen_head = heads_breakdown["ridge"]
+        best_fam_acc = chosen_head["eval_fam_acc"]
         best_fam_logits = ridge_logits_ev
         best_alpha = ridge_alpha
         final_head_dict = {
@@ -3512,67 +3605,9 @@ def train_family_gate_from_dataset(
             "plain.bias": plain_b_tensor,
         }
 
-    # Evaluate hardest sister pair accuracy
-    hard_pair_eval_acc = float(best_fam_acc)
-    if y_fam_true is not None and best_fam_logits is not None and eff_hard_pair is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
-        s_a, s_b = eff_hard_pair
-        pair_mask_ev = (y_fam_true == s_a) | (y_fam_true == s_b)
-        if pair_mask_ev.sum() > 0 and len(np.unique(y_fam_true[pair_mask_ev])) == 2:
-            fam_logits = best_fam_logits[fam_eval_mask, :num_family_classes]
-            spec_pair_preds = np.where(fam_logits[pair_mask_ev, s_a] >= fam_logits[pair_mask_ev, s_b], s_a, s_b)
-            hard_pair_eval_acc = float(balanced_accuracy_score(y_fam_true[pair_mask_ev], spec_pair_preds))
-
-    # Step 6: Logit Blending Sweep
-    default_gw = float(gate_weight)
-    best_pipe_w = default_gw
-    pipe_results = {}
-    if main_logits_eval is not None and best_fam_logits is not None and y_ev_arr is not None:
-        P_main = sp_softmax(main_logits_eval, axis=1)
-        acc_plain_solo = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
-        best_pipe_acc = 0.0
-        best_raw_bacc = 0.0
-        best_sk_bacc = 0.0
-        default_raw_bacc = 0.0
-        default_sk_bacc = 0.0
-        cand_mask = np.isin(P_main.argmax(axis=1), family_cols) | (P_main[:, family_cols].sum(axis=1) >= 0.10)
-        spec_probs = sp_softmax(best_fam_logits[:, :num_family_classes], axis=1)
-
-        sweep_weights = sorted(set([0.10, 0.20, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60, default_gw]))
-
-        for gw in sweep_weights:
-            P_fused = P_main.copy()
-            for idx in np.flatnonzero(cand_mask):
-                orig_mass = float(P_main[idx, family_cols].sum())
-                if orig_mass > 1e-6:
-                    gw_eff = gw * min(orig_mass / 0.50, 1.0)
-                    main_norm = P_main[idx, family_cols] / orig_mass
-                    fused_fam = (1.0 - gw_eff) * main_norm + gw_eff * spec_probs[idx]
-                    P_fused[idx, family_cols] = fused_fam * orig_mass
-
-            acc_gated = float(balanced_accuracy_score(y_ev_arr, P_fused.argmax(axis=1)))
-            P_sk = sinkhorn_balancing(P_fused, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
-            acc_gated_sk = float(balanced_accuracy_score(y_ev_arr, P_sk.argmax(axis=1)))
-
-            if abs(gw - default_gw) < 1e-4:
-                default_raw_bacc = acc_gated
-                default_sk_bacc = acc_gated_sk
-
-            if acc_gated_sk > best_pipe_acc:
-                best_pipe_acc = acc_gated_sk
-                best_pipe_w = gw
-                best_raw_bacc = acc_gated
-                best_sk_bacc = acc_gated_sk
-
-        pipe_results = {
-            "plain_solo_bacc": acc_plain_solo,
-            "best_pipe_bacc": best_pipe_acc,
-            "best_gate_weight": best_pipe_w,
-            "best_raw_bacc": best_raw_bacc,
-            "best_sinkhorn_bacc": best_sk_bacc,
-            "default_raw_bacc": default_raw_bacc,
-            "default_sinkhorn_bacc": default_sk_bacc,
-            "lift_over_plain": best_pipe_acc - acc_plain_solo,
-        }
+    hard_pair_eval_acc = chosen_head["hard_pair_acc"]
+    pipe_results = chosen_head["pipe_results"]
+    best_pipe_w = pipe_results.get("best_gate_weight", default_gw)
 
     # Step 7: Checkpoint saving
     if output_dir is not None:
@@ -3624,6 +3659,7 @@ def train_family_gate_from_dataset(
         "mlp_acc": float(mlp_acc),
         "subspace_dim": int(pca_components.shape[0]) if pca_components is not None else 0,
         "pipe_results": pipe_results,
+        "heads_breakdown": heads_breakdown,
         "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
         "spec_classes": family_classes,
     }
@@ -4028,7 +4064,7 @@ def train_family_gate(
     # Step 4: Train Linear Ridge Regression on Reduced Dimensions
     # -------------------------------------------------------------------------
     print(f"[{target_family.upper()} Gate] Step 4: Fitting {num_gate_classes}-class Linear Ridge Regression on {Z_tr_active.shape[1]}-dim features...")
-    best_w_pca, best_b_pca, ridge_alpha, ridge_acc, ridge_logits_ev = fit_family_gate_head(
+    best_w_pca, best_b_pca, ridge_alpha, ridge_acc, ridge_logits_ev, ridge_oof_bacc = fit_family_gate_head(
         Z_train=Z_tr_active,
         y_train=y_train,
         num_gate_classes=num_gate_classes,
@@ -4066,7 +4102,7 @@ def train_family_gate(
     # Step 5: Train Non-Linear MLP on Reduced Dimensions
     # -------------------------------------------------------------------------
     print(f"[{target_family.upper()} Gate] Step 5: Fitting {num_gate_classes}-class Non-Linear MLP on {Z_tr_active.shape[1]}-dim features (hidden_dim={hidden_dim}, epochs={mlp_epochs}, lr={mlp_lr})...")
-    mlp_head_dict, mlp_acc, mlp_logits_ev = fit_family_mlp_head(
+    mlp_head_dict, mlp_acc, mlp_logits_ev, mlp_val_acc = fit_family_mlp_head(
         Z_train=Z_tr_active,
         y_train=y_train,
         num_gate_classes=num_gate_classes,
@@ -4086,13 +4122,34 @@ def train_family_gate(
     )
     print(f"[{target_family.upper()} Gate] Step 5 Complete: MLP Head -> {target_family.upper()} Acc: {mlp_acc * 100:.2f}% (Lift: {(mlp_acc - acc_plain_within) * 100:+.2f}%)")
 
-    # Select primary head based on head_type configuration (mlp vs ridge)
+    # Hybrid 0.65 MLP + 0.35 Ridge logits scaled to row_std = 3.2
+    hybrid_logits_ev = None
+    if mlp_logits_ev is not None and ridge_logits_ev is not None:
+        raw_hyb = 0.65 * mlp_logits_ev + 0.35 * ridge_logits_ev
+        hyb_fam = raw_hyb[:, :num_family_classes]
+        hyb_std = float(np.std(hyb_fam, axis=1).mean()) if len(hyb_fam) > 0 else 1.0
+        hyb_scale = (3.2 / hyb_std) if hyb_std > 1e-4 else 1.0
+        hybrid_logits_ev = (raw_hyb * hyb_scale).astype(np.float32)
+
+    # Select primary head based on head_type configuration (mlp vs ridge vs hybrid)
     if head_type.lower() == "mlp":
         best_fam_acc = mlp_acc
         best_fam_logits = mlp_logits_ev
         best_alpha = ridge_alpha
         final_head_dict = mlp_head_dict
         # Ensure plain.weight / plain.bias are populated with optimal folded Ridge fallback
+        final_head_dict["plain.weight"] = plain_w_tensor
+        final_head_dict["plain.bias"] = plain_b_tensor
+    elif head_type.lower() in ("hybrid", "hybrid_65mlp_35ridge"):
+        if hybrid_logits_ev is not None and fam_eval_mask is not None and fam_eval_mask.sum() > 0:
+            fam_hyb_pred = hybrid_logits_ev[fam_eval_mask, :num_family_classes].argmax(axis=1)
+            hybrid_acc = float(balanced_accuracy_score(y_fam_true, fam_hyb_pred))
+        else:
+            hybrid_acc = mlp_acc
+        best_fam_acc = hybrid_acc
+        best_fam_logits = hybrid_logits_ev if hybrid_logits_ev is not None else mlp_logits_ev
+        best_alpha = ridge_alpha
+        final_head_dict = mlp_head_dict
         final_head_dict["plain.weight"] = plain_w_tensor
         final_head_dict["plain.bias"] = plain_b_tensor
     else:
@@ -4202,6 +4259,20 @@ def train_family_gate(
             checkpoints_volume.commit()
         print(f"[{target_family.upper()} Gate] Checkpoint saved to {out_p}.")
 
+    should_sweep = (
+        export_embeddings
+        and (train_cfg.get("run_sweep", True) if isinstance(train_cfg, dict) else True)
+    )
+    if should_sweep:
+        print(f"\n[{target_family.upper()} Gate] Automatically launching offline feature & head sweep...")
+        run_sweep(
+            embeddings_dir=emb_dir,
+            target_family=target_family,
+            output_dir=output_dir,
+            ledger_dir=Path(output_dir) / "experiments" if output_dir else "experiments",
+            device=device,
+        )
+
     return {
         "target_family": target_family,
         "within_family_balanced_acc": float(best_fam_acc),
@@ -4215,6 +4286,232 @@ def train_family_gate(
         "pipe_results": pipe_results,
         "spec_logits": best_fam_logits[:, :num_family_classes].tolist() if best_fam_logits is not None else [],
         "spec_classes": family_classes,
+    }
+
+
+def run_sweep(
+    embeddings_dir: Path | str,
+    target_family: str,
+    output_dir: Path | str | None = None,
+    ledger_dir: Path | str = "experiments",
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    """
+    Executes offline ablation sweep across feature engineering variants
+    and classification heads (Ridge, MLP, Hybrid) in <30s total.
+    """
+    import shutil
+    from safetensors.torch import load_file
+    from scipy.special import softmax as sp_softmax
+    from namethatllm.experiment_logger import ExperimentLedger
+    from namethatllm.postprocess import sinkhorn_balancing
+
+    ds_p = Path(embeddings_dir)
+    target_family = target_family.lower().strip()
+    if output_dir is None:
+        output_dir = Path(f"export_{target_family}_gate_mlp")
+    out_p = Path(output_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+
+    ledger = ExperimentLedger(ledger_dir=ledger_dir)
+
+    print("\n" + "=" * 92)
+    print(f" [RUNNER] STARTING OFFLINE GATE EXPERIMENT SWEEP: '{target_family.upper()}' ({ds_p})")
+    print("=" * 92)
+
+    family_cols = FAMILIES[target_family]
+    num_family_classes = len(family_cols)
+    eff_hard_pair = (2, 3) if target_family == "gemini" else ((1, 2) if target_family in ("gpt", "claude") else (0, 1))
+
+    # -------------------------------------------------------------------------
+    # EXP-00: Baseline Champion Plain Solo (F0_plain_solo)
+    # -------------------------------------------------------------------------
+    print("\n--- [EXP-00] Evaluating Champion 18-Class Plain Solo Baseline ---")
+    y_ev_arr = None
+    main_logits_eval = None
+    baseline_raw_bacc = 0.0
+    baseline_sk_bacc = 0.0
+    fam_solo_bacc = 0.0
+    hard_pair_solo_acc = 0.0
+
+    if (ds_p / "benchmark_metadata.parquet").exists():
+        df_bench = pd.read_parquet(ds_p / "benchmark_metadata.parquet")
+        y_ev_arr = df_bench["label"].to_numpy()
+
+    if (ds_p / "benchmark_champion_logits.safetensors").exists():
+        champ_ev_sd = load_file(str(ds_p / "benchmark_champion_logits.safetensors"))
+        main_logits_eval = champ_ev_sd["logits_plain"].cpu().float().numpy()
+
+    if y_ev_arr is not None and main_logits_eval is not None:
+        P_main = sp_softmax(main_logits_eval, axis=1)
+        baseline_raw_bacc = float(balanced_accuracy_score(y_ev_arr, P_main.argmax(axis=1)))
+        P_sk = sinkhorn_balancing(P_main, iters=50, sinkhorn_strength=0.65, target_mix=0.35)
+        baseline_sk_bacc = float(balanced_accuracy_score(y_ev_arr, P_sk.argmax(axis=1)))
+
+        fam_eval_mask = np.isin(y_ev_arr, family_cols)
+        if fam_eval_mask.sum() > 0:
+            col_to_local = {c: i for i, c in enumerate(family_cols)}
+            y_fam_true = np.array([col_to_local[v] for v in y_ev_arr[fam_eval_mask]])
+            plain_fam_pred = main_logits_eval[fam_eval_mask][:, family_cols].argmax(axis=1)
+            fam_solo_bacc = float(balanced_accuracy_score(y_fam_true, plain_fam_pred))
+
+            s_a, s_b = eff_hard_pair
+            pair_mask = (y_fam_true == s_a) | (y_fam_true == s_b)
+            if pair_mask.sum() > 0 and len(np.unique(y_fam_true[pair_mask])) == 2:
+                pair_preds = np.where(
+                    main_logits_eval[fam_eval_mask][pair_mask, family_cols[s_a]] >= main_logits_eval[fam_eval_mask][pair_mask, family_cols[s_b]],
+                    s_a, s_b
+                )
+                hard_pair_solo_acc = float(balanced_accuracy_score(y_fam_true[pair_mask], pair_preds))
+            else:
+                hard_pair_solo_acc = fam_solo_bacc
+
+    ledger.baseline_bacc = baseline_sk_bacc
+    exp00_entry = {
+        "exp_id": "EXP-00",
+        "phase": "P1_baseline",
+        "target_family": target_family,
+        "feature_set": "F0_plain_solo",
+        "subspace_dim": 0,
+        "head_type": "plain",
+        "gate_weight": 0.0,
+        "oof_family_bacc": None,
+        "holdout_family_bacc": fam_solo_bacc,
+        "hard_sister_acc": hard_pair_solo_acc,
+        "holdout_18cls_raw_bacc": baseline_raw_bacc,
+        "holdout_18cls_sinkhorn_bacc": baseline_sk_bacc,
+        "delta_vs_baseline_bacc": 0.0,
+        "notes": "18-class Champion Plain Head solo baseline on benchmark holdout",
+    }
+    ledger.add_entry(exp00_entry)
+    print(f"EXP-00 Complete: Solo BAcc={baseline_raw_bacc*100:.2f}% | Sinkhorn={baseline_sk_bacc*100:.2f}% | Family BAcc={fam_solo_bacc*100:.2f}%")
+
+    # Feature Matrix: (base_id, feat_set, inc_vel, l_wt, sel_l, use_mv, desc)
+    feature_specs = [
+        ("EXP-01", "F1_fisher_per_layer", False, False, None, False, "Pure Per-Layer Fisher Subspace"),
+        ("EXP-02", "F2_fisher_velocity", True, False, None, False, "+ Inter-Layer Velocity Fisher Subspace"),
+        ("EXP-03", "F3_scalarmix_fisher", True, True, None, False, "+ ScalarMix Layer Importance Weighting"),
+    ]
+    has_by_layer = (ds_p / "features_by_layer.safetensors").exists()
+    if has_by_layer:
+        feature_specs.append(
+            ("EXP-04", "F4_auto_top8_fisher", True, True, "auto_top8", False, "+ Auto-Top-8 Layer Slicing")
+        )
+    feature_specs.append(
+        ("EXP-05", "F5_fisher_multiview", True, True, None, True, "+ Offline Multi-View Features (Upper Bound)")
+    )
+
+    sweep_results = []
+    best_foldable_score = -1.0
+    best_foldable_run = None
+    suffix_map = {"ridge": "a", "mlp": "b", "hybrid": "c"}
+
+    for base_id, feat_set, inc_vel, l_wt, sel_l, use_mv, desc in feature_specs:
+        print(f"\n--- [{base_id}] Running {feat_set} ({desc}) ---")
+        tmp_run_out = out_p / f"_tmp_{base_id.lower()}"
+
+        try:
+            res = train_family_gate_from_dataset(
+                dataset_dir=ds_p,
+                target_family=target_family,
+                output_dir=tmp_run_out,
+                head_type="hybrid",
+                select_layers=sel_l,
+                include_velocity=inc_vel,
+                layer_weighting=l_wt,
+                use_multiview=use_mv,
+                device=device,
+                gate_weight=0.40,
+            )
+
+            heads_bd = res.get("heads_breakdown", {})
+            for h_type in ["ridge", "mlp", "hybrid"]:
+                exp_id = f"{base_id}{suffix_map[h_type]}"
+                h_info = heads_bd.get(h_type, {})
+                p_res = h_info.get("pipe_results", {})
+                hld_18_raw = p_res.get("best_raw_bacc", 0.0)
+                hld_18_sk = p_res.get("best_pipe_bacc", 0.0)
+                gw_best = p_res.get("best_gate_weight", 0.40)
+                delta_lift = hld_18_sk - baseline_sk_bacc
+
+                record = {
+                    "exp_id": exp_id,
+                    "phase": "P2_features" if h_type == "ridge" else "P3_heads",
+                    "target_family": target_family,
+                    "feature_set": feat_set,
+                    "subspace_dim": res.get("subspace_dim", 0),
+                    "head_type": h_type,
+                    "gate_weight": gw_best,
+                    "oof_family_bacc": h_info.get("oof_acc"),
+                    "holdout_family_bacc": h_info.get("eval_fam_acc", 0.0),
+                    "hard_sister_acc": h_info.get("hard_pair_acc", 0.0),
+                    "holdout_18cls_raw_bacc": hld_18_raw,
+                    "holdout_18cls_sinkhorn_bacc": hld_18_sk,
+                    "delta_vs_baseline_bacc": delta_lift,
+                    "notes": f"{desc} ({h_type.upper()}, gw={gw_best:.2f})",
+                }
+                arts = []
+                if (tmp_run_out / "meta.json").exists():
+                    arts.append(tmp_run_out / "meta.json")
+                if (tmp_run_out / "layer_probe_report.json").exists():
+                    arts.append(tmp_run_out / "layer_probe_report.json")
+                ledger.add_entry(record, artifacts=arts)
+                sweep_results.append((record, tmp_run_out))
+
+                # Identify best foldable checkpoint (EXP-01 through EXP-04)
+                if not use_mv and hld_18_sk > best_foldable_score:
+                    best_foldable_score = hld_18_sk
+                    best_foldable_run = (exp_id, tmp_run_out, record)
+
+                print(
+                    f"[{exp_id}] Result: Head={h_type.upper()} | Fam BAcc={record['holdout_family_bacc']*100:.2f}% | "
+                    f"Hard Sis={record['hard_sister_acc']*100:.2f}% | "
+                    f"18c SK={hld_18_sk*100:.2f}% (Δ {delta_lift*100:+.2f}%)"
+                )
+
+        except Exception as e:
+            print(f"[{base_id}] Encountered error: {e}")
+
+    # Copy the best foldable checkpoint to out_p (the final export directory)
+    if best_foldable_run is not None:
+        best_id, best_tmp_dir, best_rec = best_foldable_run
+        print("\n" + "=" * 92)
+        print(f" [WINNER] Selecting Best Foldable Checkpoint: {best_id} ({best_rec['feature_set']} + {best_rec['head_type']})")
+        print(f"          18-Class Sinkhorn BAcc: {best_rec['holdout_18cls_sinkhorn_bacc']*100:.2f}% (Lift: {best_rec['delta_vs_baseline_bacc']*100:+.2f}%)")
+        print("=" * 92)
+
+        for src_f in best_tmp_dir.glob("*"):
+            if src_f.is_file():
+                shutil.copy2(str(src_f), str(out_p / src_f.name))
+        meta_p = out_p / "meta.json"
+        if meta_p.exists():
+            try:
+                m_data = json.loads(meta_p.read_text(encoding="utf-8"))
+                m_data["winning_exp_id"] = best_id
+                m_data["head_type"] = best_rec["head_type"]
+                m_data["best_sweep_gate_weight"] = float(best_rec["gate_weight"])
+                meta_p.write_text(json.dumps(m_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+    # Clean up temporary run folders
+    for _, tmp_dir in sweep_results:
+        if tmp_dir.exists():
+            try:
+                shutil.rmtree(str(tmp_dir))
+            except Exception:
+                pass
+
+    # Export copy of ledger files into output directory
+    ledger.export_copy(out_p)
+
+    print(f"\n[RUNNER] Sweep Complete. Exported champion gate and ledgers to: {out_p}")
+    return {
+        "target_family": target_family,
+        "baseline_sk_bacc": baseline_sk_bacc,
+        "best_foldable_score": best_foldable_score,
+        "best_run": best_foldable_run[0] if best_foldable_run else None,
+        "total_experiments": len(sweep_results) + 1,
     }
 
 

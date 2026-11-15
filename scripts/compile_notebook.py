@@ -118,7 +118,13 @@ def compile_training_notebook(config_path: Path, output_path: Path) -> Path:
         ast.parse(raw, filename=mod)
         cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
 
-    entry = "if __name__ == '__main__':\n    run_training_pipeline(TRAINING_CONFIG)\n"
+    entry = (
+        "if __name__ == '__main__':\n"
+        "    import os, json; from pathlib import Path\n"
+        "    _env = os.environ.get('NTL_TRAIN_CONFIG')\n"
+        "    _cfg = json.loads(Path(_env).read_text(encoding='utf-8')) if _env and Path(_env).exists() else TRAINING_CONFIG\n"
+        "    run_training_pipeline(_cfg)\n"
+    )
     ast.parse(entry, filename="entrypoint_training")
     cells.append(entry)
     return _build_notebook(cells, output_path)

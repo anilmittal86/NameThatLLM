@@ -862,7 +862,7 @@ class TestTrainer(unittest.TestCase):
             if y_tr[i] < 4:
                 Z_tr[i] += mu_sim[0]
 
-        head_dict, best_acc, best_logits = fit_family_mlp_head(
+        head_dict, best_acc, best_logits, *_ = fit_family_mlp_head(
             Z_train=Z_tr,
             y_train=y_tr,
             num_gate_classes=5,
@@ -896,7 +896,7 @@ class TestTrainer(unittest.TestCase):
 
         # Test pure 4-class intra-family gate training (negative_ratio = 0.0)
         y_tr_4 = np.array([i % 4 for i in range(N)])
-        head_dict_4, best_acc_4, _ = fit_family_mlp_head(
+        head_dict_4, best_acc_4, *_ = fit_family_mlp_head(
             Z_train=Z_tr,
             y_train=y_tr_4,
             num_gate_classes=4,
@@ -925,7 +925,7 @@ class TestTrainer(unittest.TestCase):
         Z_pca = pca.fit_transform(Z_raw).astype(np.float32)
 
         # Step 4: Ridge regression on reduced dimensions
-        best_w_pca, best_b_pca, _, _, _ = fit_family_gate_head(
+        best_w_pca, best_b_pca, *_ = fit_family_gate_head(
             Z_train=Z_pca,
             y_train=y_tr,
             num_gate_classes=num_classes,
@@ -944,7 +944,7 @@ class TestTrainer(unittest.TestCase):
         np.testing.assert_allclose(logits_folded, logits_pca, atol=1e-3)
 
         # Step 5: MLP on reduced dimensions with zero-cost PCA fold-in
-        mlp_dict, best_acc, _ = fit_family_mlp_head(
+        mlp_dict, best_acc, *_ = fit_family_mlp_head(
             Z_train=Z_pca,
             y_train=y_tr,
             num_gate_classes=num_classes,

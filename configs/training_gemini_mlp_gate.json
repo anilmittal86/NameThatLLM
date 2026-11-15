@@ -20,6 +20,7 @@
   "negative_ratio": 0.10,
   "batch_size": 8,
   "output_dir": "export_gemini_gate_mlp",
+  "run_sweep": true,
   "export_embeddings": {
     "enabled": true,
     "save_all_layers": true,

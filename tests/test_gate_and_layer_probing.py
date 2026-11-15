@@ -77,7 +77,7 @@ class TestGateAndLayerProbing:
         # Fit FamilyMLPHead on the whitened features
         Z_white_train = ((Z_train - mu_fam) @ C_eff.T).astype(np.float32)
         y_fam_mask = y_train < num_family_classes
-        head_dict, best_acc, best_logits = fit_family_mlp_head(
+        head_dict, best_acc, best_logits, *_ = fit_family_mlp_head(
             Z_train=Z_white_train[y_fam_mask],
             y_train=y_train[y_fam_mask],
             num_gate_classes=num_family_classes,
@@ -449,7 +449,7 @@ class TestGateAndLayerProbing:
         y_eval_true = np.array([i % K_fam for i in range(20)], dtype=np.int64)
         eval_mask = np.ones(20, dtype=bool)
 
-        head_dict, acc, eval_logits = fit_family_mlp_head(
+        head_dict, acc, eval_logits, *_ = fit_family_mlp_head(
             Z_train=Z_train,
             y_train=y_train,
             num_gate_classes=K_gate,

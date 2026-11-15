@@ -16,6 +16,7 @@ local_data/*
 kaggle_logs/
 kaggle_output/
 kaggle_training_output/
+experiments/
 references/
 artifacts/
 output/

@@ -397,6 +397,11 @@ def build_supervised_family_subspace(
             hard_sister_pair = (0, 1)
 
     # Compute Layer-Probing Importance Weights if layer_weighting is enabled
+    fam_pids = (
+        np.asarray(prompt_ids)[fam_mask]
+        if (prompt_ids is not None and len(prompt_ids) == len(y_train))
+        else prompt_ids
+    )
     if layer_weighting:
         w_layers, oof_baccs, comp_scores = _compute_layer_oof_scores(
             Z_fam_c=Z_fam_c,
@@ -404,7 +409,7 @@ def build_supervised_family_subspace(
             num_tapped_layers=num_tapped_layers,
             num_family_classes=num_family_classes,
             hard_sister_pair=hard_sister_pair,
-            prompt_ids=prompt_ids,
+            prompt_ids=fam_pids,
         )
     else:
         w_layers = np.full(num_tapped_layers, 1.0 / max(num_tapped_layers, 1), dtype=np.float32)
@@ -420,8 +425,6 @@ def build_supervised_family_subspace(
         e_col = (l_idx + 1) * D_layer
         X_l = Z_fam_c[:, s_col:e_col]
 
-        alpha_l = float(np.sqrt(float(num_tapped_layers) * float(w_layers[l_idx])))
-
         W_ovr, W_pairs = _solve_within_class_fisher_gpu(
             X_l, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio,
             reg_scales=(0.03, 0.12, 0.45), device=device
@@ -429,7 +432,7 @@ def build_supervised_family_subspace(
         stacked_dirs = np.vstack([W_ovr, W_pairs]) if len(W_pairs) > 0 else W_ovr
         for row in stacked_dirs:
             full_vec = np.zeros(D_total, dtype=np.float32)
-            full_vec[s_col:e_col] = row * alpha_l
+            full_vec[s_col:e_col] = row
             basis_rows.append(full_vec)
 
         layer_fisher_norms[l_idx] = float(np.linalg.norm(W_pairs)) if len(W_pairs) > 0 else 0.0
@@ -441,17 +444,14 @@ def build_supervised_family_subspace(
             s_curr, e_curr = l_idx * D_layer, (l_idx + 1) * D_layer
             Delta_X = Z_fam_c[:, s_curr:e_curr] - Z_fam_c[:, s_prev:e_prev]
 
-            w_avg = 0.5 * (float(w_layers[l_idx]) + float(w_layers[l_idx - 1]))
-            alpha_vel = float(np.sqrt(float(num_tapped_layers) * w_avg))
-
             _, W_vel_pairs = _solve_within_class_fisher_gpu(
                 Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5,
                 reg_scales=(0.05, 0.20, 0.60), device=device
             )
             for row in W_vel_pairs:
                 full_vec = np.zeros(D_total, dtype=np.float32)
-                full_vec[s_curr:e_curr] = (row / np.sqrt(2.0)) * alpha_vel
-                full_vec[s_prev:e_prev] = (-row / np.sqrt(2.0)) * alpha_vel
+                full_vec[s_curr:e_curr] = row / np.sqrt(2.0)
+                full_vec[s_prev:e_prev] = -row / np.sqrt(2.0)
                 basis_rows.append(full_vec)
 
     W_sup = np.vstack(basis_rows)  # (D_sup, 40960)
@@ -465,10 +465,21 @@ def build_supervised_family_subspace(
     if subspace_dim is not None and subspace_dim > 0 and V_basis.shape[0] > subspace_dim:
         V_basis = V_basis[:subspace_dim]
 
-    # Part 4: Whiten each Fisher coordinate by its intra-family training std
+    # Part 4: Whiten each Fisher coordinate by its intra-family training std, then apply layer_weighting
     Z_fam_proj = Z_fam_c @ V_basis.T  # (N_fam, D_fisher)
     sd_proj = Z_fam_proj.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
-    C_eff = (V_basis / sd_proj.T).astype(np.float32)
+    C_white = (V_basis / sd_proj.T).astype(np.float32)
+
+    if layer_weighting:
+        # Each row v_k of V_basis has unit L2 norm; block_energy[k, l] is the fraction of v_k's energy in layer l
+        V_blocks = V_basis.reshape(V_basis.shape[0], num_tapped_layers, D_layer)
+        block_energy = np.sum(V_blocks * V_blocks, axis=2)  # (D_fisher, num_tapped_layers)
+        dir_scales = np.sqrt(
+            np.sum(block_energy * (float(num_tapped_layers) * w_layers[None, :]), axis=1, keepdims=True)
+        ).astype(np.float32)
+        C_eff = (C_white * dir_scales).astype(np.float32)
+    else:
+        C_eff = C_white
 
     diagnostics = {
         "n_supervised_dirs": int(V_basis.shape[0]),
