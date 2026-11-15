@@ -1561,12 +1561,25 @@ def run_training_pipeline(
                 print(f"[Trainer] Note on loading adapter for extraction: {e}")
 
         head_loaded = False
-        for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
-            if any(term in str(cand).lower() for term in ["champion", "inhouse", "stage1", "backbone", "18class", "full"]):
-                if load_and_slice_champion_heads(cand, model, fam_cols=None):
-                    print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
+        if adapter_found is not None:
+            for cand in [
+                adapter_found / "heads.safetensors",
+                adapter_found.parent / "heads.safetensors",
+                adapter_found / "heads.pt",
+                adapter_found.parent / "heads.pt",
+            ]:
+                if cand.exists() and load_and_slice_champion_heads(cand, model, fam_cols=None):
+                    print(f"[Trainer] Loaded champion norms & heads from adapter directory: {cand}")
                     head_loaded = True
                     break
+
+        if not head_loaded:
+            for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
+                if any(term in str(cand).lower() for term in ["champion", "inhouse", "stage1", "backbone", "18class", "full"]):
+                    if load_and_slice_champion_heads(cand, model, fam_cols=None):
+                        print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
+                        head_loaded = True
+                        break
         if not head_loaded:
             for cand in list(input_dir.rglob("heads.safetensors")):
                 if load_and_slice_champion_heads(cand, model, fam_cols=None):
@@ -1644,12 +1657,25 @@ def run_training_pipeline(
                     raise RuntimeError(f"Discovered adapters on disk but none were compatible with {backbone_name} (r={lora_r_val}): {found_all}")
 
         head_loaded = False
-        for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
-            if any(term in str(cand).lower() for term in ["champion", "inhouse", "stage1", "backbone", "18class", "full"]):
-                if load_and_slice_champion_heads(cand, model, fam_cols=None):
-                    print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
+        if adapter_found is not None:
+            for cand in [
+                adapter_found / "heads.safetensors",
+                adapter_found.parent / "heads.safetensors",
+                adapter_found / "heads.pt",
+                adapter_found.parent / "heads.pt",
+            ]:
+                if cand.exists() and load_and_slice_champion_heads(cand, model, fam_cols=None):
+                    print(f"[Trainer] Loaded champion norms & heads from adapter directory: {cand}")
                     head_loaded = True
                     break
+
+        if not head_loaded:
+            for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
+                if any(term in str(cand).lower() for term in ["champion", "inhouse", "stage1", "backbone", "18class", "full"]):
+                    if load_and_slice_champion_heads(cand, model, fam_cols=None):
+                        print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
+                        head_loaded = True
+                        break
         if not head_loaded:
             for cand in list(input_dir.rglob("heads.safetensors")):
                 if load_and_slice_champion_heads(cand, model, fam_cols=None):
@@ -2654,9 +2680,9 @@ def load_and_slice_champion_heads(
     fam_cols: list[int] | None = None,
 ) -> bool:
     """
-    Loads champion per-layer LayerNorms (model.norms) and plain_head weights into model.
-    If the checkpoint contains an 18-class head and model.plain_head has len(fam_cols) rows,
-    slices the target family classes; otherwise loads the full 18-class head.
+    Loads champion per-layer LayerNorms (model.norms), plain_head, and centered_head weights into model.
+    Verifies plain_head shape compatibility BEFORE touching model.norms to ensure non-matching
+    specialist heads never overwrite model.norms.
     """
     if not Path(heads_path).exists():
         return False
@@ -2664,19 +2690,9 @@ def load_and_slice_champion_heads(
     try:
         if str(heads_path).endswith(".safetensors"):
             from safetensors.torch import load_file
-
             h_sd = load_file(str(heads_path))
         else:
             h_sd = torch.load(str(heads_path), map_location="cpu")
-
-        # 1. Always load trained per-layer LayerNorm parameters
-        if hasattr(model, "norms") and model.norms is not None:
-            for i, norm in enumerate(model.norms):
-                wk, bk = f"norms.{i}.weight", f"norms.{i}.bias"
-                if wk in h_sd and norm.weight.shape == h_sd[wk].shape:
-                    norm.weight.data.copy_(h_sd[wk].to(norm.weight.device, dtype=norm.weight.dtype))
-                if bk in h_sd and hasattr(norm, "bias") and norm.bias is not None and norm.bias.shape == h_sd[bk].shape:
-                    norm.bias.data.copy_(h_sd[bk].to(norm.bias.device, dtype=norm.bias.dtype))
 
         if not hasattr(model, "plain_head") or model.plain_head is None:
             return False
@@ -2690,22 +2706,54 @@ def load_and_slice_champion_heads(
         tgt_w = model.plain_head.weight
         tgt_b = model.plain_head.bias
 
-        # Case A: Exact shape match (e.g., 18-class champion head into 18-class model)
-        if tgt_w.shape == w_ckpt.shape and tgt_b.shape == b_ckpt.shape:
+        # 1. Verify plain_head compatibility before modifying any model state
+        is_exact = (tgt_w.shape == w_ckpt.shape and tgt_b.shape == b_ckpt.shape)
+        is_sliced = False
+        sliced_w, sliced_b = None, None
+        if not is_exact:
+            if fam_cols is not None and w_ckpt.shape[0] >= max(fam_cols) + 1:
+                sliced_w = w_ckpt[fam_cols]
+                sliced_b = b_ckpt[fam_cols]
+                if sliced_w.shape == tgt_w.shape and sliced_b.shape == tgt_b.shape:
+                    is_sliced = True
+            if not is_sliced:
+                return False
+
+        # Load verified plain_head weights
+        if is_exact:
             tgt_w.data.copy_(w_ckpt.to(tgt_w.device, dtype=tgt_w.dtype))
             tgt_b.data.copy_(b_ckpt.to(tgt_b.device, dtype=tgt_b.dtype))
-            return True
+        else:
+            tgt_w.data.copy_(sliced_w.to(tgt_w.device, dtype=tgt_w.dtype))
+            tgt_b.data.copy_(sliced_b.to(tgt_b.device, dtype=tgt_b.dtype))
 
-        # Case B: Checkpoint is 18-class, model is a Stage 1/2 specialist (e.g., 4-class)
-        if fam_cols is not None and w_ckpt.shape[0] >= max(fam_cols) + 1:
-            sliced_w = w_ckpt[fam_cols]
-            sliced_b = b_ckpt[fam_cols]
-            if sliced_w.shape == tgt_w.shape and sliced_b.shape == tgt_b.shape:
-                tgt_w.data.copy_(sliced_w.to(tgt_w.device, dtype=tgt_w.dtype))
-                tgt_b.data.copy_(sliced_b.to(tgt_b.device, dtype=tgt_b.dtype))
-                return True
+        # 2. Load trained per-layer LayerNorm parameters ONLY after head compatibility is verified
+        if hasattr(model, "norms") and model.norms is not None:
+            for i, norm in enumerate(model.norms):
+                wk, bk = f"norms.{i}.weight", f"norms.{i}.bias"
+                if wk in h_sd and norm.weight.shape == h_sd[wk].shape:
+                    norm.weight.data.copy_(h_sd[wk].to(norm.weight.device, dtype=norm.weight.dtype))
+                if bk in h_sd and hasattr(norm, "bias") and norm.bias is not None and norm.bias.shape == h_sd[bk].shape:
+                    norm.bias.data.copy_(h_sd[bk].to(norm.bias.device, dtype=norm.bias.dtype))
 
-        return False
+        # 3. Load centered_head parameters if present and shape matches
+        if hasattr(model, "centered_head") and model.centered_head is not None:
+            cw = h_sd.get("centered.weight", None)
+            cb = h_sd.get("centered.bias", None)
+            if cw is not None and cb is not None:
+                tgt_cw = model.centered_head.weight
+                tgt_cb = model.centered_head.bias
+                if tgt_cw.shape == cw.shape and tgt_cb.shape == cb.shape:
+                    tgt_cw.data.copy_(cw.to(tgt_cw.device, dtype=tgt_cw.dtype))
+                    tgt_cb.data.copy_(cb.to(tgt_cb.device, dtype=tgt_cb.dtype))
+                elif fam_cols is not None and cw.shape[0] >= max(fam_cols) + 1:
+                    cw_sl = cw[fam_cols]
+                    cb_sl = cb[fam_cols]
+                    if cw_sl.shape == tgt_cw.shape and cb_sl.shape == tgt_cb.shape:
+                        tgt_cw.data.copy_(cw_sl.to(tgt_cw.device, dtype=tgt_cw.dtype))
+                        tgt_cb.data.copy_(cb_sl.to(tgt_cb.device, dtype=tgt_cb.dtype))
+
+        return True
     except Exception as e:
         print(f"[Trainer] Note on loading/slicing champion head: {e}")
         return False
@@ -3241,11 +3289,11 @@ def train_family_gate_from_dataset(
     feat_sd = load_file(str(ds_p / "features_concat.safetensors"))
     Z_train = feat_sd["features_concat"].cpu().float().numpy()
 
-    # Load all-layers tensor if present
+    # Load all-layers tensor if present (keep FP16 to save ~4.8 GB RAM)
     Z_train_layers = None
     if (ds_p / "features_by_layer.safetensors").exists():
         feat_l_sd = load_file(str(ds_p / "features_by_layer.safetensors"))
-        Z_train_layers = feat_l_sd["features_by_layer"].cpu().float().numpy()
+        Z_train_layers = feat_l_sd["features_by_layer"].cpu().numpy()
 
     df_meta = pd.read_parquet(ds_p / "metadata.parquet")
     model_names = df_meta["model"].tolist()
@@ -3306,7 +3354,7 @@ def train_family_gate_from_dataset(
                 chosen_layers = None
             else:
                 print(f"[{target_family.upper()} Gate] Slicing select_layers={chosen_layers} from features_by_layer...")
-                Z_train_sel = Z_train_layers[:, chosen_layers, :]
+                Z_train_sel = Z_train_layers[:, chosen_layers, :].astype(np.float32)
                 m_l = Z_train_sel.mean(axis=-1, keepdims=True)
                 s_l = Z_train_sel.std(axis=-1, keepdims=True) + 1e-5
                 Z_train_sel = (Z_train_sel - m_l) / s_l
@@ -3323,10 +3371,10 @@ def train_family_gate_from_dataset(
 
     if (ds_p / "benchmark_features_by_layer.safetensors").exists():
         bench_l_sd = load_file(str(ds_p / "benchmark_features_by_layer.safetensors"))
-        Z_ev_layers = bench_l_sd["benchmark_features_by_layer"].cpu().float().numpy()
+        Z_ev_layers = bench_l_sd["benchmark_features_by_layer"].cpu().numpy()
 
     if chosen_layers is not None and Z_ev_layers is not None and max(chosen_layers) < Z_ev_layers.shape[1]:
-        Z_ev_sel = Z_ev_layers[:, chosen_layers, :]
+        Z_ev_sel = Z_ev_layers[:, chosen_layers, :].astype(np.float32)
         m_ev = Z_ev_sel.mean(axis=-1, keepdims=True)
         s_ev = Z_ev_sel.std(axis=-1, keepdims=True) + 1e-5
         Z_ev_sel = (Z_ev_sel - m_ev) / s_ev
@@ -4259,6 +4307,16 @@ def train_family_gate(
             checkpoints_volume.commit()
         print(f"[{target_family.upper()} Gate] Checkpoint saved to {out_p}.")
 
+    # Free in-memory extraction arrays before running offline sweep to prevent RAM duplication
+    try:
+        del Z_train, Z_train_layers, Z_eval, Z_eval_layers, Z_tr_active, Z_ev_active
+    except Exception:
+        pass
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     should_sweep = (
         export_embeddings
         and (train_cfg.get("run_sweep", True) if isinstance(train_cfg, dict) else True)
@@ -4392,7 +4450,15 @@ def run_sweep(
         ("EXP-02", "F2_fisher_velocity", True, False, None, False, "+ Inter-Layer Velocity Fisher Subspace"),
         ("EXP-03", "F3_scalarmix_fisher", True, True, None, False, "+ ScalarMix Layer Importance Weighting"),
     ]
-    has_by_layer = (ds_p / "features_by_layer.safetensors").exists()
+    has_by_layer = False
+    if (ds_p / "features_by_layer.safetensors").exists():
+        try:
+            from safetensors import safe_open
+            with safe_open(str(ds_p / "features_by_layer.safetensors"), framework="pt") as f:
+                shp = f.get_slice("features_by_layer").get_shape()
+                has_by_layer = len(shp) == 3 and shp[1] > 8
+        except Exception:
+            has_by_layer = False
     if has_by_layer:
         feature_specs.append(
             ("EXP-04", "F4_auto_top8_fisher", True, True, "auto_top8", False, "+ Auto-Top-8 Layer Slicing")
@@ -4458,8 +4524,8 @@ def run_sweep(
                 ledger.add_entry(record, artifacts=arts)
                 sweep_results.append((record, tmp_run_out))
 
-                # Identify best foldable checkpoint (EXP-01 through EXP-04)
-                if not use_mv and hld_18_sk > best_foldable_score:
+                # Identify best zero-cost foldable checkpoint compatible with canonical 8-layer Z_te (EXP-01 through EXP-03)
+                if sel_l is None and not use_mv and hld_18_sk > best_foldable_score:
                     best_foldable_score = hld_18_sk
                     best_foldable_run = (exp_id, tmp_run_out, record)
 

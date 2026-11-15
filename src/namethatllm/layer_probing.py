@@ -535,7 +535,7 @@ def run_all_layers_probe_sweep(
     if fam_mask.sum() == 0:
         fam_mask = np.ones(len(y), dtype=bool)
 
-    X_layers = features_by_layer[fam_mask].astype(np.float32)
+    X_layers = features_by_layer[fam_mask]
     y_fam = y[fam_mask]
     N, L, D = X_layers.shape
 
@@ -570,7 +570,7 @@ def run_all_layers_probe_sweep(
     print("--------------------------------------------------------------------------------")
 
     for l_idx in range(L):
-        X_l = X_layers[:, l_idx, :]
+        X_l = X_layers[:, l_idx, :].astype(np.float32)
         oof_l = np.zeros((N, num_family_classes), dtype=np.float32)
 
         for tr_idx, val_idx in folds:
@@ -703,14 +703,23 @@ def engineer_multiview_features(
     inter_vel = np.linalg.norm(blocks[:, 1:, :] - blocks[:, :-1, :], axis=2)    # (N, 7)
     feats.extend([inter_cos, inter_vel])
 
-    # If full all-28-layer tensor is provided, add trajectory curvature across early/mid/late thirds
+    # If full all-28-layer tensor is provided, compute per-layer norms and adjacent cosine similarities layer-by-layer
     if features_by_layer is not None and features_by_layer.ndim == 3:
-        f_all = features_by_layer.astype(np.float32)
-        f_norms = np.linalg.norm(f_all, axis=2).clip(min=1e-6)
-        feats.append(f_norms)
-        f_unit = f_all / f_norms[:, :, None]
-        adj_cos = np.sum(f_unit[:, 1:, :] * f_unit[:, :-1, :], axis=2)  # (N, L_all - 1)
-        feats.append(adj_cos)
+        L_all = features_by_layer.shape[1]
+        f_norms_list = []
+        adj_cos_list = []
+        prev_unit = None
+        for l_idx in range(L_all):
+            layer_f = features_by_layer[:, l_idx, :].astype(np.float32)
+            l_norm = np.linalg.norm(layer_f, axis=1, keepdims=True).clip(min=1e-6)
+            f_norms_list.append(l_norm)
+            curr_unit = layer_f / l_norm
+            if prev_unit is not None:
+                adj_cos_list.append(np.sum(curr_unit * prev_unit, axis=1, keepdims=True))
+            prev_unit = curr_unit
+        feats.append(np.hstack(f_norms_list))
+        if adj_cos_list:
+            feats.append(np.hstack(adj_cos_list))
 
     if head_tail_cos is not None:
         feats.append(head_tail_cos.astype(np.float32))

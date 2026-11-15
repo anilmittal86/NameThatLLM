@@ -1215,7 +1215,8 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                     K_fam = len(FAMILIES[fam_nm])
                                                     family_spec_gate_weights[fam_nm] = float(meta_spec.get("default_gate_weight", 0.40))
 
-                                                    if "mlp_w1" in heads_spec:
+                                                    spec_head_type = str(meta_spec.get("head_type", "hybrid")).lower()
+                                                    if "mlp_w1" in heads_spec and spec_head_type != "ridge":
                                                         w1 = torch.as_tensor(heads_spec["mlp_w1"], dtype=torch.float32)
                                                         b1 = torch.as_tensor(heads_spec["mlp_b1"], dtype=torch.float32)
                                                         w2 = torch.as_tensor(heads_spec["mlp_w2"], dtype=torch.float32)
@@ -1228,6 +1229,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                             ln_w, ln_b = ln_w.to(dev), ln_b.to(dev)
                                                         pw = torch.as_tensor(heads_spec["plain.weight"], dtype=torch.float32).to(dev) if "plain.weight" in heads_spec else None
                                                         pb = torch.as_tensor(heads_spec["plain.bias"], dtype=torch.float32).to(dev) if "plain.bias" in heads_spec else None
+                                                        use_hyb = spec_head_type in ("hybrid", "hybrid_65mlp_35ridge")
 
                                                         def _eval_mlp_gate(z_arr):
                                                             with torch.no_grad():
@@ -1236,7 +1238,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                                 if ln_w is not None and ln_b is not None:
                                                                     h = torch.nn.functional.layer_norm(h, (h.shape[-1],), ln_w, ln_b)
                                                                 mlp_out = (h @ w2.T + b2)[:, :K_fam]
-                                                                if pw is not None and pb is not None and pw.shape[0] >= K_fam:
+                                                                if use_hyb and pw is not None and pb is not None and pw.shape[0] >= K_fam:
                                                                     ridge_out = z_t @ pw[:K_fam].T + pb[:K_fam]
                                                                     out_t = 0.65 * mlp_out + 0.35 * ridge_out
                                                                     row_std = out_t.std(dim=1, keepdim=True).mean().clamp(min=1e-4)
@@ -1264,7 +1266,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                                                             and len(Z_unseen) == N_unseen
                                                             and N_unseen > 0
                                                         ):
-                                                            if "mlp_w1" in heads_spec:
+                                                            if "mlp_w1" in heads_spec and spec_head_type != "ridge":
                                                                 raw_spec_u = _eval_mlp_gate(Z_unseen)
                                                             else:
                                                                 raw_spec_u = (Z_unseen @ W_spec.T + b_spec)[:, :K_fam].astype(np.float32)
