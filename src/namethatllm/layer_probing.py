@@ -710,6 +710,7 @@ def engineer_multiview_features(
         std_f = token_std_norms.astype(np.float32)
         feats.append(std_f)
         # Coefficient of variation (dispersion relative to layer norm)
-        feats.append(std_f / block_norms)
+        if std_f.shape[1] == block_norms.shape[1]:
+            feats.append(std_f / block_norms)
 
     return np.hstack(feats).astype(np.float32)

@@ -1560,10 +1560,18 @@ def run_training_pipeline(
             except Exception as e:
                 print(f"[Trainer] Note on loading adapter for extraction: {e}")
 
+        head_loaded = False
         for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
-            if "export_champion" in str(cand) or "inhouse" in str(cand):
+            if any(term in str(cand).lower() for term in ["champion", "inhouse", "stage1", "backbone", "18class", "full"]):
                 if load_and_slice_champion_heads(cand, model, fam_cols=None):
                     print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
+                    head_loaded = True
+                    break
+        if not head_loaded:
+            for cand in list(input_dir.rglob("heads.safetensors")):
+                if load_and_slice_champion_heads(cand, model, fam_cols=None):
+                    print(f"[Trainer] Loaded champion norms & 18-class plain head from fallback {cand}")
+                    head_loaded = True
                     break
 
         extract_and_export_embeddings(
@@ -1637,9 +1645,15 @@ def run_training_pipeline(
 
         head_loaded = False
         for cand in list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt")):
-            if "export_champion" in str(cand) or "inhouse" in str(cand):
+            if any(term in str(cand).lower() for term in ["champion", "inhouse", "stage1", "backbone", "18class", "full"]):
                 if load_and_slice_champion_heads(cand, model, fam_cols=None):
                     print(f"[Trainer] Loaded champion norms & 18-class plain head from {cand}")
+                    head_loaded = True
+                    break
+        if not head_loaded:
+            for cand in list(input_dir.rglob("heads.safetensors")):
+                if load_and_slice_champion_heads(cand, model, fam_cols=None):
+                    print(f"[Trainer] Loaded champion norms & 18-class plain head from fallback {cand}")
                     head_loaded = True
                     break
 
@@ -1683,7 +1697,7 @@ def run_training_pipeline(
             exp_out = train_cfg.get("embeddings_output_dir")
         elif isinstance(exp_cfg, dict):
             exp_enabled = bool(exp_cfg.get("enabled", True))
-            exp_save_all = bool(exp_cfg.get("save_all_layers", False))
+            exp_save_all = bool(exp_cfg.get("save_all_layers", train_cfg.get("save_all_layers", False)))
             exp_out = exp_cfg.get("output_dir") or train_cfg.get("embeddings_output_dir")
         else:
             exp_enabled = bool(train_cfg.get("export_embeddings", False))
@@ -2475,7 +2489,7 @@ def fit_family_mlp_head(
     # 4. Evaluate folded MLP directly on raw uncentered Z_eval (verifying exact fast-path equivalence)
     best_eval_acc = best_val_acc
     best_eval_logits = None
-    eval_target = raw_Z_eval if raw_Z_eval is not None else (Z_eval if pca_components is None else None)
+    eval_target = raw_Z_eval if (raw_Z_eval is not None and pca_components is not None) else Z_eval
     if eval_target is not None:
         with torch.no_grad():
             Z_ev_raw_t = torch.from_numpy(eval_target).float().to(device)
@@ -3294,12 +3308,17 @@ def train_family_gate_from_dataset(
         else:
             chosen_layers = list(select_layers)
 
-        print(f"[{target_family.upper()} Gate] Slicing select_layers={chosen_layers} from features_by_layer...")
-        Z_train_sel = Z_train_layers[:, chosen_layers, :]
-        m_l = Z_train_sel.mean(axis=-1, keepdims=True)
-        s_l = Z_train_sel.std(axis=-1, keepdims=True) + 1e-5
-        Z_train_sel = (Z_train_sel - m_l) / s_l
-        Z_train = Z_train_sel.reshape(Z_train_sel.shape[0], -1).astype(np.float32)
+        if chosen_layers is not None and len(chosen_layers) > 0:
+            if max(chosen_layers) >= Z_train_layers.shape[1]:
+                print(f"[{target_family.upper()} Gate] Warning: select_layers {chosen_layers} exceeds available layers ({Z_train_layers.shape[1]}). Using all available layers.")
+                chosen_layers = None
+            else:
+                print(f"[{target_family.upper()} Gate] Slicing select_layers={chosen_layers} from features_by_layer...")
+                Z_train_sel = Z_train_layers[:, chosen_layers, :]
+                m_l = Z_train_sel.mean(axis=-1, keepdims=True)
+                s_l = Z_train_sel.std(axis=-1, keepdims=True) + 1e-5
+                Z_train_sel = (Z_train_sel - m_l) / s_l
+                Z_train = Z_train_sel.reshape(Z_train_sel.shape[0], -1).astype(np.float32)
 
     # Load holdout benchmark features if available
     Z_eval, y_ev_arr, main_logits_eval = None, None, None
@@ -3314,7 +3333,7 @@ def train_family_gate_from_dataset(
         bench_l_sd = load_file(str(ds_p / "benchmark_features_by_layer.safetensors"))
         Z_ev_layers = bench_l_sd["benchmark_features_by_layer"].cpu().float().numpy()
 
-    if chosen_layers is not None and Z_ev_layers is not None:
+    if chosen_layers is not None and Z_ev_layers is not None and max(chosen_layers) < Z_ev_layers.shape[1]:
         Z_ev_sel = Z_ev_layers[:, chosen_layers, :]
         m_ev = Z_ev_sel.mean(axis=-1, keepdims=True)
         s_ev = Z_ev_sel.std(axis=-1, keepdims=True) + 1e-5
@@ -3330,7 +3349,9 @@ def train_family_gate_from_dataset(
             main_logits_eval = champ_sd["logits_plain"].cpu().float().numpy()
 
     # Step 3: 100% Pure Supervised Fisher Subspace (Zero PCA)
-    num_tapped = 8
+    num_tapped = len(chosen_layers) if chosen_layers is not None else (
+        Z_train.shape[1] // 5120 if (Z_train.shape[1] % 5120 == 0) else 8
+    )
     pca_components = None
     pca_mean = None
     if use_supervised_subspace:
@@ -3362,9 +3383,10 @@ def train_family_gate_from_dataset(
             if "token_std_norms" in c_sd:
                 std_tr = c_sd["token_std_norms"].cpu().float().numpy()
 
+        f_by_layer_tr = Z_train_layers if (Z_eval is None or Z_ev_layers is not None) else None
         mv_tr = engineer_multiview_features(
             features_concat=Z_train,
-            features_by_layer=Z_train_layers,
+            features_by_layer=f_by_layer_tr,
             head_tail_cos=ht_tr,
             token_std_norms=std_tr,
             num_tapped_layers=num_tapped,
@@ -3382,9 +3404,10 @@ def train_family_gate_from_dataset(
                     ht_ev = b_sd["head_tail_cos"].cpu().float().numpy()
                 if "token_std_norms" in b_sd:
                     std_ev = b_sd["token_std_norms"].cpu().float().numpy()
+            f_by_layer_ev = Z_ev_layers if (Z_train_layers is not None) else None
             mv_ev = engineer_multiview_features(
                 features_concat=Z_eval,
-                features_by_layer=Z_ev_layers,
+                features_by_layer=f_by_layer_ev,
                 head_tail_cos=ht_ev,
                 token_std_norms=std_ev,
                 num_tapped_layers=num_tapped,
@@ -3453,7 +3476,7 @@ def train_family_gate_from_dataset(
         device=device,
         pca_components=pca_components,
         pca_mean=pca_mean,
-        raw_Z_eval=Z_eval,
+        raw_Z_eval=Z_eval if pca_components is not None else None,
     )
 
     # Hybrid 0.65 MLP + 0.35 Ridge logits if both available
@@ -3758,6 +3781,21 @@ def train_family_gate(
     tr_cos_list = []
     tr_std_list = []
     need_layers = bool(export_embeddings or save_all_layers)
+    if save_all_layers and export_embeddings:
+        try:
+            emb_target_dir = Path(embeddings_output_dir) if embeddings_output_dir else (Path(output_dir) / "embeddings" if output_dir else Path("export_embeddings"))
+            emb_target_dir.mkdir(parents=True, exist_ok=True)
+            _, _, free_bytes = shutil.disk_usage(emb_target_dir)
+            est_all_layers_bytes = len(train_texts) * 28 * 5120 * 2
+            if est_all_layers_bytes > 0.80 * free_bytes:
+                print(
+                    f"\n[WARNING][Disk Safety Guard] Estimated 28-layer tensor size ({est_all_layers_bytes / (1024**3):.2f} GB) "
+                    f"exceeds 80% of available free disk space ({free_bytes / (1024**3):.2f} GB) in {emb_target_dir}."
+                )
+                print("  -> Automatically falling back to saving 8 tapped layers in features_by_layer.safetensors ([N, 8, 5120]) to prevent OSError: No space left on device.\n")
+                save_all_layers = False
+        except Exception:
+            pass
     with torch.no_grad():
         with torch.amp.autocast(device.type, dtype=amp_dtype):
             for batch in loader_tr:
@@ -4044,7 +4082,7 @@ def train_family_gate(
         device=device,
         pca_components=pca_components,
         pca_mean=pca_mean,
-        raw_Z_eval=Z_eval,
+        raw_Z_eval=Z_eval if pca_components is not None else None,
     )
     print(f"[{target_family.upper()} Gate] Step 5 Complete: MLP Head -> {target_family.upper()} Acc: {mlp_acc * 100:.2f}% (Lift: {(mlp_acc - acc_plain_within) * 100:+.2f}%)")
 

@@ -241,3 +241,54 @@ def test_run_gate_experiments_sweep(tmp_path: Path):
     assert "hard_pair_eval_acc" in meta
     assert "default_gate_weight" in meta
     assert meta["target_family"] == "gemini"
+
+
+def test_train_family_gate_from_dataset_robustness(tmp_path: Path):
+    from namethatllm.trainer import train_family_gate_from_dataset
+
+    bundle_dir = tmp_path / "bundle_robust"
+    bundle_dir.mkdir(parents=True)
+
+    target_family = "gemini"
+    fam_cols = FAMILIES[target_family]
+    fam_models = [LABELS[i] for i in fam_cols]
+    n_per_c = 6
+    models = []
+    for m in fam_models:
+        models.extend([m] * n_per_c)
+    models.extend(["__OTHER__"] * 4)
+    N_tr = len(models)
+    D = 64
+
+    # Save 4 tapped layers x 16 dims
+    Z_tr = np.random.randn(N_tr, D).astype(np.float32)
+    save_file({"features_concat": torch.from_numpy(Z_tr)}, str(bundle_dir / "features_concat.safetensors"))
+    # Save features_by_layer with 4 layers
+    Z_layers = np.random.randn(N_tr, 4, 16).astype(np.float32)
+    save_file({"features_by_layer": torch.from_numpy(Z_layers)}, str(bundle_dir / "features_by_layer.safetensors"))
+
+    df_meta = pd.DataFrame({"model": models, "prompt_id": [f"p_{i}" for i in range(N_tr)]})
+    df_meta.to_parquet(bundle_dir / "metadata.parquet")
+
+    # Benchmark: 18 samples, but WITHOUT benchmark_features_by_layer to test multiview parity
+    N_bench = 18
+    Z_ev = np.random.randn(N_bench, D).astype(np.float32)
+    save_file({"benchmark_features_concat": torch.from_numpy(Z_ev)}, str(bundle_dir / "benchmark_features_concat.safetensors"))
+    df_bench = pd.DataFrame({"model": list(LABELS), "label": list(range(18))})
+    df_bench.to_parquet(bundle_dir / "benchmark_metadata.parquet")
+
+    # Test 1: select_layers out-of-bounds (e.g. asking for layer 27 when only 4 layers exist)
+    out_dir = tmp_path / "out_robust"
+    res = train_family_gate_from_dataset(
+        dataset_dir=bundle_dir,
+        target_family="gemini",
+        output_dir=out_dir,
+        head_type="hybrid",
+        select_layers=[2, 4, 27],  # Out of bounds -> should safely fallback without crashing
+        use_multiview=True,        # Train has by_layer, eval does not -> should safely handle parity
+        device=torch.device("cpu"),
+    )
+
+    assert res["target_family"] == "gemini"
+    assert (out_dir / "heads.safetensors").exists()
+    assert (out_dir / "meta.json").exists()
