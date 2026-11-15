@@ -383,6 +383,11 @@ def build_supervised_family_subspace(
 
     Z_fam = Z_train[fam_mask]
     y_fam = y_train[fam_mask]
+    fam_pids = (
+        np.asarray(prompt_ids)[fam_mask]
+        if (prompt_ids is not None and len(prompt_ids) == len(y_train))
+        else prompt_ids
+    )
 
     mu_fam = Z_fam.mean(axis=0, keepdims=True).astype(np.float32)
     Z_fam_c = (Z_fam - mu_fam).astype(np.float32)
@@ -397,11 +402,6 @@ def build_supervised_family_subspace(
             hard_sister_pair = (0, 1)
 
     # Compute Layer-Probing Importance Weights if layer_weighting is enabled
-    fam_pids = (
-        np.asarray(prompt_ids)[fam_mask]
-        if (prompt_ids is not None and len(prompt_ids) == len(y_train))
-        else prompt_ids
-    )
     if layer_weighting:
         w_layers, oof_baccs, comp_scores = _compute_layer_oof_scores(
             Z_fam_c=Z_fam_c,
@@ -419,7 +419,7 @@ def build_supervised_family_subspace(
     basis_rows: list[np.ndarray] = []
     layer_fisher_norms: dict[int, float] = {}
 
-    # Part 1: Per-Layer Multi-Scale Fisher Directions
+    # Part 1: Per-Layer Multi-Scale Fisher Directions (unscaled before QR)
     for l_idx in range(num_tapped_layers):
         s_col = l_idx * D_layer
         e_col = (l_idx + 1) * D_layer
@@ -465,18 +465,16 @@ def build_supervised_family_subspace(
     if subspace_dim is not None and subspace_dim > 0 and V_basis.shape[0] > subspace_dim:
         V_basis = V_basis[:subspace_dim]
 
-    # Part 4: Whiten each Fisher coordinate by its intra-family training std, then apply layer_weighting
+    # Part 4: Whiten each Fisher coordinate to std=1.0 first, THEN apply post-whitening layer volume boost
     Z_fam_proj = Z_fam_c @ V_basis.T  # (N_fam, D_fisher)
     sd_proj = Z_fam_proj.std(axis=0, keepdims=True).clip(min=1e-3).astype(np.float32)
     C_white = (V_basis / sd_proj.T).astype(np.float32)
 
     if layer_weighting:
-        # Each row v_k of V_basis has unit L2 norm; block_energy[k, l] is the fraction of v_k's energy in layer l
         V_blocks = V_basis.reshape(V_basis.shape[0], num_tapped_layers, D_layer)
         block_energy = np.sum(V_blocks * V_blocks, axis=2)  # (D_fisher, num_tapped_layers)
-        dir_scales = np.sqrt(
-            np.sum(block_energy * (float(num_tapped_layers) * w_layers[None, :]), axis=1, keepdims=True)
-        ).astype(np.float32)
+        layer_mult = float(num_tapped_layers) * w_layers[None, :]
+        dir_scales = np.sqrt(np.sum(block_energy * layer_mult, axis=1, keepdims=True)).astype(np.float32)
         C_eff = (C_white * dir_scales).astype(np.float32)
     else:
         C_eff = C_white

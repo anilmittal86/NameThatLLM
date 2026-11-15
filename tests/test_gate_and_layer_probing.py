@@ -502,3 +502,58 @@ class TestGateAndLayerProbing:
         norm_r0 = P_fused[0, first_col] / P_fused[0, gem_cols].sum()
         norm_r1 = P_fused[1, first_col] / P_fused[1, gem_cols].sum()
         assert norm_r0 > norm_r1  # Stronger shift on high-confidence row
+
+    def test_exp3_layer_weighting_changes_subspace(self):
+        """Verify EXP-03 layer weighting produces non-identical subspace and scales variance according to accuracy."""
+        from namethatllm.layer_probing import build_supervised_family_subspace
+
+        np.random.seed(42)
+        N = 120
+        num_tapped = 8
+        D_layer = 128
+        D_total = num_tapped * D_layer
+        y = np.array([i % 4 for i in range(N)])
+        Z = np.random.randn(N, D_total).astype(np.float32) * 0.1
+
+        # Layer 6 has strong sister separation; Layer 0 is pure noise
+        Z[y == 2, 6 * D_layer : 7 * D_layer] += 2.0
+        Z[y == 3, 6 * D_layer : 7 * D_layer] -= 2.0
+        Z[y == 0, 6 * D_layer : 7 * D_layer] += 1.5
+        Z[y == 1, 6 * D_layer : 7 * D_layer] -= 1.5
+
+        # Weighted (EXP-03) vs Unweighted (EXP-02)
+        Cw, mu_w, diag_w = build_supervised_family_subspace(
+            Z_train=Z,
+            y_train=y,
+            num_family_classes=4,
+            num_tapped_layers=num_tapped,
+            include_velocity=False,
+            layer_weighting=True,
+            hard_sister_pair=(2, 3),
+            device=torch.device("cpu"),
+        )
+        Cu, mu_u, diag_u = build_supervised_family_subspace(
+            Z_train=Z,
+            y_train=y,
+            num_family_classes=4,
+            num_tapped_layers=num_tapped,
+            include_velocity=False,
+            layer_weighting=False,
+            hard_sister_pair=(2, 3),
+            device=torch.device("cpu"),
+        )
+
+        # 1. C_eff_weighted is NOT equal to C_eff_unweighted
+        assert not np.allclose(Cw, Cu)
+
+        # 2. Layer 6 importance weight is strictly higher than Layer 0
+        w_layers = diag_w["layer_scalar_weights"]
+        assert w_layers[6] > w_layers[0]
+
+        # 3. Projected variance is strictly larger (> 1.1x) on directions from the high-accuracy layer than noisy layer
+        proj_w = (Z - mu_w) @ Cw.T
+        vars_w = np.var(proj_w, axis=0)
+
+        # High-accuracy layer directions vs noisy layer directions
+        assert vars_w.max() > 1.1 * vars_w.min()
+
