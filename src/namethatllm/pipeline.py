@@ -1617,6 +1617,34 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # Execute DeBERTa Family Specialists on Trunk 4
+        deb_spec_ckpts = [
+            ("deberta_gemini", "gemini"),
+            ("deberta_claude_glm", "claude_glm"),
+            ("deberta_gpt_qwen_kimi", "gpt_qwen_kimi"),
+        ]
+        for deb_spec_k, fam_nm in deb_spec_ckpts:
+            if deb_spec_k in ckpts and fam_nm not in family_spec_logits_te:
+                deb_spec_p = ckpts[deb_spec_k]
+                base_deb_dir = verified_bases.get("deberta_v3_large") or find_base_model(input_dir, "deberta", 1024, 24)
+                print(f"[Pipeline] Running Trunk 4 DeBERTa Specialist: {deb_spec_k} ({fam_nm}) from {deb_spec_p}...")
+                Z_all_s, _, W_p_s, b_p_s, W_c_s, b_c_s, s_labels = extract_deberta_checkpoint(
+                    deb_spec_p, base_deb_dir, test_texts + (unseen_texts if N_unseen > 0 else []), [], []
+                )
+                if W_p_s is not None:
+                    raw_s_te = (Z_all_s[:N_test] @ W_p_s.T + b_p_s).astype(np.float32)
+                    family_spec_logits_te[fam_nm] = raw_s_te
+                    family_spec_classes[fam_nm] = s_labels
+                    meta_s = read_checkpoint_meta(deb_spec_p, default_keep=24, default_layers=[], default_max_len=512)
+                    family_spec_gate_weights[fam_nm] = float(meta_s.get("default_gate_weight", 0.35))
+                    if N_unseen > 0:
+                        raw_s_u = (Z_all_s[N_test : N_test + N_unseen] @ W_p_s.T + b_p_s).astype(np.float32)
+                        family_spec_logits_unseen[fam_nm] = raw_s_u
+                del Z_all_s
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         # Add Secondary LoRAs to COMP_LIST
         if comp_lora_posteriors:
             tot_w = sum(w for w, _ in comp_lora_posteriors)
@@ -1775,9 +1803,9 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
     )
 
     # -------------------------------------------------------------------------
-    # STAGE 3B: Deep Neural Family-Specialist LoRA Gates (GPT, Gemini, GLM)
+    # STAGE 3B: Deep Neural Family-Specialist LoRA Gates (GPT, Gemini, GLM, Claude, Super-clusters)
     # -------------------------------------------------------------------------
-    for fam_k in ["gpt", "gemini", "glm"]:
+    for fam_k in ["gpt", "gemini", "glm", "claude", "claude_glm", "gpt_qwen_kimi"]:
         spec_te_logits = family_spec_logits_te.get(fam_k)
         if spec_te_logits is not None:
             spec_cls = family_spec_classes.get(fam_k)
@@ -1936,7 +1964,7 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         cache_dict["num_extra"] = np.array([len(extra_streams)], dtype=np.int32)
         if "claude_spec_logits_unseen" in locals() and claude_spec_logits_unseen is not None:
             cache_dict["claude_spec_logits_unseen"] = claude_spec_logits_unseen.astype(np.float32)
-        for fam_k in ("gpt", "gemini", "glm"):
+        for fam_k in ("gpt", "gemini", "glm", "claude", "claude_glm", "gpt_qwen_kimi"):
             if "family_spec_logits_te" in locals() and fam_k in family_spec_logits_te and family_spec_logits_te[fam_k] is not None:
                 cache_dict[f"{fam_k}_spec_logits"] = family_spec_logits_te[fam_k].astype(np.float32)
             if (

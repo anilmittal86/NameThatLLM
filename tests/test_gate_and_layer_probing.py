@@ -600,4 +600,49 @@ class TestGateAndLayerProbing:
         cos_sim = F.cosine_similarity(out_patched_fp16.float().flatten(), out_ref_fp32.flatten(), dim=0)
         assert cos_sim.item() > 0.95
 
+    def test_build_oof_supervised_family_subspace_eliminates_leakage(self):
+        """
+        Verifies that build_oof_supervised_family_subspace prevents 99%+ label memorization leakage
+        on random noise high-dimensional representations.
+        """
+        from namethatllm.layer_probing import build_oof_supervised_family_subspace, build_supervised_family_subspace
+        from namethatllm.trainer import fit_family_gate_head
+
+        np.random.seed(42)
+        torch.manual_seed(42)
+
+        # 80 samples in D=512 (8 tapped layers of 64 dims), purely random Gaussian noise
+        N = 80
+        D = 512
+        K_fam = 4
+        Z_random = np.random.randn(N, D).astype(np.float32)
+        y_random = np.random.randint(0, K_fam, size=N).astype(np.int64)
+
+        # 1. In-sample projection: fits on full Z_random
+        C_insample, mu_insample, _ = build_supervised_family_subspace(
+            Z_random, y_random, num_family_classes=K_fam, num_tapped_layers=8, subspace_dim=32, device=torch.device("cpu")
+        )
+        Z_insample = (Z_random - mu_insample) @ C_insample.T
+
+        # 2. Out-of-fold projection: strictly fold-independent
+        Z_oof, _, C_full, mu_full, _ = build_oof_supervised_family_subspace(
+            Z_random, y_random, num_family_classes=K_fam, num_tapped_layers=8, subspace_dim=32, n_splits=5, device=torch.device("cpu")
+        )
+
+        assert Z_oof.shape == Z_insample.shape
+
+        # Train Ridge on Z_oof: accuracy on random noise must be realistic (<= 0.55 on 4 classes)
+        # and cannot achieve 95%+ false memorization!
+        res_gate = fit_family_gate_head(
+            Z_train=Z_oof,
+            y_train=y_random,
+            num_gate_classes=K_fam,
+            num_family_classes=K_fam,
+            device=torch.device("cpu"),
+        )
+        oof_acc = res_gate[3]
+
+        assert oof_acc < 0.60, f"OOF accuracy {oof_acc:.4f} must not show 90%+ memorization on random noise!"
+
+
 

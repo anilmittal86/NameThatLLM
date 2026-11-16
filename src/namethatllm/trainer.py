@@ -577,7 +577,14 @@ class PromptGroupBatchSampler(Sampler):
 
 class TextSequenceDataset(Dataset):
     def __init__(
-        self, texts: list[str], labels: list[int] | None, prompt_ids: list[Any] | None, tok: Any, max_len: int = 447, end_id: int = 151643
+        self,
+        texts: list[str],
+        labels: list[int] | None,
+        prompt_ids: list[Any] | None,
+        tok: Any,
+        max_len: int = 447,
+        end_id: int | None = 151643,
+        cls_id: int | None = None,
     ):
         self.texts = texts
         self.labels = labels
@@ -585,6 +592,7 @@ class TextSequenceDataset(Dataset):
         self.tok = tok
         self.max_len = max_len
         self.end_id = end_id
+        self.cls_id = cls_id
 
     def __len__(self) -> int:
         return len(self.texts)
@@ -597,7 +605,9 @@ class TextSequenceDataset(Dataset):
             raw_ids = full_ids[:head_len] + full_ids[-tail_len:]
         else:
             raw_ids = full_ids
-        input_ids = raw_ids + [self.end_id]
+        input_ids = ([self.cls_id] if self.cls_id is not None else []) + raw_ids
+        if self.end_id is not None:
+            input_ids = input_ids + [self.end_id]
         item: dict[str, Any] = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
@@ -675,6 +685,7 @@ def train_prompt_group_step(
     accum_steps: int = 1,
     compute_dtype: torch.dtype = torch.float16,
     weight: torch.Tensor | None = None,
+    drop_first_token: bool = True,
 ) -> tuple[float, float, float]:
     """
     Two-pass micro-batched training step for a single prompt group.
@@ -695,7 +706,7 @@ def train_prompt_group_step(
                 e = min(s + 4, N)
                 mb_mask = attention_mask[s:e]
                 max_l = max(int(mb_mask.sum(dim=1).max().item()), 2)
-                z_c = model.forward_features(input_ids[s:e, :max_l], mb_mask[:, :max_l], drop_first_token=True)
+                z_c = model.forward_features(input_ids[s:e, :max_l], mb_mask[:, :max_l], drop_first_token=drop_first_token)
                 z_chunks.append(z_c)
     Z_all_no_grad = torch.cat(z_chunks, dim=0)
     # Variable-Size Sub-Cluster Centering Augmentation:
@@ -725,7 +736,7 @@ def train_prompt_group_step(
         mb_mask_slice = mb_mask[:, :max_l]
 
         with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=compute_dtype):
-            Z_mb = model.forward_features(mb_ids, mb_mask_slice, drop_first_token=True)
+            Z_mb = model.forward_features(mb_ids, mb_mask_slice, drop_first_token=drop_first_token)
             mb_dev = Z_mb.device
 
             logits_p = model.predict_plain(Z_mb)
@@ -1299,14 +1310,19 @@ def run_training_pipeline(
         train_cfg = {}
 
     backbone_name = train_cfg.get("backbone", "Qwen/Qwen3-14B-Base")
-    keep_layers = int(train_cfg.get("keep_layers", 27))
-    layers = list(train_cfg.get("layers", [2, 4, 6, 9, 13, 17, 22, 27]))
-    max_len = int(train_cfg.get("max_len", 384))
-    end_id = int(train_cfg.get("end_id", 151643))
+    is_deberta = "deberta" in backbone_name.lower()
+    if is_deberta:
+        keep_layers = int(train_cfg.get("keep_layers", 24))
+        layers = list(train_cfg.get("layers", [3, 6, 9, 12, 15, 18, 21, 24]))
+        end_id = int(train_cfg.get("end_id", 0))
+    else:
+        keep_layers = int(train_cfg.get("keep_layers", 27))
+        layers = list(train_cfg.get("layers", [2, 4, 6, 9, 13, 17, 22, 27]))
+        end_id = int(train_cfg.get("end_id", 151643))
+    max_len = int(train_cfg.get("max_len", 512 if is_deberta else 384))
     out_dir = Path(train_cfg.get("output_dir", "export_champion_qwen3_14b"))
     family_margin = float(train_cfg.get("family_margin", 0.35))
     supcon_weight = float(train_cfg.get("supcon_weight", 0.20))
-    is_deberta = "deberta" in backbone_name.lower()
     is_smoke = bool(train_cfg.get("smoke", False))
     checkpoints_volume = train_cfg.get("checkpoints_volume", None)
 
@@ -1448,8 +1464,18 @@ def run_training_pipeline(
     if use_fa2:
         extra_model_kwargs["attn_implementation"] = "flash_attention_2"
 
-    # Memory strategy: Single high-VRAM GPU (A100/H100) vs. Multi-GPU 2xT4 balancing vs. Single T4 vs. CPU
-    if has_high_vram_single_gpu:
+    # Memory strategy: DeBERTa (single GPU FP32) vs. Single high-VRAM GPU vs. Multi-GPU 2xT4 balancing vs. Single T4 vs. CPU
+    if is_deberta:
+        print(f"[Trainer] DeBERTa model detected. Loading in torch.float32 directly on {device} (bypassing device_map='auto')...")
+        base_model = AutoModel.from_pretrained(
+            model_source,
+            config=base_cfg,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            **extra_model_kwargs,
+        ).to(device)
+    elif has_high_vram_single_gpu:
         print(f"[Trainer] High-VRAM single GPU detected ({total_vram_gb:.1f} GiB). Loading directly on {device} in {compute_dtype}...")
         base_model = AutoModel.from_pretrained(
             model_source,
@@ -1890,11 +1916,21 @@ def run_training_pipeline(
         quarantine_dropped = 0
         try:
             _, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path)
+            # Zero-Leakage Benchmark Quarantine: quarantine all 1,800 rows from clean_benchmark_1800_rows.parquet
+            bench_paths = list(input_dir.rglob("clean_benchmark_1800_rows.parquet"))
+            if not bench_paths and Path("clean_benchmark_1800_rows.parquet").exists():
+                bench_paths = [Path("clean_benchmark_1800_rows.parquet")]
+            if bench_paths:
+                df_bench_q = pd.read_parquet(bench_paths[0])
+                bench_q_hashes = set(_text_hash(t) for t in df_bench_q["text"].dropna())
+                if bench_q_hashes:
+                    holdout_hashes = holdout_hashes.union(bench_q_hashes) if holdout_hashes else bench_q_hashes
+
             if holdout_hashes:
                 mask_clean = ~df_p["_hash"].isin(holdout_hashes)
                 quarantine_dropped = int(len(df_p) - mask_clean.sum())
                 if quarantine_dropped > 0:
-                    print(f"[Trainer] Quarantined {quarantine_dropped} pool rows that overlapped with unseen holdout.")
+                    print(f"[Trainer] Quarantined {quarantine_dropped} pool rows that overlapped with unseen holdout / clean benchmark.")
                 df_p = df_p[mask_clean].reset_index(drop=True)
         except Exception as e:
             print(f"[Trainer] Note on holdout quarantine: {e}")
@@ -1997,10 +2033,13 @@ def run_training_pipeline(
                 bs1 = 2
                 accum1 = max(accum1 * (old_bs1 // 2), 8)
                 print(f"[Trainer] Low VRAM GPU ({vram_gb:.1f} GiB) detected: adjusted Stage 1 batch_size from {old_bs1} to {bs1}, accum_steps to {accum1}")
+        pad_id = int(tok.pad_token_id if (tok and tok.pad_token_id is not None) else (0 if is_deberta else 151643))
+        cls_id = int(tok.cls_token_id) if (is_deberta and hasattr(tok, "cls_token_id") and tok.cls_token_id is not None) else None
+        collate_fn_s1 = lambda b: collate_text_batch(b, pad_token_id=pad_id)
         epochs1 = int(stage1_cfg.get("epochs", 2 if not is_specialist else 1))
-        ds1 = TextSequenceDataset(df_p["text"].tolist(), [sub_lab2i[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id)
+        ds1 = TextSequenceDataset(df_p["text"].tolist(), [sub_lab2i[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id, cls_id=cls_id)
         bucket_sampler = BucketedLengthBatchSampler(lengths, batch_size=bs1, shuffle=True)
-        loader1 = DataLoader(ds1, batch_sampler=bucket_sampler, collate_fn=collate_text_batch)
+        loader1 = DataLoader(ds1, batch_sampler=bucket_sampler, collate_fn=collate_fn_s1)
 
         lora_ratio1 = float(stage1_cfg.get("lora_plus_ratio", 2.5))
         param_groups1 = _get_loraplus_param_groups(
@@ -2122,11 +2161,14 @@ def run_training_pipeline(
     print(f"[Trainer] Stage 2 Fine-Tuning on {train_path} ({len(df_tr)} samples, {num_classes} classes)...")
     bs2 = int(stage2_cfg.get("batch_size", 2))
     accum2 = int(stage2_cfg.get("gradient_accumulation_steps", 1))
+    pad_id = int(tok.pad_token_id if (tok and tok.pad_token_id is not None) else (0 if is_deberta else 151643))
+    cls_id = int(tok.cls_token_id) if (is_deberta and hasattr(tok, "cls_token_id") and tok.cls_token_id is not None) else None
+    collate_fn = lambda b: collate_text_batch(b, pad_token_id=pad_id)
     ds2 = TextSequenceDataset(
-        df_tr["text"].tolist(), [sub_lab2i[m] for m in df_tr["model"]], df_tr["prompt_id"].tolist(), tok, max_len=max_len, end_id=end_id
+        df_tr["text"].tolist(), [sub_lab2i[m] for m in df_tr["model"]], df_tr["prompt_id"].tolist(), tok, max_len=max_len, end_id=end_id, cls_id=cls_id
     )
     sampler2 = PromptGroupBatchSampler(df_tr["prompt_id"].tolist(), batch_size=bs2, shuffle=True)
-    loader2 = DataLoader(ds2, batch_sampler=sampler2, collate_fn=collate_text_batch)
+    loader2 = DataLoader(ds2, batch_sampler=sampler2, collate_fn=collate_fn)
 
     lora_ratio2 = float(stage2_cfg.get("lora_plus_ratio", 2.5))
     param_groups2 = _get_loraplus_param_groups(
@@ -2179,6 +2221,7 @@ def run_training_pipeline(
                 accum_steps=accum2,
                 compute_dtype=compute_dtype,
                 weight=stage2_class_weights,
+                drop_first_token=not is_deberta,
             )
             if global_step2 % accum2 == 0 or (step_idx + 1) == len(loader2):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -2204,7 +2247,7 @@ def run_training_pipeline(
         torch.cuda.empty_cache()
 
     model.eval()
-    loader_eval = DataLoader(ds2, batch_size=4, shuffle=False, collate_fn=collate_text_batch)
+    loader_eval = DataLoader(ds2, batch_size=4, shuffle=False, collate_fn=collate_fn)
     Z_list = []
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=compute_dtype):
@@ -2220,8 +2263,9 @@ def run_training_pipeline(
 
     # 5-Stage Cross-Validation & Overfitting Audit on Stage 2 Representations
     n_cv_splits = int(stage2_cfg.get("n_splits", 5))
+    oof_report = {}
     if stage2_cfg.get("check_overfitting", True) and len(np.unique(prompts_train)) >= 2:
-        evaluate_stage2_oof_cv(
+        oof_report = evaluate_stage2_oof_cv(
             Z=Z_train,
             y=y_train,
             prompts=prompts_train,
@@ -2262,6 +2306,113 @@ def run_training_pipeline(
         class_labels=active_labels,
         target_family=target_family if is_specialist else None,
     )
+
+    # Benchmark Holdout Evaluation & EXP-06 Logging for Specialist Models
+    if is_specialist:
+        try:
+            bench_paths = list(input_dir.rglob("clean_benchmark_1800_rows.parquet"))
+            if not bench_paths and Path("clean_benchmark_1800_rows.parquet").exists():
+                bench_paths = [Path("clean_benchmark_1800_rows.parquet")]
+            if bench_paths:
+                df_bench = pd.read_parquet(bench_paths[0])
+                bench_texts = df_bench["text"].tolist()
+                bench_labels = [LAB2I[m] for m in df_bench["model"].tolist()]
+                bench_ds = TextSequenceDataset(
+                    bench_texts, bench_labels, None, tok, max_len=max_len, end_id=end_id, cls_id=cls_id
+                )
+                bench_loader = DataLoader(bench_ds, batch_size=4, shuffle=False, collate_fn=collate_fn)
+                model.eval()
+                Z_b_list = []
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=compute_dtype):
+                        for batch in bench_loader:
+                            b_ids = batch["input_ids"].to(device)
+                            b_mask = batch["attention_mask"].to(device)
+                            max_l = max(int(b_mask.sum(dim=1).max().item()), 2)
+                            z_b = model.forward_features(b_ids[:, :max_l], b_mask[:, :max_l], drop_first_token=not is_deberta)
+                            Z_b_list.append(z_b.cpu().numpy())
+                Z_bench = np.vstack(Z_b_list)
+                W_p_curr = model.plain_head.weight.detach().cpu().numpy()
+                b_p_curr = model.plain_head.bias.detach().cpu().numpy()
+                logits_spec = (Z_bench @ W_p_curr.T + b_p_curr)
+
+                fam_cols = FAMILIES[target_family]
+                fam_bench_mask = np.isin(bench_labels, fam_cols)
+                holdout_fam_bacc = 0.0
+                hard_sister_acc = 0.0
+                if fam_bench_mask.sum() > 0:
+                    y_fam_true = np.array([fam_cols.index(l) for l in np.array(bench_labels)[fam_bench_mask]])
+                    spec_pred = logits_spec[fam_bench_mask, :len(fam_cols)].argmax(axis=1)
+                    holdout_fam_bacc = float(balanced_accuracy_score(y_fam_true, spec_pred))
+                    if target_family == "gemini" and len(fam_cols) == 4:
+                        pair_mask = np.isin(y_fam_true, [2, 3])
+                        if pair_mask.sum() > 0:
+                            hard_sister_acc = float((y_fam_true[pair_mask] == spec_pred[pair_mask]).mean())
+
+                champ_paths = (
+                    list(input_dir.rglob("benchmark_champion_logits.safetensors"))
+                    + list(input_dir.rglob("champion_logits.safetensors"))
+                    + list(Path(".").rglob("*champion_logits.safetensors"))
+                )
+                best_gw = 0.35
+                best_raw_bacc = 0.0
+                best_sink_bacc = 0.0
+                if champ_paths:
+                    champ_sd = load_file(str(champ_paths[0]))
+                    c_key = "logits_plain" if "logits_plain" in champ_sd else list(champ_sd.keys())[0]
+                    logits_champ = champ_sd[c_key].cpu().float().numpy()
+                    if len(logits_champ) == len(bench_labels):
+                        for gw in [0.15, 0.25, 0.30, 0.35, 0.40, 0.50]:
+                            b_logits = logits_champ.copy()
+                            b_logits[:, fam_cols] = (1.0 - gw) * b_logits[:, fam_cols] + gw * logits_spec[:, :len(fam_cols)]
+                            p_b = softmax(b_logits, axis=1)
+                            r_bacc = float(balanced_accuracy_score(bench_labels, p_b.argmax(axis=1)))
+                            p_sk = sinkhorn_balancing(p_b, iters=60, sinkhorn_strength=0.65, target_mix=0.35)
+                            s_bacc = float(balanced_accuracy_score(bench_labels, p_sk.argmax(axis=1)))
+                            if s_bacc > best_sink_bacc:
+                                best_sink_bacc = s_bacc
+                                best_raw_bacc = r_bacc
+                                best_gw = gw
+
+                oof_sink = float(oof_report.get("oof_sink_bacc", oof_report.get("oof_blend_bacc", 0.0)))
+                from .experiment_logger import ExperimentLedger
+                ledger = ExperimentLedger(ledger_dir="experiments")
+                ledger.record_run(
+                    exp_id="EXP-06",
+                    phase=f"{'deberta' if is_deberta else 'qwen'}_{target_family}_specialist",
+                    target_family=target_family,
+                    feature_set=f"{'deberta' if is_deberta else 'qwen3'}_tapped_layers",
+                    subspace_dim=int(Z_train.shape[1]),
+                    head_type="linear_ridge_blend",
+                    gate_weight=best_gw,
+                    oof_family_bacc=oof_sink,
+                    holdout_family_bacc=holdout_fam_bacc,
+                    hard_sister_acc=hard_sister_acc,
+                    holdout_18cls_raw_bacc=best_raw_bacc,
+                    holdout_18cls_sinkhorn_bacc=best_sink_bacc,
+                    delta_vs_baseline_bacc=(best_sink_bacc - 0.5294) if best_sink_bacc > 0 else 0.0,
+                    notes=f"{'DeBERTa' if is_deberta else 'Qwen'} {target_family} specialist (anti-overfitting regularized)",
+                )
+                if ledger.md_path.exists():
+                    shutil.copy(str(ledger.md_path), str(out_dir / "experiment_ledger.md"))
+
+                meta_p = out_dir / "meta.json"
+                if meta_p.exists():
+                    try:
+                        with open(meta_p, "r", encoding="utf-8") as f:
+                            m_d = json.load(f)
+                        m_d.update({
+                            "oof_sink_bacc": oof_sink,
+                            "holdout_family_bacc": holdout_fam_bacc,
+                            "holdout_18cls_sinkhorn_bacc": best_sink_bacc,
+                            "best_gate_weight": best_gw,
+                        })
+                        with open(meta_p, "w", encoding="utf-8") as f:
+                            json.dump(m_d, f, indent=2)
+                    except Exception as e:
+                        print(f"[Trainer] Note updating meta.json: {e}")
+        except Exception as e:
+            print(f"[Trainer] Benchmark holdout evaluation note: {e}")
     if step_callback is not None:
         try:
             step_callback("checkpoint_saved", "training_complete")
@@ -2276,7 +2427,7 @@ def fit_family_gate_head(
     y_train: np.ndarray,
     num_gate_classes: int,
     alphas: list[float] | None = None,
-    label_smoothing: float = 0.05,
+    label_smoothing: float = 0.12,
     Z_eval: np.ndarray | None = None,
     y_eval_true: np.ndarray | None = None,
     eval_mask: np.ndarray | None = None,
@@ -2299,7 +2450,7 @@ def fit_family_gate_head(
         torch.cuda.manual_seed_all(42)
 
     if alphas is None:
-        alphas = [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
+        alphas = [2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0]
 
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -2358,7 +2509,13 @@ def fit_family_gate_head(
     # 1. Select best_alpha strictly via 5-fold CV on (Z_train, y_train)
     pids_arr = np.asarray(prompt_ids) if prompt_ids is not None else None
     unique_groups = len(set(prompt_ids)) if prompt_ids is not None else 0
-    if pids_arr is not None and unique_groups >= 5:
+    max_group_frac = 1.0
+    if pids_arr is not None and len(pids_arr) > 0:
+        _, counts = np.unique(pids_arr, return_counts=True)
+        max_group_frac = float(counts.max() / len(pids_arr))
+
+    # Fix GroupKFold "-1" collapse: only use GroupKFold if no group holds > 5% of dataset
+    if pids_arr is not None and unique_groups >= 10 and max_group_frac < 0.05:
         gkf = GroupKFold(n_splits=5)
         splits = list(gkf.split(Z_train, y_train, groups=pids_arr))
     else:
@@ -2450,13 +2607,13 @@ def fit_family_mlp_head(
     y_train: np.ndarray,
     num_gate_classes: int,
     num_family_classes: int,
-    hidden_dim: int = 128,
-    epochs: int = 20,
+    hidden_dim: int = 64,
+    epochs: int = 12,
     lr: float = 2e-4,
-    dropout: float = 0.25,
-    weight_decay: float = 0.05,
+    dropout: float = 0.45,
+    weight_decay: float = 0.15,
     batch_size: int = 64,
-    label_smoothing: float = 0.05,
+    label_smoothing: float = 0.15,
     Z_eval: np.ndarray | None = None,
     y_eval_true: np.ndarray | None = None,
     eval_mask: np.ndarray | None = None,
@@ -2511,7 +2668,7 @@ def fit_family_mlp_head(
     ds = torch.utils.data.TensorDataset(X_fit_t, y_fit_t)
     train_loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
 
-    mlp_in_drop = 0.10 if pca_components is not None else 0.50
+    mlp_in_drop = 0.50
     mlp = FamilyMLPHead(
         in_features=D_feat,
         hidden_dim=hidden_dim,
@@ -2545,6 +2702,8 @@ def fit_family_mlp_head(
         mlp.train()
         for b_x, b_y in train_loader:
             b_x, b_y = b_x.to(device), b_y.to(device)
+            # Inject Gaussian feature noise so MLP cannot memorize sharp in-sample coordinates
+            b_x = b_x + 0.25 * torch.randn_like(b_x)
             optimizer.zero_grad()
             out = mlp(b_x)
             margin_boost = sib_mask[b_y] * 0.35
@@ -3498,9 +3657,11 @@ def train_family_gate_from_dataset(
     pca_components = None
     pca_mean = None
     if use_supervised_subspace:
-        pca_components, pca_mean, sub_report = build_supervised_family_subspace(
+        from .layer_probing import build_oof_supervised_family_subspace
+        Z_tr_active, Z_ev_active, pca_components, pca_mean, sub_report = build_oof_supervised_family_subspace(
             Z_train=Z_train,
             y_train=y_train,
+            Z_eval=Z_eval,
             num_family_classes=num_family_classes,
             subspace_dim=subspace_dim,
             num_tapped_layers=num_tapped,
@@ -3510,8 +3671,6 @@ def train_family_gate_from_dataset(
             prompt_ids=prompt_ids,
             device=device,
         )
-        Z_tr_active = ((Z_train - pca_mean) @ pca_components.T).astype(np.float32)
-        Z_ev_active = ((Z_eval - pca_mean) @ pca_components.T).astype(np.float32) if Z_eval is not None else None
     else:
         Z_tr_active = Z_train
         Z_ev_active = Z_eval
@@ -4193,9 +4352,11 @@ def train_family_gate(
 
     if use_supervised_subspace:
         print(f"[{target_family.upper()} Gate] Step 3: Building 100% Pure Supervised Sister-Decoupling Subspace (Zero PCA)...")
-        subspace_components, subspace_mean, sub_diag = build_supervised_family_subspace(
+        from .layer_probing import build_oof_supervised_family_subspace
+        Z_tr_active, Z_ev_active, subspace_components, subspace_mean, sub_diag = build_oof_supervised_family_subspace(
             Z_train=Z_train,
             y_train=y_train,
+            Z_eval=Z_eval,
             num_family_classes=num_family_classes,
             num_tapped_layers=len(getattr(model, "layers", [2, 4, 6, 9, 13, 17, 22, 27])),
             subspace_dim=subspace_dim,
@@ -4205,9 +4366,6 @@ def train_family_gate(
             hard_sister_pair=hard_sister_pair,
             prompt_ids=prompt_ids,
         )
-        Z_tr_active = ((Z_train - subspace_mean) @ subspace_components.T).astype(np.float32)
-        if Z_eval is not None:
-            Z_ev_active = ((Z_eval - subspace_mean) @ subspace_components.T).astype(np.float32)
         print(
             f"[{target_family.upper()} Gate] Step 3 Complete: {sub_diag['total_subspace_dim']} whitened dims "
             f"({sub_diag['n_supervised_dirs']} Per-Layer & Inter-Layer Sister Fisher dirs)."

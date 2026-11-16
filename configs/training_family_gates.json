@@ -1,0 +1,43 @@
+{
+  "version": "2.1.0",
+  "name": "qwen3_14b_supervised_family_gates",
+  "description": "Consolidated Phase 3 Supervised Subspace + Regularized MLP/Ridge Family Gates (OOF Fisher Stacking, Noise Injection, High Alpha)",
+  "pipeline_mode": "family_gate",
+  "backbone": "Qwen/Qwen3-14B-Base",
+  "keep_layers": 27,
+  "layers": [2, 4, 6, 9, 13, 17, 22, 27],
+  "max_len": 384,
+  "end_id": 151643,
+  "head_type": "mlp",
+  "gate_weight": 0.40,
+  "use_supervised_subspace": true,
+  "hidden_dim": 64,
+  "mlp_epochs": 12,
+  "mlp_lr": 0.0003,
+  "mlp_dropout": 0.45,
+  "samples_per_class": 1500,
+  "negative_ratio": 0.10,
+  "batch_size": 8,
+  "specialist_jobs": [
+    {
+      "target_family": "gemini",
+      "output_dir": "export_gemini_gate_mlp",
+      "export_embeddings": { "enabled": true, "target": "gemini", "save_all_layers": true, "output_dir": "export_embeddings_gemini" }
+    },
+    {
+      "target_family": "gpt",
+      "output_dir": "export_gpt_gate_mlp",
+      "export_embeddings": { "enabled": true, "target": "gpt", "save_all_layers": true, "output_dir": "export_embeddings_gpt" }
+    },
+    {
+      "target_family": "glm",
+      "output_dir": "export_glm_gate_mlp",
+      "export_embeddings": { "enabled": true, "target": "glm", "save_all_layers": true, "output_dir": "export_embeddings_glm" }
+    },
+    {
+      "target_family": "claude",
+      "output_dir": "export_claude_gate_mlp",
+      "export_embeddings": { "enabled": true, "target": "claude", "save_all_layers": true, "output_dir": "export_embeddings_claude" }
+    }
+  ]
+}

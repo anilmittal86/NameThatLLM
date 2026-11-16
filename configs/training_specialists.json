@@ -1,7 +1,7 @@
 {
-  "version": "2.1.0",
-  "name": "qwen3_14b_family_specialists",
-  "description": "Sequential Family-Specialist LoRA 14B Trainer for GPT (5-class), Gemini (4-class), and GLM (2-class) on Qwen/Qwen3-14B-Base (keep_layers=27)",
+  "version": "2.2.0",
+  "name": "family_specialists_suite",
+  "description": "Unified Family-Specialist Training Suite for Qwen3-14B (Gemini, GLM, GPT) and DeBERTa-v3-Large (Gemini Quarantine Specialist)",
   "backbone": "Qwen/Qwen3-14B-Base",
   "keep_layers": 27,
   "layers": [2, 4, 6, 9, 13, 17, 22, 27],
@@ -17,6 +17,7 @@
   "family_margin": 0.40,
   "supcon_weight": 0.25,
   "hard_class_weight": 1.00,
+  "weight_decay": 0.01,
   "stage1": {
     "enabled": true,
     "lr_lora": 1.5e-4,
@@ -24,9 +25,9 @@
     "lora_plus_ratio": 2.5,
     "batch_size": 2,
     "gradient_accumulation_steps": 8,
-    "epochs": 2,
-    "max_samples": 150000,
-    "warmup_steps": 60
+    "epochs": 1,
+    "max_samples": 10000,
+    "warmup_steps": 50
   },
   "stage2": {
     "enabled": true,
@@ -42,23 +43,69 @@
     "check_overfitting": true,
     "swa": true
   },
-  "weight_decay": 0.01,
-  "output_dir": "export_gemini_specialist_14b",
   "specialist_jobs": [
     {
+      "name": "qwen3_14b_gemini_specialist",
       "target_family": "gemini",
       "output_dir": "export_gemini_specialist_14b",
       "stage1": { "enabled": true, "lr_lora": 1.5e-4, "lr_head": 8e-4, "batch_size": 2, "gradient_accumulation_steps": 8, "epochs": 1, "max_samples": 8000, "warmup_steps": 50 }
     },
     {
+      "name": "qwen3_14b_glm_specialist",
       "target_family": "glm",
       "output_dir": "export_glm_specialist_14b",
       "stage1": { "enabled": true, "lr_lora": 1.5e-4, "lr_head": 8e-4, "batch_size": 2, "gradient_accumulation_steps": 8, "epochs": 1, "max_samples": 8000, "warmup_steps": 50 }
     },
     {
+      "name": "qwen3_14b_gpt_specialist",
       "target_family": "gpt",
       "output_dir": "export_gpt_specialist_14b",
       "stage1": { "enabled": true, "lr_lora": 1.5e-4, "lr_head": 8e-4, "batch_size": 2, "gradient_accumulation_steps": 8, "epochs": 1, "max_samples": 10000, "warmup_steps": 60 }
+    },
+    {
+      "name": "deberta_v3_large_gemini_specialist",
+      "target_family": "gemini",
+      "backbone": "microsoft/deberta-v3-large",
+      "keep_layers": 24,
+      "layers": [3, 6, 9, 12, 15, 18, 21, 24],
+      "max_len": 512,
+      "end_id": 0,
+      "lora_r": 16,
+      "lora_alpha": 32,
+      "lora_dropout": 0.15,
+      "lora_target_modules": [
+        "query_proj", "key_proj", "value_proj", "dense"
+      ],
+      "family_margin": 0.40,
+      "supcon_weight": 0.20,
+      "hard_class_weight": 1.00,
+      "weight_decay": 0.05,
+      "output_dir": "export_deberta_gemini_specialist",
+      "stage1": {
+        "enabled": true,
+        "lr_lora": 1.5e-4,
+        "lr_head": 8e-4,
+        "lora_plus_ratio": 2.5,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 8,
+        "epochs": 1,
+        "max_samples": 6000,
+        "warmup_steps": 50
+      },
+      "stage2": {
+        "enabled": true,
+        "lr_lora": 3e-5,
+        "lr_head": 2e-4,
+        "lora_plus_ratio": 2.5,
+        "batch_size": 2,
+        "gradient_accumulation_steps": 2,
+        "epochs": 2,
+        "centered_weight": 0.60,
+        "warmup_steps": 30,
+        "n_splits": 5,
+        "check_overfitting": true,
+        "swa": true
+      }
     }
   ]
 }

@@ -21,6 +21,8 @@ references/
 artifacts/
 output/
 output_*/
+export_*/
+mlruns/
 cache/
 checkpoints/*
 scratch/

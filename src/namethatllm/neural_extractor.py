@@ -648,13 +648,27 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: list
     meta_p = ckpt_dir / "meta.json"
     dir_str = str(ckpt_dir).lower().replace("\\", "/")
     is_dhruv = any(x in dir_str for x in ("q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x"))
+    is_deberta = "deberta" in dir_str
 
     labels = sorted(LABELS) if is_dhruv else list(LABELS)
-    keep = 24 if is_dhruv else default_keep
-    layers = [2, 4, 6, 8, 12, 16, 20, 24] if is_dhruv else list(default_layers)
-    max_len = 384 if is_dhruv else default_max_len
-    end_id = None if is_dhruv else 151643
-    no_final_norm = False if is_dhruv else True
+    if is_deberta:
+        keep = 24
+        layers = [3, 6, 9, 12, 15, 18, 21, 24]
+        max_len = 512
+        end_id = None
+        no_final_norm = False
+    elif is_dhruv:
+        keep = 24
+        layers = [2, 4, 6, 8, 12, 16, 20, 24]
+        max_len = 384
+        end_id = None
+        no_final_norm = False
+    else:
+        keep = default_keep
+        layers = list(default_layers)
+        max_len = default_max_len
+        end_id = 151643
+        no_final_norm = True
 
     if meta_p.exists():
         try:

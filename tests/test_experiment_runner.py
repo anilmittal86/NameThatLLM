@@ -17,7 +17,7 @@ from safetensors.torch import save_file
 from namethatllm.config import FAMILIES, LABELS
 from namethatllm.experiment_logger import ExperimentLedger, LEDGER_COLUMNS
 from namethatllm.layer_probing import build_supervised_family_subspace
-from scripts.run_gate_experiments import run_sweep
+from namethatllm.trainer import run_sweep
 
 
 def test_experiment_ledger_creation_and_logging(tmp_path: Path):

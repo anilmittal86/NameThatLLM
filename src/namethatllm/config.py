@@ -73,6 +73,8 @@ SPECIALIST_GROUPS = {
     "glm_kimi_triad": [15, 16, 17],  # Resolves glm-5.3 <-> glm-5.3-flash <-> kimi-k3 confusion!
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],  # resolves claude-fable-5/opus-4-8 <-> glm-5.3/flash <-> kimi-k3 <-> qwen3.8-max!
     "kimi_gpt55_qwen": [0, 14, 17],  # resolves kimi-k3 <-> gpt-5.5 <-> qwen3.8-max confusion!
+    "claude_glm": [9, 10, 11, 12, 13, 15, 16],
+    "gpt_qwen_kimi": [0, 1, 2, 3, 4, 14, 17],
 }
 
 PRIOR_SCALES = {
@@ -82,6 +84,9 @@ PRIOR_SCALES = {
     "qwen25_14b_inhouse": 0.85,
     "deberta_p2": 0.80,
     "deberta_inhouse": 0.80,
+    "deberta_gemini": 0.40,
+    "deberta_claude_glm": 0.35,
+    "deberta_gpt_qwen_kimi": 0.35,
     "qwen3_14b_p1": 0.50,
     "instyle": 0.45,
     "qwen3_8b_claude": 0.30,
@@ -319,19 +324,26 @@ def find_checkpoints(input_dir: Path) -> dict[str, Path]:
             else:
                 ckpts[key] = path
 
+        is_deb = "deberta" in p_str or "deberta" in str(p.parent).lower()
         if target_family == "gpt" or any(t in p_str for t in ("export_gpt", "gpt_specialist", "gpt_spec", "qwen3_14b_gpt")):
-            _set_family_ckpt("qwen3_14b_gpt", p.parent)
+            _set_family_ckpt("deberta_gpt" if is_deb else "qwen3_14b_gpt", p.parent)
             continue
         elif target_family == "gemini" or any(
-            t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini")
+            t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini", "deberta_gemini")
         ):
-            _set_family_ckpt("qwen3_14b_gemini", p.parent)
+            _set_family_ckpt("deberta_gemini" if is_deb else "qwen3_14b_gemini", p.parent)
             continue
         elif target_family == "glm" or any(t in p_str for t in ("export_glm", "glm_specialist", "glm_spec", "qwen3_14b_glm")):
-            _set_family_ckpt("qwen3_14b_glm", p.parent)
+            _set_family_ckpt("deberta_glm" if is_deb else "qwen3_14b_glm", p.parent)
             continue
         elif target_family == "claude" or any(t in p_str for t in ("export_claude", "claude_specialist", "claude_spec", "qwen3_14b_claude")):
-            _set_family_ckpt("qwen3_14b_claude", p.parent)
+            _set_family_ckpt("deberta_claude" if is_deb else "qwen3_14b_claude", p.parent)
+            continue
+        elif target_family == "claude_glm" or any(t in p_str for t in ("export_claude_glm", "claude_glm_specialist", "claude_glm_spec", "deberta_claude_glm")):
+            _set_family_ckpt("deberta_claude_glm", p.parent)
+            continue
+        elif target_family == "gpt_qwen_kimi" or any(t in p_str for t in ("export_gpt_qwen_kimi", "gpt_qwen_kimi_specialist", "gpt_qwen_kimi_spec", "deberta_gpt_qwen_kimi")):
+            _set_family_ckpt("deberta_gpt_qwen_kimi", p.parent)
             continue
 
         if "lora_qwen3_14b" in p_str or "qwen3_14b_part2" in p_str or ("14b" in p_str and "part2" in p_str and "qwen3" in p_str):

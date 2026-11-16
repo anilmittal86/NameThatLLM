@@ -187,8 +187,8 @@ def _solve_within_class_fisher_gpu(
     X_fam: np.ndarray,
     y_fam: np.ndarray,
     num_family_classes: int,
-    reg_ratio: float = 0.15,
-    reg_scales: tuple[float, ...] = (0.03, 0.12, 0.45),
+    reg_ratio: float = 0.40,
+    reg_scales: tuple[float, ...] = (0.30, 0.80, 2.00),
     device: torch.device | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -360,8 +360,8 @@ def build_supervised_family_subspace(
     y_train: np.ndarray,
     num_family_classes: int,
     num_tapped_layers: int = 8,
-    subspace_dim: int | None = None,
-    reg_ratio: float = 0.15,
+    subspace_dim: int | None = 96,
+    reg_ratio: float = 0.40,
     device: torch.device | None = None,
     include_velocity: bool = True,
     layer_weighting: bool = True,
@@ -375,9 +375,11 @@ def build_supervised_family_subspace(
          optionally weighted by layer importance w_l = softmax(12 * s_l).
       2. Part 2: Inter-Layer Residual Velocity Fisher directions on Delta X^(l) = X^(l) - X^(l-1),
          optionally enabled via include_velocity.
-      3. Part 3: Economic QR orthonormalization (filtering collinear directions via diag_r > 1e-3 * max).
+      3. Part 3: Economic QR orthonormalization (filtering collinear directions via diag_r > 5e-2 * max).
       4. Part 4: Unit-variance coordinate whitening by intra-family training std.
     """
+    if subspace_dim is None:
+        subspace_dim = 96
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -437,7 +439,7 @@ def build_supervised_family_subspace(
 
         W_ovr, W_pairs = _solve_within_class_fisher_gpu(
             X_l, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio,
-            reg_scales=(0.03, 0.12, 0.45), device=device
+            reg_scales=(0.30, 0.80, 2.00), device=device
         )
         stacked_dirs = np.vstack([W_ovr, W_pairs]) if len(W_pairs) > 0 else W_ovr
         for row in stacked_dirs:
@@ -456,7 +458,7 @@ def build_supervised_family_subspace(
 
             _, W_vel_pairs = _solve_within_class_fisher_gpu(
                 Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5,
-                reg_scales=(0.05, 0.20, 0.60), device=device
+                reg_scales=(0.40, 1.00, 2.50), device=device
             )
             for row in W_vel_pairs:
                 full_vec = np.zeros(D_total, dtype=np.float32)
@@ -469,7 +471,7 @@ def build_supervised_family_subspace(
     # Part 3: Orthonormalize pure Fisher directions via reduced QR (rejecting float32 noise)
     Q_sup, R_sup = np.linalg.qr(W_sup.T, mode="reduced")
     diag_r = np.abs(np.diag(R_sup))
-    r_thr = max(float(diag_r.max()) * 1e-3, 1e-4) if len(diag_r) > 0 else 1e-4
+    r_thr = max(float(diag_r.max()) * 5e-2, 1e-4) if len(diag_r) > 0 else 1e-4
     valid_sup = diag_r > r_thr
     V_basis = Q_sup[:, valid_sup].T.astype(np.float32)  # (D_fisher, 40960)
     if subspace_dim is not None and subspace_dim > 0 and V_basis.shape[0] > subspace_dim:
@@ -502,6 +504,102 @@ def build_supervised_family_subspace(
         "layer_weighting": layer_weighting,
     }
     return C_eff, mu_fam, diagnostics
+
+
+def build_oof_supervised_family_subspace(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    Z_eval: np.ndarray | None = None,
+    num_family_classes: int = 4,
+    num_tapped_layers: int = 8,
+    subspace_dim: int | None = 96,
+    reg_ratio: float = 0.40,
+    device: torch.device | None = None,
+    include_velocity: bool = True,
+    layer_weighting: bool = True,
+    hard_sister_pair: tuple[int, int] | None = None,
+    prompt_ids: list[Any] | np.ndarray | None = None,
+    n_splits: int = 5,
+    random_state: int = 42,
+    **kwargs: Any,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray, dict[str, Any]]:
+    """
+    Out-of-Fold (OOF) Supervised Fisher Subspace Stacking:
+    Eliminates 99%+ training/OOF label leakage by fitting Fisher bases strictly on (K-1) folds
+    and projecting held-out validation folds, aligned to the full-dataset Fisher basis
+    via orthogonal Procrustes / least-squares alignment.
+
+    Returns: (Z_tr_oof, Z_ev_active, C_full, mu_full, diagnostics)
+    """
+    if device is None:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # 1. Fits C_full, mu_full, diag on the full training set to serve as the target basis
+    C_full, mu_full, diag = build_supervised_family_subspace(
+        Z_train=Z_train,
+        y_train=y_train,
+        num_family_classes=num_family_classes,
+        num_tapped_layers=num_tapped_layers,
+        subspace_dim=subspace_dim,
+        reg_ratio=reg_ratio,
+        device=device,
+        include_velocity=include_velocity,
+        layer_weighting=layer_weighting,
+        hard_sister_pair=hard_sister_pair,
+        prompt_ids=prompt_ids,
+        **kwargs,
+    )
+    Z_ev_active = ((Z_eval - mu_full) @ C_full.T).astype(np.float32) if Z_eval is not None else None
+
+    N_samples = Z_train.shape[0]
+    D_full = C_full.shape[0]
+    Z_tr_oof = np.zeros((N_samples, D_full), dtype=np.float32)
+
+    pids_arr = np.asarray(prompt_ids) if prompt_ids is not None else None
+    unique_groups = len(set(prompt_ids)) if prompt_ids is not None else 0
+    max_group_frac = 1.0
+    if pids_arr is not None and len(pids_arr) > 0:
+        _, counts = np.unique(pids_arr, return_counts=True)
+        max_group_frac = float(counts.max() / len(pids_arr))
+
+    # Fix GroupKFold "-1" collapse: only use GroupKFold if no group holds > 5% of dataset
+    if pids_arr is not None and unique_groups >= 10 and max_group_frac < 0.05:
+        splitter = GroupKFold(n_splits=n_splits)
+        splits = list(splitter.split(Z_train, y_train, groups=pids_arr))
+    else:
+        try:
+            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            splits = list(splitter.split(Z_train, y_train))
+        except Exception:
+            from sklearn.model_selection import KFold
+            splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            splits = list(splitter.split(Z_train, y_train))
+
+    for tr_idx, val_idx in splits:
+        pids_fold = pids_arr[tr_idx] if pids_arr is not None else None
+        C_fold, mu_fold, _ = build_supervised_family_subspace(
+            Z_train=Z_train[tr_idx],
+            y_train=y_train[tr_idx],
+            num_family_classes=num_family_classes,
+            num_tapped_layers=num_tapped_layers,
+            subspace_dim=subspace_dim,
+            reg_ratio=reg_ratio,
+            device=device,
+            include_velocity=include_velocity,
+            layer_weighting=layer_weighting,
+            hard_sister_pair=hard_sister_pair,
+            prompt_ids=pids_fold,
+            **kwargs,
+        )
+        # Least-squares Procrustes alignment to target basis C_full on tr_idx:
+        P_target = (Z_train[tr_idx] - mu_full) @ C_full.T
+        P_fold_tr = (Z_train[tr_idx] - mu_fold) @ C_fold.T
+        R_align, _, _, _ = np.linalg.lstsq(P_fold_tr, P_target, rcond=1e-3)
+
+        P_fold_val = (Z_train[val_idx] - mu_fold) @ C_fold.T
+        Z_tr_oof[val_idx] = (P_fold_val @ R_align).astype(np.float32)
+
+    return Z_tr_oof, Z_ev_active, C_full, mu_full, diag
 
 
 # ============================================================================
