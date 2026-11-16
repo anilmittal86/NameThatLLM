@@ -43,6 +43,8 @@ FAMILIES = {
     "gemini": [5, 6, 7, 8],
     "claude": [9, 10, 11, 12, 13],
     "glm": [15, 16],
+    "claude_glm": [9, 10, 11, 12, 13, 15, 16],
+    "gpt_qwen_kimi": [0, 1, 2, 3, 4, 14, 17],
 }
 
 # Master list of highest-error and most confused classes requiring loss upweighting:
@@ -85,6 +87,9 @@ PRIOR_SCALES = {
     "deberta_p2": 0.80,
     "deberta_inhouse": 0.80,
     "deberta_gemini": 0.40,
+    "deberta_glm": 0.35,
+    "deberta_gpt": 0.35,
+    "deberta_claude": 0.35,
     "deberta_claude_glm": 0.35,
     "deberta_gpt_qwen_kimi": 0.35,
     "qwen3_14b_p1": 0.50,
@@ -325,18 +330,18 @@ def find_checkpoints(input_dir: Path) -> dict[str, Path]:
                 ckpts[key] = path
 
         is_deb = "deberta" in p_str or "deberta" in str(p.parent).lower()
-        if target_family == "gpt" or any(t in p_str for t in ("export_gpt", "gpt_specialist", "gpt_spec", "qwen3_14b_gpt")):
+        if target_family == "gpt" or any(t in p_str for t in ("export_gpt", "gpt_specialist", "gpt_spec", "qwen3_14b_gpt", "deberta_gpt")):
             _set_family_ckpt("deberta_gpt" if is_deb else "qwen3_14b_gpt", p.parent)
             continue
         elif target_family == "gemini" or any(
-            t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini", "deberta_gemini")
+            t in p_str for t in ("export_gemini", "gemini_specialist", "gemini_spec", "qwen3_14b_gemini", "deberta_gemini", "export_deberta_gemini")
         ):
             _set_family_ckpt("deberta_gemini" if is_deb else "qwen3_14b_gemini", p.parent)
             continue
-        elif target_family == "glm" or any(t in p_str for t in ("export_glm", "glm_specialist", "glm_spec", "qwen3_14b_glm")):
+        elif target_family == "glm" or any(t in p_str for t in ("export_glm", "glm_specialist", "glm_spec", "qwen3_14b_glm", "deberta_glm")):
             _set_family_ckpt("deberta_glm" if is_deb else "qwen3_14b_glm", p.parent)
             continue
-        elif target_family == "claude" or any(t in p_str for t in ("export_claude", "claude_specialist", "claude_spec", "qwen3_14b_claude")):
+        elif target_family == "claude" or any(t in p_str for t in ("export_claude", "claude_specialist", "claude_spec", "qwen3_14b_claude", "deberta_claude")):
             _set_family_ckpt("deberta_claude" if is_deb else "qwen3_14b_claude", p.parent)
             continue
         elif target_family == "claude_glm" or any(t in p_str for t in ("export_claude_glm", "claude_glm_specialist", "claude_glm_spec", "deberta_claude_glm")):

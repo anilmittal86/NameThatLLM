@@ -187,8 +187,8 @@ def _solve_within_class_fisher_gpu(
     X_fam: np.ndarray,
     y_fam: np.ndarray,
     num_family_classes: int,
-    reg_ratio: float = 0.40,
-    reg_scales: tuple[float, ...] = (0.30, 0.80, 2.00),
+    reg_ratio: float = 0.35,
+    reg_scales: tuple[float, ...] = (0.20, 0.60, 1.50),
     device: torch.device | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -361,7 +361,7 @@ def build_supervised_family_subspace(
     num_family_classes: int,
     num_tapped_layers: int = 8,
     subspace_dim: int | None = 96,
-    reg_ratio: float = 0.40,
+    reg_ratio: float = 0.35,
     device: torch.device | None = None,
     include_velocity: bool = True,
     layer_weighting: bool = True,
@@ -439,7 +439,7 @@ def build_supervised_family_subspace(
 
         W_ovr, W_pairs = _solve_within_class_fisher_gpu(
             X_l, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio,
-            reg_scales=(0.30, 0.80, 2.00), device=device
+            reg_scales=(0.20, 0.60, 1.50), device=device
         )
         stacked_dirs = np.vstack([W_ovr, W_pairs]) if len(W_pairs) > 0 else W_ovr
         for row in stacked_dirs:
@@ -458,7 +458,7 @@ def build_supervised_family_subspace(
 
             _, W_vel_pairs = _solve_within_class_fisher_gpu(
                 Delta_X, y_fam, num_family_classes=num_family_classes, reg_ratio=reg_ratio * 1.5,
-                reg_scales=(0.40, 1.00, 2.50), device=device
+                reg_scales=(0.30, 0.80, 2.00), device=device
             )
             for row in W_vel_pairs:
                 full_vec = np.zeros(D_total, dtype=np.float32)
@@ -471,7 +471,7 @@ def build_supervised_family_subspace(
     # Part 3: Orthonormalize pure Fisher directions via reduced QR (rejecting float32 noise)
     Q_sup, R_sup = np.linalg.qr(W_sup.T, mode="reduced")
     diag_r = np.abs(np.diag(R_sup))
-    r_thr = max(float(diag_r.max()) * 5e-2, 1e-4) if len(diag_r) > 0 else 1e-4
+    r_thr = max(float(diag_r.max()) * 2e-2, 1e-4) if len(diag_r) > 0 else 1e-4
     valid_sup = diag_r > r_thr
     V_basis = Q_sup[:, valid_sup].T.astype(np.float32)  # (D_fisher, 40960)
     if subspace_dim is not None and subspace_dim > 0 and V_basis.shape[0] > subspace_dim:
@@ -513,7 +513,7 @@ def build_oof_supervised_family_subspace(
     num_family_classes: int = 4,
     num_tapped_layers: int = 8,
     subspace_dim: int | None = 96,
-    reg_ratio: float = 0.40,
+    reg_ratio: float = 0.35,
     device: torch.device | None = None,
     include_velocity: bool = True,
     layer_weighting: bool = True,
@@ -773,6 +773,34 @@ def run_all_layers_probe_sweep(
     )
     top8_layers = sorted([d["layer"] for d in ranked_layers[:8]])
 
+    # -------------------------------------------------------------------------
+    # Layer-to-Layer Cosine Similarity / Correlation Matrix Analysis
+    # -------------------------------------------------------------------------
+    X_f = X_layers.astype(np.float32)
+    norms = np.linalg.norm(X_f, axis=-1, keepdims=True) + 1e-7
+    X_norm = X_f / norms
+
+    layer_corr = np.zeros((L, L), dtype=np.float32)
+    chunk_sz = 2000
+    for c_start in range(0, N, chunk_sz):
+        c_end = min(c_start + chunk_sz, N)
+        sub_x = X_norm[c_start:c_end]
+        layer_corr += np.einsum("bld,bkd->lk", sub_x, sub_x)
+    layer_corr /= float(max(N, 1))
+
+    print("\n--- Layer-to-Layer Representation Similarity ---")
+    print(" Adjacent Layer Cosine Similarities (Trajectory Continuity):")
+    for l_i in range(L - 1):
+        print(f"   L{l_i:02d} <-> L{l_i+1:02d} : {layer_corr[l_i, l_i+1]:.4f}")
+
+    sampled_indices = [int(i) for i in np.linspace(0, L - 1, min(8, L)).round()]
+    if len(sampled_indices) > 1:
+        hdr = "       " + " ".join(f"L{idx:02d}  " for idx in sampled_indices)
+        print(f"\n Sampled Inter-Layer Cosine Correlation Matrix:\n{hdr}")
+        for r_idx in sampled_indices:
+            row_str = f" L{r_idx:02d}  " + " ".join(f"{layer_corr[r_idx, c_idx]:.3f} " for c_idx in sampled_indices)
+            print(row_str)
+
     print("--------------------------------------------------------------------------------")
     print(f" ScalarMix All-{L}-Layer OOF BAcc: {mix_bacc * 100:.2f}% | Hard Pair ({s_a} vs {s_b}): {mix_pair_acc * 100:.2f}%")
     print(f" Empirically Optimal Top-8 Layers: {top8_layers}")
@@ -789,6 +817,8 @@ def run_all_layers_probe_sweep(
         "top_4_layers": [d["layer"] for d in ranked_layers[:4]],
         "top_8_layers": top8_layers,
         "best_single_layer": ranked_layers[0],
+        "layer_correlation_matrix": layer_corr.tolist(),
+        "adjacent_layer_similarities": [float(layer_corr[i, i + 1]) for i in range(L - 1)],
     }
 
     if output_dir is not None:

@@ -290,7 +290,7 @@ def resolve_head_tensors(
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Resolves plain and centered head weights and biases matching American/British naming and handles transposed weights."""
     W_p, b_p, W_c, b_c = None, None, None, None
-    valid_k = (num_classes,) if num_classes is not None else (K, 5, 4, 2)
+    valid_k = (num_classes,) if num_classes is not None else (K, 7, 5, 4, 2)
 
     for wk, bk in [
         ("plain.weight", "plain.bias"),
@@ -838,19 +838,33 @@ def extract_deberta_checkpoint(
                     all_vecs[idx] = out.cpu().numpy()
         return all_vecs
 
-    # Probe drop_first_token on train.csv[:180]
+    # For DeBERTa, always preserve [CLS] token at position 0 (drop_first=False)
+    best_drop = False
     probe_n = min(180, len(texts_train))
-    best_drop = False if is_single_last_layer else True
     if probe_n > 0 and W_p is not None:
-        best_acc = -1.0
-        for cand_drop in [False, True] if is_single_last_layer else [True, False]:
-            z_pr = pool_texts(texts_train[:probe_n], drop_first=cand_drop)
-            preds = align_cols(z_pr @ W_p.T + b_p, ckpt_labels).argmax(axis=1)
-            acc = float((preds == y_train[:probe_n]).mean())
-            if acc > best_acc:
-                best_acc = acc
-                best_drop = cand_drop
-        print(f"[DeBERTa Extractor] Probed drop_first={best_drop} (accuracy = {best_acc:.4f})")
+        try:
+            if len(ckpt_labels) == 18:
+                best_acc = -1.0
+                for cand_drop in [False, True] if is_single_last_layer else [False]:
+                    z_pr = pool_texts(texts_train[:probe_n], drop_first=cand_drop)
+                    preds = align_cols(z_pr @ W_p.T + b_p, ckpt_labels).argmax(axis=1)
+                    acc = float((preds == y_train[:probe_n]).mean())
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_drop = cand_drop
+                print(f"[DeBERTa Extractor] Probed drop_first={best_drop} (accuracy = {best_acc:.4f})")
+            else:
+                # Specialist checkpoint (K_fam < 18)
+                spec_indices = [LAB2I[l] for l in ckpt_labels if l in LAB2I]
+                spec_mask = np.isin(y_train[:probe_n], spec_indices)
+                if spec_mask.sum() > 0:
+                    y_spec_local = np.array([spec_indices.index(y) for y in y_train[:probe_n][spec_mask]])
+                    z_pr = pool_texts(texts_train[:probe_n], drop_first=False)
+                    preds = (z_pr[spec_mask] @ W_p.T + b_p).argmax(axis=1)
+                    acc = float((preds == y_spec_local).mean())
+                    print(f"[DeBERTa Specialist Extractor] Specialist {len(ckpt_labels)}-class accuracy = {acc:.4f} (drop_first=False)")
+        except Exception as e:
+            print(f"[DeBERTa Extractor] Note on probing: {e}")
 
     out_dim = hidden_dim if is_single_last_layer else (len(layers) * hidden_dim)
     Z_test = pool_texts(texts_test, drop_first=best_drop)

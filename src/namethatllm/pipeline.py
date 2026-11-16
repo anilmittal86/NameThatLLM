@@ -485,6 +485,12 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         "qwen3_14b_inhouse",
         "deberta_p2",
         "deberta_inhouse",
+        "deberta_gemini",
+        "deberta_glm",
+        "deberta_gpt",
+        "deberta_claude",
+        "deberta_claude_glm",
+        "deberta_gpt_qwen_kimi",
         "qwen3_8b_claude",
         "qwen3_14b_gpt",
         "qwen3_14b_gemini",
@@ -1620,6 +1626,9 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
         # Execute DeBERTa Family Specialists on Trunk 4
         deb_spec_ckpts = [
             ("deberta_gemini", "gemini"),
+            ("deberta_glm", "glm"),
+            ("deberta_gpt", "gpt"),
+            ("deberta_claude", "claude"),
             ("deberta_claude_glm", "claude_glm"),
             ("deberta_gpt_qwen_kimi", "gpt_qwen_kimi"),
         ]
@@ -1631,15 +1640,57 @@ def run_submission_pipeline(cfg: dict[str, Any] | None = None) -> tuple[pd.DataF
                 Z_all_s, _, W_p_s, b_p_s, W_c_s, b_c_s, s_labels = extract_deberta_checkpoint(
                     deb_spec_p, base_deb_dir, test_texts + (unseen_texts if N_unseen > 0 else []), [], []
                 )
-                if W_p_s is not None:
-                    raw_s_te = (Z_all_s[:N_test] @ W_p_s.T + b_p_s).astype(np.float32)
-                    family_spec_logits_te[fam_nm] = raw_s_te
-                    family_spec_classes[fam_nm] = s_labels
-                    meta_s = read_checkpoint_meta(deb_spec_p, default_keep=24, default_layers=[], default_max_len=512)
-                    family_spec_gate_weights[fam_nm] = float(meta_s.get("default_gate_weight", 0.35))
+                heads_spec = load_head_file(deb_spec_p)
+                meta_s = read_checkpoint_meta(deb_spec_p, default_keep=24, default_layers=[], default_max_len=512)
+                K_fam = len(FAMILIES[fam_nm])
+                spec_head_type = str(meta_s.get("head_type", "hybrid")).lower()
+                family_spec_gate_weights[fam_nm] = float(meta_s.get("default_gate_weight", 0.35))
+                family_spec_classes[fam_nm] = s_labels[:K_fam] if len(s_labels) >= K_fam else s_labels
+
+                if "mlp_w1" in heads_spec and spec_head_type != "ridge":
+                    w1 = torch.as_tensor(heads_spec["mlp_w1"], dtype=torch.float32)
+                    b1 = torch.as_tensor(heads_spec["mlp_b1"], dtype=torch.float32)
+                    w2 = torch.as_tensor(heads_spec["mlp_w2"], dtype=torch.float32)
+                    b2 = torch.as_tensor(heads_spec["mlp_b2"], dtype=torch.float32)
+                    ln_w = torch.as_tensor(heads_spec["ln_weight"], dtype=torch.float32) if "ln_weight" in heads_spec else None
+                    ln_b = torch.as_tensor(heads_spec["ln_bias"], dtype=torch.float32) if "ln_bias" in heads_spec else None
+                    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    w1, b1, w2, b2 = w1.to(dev), b1.to(dev), w2.to(dev), b2.to(dev)
+                    if ln_w is not None and ln_b is not None:
+                        ln_w, ln_b = ln_w.to(dev), ln_b.to(dev)
+                    pw = torch.as_tensor(heads_spec["plain.weight"], dtype=torch.float32).to(dev) if "plain.weight" in heads_spec else None
+                    pb = torch.as_tensor(heads_spec["plain.bias"], dtype=torch.float32).to(dev) if "plain.bias" in heads_spec else None
+                    use_hyb = spec_head_type in ("hybrid", "hybrid_65mlp_35ridge")
+
+                    def _eval_deb_mlp(z_arr):
+                        with torch.no_grad():
+                            z_t = torch.from_numpy(z_arr).to(dev, dtype=torch.float32)
+                            h = torch.nn.functional.gelu(z_t @ w1.T + b1)
+                            if ln_w is not None and ln_b is not None:
+                                h = torch.nn.functional.layer_norm(h, (h.shape[-1],), ln_w, ln_b)
+                            mlp_out = (h @ w2.T + b2)[:, :K_fam]
+                            if use_hyb and pw is not None and pb is not None and pw.shape[0] >= K_fam:
+                                ridge_out = z_t @ pw[:K_fam].T + pb[:K_fam]
+                                out_t = 0.65 * mlp_out + 0.35 * ridge_out
+                                row_std = out_t.std(dim=1, keepdim=True).mean().clamp(min=1e-4)
+                                out_t = out_t * (3.2 / row_std)
+                            else:
+                                out_t = mlp_out
+                            out = out_t.cpu().numpy().astype(np.float32)
+                            del z_t, h
+                        return out
+
+                    family_spec_logits_te[fam_nm] = _eval_deb_mlp(Z_all_s[:N_test])
                     if N_unseen > 0:
-                        raw_s_u = (Z_all_s[N_test : N_test + N_unseen] @ W_p_s.T + b_p_s).astype(np.float32)
-                        family_spec_logits_unseen[fam_nm] = raw_s_u
+                        family_spec_logits_unseen[fam_nm] = _eval_deb_mlp(Z_all_s[N_test : N_test + N_unseen])
+                elif W_p_s is not None:
+                    raw_s_te = (Z_all_s[:N_test] @ W_p_s.T + b_p_s)[:, :K_fam].astype(np.float32)
+                    s_std_te = float(np.std(raw_s_te, axis=1).mean()) if len(raw_s_te) > 0 else 1.0
+                    family_spec_logits_te[fam_nm] = (raw_s_te * (3.2 / max(s_std_te, 1e-4))).astype(np.float32)
+                    if N_unseen > 0:
+                        raw_s_u = (Z_all_s[N_test : N_test + N_unseen] @ W_p_s.T + b_p_s)[:, :K_fam].astype(np.float32)
+                        s_std_u = float(np.std(raw_s_u, axis=1).mean()) if len(raw_s_u) > 0 else 1.0
+                        family_spec_logits_unseen[fam_nm] = (raw_s_u * (3.2 / max(s_std_u, 1e-4))).astype(np.float32)
                 del Z_all_s
                 gc.collect()
                 if torch.cuda.is_available():

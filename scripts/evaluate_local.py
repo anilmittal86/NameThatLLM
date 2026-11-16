@@ -114,7 +114,8 @@ def compute_top_confused_pairs(
 
     for fam, indices in FAMILIES.items():
         for idx in indices:
-            model_to_fam[idx] = fam
+            if idx not in model_to_fam:
+                model_to_fam[idx] = fam
 
     pair_counts: dict[tuple[int, int], int] = {}
 

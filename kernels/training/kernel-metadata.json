@@ -14,7 +14,8 @@
     "nishantdahal/ntl-handwriting-blend",
     "dhruvtibarewal/nlm-matched-clean",
     "nishantdahal/ntl-two-stage-lora",
-    "willrice/name-that-llm-openrouter-harvest"
+    "willrice/name-that-llm-openrouter-harvest",
+    "anilmittal/ntl-deberta-frozen-gemini-features"
   ],
   "competition_sources": [
     "name-that-llm"

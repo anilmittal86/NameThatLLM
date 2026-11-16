@@ -340,6 +340,11 @@ class ExperimentLedger:
         self._regenerate_markdown()
         return entry
 
+    def record_run(self, **kwargs) -> dict[str, Any]:
+        """Convenience method accepting keyword arguments for add_entry."""
+        artifacts = kwargs.pop("artifacts", None)
+        return self.add_entry(kwargs, artifacts=artifacts)
+
     def get_dataframe(self) -> pd.DataFrame:
         """Loads all logged experiments as a pandas DataFrame."""
         if self.db_path.exists():
