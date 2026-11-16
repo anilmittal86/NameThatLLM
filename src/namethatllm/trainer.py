@@ -3807,11 +3807,21 @@ def train_family_gate_from_dataset(
 
     if (ds_p / "benchmark_champion_logits.safetensors").exists():
         champ_ev_sd = load_file(str(ds_p / "benchmark_champion_logits.safetensors"))
-        main_logits_eval = champ_ev_sd["logits_plain"].cpu().float().numpy()
+        if "logits_plain" in champ_ev_sd:
+            main_logits_eval = champ_ev_sd["logits_plain"].cpu().float().numpy()
+        elif "champion_logits" in champ_ev_sd:
+            main_logits_eval = champ_ev_sd["champion_logits"].cpu().float().numpy()
+        elif len(champ_ev_sd) > 0 and any("logit" in k.lower() for k in champ_ev_sd):
+            for k in champ_ev_sd:
+                if "logit" in k.lower():
+                    main_logits_eval = champ_ev_sd[k].cpu().float().numpy()
+                    break
     elif (ds_p / "champion_logits.safetensors").exists() and Z_eval is not None:
         champ_sd = load_file(str(ds_p / "champion_logits.safetensors"))
-        if len(champ_sd["logits_plain"]) == len(Z_eval):
+        if "logits_plain" in champ_sd and len(champ_sd["logits_plain"]) == len(Z_eval):
             main_logits_eval = champ_sd["logits_plain"].cpu().float().numpy()
+        elif "champion_logits" in champ_sd and len(champ_sd["champion_logits"]) == len(Z_eval):
+            main_logits_eval = champ_sd["champion_logits"].cpu().float().numpy()
 
     # Step 3: 100% Pure Supervised Fisher Subspace (Zero PCA)
     num_tapped = len(chosen_layers) if chosen_layers is not None else 8
@@ -4856,7 +4866,15 @@ def run_sweep(
 
     if (ds_p / "benchmark_champion_logits.safetensors").exists():
         champ_ev_sd = load_file(str(ds_p / "benchmark_champion_logits.safetensors"))
-        main_logits_eval = champ_ev_sd["logits_plain"].cpu().float().numpy()
+        if "logits_plain" in champ_ev_sd:
+            main_logits_eval = champ_ev_sd["logits_plain"].cpu().float().numpy()
+        elif "champion_logits" in champ_ev_sd:
+            main_logits_eval = champ_ev_sd["champion_logits"].cpu().float().numpy()
+        elif len(champ_ev_sd) > 0 and any("logit" in k.lower() for k in champ_ev_sd):
+            for k in champ_ev_sd:
+                if "logit" in k.lower():
+                    main_logits_eval = champ_ev_sd[k].cpu().float().numpy()
+                    break
 
     if y_ev_arr is not None and main_logits_eval is not None:
         if main_logits_eval.shape[1] == len(LABELS):
