@@ -9,13 +9,9 @@
   "enable_tpu": false,
   "enable_internet": false,
   "dataset_sources": [
+    "anilmittal/ntl-clean-master-pool",
     "anilmittal/ntl-clean-benchmark-1800",
-    "anilmittal/ntl-inhouse-two-stage-lora24",
-    "nishantdahal/ntl-handwriting-blend",
-    "dhruvtibarewal/nlm-matched-clean",
-    "nishantdahal/ntl-two-stage-lora",
-    "willrice/name-that-llm-openrouter-harvest",
-    "anilmittal/ntl-deberta-frozen-gemini-features"
+    "anilmittal/ntl-inhouse-two-stage-lora24"
   ],
   "competition_sources": [
     "name-that-llm"

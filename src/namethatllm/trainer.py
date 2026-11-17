@@ -375,6 +375,7 @@ def family_margin_cross_entropy(
     label_smoothing: float = 0.0,
     weight: torch.Tensor | None = None,
     boost_hard_sisters: bool = True,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Computes Cross-Entropy with Sibling Margin Penalty (Additive Margin on Sister Classes).
@@ -417,6 +418,10 @@ def family_margin_cross_entropy(
                             mask[i, j] = 1.4
         boost = mask[labels] * family_margin
         logits = logits + boost
+    if sample_weight is not None:
+        per_sample_loss = F.cross_entropy(logits, labels, weight=weight, label_smoothing=label_smoothing, reduction="none")
+        sw = sample_weight.to(logits.device, dtype=torch.float32)
+        return (per_sample_loss * sw).sum() / sw.sum().clamp(min=1e-6)
     return F.cross_entropy(logits, labels, weight=weight, label_smoothing=label_smoothing)
 
 
@@ -586,6 +591,7 @@ class TextSequenceDataset(Dataset):
         max_len: int = 447,
         end_id: int | None = 151643,
         cls_id: int | None = None,
+        sample_weights: list[float] | None = None,
     ):
         self.texts = texts
         self.labels = labels
@@ -594,6 +600,7 @@ class TextSequenceDataset(Dataset):
         self.max_len = max_len
         self.end_id = end_id
         self.cls_id = cls_id
+        self.sample_weights = sample_weights
 
     def __len__(self) -> int:
         return len(self.texts)
@@ -617,6 +624,8 @@ class TextSequenceDataset(Dataset):
             item["label"] = torch.tensor(self.labels[idx], dtype=torch.long)
         if self.prompt_ids is not None:
             item["prompt_id"] = self.prompt_ids[idx]
+        if self.sample_weights is not None:
+            item["sample_weight"] = torch.tensor(float(self.sample_weights[idx]), dtype=torch.float32)
         return item
 
 
@@ -630,6 +639,8 @@ def collate_text_batch(batch: list[dict[str, Any]], pad_token_id: int = 151643) 
         res["labels"] = torch.stack([item["label"] for item in batch])
     if "prompt_id" in batch[0]:
         res["prompt_ids"] = [item["prompt_id"] for item in batch]
+    if "sample_weight" in batch[0]:
+        res["sample_weights"] = torch.stack([item["sample_weight"] for item in batch])
     return res
 
 
@@ -2090,7 +2101,10 @@ def run_training_pipeline(
         cls_id = int(tok.cls_token_id) if (is_deberta and hasattr(tok, "cls_token_id") and tok.cls_token_id is not None) else None
         collate_fn_s1 = functools.partial(collate_text_batch, pad_token_id=pad_id)
         epochs1 = int(stage1_cfg.get("epochs", 2 if not is_specialist else 1))
-        ds1 = TextSequenceDataset(df_p["text"].tolist(), [sub_lab2i[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id, cls_id=cls_id)
+        sample_weights_s1 = df_p["match_weight"].astype(float).tolist() if "match_weight" in df_p.columns else None
+        if sample_weights_s1 is not None:
+            print(f"[Trainer] Enabled sample match weighting on {len(sample_weights_s1)} training samples (mean={np.mean(sample_weights_s1):.2f})")
+        ds1 = TextSequenceDataset(df_p["text"].tolist(), [sub_lab2i[m] for m in df_p["model"]], None, tok, max_len=max_len, end_id=end_id, cls_id=cls_id, sample_weights=sample_weights_s1)
         bucket_sampler = BucketedLengthBatchSampler(lengths, batch_size=bs1, shuffle=True)
         loader1 = DataLoader(ds1, batch_sampler=bucket_sampler, collate_fn=collate_fn_s1)
 
@@ -2134,7 +2148,8 @@ def run_training_pipeline(
 
                 with torch.amp.autocast("cuda", enabled=torch.cuda.is_available(), dtype=compute_dtype):
                     Z_s1, logits_p, _ = model(mb_ids, mb_mask, drop_first_token=not is_deberta)
-                    loss_ce = family_margin_cross_entropy(logits_p, labels_dev, family_margin=family_margin, weight=stage1_class_weights)
+                    sw_s1 = batch.get("sample_weights")
+                    loss_ce = family_margin_cross_entropy(logits_p, labels_dev, family_margin=family_margin, weight=stage1_class_weights, sample_weight=sw_s1)
                     loss_sup = compute_supcon_loss(Z_s1, labels_dev, temperature=0.10, prototypes=model.plain_head.weight.detach())
                     loss = (loss_ce + 0.15 * loss_sup) / accum1
 

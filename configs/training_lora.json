@@ -26,8 +26,8 @@
     "batch_size": 32,
     "gradient_accumulation_steps": 1,
     "epochs": 2,
-    "max_samples": 150000,
-    "max_hours": 12.0,
+    "max_samples": 267346,
+    "max_hours": 8.0,
     "warmup_steps": 100
   },
   "stage2": {
