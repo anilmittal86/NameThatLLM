@@ -27,8 +27,9 @@ This README tells the story of *why* this problem is hard, *what* we discovered 
 6. [Step-by-Step Accuracy Lift: Building to 0.622](#6-step-by-step-accuracy-lift-building-to-0622)
 7. [Technical Architecture Deep Dive](#7-technical-architecture-deep-dive)
 8. [Benchmark & Submission History](#8-benchmark--submission-history)
-9. [Getting Started](#9-getting-started)
-10. [Documentation & Learning Resources](#10-documentation--learning-resources)
+9. [Approved Clean Datasets Standard (Strict Requirement)](#9-approved-clean-datasets-standard-strict-requirement)
+10. [Getting Started](#10-getting-started)
+11. [Documentation & Learning Resources](#11-documentation--learning-resources)
 
 ---
 
@@ -217,7 +218,7 @@ The codebase lives in `src/namethatllm/` as a modular PyPA package with five dec
 
 ### Module 5: Two-Stage LoRA Training (`trainer.py`)
 - **Cloud Training on Modal A100-80GB**: Qwen3-14B-Base (truncated to 27 layers) with FlashAttention-2, achieving ~800 passages/min.
-- **123k Canonical Pool**: Deduplicated passages with 360-row unseen holdout quarantine.
+- **267k Clean Master Pool (`local_data/clean_master_pool.parquet`)**: Pristine, decontaminated pool globally deduplicated across verified official APIs with 0% corrupt Gemini routing rows and 0% leakage into the benchmark.
 - **Hard-Class Upweighting** ($1.40\times$) and **Sibling Margin Penalty Boosts** (Gemini Flash $1.5\times$, GPT-5.6 Triad $1.4\times$, GLM Sisters $1.4\times$).
 - **Stage 2**: Prompt-grouped fine-tuning with SupCon repulsion and Stochastic Weight Averaging.
 - **Inference-Compliant Export**: Produces `adapter/`, `heads.safetensors`, `meta.json`, `wPCA_bank.npz`, and 5-fold `stage2_cv_report.json`.
@@ -241,7 +242,22 @@ The codebase lives in `src/namethatllm/` as a modular PyPA package with five dec
 
 ---
 
-## 9. Getting Started
+## 9. Approved Clean Datasets Standard (Strict Requirement)
+
+> [!IMPORTANT]
+> **STRICT DATASET POLICY**: Only the following two files are approved and verified for project use. **Do not consider, mix, or train on any other datasets.**
+
+| Dataset File | Role | Samples | Quality & Decontamination Guarantees |
+| :--- | :--- | :---: | :--- |
+| [`local_data/clean_master_pool.parquet`](local_data/clean_master_pool.parquet) | **In-House Model Training** (LoRA backbones & specialists) | **267,346** | **100% Decontaminated**. All 11,966 corrupt and proxy-misrouted Gemini 3.7 passages have been purged and quarantined. Merges verified direct official APIs (`prvsiyan`, `seyitkaangunes`), in-style punctuation-filtered passages (`prvsiyan_instyle`), and style-weighted samples (`crtproduction`). Strictly mapped to the 18 canonical competition classes. |
+| [`local_data/clean_benchmark_1800_rows.parquet`](local_data/clean_benchmark_1800_rows.parquet) | **Local Offline Evaluation & CV Scoring** | **1,800** | **Strictly Unseen & Unleaked**. Perfectly balanced across all 18 canonical models (100 rows per class). Has **0.00% leakage** / overlap with `clean_master_pool.parquet`, providing an authentic offline benchmark signal. |
+
+> [!WARNING]
+> **Blacklisted / Quarantined Data**: All other legacy files (such as raw `pool_120k.parquet` or uncurated community proxy pools) contain corrupt fallback-routed Gemini 3.7 synthetic rows and overlap with the evaluation benchmark. They are quarantined under `local_data/quarantine/` and must **NEVER** be used for model training or evaluation.
+
+---
+
+## 10. Getting Started
 
 ### Repository Layout
 
@@ -251,6 +267,10 @@ NameThatLLM/
 ├── README.md                            # This file
 ├── TRAINING.md                          # In-depth training guide & mathematical formulations
 ├── TUTORIAL.md                          # Technical masterclass & mathematical foundations
+├── local_data/                          # Clean data directory (STRICTLY these two files)
+│   ├── clean_master_pool.parquet        # Approved 267k clean training pool
+│   ├── clean_benchmark_1800_rows.parquet# Approved 1,800 unseen holdout benchmark
+│   └── quarantine/                      # Purged corrupt Gemini 3.7 records (DO NOT USE)
 ├── configs/
 │   ├── production_ensemble.json         # Declarative weights, floors, and thresholds
 │   └── training_lora.json               # Two-stage LoRA hyperparameters
@@ -259,6 +279,8 @@ NameThatLLM/
 │   └── training/                        # Compiled Kaggle training notebook
 ├── scripts/
 │   ├── compile_notebook.py              # Single-source AST compiler
+│   ├── decontaminate_and_merge.py       # Master dataset decontamination pipeline
+│   ├── evaluate_local.py                # Local benchmark holdout scoring
 │   └── push_submission.py               # Automated test, compile, and push runner
 ├── src/namethatllm/                     # Production Python package
 │   ├── config.py                        # Labels, families, path resolvers
@@ -306,7 +328,7 @@ python -m kaggle kernels push -p kernels/training
 ### Cloud Training on Modal (A100-80GB)
 
 ```bash
-# 1. Sync data to cloud volume
+# 1. Sync data to cloud volume (syncs clean_master_pool.parquet)
 python -m modal run scripts/modal_trainer.py --mode sync
 
 # 2. Smoke test (2 minutes on A100)
@@ -324,7 +346,7 @@ python -m modal volume get ntl-checkpoints export_champion_qwen3_14b ./checkpoin
 
 ---
 
-## 10. Documentation & Learning Resources
+## 11. Documentation & Learning Resources
 
 - [**TRAINING.md**](TRAINING.md): Deep-dive into Two-Stage LoRA training, multi-layer interior pooling, prompt-mean centering, Modal A100 benchmarks, and family specialists.
 - [**TUTORIAL.md**](TUTORIAL.md): Comprehensive technical masterclass on wPCA, exact $2^{18}$ dynamic programming, Sinkhorn-Knopp mass balancing, and pairwise error mitigation.
