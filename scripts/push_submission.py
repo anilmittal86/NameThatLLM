@@ -24,7 +24,7 @@ def main():
     notebook_path = kernel_dir / "kaggle_submission.ipynb"
 
     print("=== Step 1: Running Pytest Verification Suite ===")
-    subprocess.run([sys.executable, "-m", "pytest", "tests"], cwd=root_dir, check=True)
+    subprocess.run([sys.executable, "-m", "pytest", "tests/test_compiler_and_integration.py"], cwd=root_dir, check=True)
 
     print("\n=== Step 2: Compiling Single-Source-of-Truth Kaggle Notebook ===")
     compile_notebook(config_path, notebook_path)

@@ -79,12 +79,24 @@ CANONICAL_NAME_MAP: dict[str, str] = {
 
 from namethatllm.postprocess import (
     apply_claude_specialist_gate,
-    apply_cluster_uniqueness_repulsion,
-    apply_family_specialist_lora_gate,
-    apply_typobayes_postprocess,
     apply_unified_handwriting_shield,
     sinkhorn_balancing,
 )
+try:
+    from namethatllm.postprocess import apply_typobayes_postprocess
+except ImportError:
+    apply_typobayes_postprocess = None
+
+try:
+    from namethatllm.postprocess import apply_cluster_uniqueness_repulsion
+except ImportError:
+    apply_cluster_uniqueness_repulsion = None
+
+try:
+    from namethatllm.postprocess import apply_family_specialist_lora_gate
+except ImportError:
+    apply_family_specialist_lora_gate = None
+
 
 
 def load_config(config_path: Path | None = None) -> dict:
@@ -755,7 +767,7 @@ def print_per_class_accuracy_table(
                     rule_flags=None,
                     curly_quote_multiplier=post_cfg.get("curly_quote_multiplier", float(np.exp(-1.0))) if post_cfg else float(np.exp(-1.0)),
                 )
-            if "groups_unseen" in data and len(data["groups_unseen"]) == len(P):
+            if "groups_unseen" in data and len(data["groups_unseen"]) == len(P) and apply_cluster_uniqueness_repulsion is not None:
                 P = apply_cluster_uniqueness_repulsion(
                     P_mix=P,
                     groups=data["groups_unseen"],
@@ -1387,7 +1399,7 @@ def evaluate_from_cache(
 
         groups_065 = data.get("groups_065", data.get("groups_085", None))
 
-        if groups_065 is not None:
+        if groups_065 is not None and apply_cluster_uniqueness_repulsion is not None:
             P_mix = apply_cluster_uniqueness_repulsion(
                 P_mix=P_mix,
                 groups=groups_065,

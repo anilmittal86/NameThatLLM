@@ -5,34 +5,20 @@ Constructs full-rank cross-backbone spectral representations from unsupervised
 prompt-centered principal components V_top64, scaled by out-of-sample prior scales.
 """
 
+from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
-from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
-from sklearn.linear_model import LogisticRegression
+from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import GroupKFold
+from sklearn.linear_model import LogisticRegression
 
-from .config import (
-    FAMILIES,
-    LABELS,
-    SPECIALIST_GROUPS,
-    K,
-    align_cols,
-    log_softmax,
-    softmax,
-)
+from .config import LABELS, K, align_cols, softmax
 from .wpca_gaussian import split_oversized_clusters_dist
 
-
-def make_spectral_blocks(Z_tr: np.ndarray, Z_te: np.ndarray, res: dict, prior_scale: float) -> tuple[np.ndarray, np.ndarray]:
+def make_spectral_blocks(Z_tr: np.ndarray, Z_te: np.ndarray, res: dict, prior_scale: float) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Constructs unit-normalized spectral feature blocks projected onto unsupervised principal components.
-
-    Why This Works (Zero Label Leakage):
-    -----------------------------------
-    V_top64 is computed purely via within-prompt covariance decomposition (no model labels are used).
-    Projecting representations onto V_top64 isolates the 64 highest-variance directions of stylistic
-    variation across prompts, regularized by the reader's out-of-sample prior scale.
+    Projects train and test features onto V_top64 and scales by out-of-sample prior scale.
     """
     mx, sx, V64 = res["mx"], res["sx"], res["V_top64"]
     S_tr = (((Z_tr - mx) / sx) @ V64).astype(np.float32)
@@ -41,57 +27,20 @@ def make_spectral_blocks(Z_tr: np.ndarray, Z_te: np.ndarray, res: dict, prior_sc
     S_te = (S_te / np.linalg.norm(S_te, axis=1, keepdims=True).clip(min=1e-6)) * float(prior_scale)
     return S_tr, S_te
 
-
-def _resolve_spectral_groups(
-    X_te: np.ndarray,
-    D_tfidf: np.ndarray | None,
-    D_neural_sum: np.ndarray | None,
-    D_neural_weight_total: float,
-    max_cluster_size: int = 14,
-    groups_override: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    Identifies test prompt clusters by blending lexical and neural cosine distances:
-        D_hybrid = 0.55 * D_tfidf + 0.45 * D_neural
-    Clusters at average-linkage distance threshold 0.65, splitting clusters > 14.
-    """
-    N_te = len(X_te)
-    if N_te < 2:
-        return np.ones(N_te, dtype=int)
-    if groups_override is not None and len(groups_override) == N_te:
-        _, inv = np.unique(np.asarray(groups_override, dtype=str), return_inverse=True)
-        return split_oversized_clusters_dist(None, inv + 1, max_cluster_size=max_cluster_size)
-    if D_tfidf is not None and D_tfidf.shape == (N_te, N_te):
-        if D_neural_sum is not None and D_neural_weight_total > 0 and D_neural_sum.shape == (N_te, N_te):
-            D_neural_final = D_neural_sum / max(1e-6, D_neural_weight_total)
-            D_hybrid_final = 0.55 * D_tfidf + 0.45 * D_neural_final
-        else:
-            D_hybrid_final = D_tfidf.copy()
-    else:
-        X_c = X_te - X_te.mean(axis=0, keepdims=True)
-        X_n = X_c / np.linalg.norm(X_c, axis=1, keepdims=True).clip(min=1e-6)
-        D_hybrid_final = np.clip(1.0 - (X_n @ X_n.T), 0.0, None)
-        np.fill_diagonal(D_hybrid_final, 0.0)
-    g65 = fcluster(linkage(squareform(D_hybrid_final, checks=False), method="average"), t=0.65, criterion="distance")
-    return split_oversized_clusters_dist(D_hybrid_final, g65, max_cluster_size=max_cluster_size)
-
-
 def fit_joint_spectral_bank(
-    spectral_tr_blocks: list[np.ndarray],
-    spectral_te_blocks: list[np.ndarray],
+    spectral_tr_blocks: List[np.ndarray],
+    spectral_te_blocks: List[np.ndarray],
     y_sub: np.ndarray,
     prompts_sub: np.ndarray,
-    D_tfidf: np.ndarray | None,
-    D_neural_sum: np.ndarray | None,
+    D_tfidf: np.ndarray,
+    D_neural_sum: np.ndarray,
     D_neural_weight_total: float,
     N_test: int,
     plain_C: float = 0.04,
     center_C: float = 0.03,
     center_blend: float = 0.35,
-    max_cluster_size: int = 14,
-    groups_override: np.ndarray | None = None,
-    compute_oof: bool = True,
-) -> tuple[np.ndarray, float]:
+    max_cluster_size: int = 14
+) -> Tuple[np.ndarray, float]:
     """
     Fits plain and prompt-centered logistic regressions on stacked unsupervised spectral features.
     Returns:
@@ -104,41 +53,40 @@ def fit_joint_spectral_bank(
     X_spec_tr = np.hstack(spectral_tr_blocks)
     X_spec_te = np.hstack(spectral_te_blocks)
 
-    oof_bacc = 0.0
-    if compute_oof:
-        # 5-fold GroupKFold OOF Balanced Accuracy (zero label leakage)
-        gkf = GroupKFold(n_splits=5)
-        oof_preds = np.zeros(len(y_sub), dtype=int)
-        for tr_idx, val_idx in gkf.split(X_spec_tr, y_sub, groups=prompts_sub):
-            clf_fold = LogisticRegression(C=plain_C, max_iter=2000, random_state=42)
-            clf_fold.fit(X_spec_tr[tr_idx], y_sub[tr_idx])
-            oof_preds[val_idx] = clf_fold.predict(X_spec_tr[val_idx])
-        oof_bacc = float(balanced_accuracy_score(y_sub, oof_preds))
+    # 5-fold GroupKFold OOF Balanced Accuracy (zero label leakage)
+    gkf = GroupKFold(n_splits=5)
+    oof_preds = np.zeros(len(y_sub), dtype=int)
+    for tr_idx, val_idx in gkf.split(X_spec_tr, y_sub, groups=prompts_sub):
+        clf_fold = LogisticRegression(C=plain_C, max_iter=2000, random_state=42)
+        clf_fold.fit(X_spec_tr[tr_idx], y_sub[tr_idx])
+        oof_preds[val_idx] = clf_fold.predict(X_spec_tr[val_idx])
+    oof_bacc = float(balanced_accuracy_score(y_sub, oof_preds))
 
     # Plain Logistic Regression
     clf_plain = LogisticRegression(C=plain_C, max_iter=2000, random_state=42)
     clf_plain.fit(X_spec_tr, y_sub)
     lp_spec_plain = clf_plain.predict_log_proba(X_spec_te)
-    if hasattr(clf_plain, "classes_"):
+    if hasattr(clf_plain, 'classes_'):
         lp_spec_plain = align_cols(lp_spec_plain, [LABELS[c] for c in clf_plain.classes_])
 
     # Prompt-Centered Logistic Regression
     X_spec_tr_c = X_spec_tr.copy()
     for p in np.unique(prompts_sub):
-        mask = prompts_sub == p
+        mask = (prompts_sub == p)
         X_spec_tr_c[mask] -= X_spec_tr_c[mask].mean(axis=0, keepdims=True)
     clf_center = LogisticRegression(C=center_C, max_iter=2000, random_state=42)
     clf_center.fit(X_spec_tr_c, y_sub)
 
     # Prompt-centered test features
     X_spec_te_c = X_spec_te.copy()
-    safe_groups = _resolve_spectral_groups(
-        X_spec_te, D_tfidf, D_neural_sum, D_neural_weight_total, max_cluster_size=max_cluster_size, groups_override=groups_override
-    )
+    D_neural_final = D_neural_sum / max(1e-6, D_neural_weight_total) if D_neural_weight_total > 0 else D_tfidf
+    D_hybrid_final = 0.55 * D_tfidf + 0.45 * D_neural_final
+    g65_final = fcluster(linkage(squareform(D_hybrid_final, checks=False), method='average'), t=0.65, criterion='distance') if N_test >= 2 else np.ones(N_test, dtype=int)
+    safe_groups = split_oversized_clusters_dist(D_hybrid_final, g65_final, max_cluster_size=max_cluster_size)
 
     if N_test >= 2 and len(np.unique(safe_groups)) > 0:
         for g in np.unique(safe_groups):
-            mask = safe_groups == g
+            mask = (safe_groups == g)
             if mask.sum() > 1:
                 X_spec_te_c[mask] -= X_spec_te_c[mask].mean(axis=0, keepdims=True)
             else:
@@ -147,7 +95,7 @@ def fit_joint_spectral_bank(
         X_spec_te_c = np.zeros_like(X_spec_te)
 
     lp_spec_center = clf_center.predict_log_proba(X_spec_te_c)
-    if hasattr(clf_center, "classes_"):
+    if hasattr(clf_center, 'classes_'):
         lp_spec_center = align_cols(lp_spec_center, [LABELS[c] for c in clf_center.classes_])
 
     lp_spec_joint = lp_spec_plain + center_blend * lp_spec_center
@@ -155,86 +103,3 @@ def fit_joint_spectral_bank(
 
     return P_spectral, oof_bacc
 
-
-def fit_within_family_spectral_gates(
-    spectral_tr_blocks: list[np.ndarray],
-    spectral_te_blocks: list[np.ndarray],
-    y_sub: np.ndarray,
-    prompts_sub: np.ndarray,
-    D_tfidf: np.ndarray | None,
-    D_neural_sum: np.ndarray | None,
-    D_neural_weight_total: float,
-    N_test: int,
-    max_cluster_size: int = 14,
-    hw_tr: np.ndarray | None = None,
-    hw_te: np.ndarray | None = None,
-    groups_override: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
-    """
-    Fits plain + prompt-centered LogisticRegression sibling specialist gates
-    on the stacked cross-backbone spectral features for each provider family
-    ('gpt', 'gemini', 'claude', 'glm').
-    Returns dict mapping family_name -> (N_test, len(fam_cols)) log-probabilities.
-    """
-    if len(spectral_tr_blocks) == 0 or N_test == 0:
-        return {}
-    X_tr = np.hstack(spectral_tr_blocks)
-    X_te = np.hstack(spectral_te_blocks)
-
-    if hw_tr is not None and hw_te is not None and len(hw_tr) == len(X_tr) and len(hw_te) == len(X_te):
-        hw_tr_n = (hw_tr / np.linalg.norm(hw_tr, axis=1, keepdims=True).clip(min=1e-6)) * 0.35
-        hw_te_n = (hw_te / np.linalg.norm(hw_te, axis=1, keepdims=True).clip(min=1e-6)) * 0.35
-        X_tr = np.hstack([X_tr, hw_tr_n])
-        X_te = np.hstack([X_te, hw_te_n])
-
-    X_tr_c = X_tr.copy()
-    for p in np.unique(prompts_sub):
-        m = prompts_sub == p
-        if m.sum() > 1:
-            X_tr_c[m] -= X_tr_c[m].mean(axis=0, keepdims=True)
-
-    X_te_c = X_te.copy()
-    safe_groups = _resolve_spectral_groups(
-        X_te, D_tfidf, D_neural_sum, D_neural_weight_total, max_cluster_size=max_cluster_size, groups_override=groups_override
-    )
-    if N_test >= 2:
-        for g in np.unique(safe_groups):
-            m = safe_groups == g
-            if m.sum() > 1:
-                X_te_c[m] -= X_te_c[m].mean(axis=0, keepdims=True)
-            else:
-                X_te_c[m] = 0.0
-    else:
-        X_te_c = np.zeros_like(X_te)
-
-    groups_dict = SPECIALIST_GROUPS if SPECIALIST_GROUPS else FAMILIES
-    family_gates: dict[str, np.ndarray] = {}
-    for fam_name, fam_cols in groups_dict.items():
-        mask_tr = np.isin(y_sub, fam_cols)
-        min_samples = 20 if len(fam_cols) <= 3 else 30
-        if mask_tr.sum() >= min_samples and len(np.unique(y_sub[mask_tr])) == len(fam_cols):
-            sub_y = np.array([fam_cols.index(int(c)) for c in y_sub[mask_tr]], dtype=int)
-            clf_p = LogisticRegression(C=0.10, max_iter=1000, class_weight="balanced", random_state=42)
-            clf_p.fit(X_tr[mask_tr], sub_y)
-            lp_p = clf_p.predict_log_proba(X_te)
-
-            clf_c = LogisticRegression(C=0.06, max_iter=1000, class_weight="balanced", random_state=42)
-            clf_c.fit(X_tr_c[mask_tr], sub_y)
-            lp_c = clf_c.predict_log_proba(X_te_c)
-
-            w_p, w_c = (
-                (0.35, 0.65)
-                if fam_name
-                in (
-                    "gemini_37_38_pair",
-                    "gemini_flash_triad",
-                    "glm",
-                    "glm_kimi_triad",
-                    "gpt_56_triad",
-                    "kimi_gpt55_qwen",
-                    "frontier_and_fable",
-                )
-                else (0.65, 0.35)
-            )
-            family_gates[fam_name] = log_softmax(w_p * lp_p + w_c * lp_c, axis=1)
-    return family_gates

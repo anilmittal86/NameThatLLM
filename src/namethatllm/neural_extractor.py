@@ -7,24 +7,23 @@ and bit-exact CPU fp16 snapshot/restore for shared trunks.
 """
 
 import gc
-import json
 import os
 import re
-import shutil
+import json
 import time
+import shutil
 from pathlib import Path
-from typing import Any
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import torch
-from safetensors.torch import load_file
-from torch import nn
+import torch.nn as nn
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+from safetensors.torch import load_file
 
 from .config import LABELS, K, align_cols, log_softmax
 
-
-def infer_adapter_max_layer(ckpt_dir: Path) -> int | None:
+def infer_adapter_max_layer(ckpt_dir: Path) -> Optional[int]:
     """Returns 1-indexed max transformer layer modified by the LoRA adapter (e.g. 24 or 27)."""
     ckpt_dir = Path(ckpt_dir)
     for rel in (
@@ -55,24 +54,21 @@ def infer_adapter_max_layer(ckpt_dir: Path) -> int | None:
                 continue
     return None
 
-
 def in_place_copy(dst: torch.Tensor, src: torch.Tensor):
     """In-place weight copy."""
     dst.data.copy_(src.to(device=dst.device, dtype=dst.dtype))
 
-
-def _resolve_module_name(k: str, state_dict: dict) -> str | None:
+def _resolve_module_name(k: str, state_dict: dict) -> Optional[str]:
     """Resolves module name across various AutoModel and PEFT naming schemes."""
     raw = k.split(".lora_A")[0]
     candidates = [raw, raw.replace("base_model.model.", "")]
     if "layers." in raw:
-        rel = raw[raw.index("layers.") :]
+        rel = raw[raw.index("layers."):]
         candidates.extend([rel, f"model.{rel}"])
     for c in candidates:
         if c in state_dict and hasattr(state_dict[c], "weight"):
             return c
     return None
-
 
 def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool:
     """
@@ -98,8 +94,7 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
     scale = 1.0
     if cfg_p.exists():
         try:
-            with open(cfg_p, "r", encoding="utf-8") as f:
-                c = json.load(f)
+            c = json.load(open(cfg_p))
             scale = float(c.get("lora_alpha", 16)) / float(c.get("r", 16))
         except Exception:
             scale = 1.0
@@ -143,17 +138,9 @@ def merge_lora(model: nn.Module, adapter_path: Path, sign: float = +1.0) -> bool
                 applied += 1
     return applied > 0
 
-
-@torch.inference_mode()
-def forward_and_pool_batch(
-    model: nn.Module,
-    enc: dict,
-    layers: list[int],
-    norms: nn.ModuleList,
-    dtype: torch.dtype = torch.float16,
-    drop_first_token: bool = True,
-    final_norm: nn.Module | None = None,
-):
+@torch.no_grad()
+def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms: nn.ModuleList,
+                           dtype: torch.dtype = torch.float16, drop_first_token: bool = True):
     """
     Runs forward pass in `dtype` (float16 on T4).
     CRITICAL: If any target layer overflows fp16 (Inf/NaN), recomputes ONLY the overflowed
@@ -180,68 +167,30 @@ def forward_and_pool_batch(
     good_rows = torch.where(~bad_mask)[0].to(first_norm_dev)
     if len(good_rows) > 0:
         for idx_l, l in enumerate(layers):
-            h_raw = hs[l][good_rows.to(hs[l].device)]
-            if final_norm is not None and idx_l == len(layers) - 1:
-                fn_params = list(final_norm.parameters())
-                fn_dev = fn_params[0].device if fn_params else h_raw.device
-                fn_dtype = fn_params[0].dtype if fn_params else h_raw.dtype
-                h_raw = final_norm(h_raw.to(device=fn_dev, dtype=fn_dtype)).to(h_raw.device)
-            h_good = h_raw.to(first_norm_dev).float()
+            h_good = hs[l][good_rows.to(hs[l].device)].to(first_norm_dev).float()
             pooled_layers[idx_l][good_rows] = (h_good * m[good_rows]).sum(dim=1) / den[good_rows]
 
-    # Rescue overflowed rows safely without mutating model parameters in-place
-    # (In-place model.to(torch.bfloat16) permanently truncates FP16 mantissa bits when restoring).
+    # Rescue overflowed rows in bfloat16 (exact exponent range as float32, NEVER overflows!)
     if n_bad > 0:
         bad_rows = torch.where(bad_mask)[0]
-        bad_rows_dev = bad_rows.to(first_norm_dev)
-
-        # Baseline fallback: sanitize existing raw activations so bad rows are never left as zeros
-        for idx_l, l in enumerate(layers):
-            h_fallback = hs[l][bad_rows.to(hs[l].device)]
-            if final_norm is not None and idx_l == len(layers) - 1:
-                fn_params = list(final_norm.parameters())
-                fn_dev = fn_params[0].device if fn_params else h_fallback.device
-                fn_dtype = fn_params[0].dtype if fn_params else h_fallback.dtype
-                h_fallback = final_norm(h_fallback.to(device=fn_dev, dtype=fn_dtype)).to(h_fallback.device)
-            h_fb = torch.nan_to_num(h_fallback.to(first_norm_dev).float(), nan=0.0, posinf=1e4, neginf=-1e4)
-            pooled_layers[idx_l][bad_rows_dev] = (h_fb * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
-
         del hs
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        emb_mod = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
-        hook = None
-        if emb_mod is not None:
-            hook = emb_mod.register_forward_hook(lambda _m, _inp, out: out.float())
-
-        try:
-            enc_bad = {k: v[bad_rows] for k, v in enc.items()}
-            with torch.autocast(device_type=device_type, dtype=torch.float32):
-                hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
-            for idx_l, l in enumerate(layers):
-                h_b = hs_bad[l]
-                if final_norm is not None and idx_l == len(layers) - 1:
-                    fn_params = list(final_norm.parameters())
-                    fn_dev = fn_params[0].device if fn_params else h_b.device
-                    fn_dtype = fn_params[0].dtype if fn_params else h_b.dtype
-                    h_b = final_norm(h_b.to(device=fn_dev, dtype=fn_dtype)).to(h_b.device)
-                h_b = h_b.to(first_norm_dev).float()
-                h_b = torch.nan_to_num(h_b, nan=0.0, posinf=1e4, neginf=-1e4)
-                pooled_layers[idx_l][bad_rows_dev] = (h_b * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
-            del hs_bad
-        except Exception as e:
-            print(f"[NeuralExtractor] Warning: Exception during overflow rescue, keeping sanitized fallback: {e}")
-        finally:
-            if hook is not None:
-                hook.remove()
+        model.to(torch.bfloat16)
+        enc_bad = {k: v[bad_rows] for k, v in enc.items()}
+        hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
+        bad_rows_dev = bad_rows.to(first_norm_dev)
+        for idx_l, l in enumerate(layers):
+            h_b = hs_bad[l].to(first_norm_dev).float()
+            h_b = torch.nan_to_num(h_b, nan=0.0, posinf=1e4, neginf=-1e4)
+            pooled_layers[idx_l][bad_rows_dev] = (h_b * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
+        del hs_bad
+        model.to(dtype)
 
     out = torch.cat([nm(pooled_layers[idx_l]) for idx_l, nm in enumerate(norms)], dim=-1)
     return out.cpu().numpy(), n_bad
 
-
-def _flatten_state_dict(obj: Any, prefix: str = "", out: dict | None = None) -> dict:
+def _flatten_state_dict(obj: Any, prefix: str = "", out: Optional[dict] = None) -> dict:
     if out is None:
         out = {}
     if hasattr(obj, "state_dict") and callable(obj.state_dict):
@@ -260,7 +209,6 @@ def _flatten_state_dict(obj: Any, prefix: str = "", out: dict | None = None) -> 
             new_k = f"{prefix}.{idx}" if prefix else str(idx)
             _flatten_state_dict(item, new_k, out)
     return out
-
 
 def load_head_file(path_or_dir: Path) -> dict:
     """Unified loader for classification head state dicts (.safetensors, .pt, .bin, .npz)."""
@@ -284,14 +232,9 @@ def load_head_file(path_or_dir: Path) -> dict:
             return load_head_file(cand)
     return {}
 
-
-def resolve_head_tensors(
-    heads_dict: dict, num_classes: int | None = None
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+def resolve_head_tensors(heads_dict: dict) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Resolves plain and centered head weights and biases matching American/British naming and handles transposed weights."""
     W_p, b_p, W_c, b_c = None, None, None, None
-    valid_k = (num_classes,) if num_classes is not None else (K, 7, 5, 4, 2)
-
     for wk, bk in [
         ("plain.weight", "plain.bias"),
         ("plain_coef", "plain_intercept"),
@@ -307,12 +250,7 @@ def resolve_head_tensors(
             break
         elif wk in heads_dict and bk not in heads_dict:
             W_p = heads_dict[wk]
-            k_rows = (
-                W_p.shape[0]
-                if (hasattr(W_p, "shape") and len(W_p.shape) > 0 and W_p.shape[0] in valid_k)
-                else (W_p.shape[1] if (hasattr(W_p, "shape") and len(W_p.shape) > 1 and W_p.shape[1] in valid_k) else (num_classes or K))
-            )
-            b_p = np.zeros(k_rows, dtype=np.float32)
+            b_p = np.zeros(K, dtype=np.float32)
             break
 
     for wk, bk in [
@@ -330,12 +268,7 @@ def resolve_head_tensors(
             break
         elif wk in heads_dict and bk not in heads_dict:
             W_c = heads_dict[wk]
-            k_rows = (
-                W_c.shape[0]
-                if (hasattr(W_c, "shape") and len(W_c.shape) > 0 and W_c.shape[0] in valid_k)
-                else (W_c.shape[1] if (hasattr(W_c, "shape") and len(W_c.shape) > 1 and W_c.shape[1] in valid_k) else (num_classes or K))
-            )
-            b_c = np.zeros(k_rows, dtype=np.float32)
+            b_c = np.zeros(K, dtype=np.float32)
             break
 
     # Suffix / Keyword Matching fallback if W_p or W_c still None
@@ -343,51 +276,29 @@ def resolve_head_tensors(
         for k, v in heads_dict.items():
             k_lower = str(k).lower()
             shape = getattr(v, "shape", None)
-            if shape is not None and len(shape) == 2 and (shape[0] in valid_k or shape[1] in valid_k):
+            if shape is not None and len(shape) == 2 and (shape[0] == K or shape[1] == K):
                 # Check for center / twin
                 if any(tag in k_lower for tag in ("center", "centred", "twin")):
                     if W_c is None:
                         W_c = v
                         base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
-                        for bk in [
-                            f"{base_prefix}.bias",
-                            f"{base_prefix}_bias",
-                            f"{base_prefix}.intercept",
-                            f"{base_prefix}_intercept",
-                            "bias",
-                            "centered.bias",
-                            "b",
-                        ]:
-                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) is not None:
-                                b_cand = heads_dict[bk]
-                                if getattr(b_cand, "shape", ()) in [(k_item,) for k_item in valid_k]:
-                                    b_c = b_cand
-                                    break
+                        for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "centered.bias", "b"]:
+                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) == (K,):
+                                b_c = heads_dict[bk]
+                                break
                         if b_c is None:
-                            k_rows = W_c.shape[0] if W_c.shape[0] in valid_k else W_c.shape[1]
-                            b_c = np.zeros(k_rows, dtype=np.float32)
+                            b_c = np.zeros(K, dtype=np.float32)
                 # Check for plain / head / clf / classifier
                 elif any(tag in k_lower for tag in ("plain", "head", "clf", "classifier")):
                     if W_p is None:
                         W_p = v
                         base_prefix = k.rsplit(".", 1)[0] if "." in k else k.rsplit("_", 1)[0]
-                        for bk in [
-                            f"{base_prefix}.bias",
-                            f"{base_prefix}_bias",
-                            f"{base_prefix}.intercept",
-                            f"{base_prefix}_intercept",
-                            "bias",
-                            "plain.bias",
-                            "b",
-                        ]:
-                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) is not None:
-                                b_cand = heads_dict[bk]
-                                if getattr(b_cand, "shape", ()) in [(k_item,) for k_item in valid_k]:
-                                    b_p = b_cand
-                                    break
+                        for bk in [f"{base_prefix}.bias", f"{base_prefix}_bias", f"{base_prefix}.intercept", f"{base_prefix}_intercept", "bias", "plain.bias", "b"]:
+                            if bk in heads_dict and getattr(heads_dict[bk], "shape", None) == (K,):
+                                b_p = heads_dict[bk]
+                                break
                         if b_p is None:
-                            k_rows = W_p.shape[0] if W_p.shape[0] in valid_k else W_p.shape[1]
-                            b_p = np.zeros(k_rows, dtype=np.float32)
+                            b_p = np.zeros(K, dtype=np.float32)
 
     if W_p is not None and hasattr(W_p, "cpu"):
         W_p = W_p.cpu().numpy()
@@ -398,26 +309,18 @@ def resolve_head_tensors(
     if b_c is not None and hasattr(b_c, "cpu"):
         b_c = b_c.cpu().numpy()
 
-    # Transpose Guard: if shape is (D, K_cls), transpose to canonical (K_cls, D)
+    # Transpose Guard: if shape is (D, K) where K == 18, transpose to canonical (18, D)
     if W_p is not None and W_p.ndim == 2:
-        if W_p.shape[1] in valid_k and W_p.shape[0] not in valid_k:
+        if W_p.shape[1] == K and W_p.shape[0] != K:
             W_p = W_p.T
     if W_c is not None and W_c.ndim == 2:
-        if W_c.shape[1] in valid_k and W_c.shape[0] not in valid_k:
+        if W_c.shape[1] == K and W_c.shape[0] != K:
             W_c = W_c.T
 
     return W_p, b_p, W_c, b_c
 
-
-def compute_centered_logits(
-    Z_test: np.ndarray,
-    groups: np.ndarray,
-    W_c: np.ndarray,
-    b_c: np.ndarray,
-    src_labels: list,
-    max_std: float = 4.2,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Computes prompt-topic centered twin logits with temperature normalization matching plain heads."""
+def compute_centered_logits(Z_test: np.ndarray, groups: np.ndarray, W_c: np.ndarray, b_c: np.ndarray, src_labels: list) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes prompt-topic centered twin logits for valid multi-sample clusters."""
     N = len(Z_test)
     out_lp = np.zeros((N, K), dtype=np.float64)
     if N < 2 or W_c is None:
@@ -430,50 +333,14 @@ def compute_centered_logits(
         return out_lp, valid
     Zc = Z_test.copy()
     for g in np.unique(safe_g[valid]):
-        mask = safe_g == g
-        Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
-    raw_c = align_cols(Zc[valid] @ W_c.T + b_c, src_labels)
-    std_c = float(np.std(raw_c, axis=1).mean()) if len(raw_c) > 0 else 1.0
-    temp_c = max(1.0, std_c / max_std)
-    out_lp[valid] = log_softmax(raw_c / temp_c, axis=1)
-    return out_lp, valid
-
-
-def compute_family_centered_logits(
-    Z_test: np.ndarray,
-    groups: np.ndarray,
-    W_c: np.ndarray,
-    b_c: np.ndarray,
-    src_labels: list,
-    target_labels: list,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Computes within-cluster centered twin logits for a K_fam-class family specialist."""
-    N = len(Z_test)
-    K_fam = len(target_labels)
-    out_lp = np.zeros((N, K_fam), dtype=np.float64)
-    if N < 2 or W_c is None:
-        return out_lp, np.zeros(N, dtype=bool)
-    _, inv_g = np.unique(np.asarray(groups, dtype=str), return_inverse=True)
-    safe_g = inv_g + 1
-    sz = np.bincount(safe_g)[safe_g]
-    valid = (sz >= 2) & (sz <= 18)
-    if not valid.any():
-        return out_lp, valid
-    Zc = Z_test.copy()
-    for g in np.unique(safe_g[valid]):
-        mask = safe_g == g
+        mask = (safe_g == g)
         Zc[mask] -= Zc[mask].mean(axis=0, keepdims=True)
     raw_c = Zc[valid] @ W_c.T + b_c
-    src_list = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in src_labels]
-    if len(src_list) == K_fam and set(src_list) == set(target_labels):
-        perm = [src_list.index(l) for l in target_labels]
-        raw_c = raw_c[:, perm]
-    out_lp[valid] = log_softmax(raw_c, axis=1)
+    out_lp[valid] = log_softmax(align_cols(raw_c, src_labels))
     return out_lp, valid
 
-
 class UniversalLoRATrunkLoader:
-    def __init__(self, base_dir: Path, keep_layers: int, layers: list[int], max_len: int = 447):
+    def __init__(self, base_dir: Path, keep_layers: int, layers: List[int], max_len: int = 447):
         if base_dir is not None and not (base_dir / "config.json").exists():
             for sub in base_dir.rglob("config.json"):
                 base_dir = sub.parent
@@ -484,7 +351,6 @@ class UniversalLoRATrunkLoader:
         self.max_len = max_len
         self.total_rescued = 0
         self.tok = AutoTokenizer.from_pretrained(str(base_dir), trust_remote_code=True)
-        self.tok.padding_side = "right"
         if self.tok.pad_token is None:
             self.tok.pad_token = self.tok.eos_token or "<|endoftext|>"
 
@@ -498,17 +364,13 @@ class UniversalLoRATrunkLoader:
         if n_gpus >= 2:
             max_memory = {0: "13.5GiB", 1: "13.5GiB"}
             self.model = AutoModel.from_pretrained(
-                str(base_dir),
-                config=cfg,
-                device_map="auto",
-                max_memory=max_memory,
-                torch_dtype=torch.float16,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
+                str(base_dir), config=cfg, device_map="auto", max_memory=max_memory,
+                torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
             )
         elif n_gpus == 1:
             self.model = AutoModel.from_pretrained(
-                str(base_dir), config=cfg, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
+                str(base_dir), config=cfg, device_map="auto",
+                torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True
             )
         else:
             self.model = AutoModel.from_pretrained(str(base_dir), config=cfg, torch_dtype=torch.float32, low_cpu_mem_usage=True)
@@ -516,26 +378,32 @@ class UniversalLoRATrunkLoader:
         # Preserve original final trunk norm before optionally disabling
         self.orig_final_norm = getattr(self.model, "norm", None) or getattr(getattr(self.model, "model", None), "norm", None)
 
-        # Default: keep HuggingFace model.norm as nn.Identity() at all times
+        # Default: disable final trunk norm for two-stage models
         if hasattr(self.model, "norm"):
             self.model.norm = nn.Identity()
-        if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+        elif hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
             self.model.model.norm = nn.Identity()
 
-        self.final_norm_enabled = False
         self.model.eval()
         self.device_norms = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         # nn.LayerNorm with both weight and bias matching heads.safetensors
         hidden_dim = self.model.config.hidden_size
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in layers]).to(self.device_norms).float()
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim)
+            for _ in layers
+        ]).to(self.device_norms).float()
 
         self.norms.eval()
         self.first_dev = next(self.model.parameters()).device
 
     def set_final_norm(self, enabled: bool):
-        """Sets final_norm_enabled flag, keeping HuggingFace model.norm as nn.Identity()."""
-        self.final_norm_enabled = bool(enabled)
+        """Restores original trunk norm when enabled=True, disables with nn.Identity() when False."""
+        target = self.orig_final_norm if enabled and self.orig_final_norm is not None else nn.Identity()
+        if hasattr(self.model, "norm"):
+            self.model.norm = target
+        elif hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+            self.model.model.norm = target
 
     def snapshot_weights(self, adapter_path: Path) -> dict:
         """Saves CPU fp16 copies of trunk modules modified by adapter."""
@@ -562,13 +430,16 @@ class UniversalLoRATrunkLoader:
                 if m_name in state_dict and hasattr(state_dict[m_name], "weight"):
                     state_dict[m_name].weight.data.copy_(orig.to(state_dict[m_name].weight.device))
 
-    def set_active_layers(self, layers: list[int], max_len: int | None = None):
+    def set_active_layers(self, layers: List[int], max_len: Optional[int] = None):
         """Updates active pooled layers and instantiates LayerNorms matching the checkpoint."""
         self.layers = list(layers)
         if max_len is not None:
             self.max_len = max_len
         hidden_dim = self.model.config.hidden_size
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in self.layers]).to(self.device_norms).float()
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim)
+            for _ in self.layers
+        ]).to(self.device_norms).float()
         self.norms.eval()
 
     def load_norm_weights(self, heads_sd: dict):
@@ -587,11 +458,7 @@ class UniversalLoRATrunkLoader:
                     b_k = f"{pfx}.{i}.bias"
                     if w_k in heads_sd:
                         ln.weight.copy_(heads_sd[w_k].to(ln.weight.device, ln.weight.dtype))
-                    elif (
-                        f"{pfx}.{i}" in heads_sd
-                        and hasattr(heads_sd[f"{pfx}.{i}"], "shape")
-                        and heads_sd[f"{pfx}.{i}"].shape == ln.weight.shape
-                    ):
+                    elif f"{pfx}.{i}" in heads_sd and hasattr(heads_sd[f"{pfx}.{i}"], "shape") and heads_sd[f"{pfx}.{i}"].shape == ln.weight.shape:
                         ln.weight.copy_(heads_sd[f"{pfx}.{i}"].to(ln.weight.device, ln.weight.dtype))
 
                     if b_k in heads_sd and hasattr(ln, "bias") and ln.bias is not None:
@@ -605,7 +472,7 @@ class UniversalLoRATrunkLoader:
                         for i, ln in enumerate(self.norms):
                             ln.weight.copy_(stk_t[i].to(ln.weight.device, ln.weight.dtype))
 
-    def _extract_batch_ids(self, id_list: list[list[int]], batch_size: int = 8) -> np.ndarray:
+    def _extract_batch_ids(self, id_list: List[List[int]], batch_size: int = 8) -> np.ndarray:
         order = np.argsort([len(x) for x in id_list], kind="stable")
         total_dim = len(self.layers) * self.model.config.hidden_size
         Z = np.zeros((len(id_list), total_dim), dtype=np.float32)
@@ -614,16 +481,13 @@ class UniversalLoRATrunkLoader:
             idx = order[s : s + batch_size]
             enc = self.tok.pad({"input_ids": [id_list[i] for i in idx]}, padding=True, return_tensors="pt")
             enc = {k: v.to(self.first_dev) for k, v in enc.items()}
-            fn = self.orig_final_norm if getattr(self, "final_norm_enabled", False) else None
-            out_np, n_bad = forward_and_pool_batch(
-                self.model, enc, self.layers, self.norms, torch.float16, drop_first_token=True, final_norm=fn
-            )
+            out_np, n_bad = forward_and_pool_batch(self.model, enc, self.layers, self.norms, torch.float16, drop_first_token=True)
             self.total_rescued += n_bad
             Z[idx] = out_np
         return Z
 
-    @torch.inference_mode()
-    def extract_exact(self, texts: list[str], batch_size: int = 8, end_id: int | None = 151643) -> np.ndarray:
+    @torch.no_grad()
+    def extract_exact(self, texts: List[str], batch_size: int = 8, end_id: Optional[int] = 151643) -> np.ndarray:
         t0 = time.time()
         self.total_rescued = 0
         raw_ids = self.tok(list(texts), add_special_tokens=False, truncation=True, max_length=self.max_len)["input_ids"]
@@ -641,53 +505,31 @@ class UniversalLoRATrunkLoader:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-
-def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: list[int], default_max_len: int = 447) -> dict:
+def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List[int], default_max_len: int = 447) -> dict:
     """Reads keep, layers, max_len, end_id, and labels dynamically from meta.json or infers from adapter weights."""
     ckpt_dir = Path(ckpt_dir)
     meta_p = ckpt_dir / "meta.json"
-    dir_str = str(ckpt_dir).lower().replace("\\", "/")
-    is_dhruv = any(x in dir_str for x in ("q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x"))
-    is_deberta = "deberta" in dir_str
-
-    labels = sorted(LABELS) if is_dhruv else list(LABELS)
-    if is_deberta:
-        keep = 24
-        layers = [3, 6, 9, 12, 15, 18, 21, 24]
-        max_len = 512
-        end_id = None
-        no_final_norm = False
-    elif is_dhruv:
-        keep = 24
-        layers = [2, 4, 6, 8, 12, 16, 20, 24]
-        max_len = 384
-        end_id = None
-        no_final_norm = False
-    else:
-        keep = default_keep
-        layers = list(default_layers)
-        max_len = default_max_len
-        end_id = 151643
-        no_final_norm = True
-
+    labels = list(LABELS)
+    keep = default_keep
+    layers = list(default_layers)
+    max_len = default_max_len
+    end_id = 151643
     if meta_p.exists():
         try:
-            with open(meta_p, "r", encoding="utf-8") as f:
-                m = json.load(f)
+            m = json.load(open(meta_p))
             labels = m.get("labels", m.get("classes", labels))
             cfg = m.get("cfg", m)
             keep = int(cfg.get("keep", keep))
             layers = list(cfg.get("layers", layers))
             max_len = int(cfg.get("max_len", max_len))
-            if "no_final_norm" in cfg:
-                no_final_norm = bool(cfg["no_final_norm"])
             for ek in ("end_token_id", "eos_id", "eos_token_id", "end_token"):
-                if ek in cfg:
-                    end_id = int(cfg[ek]) if isinstance(cfg[ek], int) else None
+                if ek in cfg and isinstance(cfg[ek], int):
+                    end_id = int(cfg[ek])
                     break
         except Exception:
             pass
     else:
+        # Infer exact layer depth from adapter weights (e.g. l24 vs l27)
         max_l = infer_adapter_max_layer(ckpt_dir)
         if max_l == 24:
             keep = 24
@@ -700,19 +542,31 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: list
             layers = [3, 5, 8, 11, 16, 21, 27, 32]
         elif max_l is not None:
             keep = max_l
+        else:
+            dir_str = str(ckpt_dir).lower().replace("\\", "/")
+            if any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x")):
+                keep = 24
+                layers = [2, 4, 6, 8, 12, 16, 20, 24]
+
+    dir_str = str(ckpt_dir).lower().replace("\\", "/")
+    is_dhruv = any(x in dir_str for x in ("l24", "q14v5", "ts_q3b14", "ts_q3b8", "q8v5", "ll8v5", "ts_llama8", "l24x"))
+    no_final_norm = False if is_dhruv else True
+    if is_dhruv:
+        max_len = 384
+        end_id = None
+        labels = sorted(LABELS)
 
     return {"keep": keep, "layers": layers, "max_len": max_len, "end_id": end_id, "no_final_norm": no_final_norm, "labels": labels}
 
-
 def extract_deberta_checkpoint(
     ckpt_dir: Path,
-    base_deb_dir: Path | None,
-    texts_test: list[str],
-    texts_train: list[str],
+    base_deb_dir: Optional[Path],
+    texts_test: List[str],
+    texts_train: List[str],
     y_train: np.ndarray,
     max_len: int = 512,
-    batch_size: int = 8,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, list]:
+    batch_size: int = 8
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], list]:
     """
     Dedicated feature extractor for DeBERTa-v3-large sequence classification checkpoints.
     Supports both single-layer encoder (Layer 24 float32 last_hidden_state) and multi-layer heads.
@@ -759,7 +613,6 @@ def extract_deberta_checkpoint(
             load_src = model_src
 
     # CRITICAL: Always use torch.float32 for DeBERTa-v3 to avoid FP16 overflow!
-    model = None
     try:
         model = AutoModel.from_pretrained(str(load_src), torch_dtype=torch.float32).to(dev)
     finally:
@@ -768,21 +621,9 @@ def extract_deberta_checkpoint(
 
     model.eval()
 
-    # Merge LoRA adapter if present (e.g. deberta_inhouse)
-    has_adapter = (
-        (ckpt_dir / "adapter" / "adapter_model.safetensors").exists()
-        or (ckpt_dir / "adapter" / "adapter_model.bin").exists()
-        or (ckpt_dir / "adapter_model.safetensors").exists()
-        or (ckpt_dir / "adapter_model.bin").exists()
-    )
-    if has_adapter:
-        merged_deb = merge_lora(model, ckpt_dir, sign=+1.0)
-        if merged_deb:
-            print(f"[DeBERTa] Merged LoRA adapter from {ckpt_dir}")
-
     hidden_dim = model.config.hidden_size
     has_norm_keys = any(k.startswith("norms.") and k.endswith(".weight") for k in heads_sd)
-    is_single_last_layer = W_p is not None and W_p.shape[1] == hidden_dim and not has_norm_keys
+    is_single_last_layer = (W_p is not None and W_p.shape[1] == hidden_dim and not has_norm_keys)
 
     if not is_single_last_layer:
         if W_p is not None and W_p.shape[1] > 0:
@@ -807,7 +648,7 @@ def extract_deberta_checkpoint(
     else:
         norms = None
 
-    def pool_texts(txt_list: list[str], drop_first: bool = False) -> np.ndarray:
+    def pool_texts(txt_list: List[str], drop_first: bool = False) -> np.ndarray:
         out_dim = hidden_dim if is_single_last_layer else (len(layers) * hidden_dim)
         if len(txt_list) == 0:
             return np.zeros((0, out_dim), dtype=np.float32)
@@ -838,40 +679,25 @@ def extract_deberta_checkpoint(
                     all_vecs[idx] = out.cpu().numpy()
         return all_vecs
 
-    # For DeBERTa, always preserve [CLS] token at position 0 (drop_first=False)
-    best_drop = False
+    # Probe drop_first_token on train.csv[:180]
     probe_n = min(180, len(texts_train))
+    best_drop = False if is_single_last_layer else True
     if probe_n > 0 and W_p is not None:
-        try:
-            if len(ckpt_labels) == 18:
-                best_acc = -1.0
-                for cand_drop in [False, True] if is_single_last_layer else [False]:
-                    z_pr = pool_texts(texts_train[:probe_n], drop_first=cand_drop)
-                    preds = align_cols(z_pr @ W_p.T + b_p, ckpt_labels).argmax(axis=1)
-                    acc = float((preds == y_train[:probe_n]).mean())
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_drop = cand_drop
-                print(f"[DeBERTa Extractor] Probed drop_first={best_drop} (accuracy = {best_acc:.4f})")
-            else:
-                # Specialist checkpoint (K_fam < 18)
-                spec_indices = [LAB2I[l] for l in ckpt_labels if l in LAB2I]
-                spec_mask = np.isin(y_train[:probe_n], spec_indices)
-                if spec_mask.sum() > 0:
-                    y_spec_local = np.array([spec_indices.index(y) for y in y_train[:probe_n][spec_mask]])
-                    z_pr = pool_texts(texts_train[:probe_n], drop_first=False)
-                    preds = (z_pr[spec_mask] @ W_p.T + b_p).argmax(axis=1)
-                    acc = float((preds == y_spec_local).mean())
-                    print(f"[DeBERTa Specialist Extractor] Specialist {len(ckpt_labels)}-class accuracy = {acc:.4f} (drop_first=False)")
-        except Exception as e:
-            print(f"[DeBERTa Extractor] Note on probing: {e}")
+        best_acc = -1.0
+        for cand_drop in ([False, True] if is_single_last_layer else [True, False]):
+            z_pr = pool_texts(texts_train[:probe_n], drop_first=cand_drop)
+            preds = align_cols(z_pr @ W_p.T + b_p, ckpt_labels).argmax(axis=1)
+            acc = float((preds == y_train[:probe_n]).mean())
+            if acc > best_acc:
+                best_acc = acc
+                best_drop = cand_drop
+        print(f"[DeBERTa Extractor] Probed drop_first={best_drop} (accuracy = {best_acc:.4f})")
 
     out_dim = hidden_dim if is_single_last_layer else (len(layers) * hidden_dim)
     Z_test = pool_texts(texts_test, drop_first=best_drop)
     Z_train = pool_texts(texts_train, drop_first=best_drop) if len(texts_train) > 0 else np.zeros((0, out_dim), dtype=np.float32)
 
-    if model is not None:
-        del model
+    del model
     if norms is not None:
         del norms
     gc.collect()

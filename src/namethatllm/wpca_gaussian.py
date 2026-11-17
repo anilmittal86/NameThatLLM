@@ -7,77 +7,41 @@ bitmask DP author posteriors under the unique-authorship constraint.
 """
 
 from functools import lru_cache
-
+from typing import Tuple, List, Dict, Optional, Any
 import numpy as np
-from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.special import logsumexp
 from sklearn.covariance import ledoit_wolf_shrinkage
 
 from .config import K
 
-# =============================================================================
-# 1. TWO-WAY ANOVA DECOMPOSITION & COVARIANCE SHRINKAGE
-# =============================================================================
-
-
-def _two_way(
-    Z: np.ndarray, y: np.ndarray, pinv: np.ndarray, G: int, K_classes: int = 18, iters: int = 4
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Iterative Two-Way ANOVA variance decomposition.
-
-    Mathematical Formulation:
-    -------------------------
-    Each sample embedding Z_{i} is modeled as:
-        Z_{i} = mu_{y_i} + P_{g_i} + epsilon_{i}
-    where:
-    - mu_{k} is the fixed effect of LLM author k (the pure writing style centroid)
-    - P_{g} is the random effect of prompt topic g (the prompt-specific content shift)
-    - epsilon_{i} is residual noise
-
-    By alternating:
-    1. Estimate mu_{k} by averaging residuals (Z - P_{g}) for each class k
-    2. Estimate P_{g} by averaging residuals (Z - mu_{k}) for each prompt group g
-    for 4 iterations, we completely decouple the author's stylistic signature
-    from the topic/subject of the prompt!
-    """
+def _two_way(Z: np.ndarray, y: np.ndarray, pinv: np.ndarray, G: int, K_classes: int = 18, iters: int = 4) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Iterative two-way ANOVA decomposition separating author means and prompt random effects."""
     N, d = Z.shape
     mu = np.zeros((K_classes, d), dtype=np.float64)
     P = np.zeros((G, d), dtype=np.float64)
     ng = np.bincount(pinv, minlength=G).clip(min=1)
-
     for _ in range(iters):
-        # Step 1: Subtract current prompt effects, update author centroids mu
         R = Z - P[pinv]
         for k in range(K_classes):
-            idx = y == k
+            idx = (y == k)
             if idx.any():
                 mu[k] = R[idx].mean(axis=0)
-
-        # Step 2: Subtract updated author centroids, update prompt effects P
         R = Z - mu[y]
         P[:] = 0.0
         np.add.at(P, pinv, R)
         P /= ng[:, None]
-
     return mu, P, ng
 
-
 def _shrunk(S: np.ndarray, alpha: float) -> np.ndarray:
-    """
-    Shrinks covariance matrix S towards a spherical target:
-        S_shrunk = (1 - alpha) * S + alpha * (trace(S)/d) * I
-    Prevents degenerate zero-variance dimensions in high dimensions.
-    """
+    """Shrinks covariance matrix S towards spherical target."""
     d = S.shape[0]
-    tr = max(float(np.trace(S)) / d, 1e-6)
+    tr = np.trace(S) / d
     return (1.0 - alpha) * S + alpha * tr * np.eye(d)
 
-
-def fit_shared_gaussian_lowram(
-    X_tr_f32: np.ndarray, y: np.ndarray, prompts: np.ndarray, d_target: int = 256, se_floor: float = 0.10
-) -> dict:
+def fit_shared_gaussian_lowram(X_tr_f32: np.ndarray, y: np.ndarray, prompts: np.ndarray,
+                               d_target: int = 256, se_floor: float = 0.10) -> dict:
     """
     Fits shared Gaussian whitener with within-prompt centering and Ledoit-Wolf shrinkage floor.
     Returns unsupervised top-64 within-prompt principal components V_top64 (zero label leakage!).
@@ -108,7 +72,7 @@ def fit_shared_gaussian_lowram(
     del R, Gram, U, U_f32
 
     # Unsupervised within-prompt top-64 principal components (zero label leakage)
-    V_top64 = V_f32[:, : min(64, d)].copy()
+    V_top64 = V_f32[:, :min(64, d)].copy()
 
     Z = (((X_tr_f32 - mx) / sx) @ V_f32).astype(np.float64)
 
@@ -125,18 +89,7 @@ def fit_shared_gaussian_lowram(
     tr = max(np.trace(Sp_raw), 1e-8 * np.trace(Se))
     Sp = (1.0 - ap) * Sp_raw + ap * (tr / d) * np.eye(d)
 
-    L = None
-    for jitter in (0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
-        try:
-            target_matrix = Se if jitter == 0.0 else Se + jitter * np.eye(d)
-            L = np.linalg.cholesky(target_matrix)
-            break
-        except np.linalg.LinAlgError:
-            continue
-    if L is None:
-        eigvals, eigvecs = np.linalg.eigh(Se)
-        eigvals = np.clip(eigvals, 1e-6, None)
-        L = eigvecs @ np.diag(np.sqrt(eigvals))
+    L = np.linalg.cholesky(Se)
     Li = np.linalg.inv(L)
     M = 0.5 * ((Li @ Sp @ Li.T) + (Li @ Sp @ Li.T).T)
     lam, Q = np.linalg.eigh(M)
@@ -145,8 +98,10 @@ def fit_shared_gaussian_lowram(
     W_f32 = (V_f32 @ A.T.astype(np.float32)).astype(np.float32)
     m_whitened = mu @ A.T
 
-    return {"mx": mx, "sx": sx, "W": W_f32, "m": m_whitened, "lam": lam, "V_top64": V_top64, "T1": 2.40, "Tg": 2.35, "ae": ae}
-
+    return {
+        "mx": mx, "sx": sx, "W": W_f32, "m": m_whitened, "lam": lam,
+        "V_top64": V_top64, "T1": 2.40, "Tg": 2.35, "ae": ae
+    }
 
 def transform_lowram(X_f32: np.ndarray, prm: dict, batch_rows: int = 1000) -> np.ndarray:
     """Projects representations into whitened space."""
@@ -159,8 +114,7 @@ def transform_lowram(X_f32: np.ndarray, prm: dict, batch_rows: int = 1000) -> np
         U_out[s : s + batch_rows] = chunk.astype(np.float64)
     return U_out
 
-
-def split_oversized_clusters_dist(D: np.ndarray | None, groups: np.ndarray, max_cluster_size: int = 14) -> np.ndarray:
+def split_oversized_clusters_dist(D: np.ndarray, groups: np.ndarray, max_cluster_size: int = 14) -> np.ndarray:
     """Recursively splits clusters with size > max_cluster_size to prevent bitmask DP overflow."""
     if len(groups) < 2:
         return groups.copy()
@@ -172,24 +126,18 @@ def split_oversized_clusters_dist(D: np.ndarray | None, groups: np.ndarray, max_
             new_groups[rows] = next_id
             next_id += 1
         else:
-            if D is None or D.shape != (len(groups), len(groups)):
-                for start in range(0, len(rows), max_cluster_size):
-                    new_groups[rows[start : start + max_cluster_size]] = next_id
-                    next_id += 1
-                continue
             n_sub = int(np.ceil(len(rows) / max_cluster_size))
             D_sub = D[np.ix_(rows, rows)].copy()
             np.fill_diagonal(D_sub, 0.0)
             D_sub = np.clip(0.5 * (D_sub + D_sub.T), 0.0, None)
             d_condensed = squareform(D_sub, checks=False)
-            sub_labels = fcluster(linkage(d_condensed, method="average"), t=n_sub, criterion="maxclust")
+            sub_labels = fcluster(linkage(d_condensed, method='average'), t=n_sub, criterion='maxclust')
             for sg in np.unique(sub_labels):
                 s_rows = rows[sub_labels == sg]
                 for start in range(0, len(s_rows), max_cluster_size):
                     new_groups[s_rows[start : start + max_cluster_size]] = next_id
                     next_id += 1
     return new_groups
-
 
 @lru_cache(maxsize=4)
 def _bitmask_levels(k: int = 18):
@@ -198,34 +146,8 @@ def _bitmask_levels(k: int = 18):
     counts = np.fromiter((int(x).bit_count() for x in masks), dtype=np.uint8, count=len(masks))
     return tuple(masks[counts == n] for n in range(k + 1))
 
-
 class ExactAuthorPosterior:
-    """
-    Exact Gaussian Posteriors under the Unique-Authorship Constraint via 2^18 Bitmask DP.
-
-    Domain Insight & Problem Setup:
-    -------------------------------
-    When n completions (e.g. n = 4) belong to the same prompt cluster, each completion
-    must come from a DIFFERENT LLM author. This is an injective bipartite matching
-    between the n observed completions and the K = 18 potential LLM authors.
-    Evaluating all possible injective assignments naively requires:
-        18 * 17 * ... * (18 - n + 1) assignments (up to 1.76 * 10^11 permutations for n=14!)
-
-    Dynamic Programming Solution (2^18 Bitmask DP):
-    -----------------------------------------------
-    By representing the set of assigned authors as a binary bitmask of length K = 18
-    (total 2^18 = 262,144 states), we can compute the EXACT marginal posterior using
-    an efficient forward-backward message passing algorithm:
-    1. Forward Pass: Computes forward[mask], the cumulative likelihood of matching
-       the first `count` passages to the subset of authors represented by `mask`.
-    2. Terminal Prompt Correction: Evaluates the Gaussian prompt coupling effect:
-       residual = sum(U) - sum(mu_authors), adding the quadratic coupling term.
-    3. Backward Pass: Propagates backward messages from the terminal level down to the base.
-    4. Exact Marginalization: Combines forward, unary passage likelihood A[row, author],
-       and backward terms to yield the exact marginal probability P(author | all n texts in cluster).
-    Runs in milliseconds!
-    """
-
+    """Exact shared-prompt Gaussian posteriors under author uniqueness via 2^18 bitmask DP."""
     def __init__(self, m: np.ndarray, lam: np.ndarray):
         self.m = np.asarray(m, dtype=np.float64)
         self.lam = np.asarray(lam, dtype=np.float64)
@@ -291,8 +213,7 @@ class ExactAuthorPosterior:
         result -= logsumexp(result, axis=1, keepdims=True)
         return result
 
-
-def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: np.ndarray | None = None) -> np.ndarray:
+def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: np.ndarray) -> np.ndarray:
     """Wraps ExactAuthorPosterior with oversized cluster splitting guardrail."""
     N = len(U_test)
     if N == 0:
@@ -301,16 +222,7 @@ def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: n
         solver = ExactAuthorPosterior(prm["m"], prm["lam"])
         return solver.single(U_test[0], temperature=prm.get("T1", 2.40))[None, :]
 
-    _, inv_g = np.unique(np.asarray(groups, dtype=str), return_inverse=True)
-    safe_input_groups = inv_g + 1
-
-    if D_dist is None or D_dist.shape != (N, N):
-        U_c = U_test - U_test.mean(axis=0, keepdims=True)
-        U_n = U_c / np.linalg.norm(U_c, axis=1, keepdims=True).clip(min=1e-6)
-        D_dist = np.clip(1.0 - (U_n @ U_n.T), 0.0, None)
-        np.fill_diagonal(D_dist, 0.0)
-
-    safe_groups = split_oversized_clusters_dist(D_dist, safe_input_groups, max_cluster_size=14)
+    safe_groups = split_oversized_clusters_dist(D_dist, groups, max_cluster_size=14)
     solver = ExactAuthorPosterior(prm["m"], prm["lam"])
     T1 = prm.get("T1", 2.40)
     Tg = prm.get("Tg", 2.35)

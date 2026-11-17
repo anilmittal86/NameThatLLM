@@ -4,19 +4,20 @@ Unit and Integration Tests for namethatllm.wpca_gaussian
 """
 
 import unittest
-
 import numpy as np
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, fcluster
 
-from namethatllm.config import K
 from namethatllm.wpca_gaussian import (
-    ExactAuthorPosterior,
-    _shrunk,
     _two_way,
+    _shrunk,
     fit_shared_gaussian_lowram,
-    scores_exact_dp,
+    transform_lowram,
+    ExactAuthorPosterior,
     split_oversized_clusters_dist,
+    scores_exact_dp
 )
-
+from namethatllm.config import K
 
 class TestWPCAGaussian(unittest.TestCase):
     def test_two_way_decomposition(self):
@@ -103,13 +104,18 @@ class TestWPCAGaussian(unittest.TestCase):
         np.fill_diagonal(D, 0.0)
         D = 0.5 * (D + D.T)
 
-        prm = {"m": np.random.randn(K, d).astype(np.float32), "lam": np.abs(np.random.randn(d)).astype(np.float32), "T1": 2.40, "Tg": 2.35}
+        prm = {
+            "m": np.random.randn(K, d).astype(np.float32),
+            "lam": np.abs(np.random.randn(d)).astype(np.float32),
+            "T1": 2.40,
+            "Tg": 2.35
+        }
 
         # Size 25 > 18: must safely split and run without bitmask DP overflow
         lp_dp = scores_exact_dp(U_test, groups, prm, D)
         self.assertEqual(lp_dp.shape, (N, K))
         self.assertFalse(np.isnan(lp_dp).any())
 
-
 if __name__ == "__main__":
     unittest.main()
+
