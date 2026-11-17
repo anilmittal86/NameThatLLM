@@ -1,10 +1,12 @@
 {
-  "title": "NTL In-House Two-Stage LoRA24",
   "id": "anilmittal/ntl-inhouse-two-stage-lora24",
+  "title": "NTL Qwen3-14B Two-Stage Champion Backbone",
+  "subtitle": "Champion Two-Stage Multi-Layer LoRA Checkpoint & Centered Heads for Qwen3-14B",
+  "description": "# Name That LLM: In-House Two-Stage LoRA Checkpoint (Qwen3-14B Champion Backbone)\n\nProduction Two-Stage Multi-Layer LoRA classifier checkpoint, dual (plain + prompt-centered) heads, and whitened spectral style bank fine-tuned on **Qwen/Qwen3-14B-Base** for the Kaggle *Name That LLM* competition.\n\n---\n\n## Architecture Overview\n- **Base Trunk**: `Qwen/Qwen3-14B-Base` (40 transformer layers, hidden dimension $d = 5,120$)\n- **Tapped Representation Layers**: Layers `[2, 4, 6, 9, 13, 17, 22, 27]` (8 intermediate layers)\n- **Causal Attention Sink Masking**: Zero-masked token 0 (`m[:, 0] = 0.0`) to neutralize initial token attention concentration\n- **Layer Normalization**: 8 dedicated per-layer LayerNorm modules ($d = 5,120$)\n- **Feature Dimension ($Z$)**: $8 \\times 5,120 = 40,960$ dimensions\n- **Dual Heads**:\n  - `plain.weight` / `plain.bias`: Direct sequence attribution across all 18 classes\n  - `centered.weight` / `centered.bias`: Prompt-mean subtracted ($Z_c = Z - \\bar{Z}_{\\text{prompt}}$) feature attribution\n- **Training Loss**: Composite Two-Stage Loss (Supervised Contrastive + Family-Margin Cross-Entropy $m=0.45$)\n- **Classes ($K$)**: Master canonical 18 LLM classes\n- **Pre-trained Head Verification**: BAcc = **0.7362** on local prompt holdout benchmark\n\n---\n\n## Files Included\n- `heads.safetensors`: Dual classification heads (40,960 -> 18) and 8 intermediate LayerNorm weights (20 keys total)\n- `adapter/`: Full HuggingFace/PEFT LoRA adapter weights (`adapter_model.safetensors`, `adapter_config.json`, $r=32, \\alpha=64$)\n- `wPCA_bank.npz`: Whitened PCA covariance bank ($40,960 \\rightarrow 256$ dimensions)\n- `meta.json`: Checkpoint provenance, layer indices, and feature dimensionalities\n- `stage2_cv_report.json`: 5-fold cross-validation performance report\n- `data_audit_report.json`: Clean dataset hash audit confirming 0% test leakage\n",
+  "isPrivate": true,
   "licenses": [
     {
       "name": "CC0-1.0"
     }
   ]
 }
-
