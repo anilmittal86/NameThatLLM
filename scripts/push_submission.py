@@ -22,6 +22,17 @@ def main():
     config_path = root_dir / "configs" / "production_ensemble.json"
     kernel_dir = root_dir / "kernels" / "submission"
     notebook_path = kernel_dir / "kaggle_submission.ipynb"
+    metadata_path = kernel_dir / "kernel-metadata.json"
+
+    # Enforce mission-critical benchmark dataset attachment
+    import json
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if "anilmittal/ntl-clean-benchmark-1800" not in meta.get("dataset_sources", []):
+        raise RuntimeError(
+            "CRITICAL: anilmittal/ntl-clean-benchmark-1800 is NOT attached in kernels/submission/kernel-metadata.json! "
+            "Every submission must have the 1,800 benchmark dataset attached."
+        )
 
     print("=== Step 1: Running Pytest Verification Suite ===")
     subprocess.run([sys.executable, "-m", "pytest", "tests/test_compiler_and_integration.py"], cwd=root_dir, check=True)

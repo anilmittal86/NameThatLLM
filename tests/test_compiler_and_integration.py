@@ -618,6 +618,26 @@ class TestCompilerAndIntegration(unittest.TestCase):
         import namethatllm.ablation as abl
         self.assertNotIn("sinkhorn_balancing", dir(abl), "ablation.py must NOT export sinkhorn_balancing")
 
+    def test_clean_benchmark_1800_is_always_attached(self):
+        """Ensure anilmittal/ntl-clean-benchmark-1800 is attached to all kernel metadata configurations."""
+        submission_meta = self.repo_root / "kernels" / "submission" / "kernel-metadata.json"
+        self.assertTrue(submission_meta.exists())
+        data_sub = json.loads(submission_meta.read_text(encoding="utf-8"))
+        self.assertIn(
+            "anilmittal/ntl-clean-benchmark-1800",
+            data_sub.get("dataset_sources", []),
+            "anilmittal/ntl-clean-benchmark-1800 must be attached in kernels/submission/kernel-metadata.json"
+        )
+
+        training_meta = self.repo_root / "kernels" / "training" / "kernel-metadata.json"
+        self.assertTrue(training_meta.exists())
+        data_tr = json.loads(training_meta.read_text(encoding="utf-8"))
+        self.assertIn(
+            "anilmittal/ntl-clean-benchmark-1800",
+            data_tr.get("dataset_sources", []),
+            "anilmittal/ntl-clean-benchmark-1800 must be attached in kernels/training/kernel-metadata.json"
+        )
+
 if __name__ == "__main__":
     unittest.main()
 
