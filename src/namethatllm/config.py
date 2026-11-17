@@ -40,6 +40,8 @@ SPECIALIST_GROUPS = {
     "glm_kimi_triad": [15, 16, 17],
     "frontier_and_fable": [10, 13, 14, 15, 16, 17],
     "kimi_gpt55_qwen": [0, 14, 17],
+    "claude_glm": [9, 10, 11, 12, 13, 15, 16],
+    "gpt_qwen_kimi": [0, 1, 2, 3, 4, 14, 17],
 }
 
 PRIOR_SCALES = {
@@ -49,6 +51,12 @@ PRIOR_SCALES = {
     "qwen25_14b_inhouse": 0.85,
     "deberta_p2": 0.80,
     "deberta_inhouse": 0.80,
+    "deberta_gemini": 0.40,
+    "deberta_glm": 0.35,
+    "deberta_gpt": 0.35,
+    "deberta_claude": 0.35,
+    "deberta_claude_glm": 0.35,
+    "deberta_gpt_qwen_kimi": 0.35,
     "qwen3_14b_p1": 0.50,
     "instyle": 0.45,
     "qwen3_8b_claude": 0.30,
