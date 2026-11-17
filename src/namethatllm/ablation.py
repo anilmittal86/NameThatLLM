@@ -63,6 +63,31 @@ def build_unseen_holdout_dataset(
        exclude `holdout_hashes` from training!
     """
     input_dir = Path(input_dir) if input_dir else Path(".")
+
+    # 0. Check for verified clean benchmark 1800 rows first
+    bench_patterns = [
+        "clean_benchmark_1800_rows.parquet",
+        "*clean_benchmark*.parquet",
+    ]
+    for pat in bench_patterns:
+        for bench_p in input_dir.rglob(pat):
+            try:
+                df_bench = pd.read_parquet(bench_p)
+                if "text" in df_bench.columns and "model" in df_bench.columns:
+                    df_bench = df_bench.dropna(subset=["text", "model"]).copy()
+                    df_bench = df_bench[df_bench["model"].isin(LABELS)]
+                    if len(df_bench) >= 180:
+                        if "prompt_id" not in df_bench.columns and "prompt_canon" in df_bench.columns:
+                            df_bench["prompt_id"] = df_bench["prompt_canon"]
+                        elif "prompt_id" not in df_bench.columns:
+                            df_bench["prompt_id"] = np.arange(len(df_bench))
+                        df_bench["_hash"] = [_text_hash(t) for t in df_bench["text"]]
+                        holdout_hashes = set(df_bench["_hash"])
+                        print(f"[Unseen Benchmark] Loaded verified clean holdout benchmark: {len(df_bench)} rows across {len(set(df_bench['model']))} classes from {bench_p}")
+                        return df_bench, holdout_hashes
+            except Exception as e:
+                print(f"[Unseen Benchmark Warning] Failed to load {bench_p}: {e}")
+
     contaminated_hashes: Set[str] = set()
 
     # 1. Mark all train.csv rows as contaminated (seen by all Stage-2 LoRAs)
