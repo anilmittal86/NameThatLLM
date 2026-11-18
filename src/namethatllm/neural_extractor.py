@@ -487,12 +487,13 @@ class UniversalLoRATrunkLoader:
         return Z
 
     @torch.no_grad()
-    def extract_exact(self, texts: List[str], batch_size: int = 8, end_id: Optional[int] = 151643) -> np.ndarray:
+    def extract_exact(self, texts: List[str], batch_size: int = 8, end_id: Optional[int] = None) -> np.ndarray:
         t0 = time.time()
         self.total_rescued = 0
         raw_ids = self.tok(list(texts), add_special_tokens=False, truncation=True, max_length=self.max_len)["input_ids"]
-        if end_id is not None:
-            ids = [x + [end_id] for x in raw_ids]
+        eff_end = end_id if end_id is not None else getattr(self.tok, "eos_token_id", 151643)
+        if eff_end is not None:
+            ids = [x + [eff_end] for x in raw_ids]
         else:
             ids = raw_ids
         Z = self._extract_batch_ids(ids, batch_size=batch_size)
@@ -513,7 +514,7 @@ def read_checkpoint_meta(ckpt_dir: Path, default_keep: int, default_layers: List
     keep = default_keep
     layers = list(default_layers)
     max_len = default_max_len
-    end_id = 151643
+    end_id = None
     if meta_p.exists():
         try:
             m = json.load(open(meta_p))

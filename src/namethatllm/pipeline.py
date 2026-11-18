@@ -1690,6 +1690,269 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # ==============================================================================
+        # OPTIONAL CAUSAL LLM TRUNKS: Gemma-2-9B, Llama-3.1-8B, Mistral-7B-v0.3
+        # ==============================================================================
+        opt_causal_specs = [
+            ("gemma2_9b_ts", "gemma2", 3584, 42, 24, "Gemma-2-9B"),
+            ("llama31_8b_ts", "llama", 4096, 32, 24, "Llama-3.1-8B"),
+            ("mistral_7b_ts", "mistral", 4096, 32, 24, "Mistral-7B"),
+        ]
+        for opt_key, opt_family, opt_hidden, opt_layers, opt_default_keep, opt_disp_name in opt_causal_specs:
+            if opt_key not in ckpts:
+                continue
+            opt_ckpt_dir = ckpts[opt_key]
+            base_opt_dir = verified_bases.get(opt_key) or find_base_model(input_dir, opt_family, opt_hidden, opt_layers)
+            if not base_opt_dir:
+                print(f"[Pipeline] Base model for {opt_disp_name} ({opt_family}, h={opt_hidden}, l={opt_layers}) not found; skipping {opt_key}.")
+                continue
+
+            print(f"[Pipeline] Loading Trunk: {opt_disp_name} ({opt_key}) from base {base_opt_dir}...")
+            meta_opt = read_checkpoint_meta(opt_ckpt_dir, default_keep=opt_default_keep, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
+            opt_trunk = UniversalLoRATrunkLoader(
+                base_opt_dir,
+                keep_layers=meta_opt["keep"],
+                layers=meta_opt["layers"],
+                max_len=meta_opt["max_len"],
+            )
+
+            merged = merge_lora(opt_trunk.model, opt_ckpt_dir, sign=+1.0)
+            if not merged:
+                print(f"[Pipeline] Failed to merge LoRA for {opt_key}; skipping.")
+                opt_trunk.free_memory()
+                del opt_trunk
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+            heads_sd = load_head_file(opt_ckpt_dir)
+            opt_trunk.load_norm_weights(heads_sd)
+            W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+
+            w_comp_p = model_weights.get(opt_key, {}).get("plain_weight", 0.15)
+            w_comp_c = model_weights.get(opt_key, {}).get("twin_weight", 0.05)
+            w_comp_tot = w_comp_p + (w_comp_c if W_c is not None else 0.0)
+
+            opt_labels = meta_opt["labels"]
+            gate_passed = True
+
+            # Stage A: Fast unseen probe if N_unseen >= 36 and W_p is present
+            if N_unseen >= 36 and W_p is not None:
+                Z_unseen = opt_trunk.extract_exact(unseen_texts, batch_size=8, end_id=meta_opt.get("end_id"))
+                if N_unseen > 0:
+                    features_unseen_dict[opt_key] = Z_unseen.astype(np.float16)
+
+                cand_orders = [opt_labels]
+                if sorted(LABELS) not in cand_orders:
+                    cand_orders.append(sorted(LABELS))
+                if list(LABELS) not in cand_orders:
+                    cand_orders.append(list(LABELS))
+
+                best_align_order = opt_labels
+                best_solo_bacc = -1.0
+                best_lp_u = None
+                for cand_o in cand_orders:
+                    try:
+                        trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
+                        if W_c is not None:
+                            trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
+                            trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
+                        else:
+                            trial_lp = trial_lp_p
+                        trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
+                        if trial_acc > best_solo_bacc:
+                            best_solo_bacc = trial_acc
+                            best_align_order = cand_o
+                            best_lp_u = trial_lp
+                    except Exception:
+                        continue
+
+                solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
+                lp_u = best_lp_u if best_lp_u is not None else log_softmax(align_cols(Z_unseen @ W_p.T + b_p, opt_labels))
+                opt_labels = best_align_order
+                align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
+                print(f"[Fast Probe] {opt_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
+
+                if solo_bacc < probe_gate_min_bacc:
+                    print(f"[Fast Probe Pruning] {opt_key}: solo BAcc {solo_bacc:.4f} < {probe_gate_min_bacc:.2f} -> SKIPPING full extraction!")
+                    gate_passed = False
+                elif len(auditor.models) > 0:
+                    lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u, weight=w_comp_tot)
+                    if lift < -0.002:
+                        print(f"[Fast Probe Pruning] {opt_key}: marginal lift {lift:+.4f} < -0.002 -> SKIPPING full extraction!")
+                        gate_passed = False
+                    else:
+                        print(f"[Fast Probe] {opt_key}: passed probe (solo={solo_bacc:.4f}, lift={lift:+.4f}) -> extracting test/train...")
+
+                if gate_passed:
+                    Z_te_tr = opt_trunk.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=meta_opt.get("end_id"))
+                    Z_te = Z_te_tr[:N_test]
+                    Z_tr = Z_te_tr[N_test:]
+                    del Z_te_tr
+            else:
+                Z_all = opt_trunk.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=meta_opt.get("end_id"))
+                Z_te = Z_all[:N_test]
+                Z_unseen = Z_all[N_test : N_test + N_unseen]
+                Z_tr = Z_all[N_test + N_unseen :]
+                del Z_all
+                if N_unseen > 0:
+                    features_unseen_dict[opt_key] = Z_unseen.astype(np.float16)
+
+            # Free trunk memory immediately before downstream DP/Spectral math
+            opt_trunk.free_memory()
+            del opt_trunk
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if gate_passed and "Z_te" in locals():
+                pr_sc = prior_scales.get(opt_key, 0.40)
+                update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
+
+                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, opt_labels)) if W_p is not None else None
+                if W_c is not None:
+                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, opt_labels, weights=(w85, w72, w60))
+                else:
+                    lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+
+                if W_p is not None:
+                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                if W_c is not None:
+                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+
+                res_opt = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_key, 0.25))
+                U_te = transform_lowram(Z_te, res_opt)
+                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_opt, tracker_test.D_hybrid)
+                dp_posteriors.append((dp_weights.get(opt_key, 0.05), softmax(lp_dp, axis=1)))
+
+                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_opt, pr_sc)
+                spectral_blocks_tr.append(S_tr)
+                spectral_blocks_te.append(S_te)
+
+                if N_unseen > 0 and "Z_unseen" in locals() and len(Z_unseen) == N_unseen:
+                    U_u = transform_lowram(Z_unseen, res_opt)
+                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_opt, tracker_unseen.D_hybrid)
+                    dp_posteriors_u.append((dp_weights.get(opt_key, 0.05), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_opt, pr_sc)
+                    spectral_blocks_u.append(S_u)
+                    del U_u
+
+                if W_p is not None and lp_p is not None:
+                    w_tot = w_comp_p + (w_comp_c if W_c is not None else 0.0)
+                    lp_m_u = _combine_plain_and_twin_lp(lp_u, None, w_comp_p, w_comp_c) if (N_unseen > 0 and 'lp_u' in locals() and lp_u is not None) else np.zeros((0, K), dtype=np.float32)
+                    lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c)
+                    auditor.add_model(opt_disp_name, tier="Comp", weight=w_tot, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
+
+                del res_opt, U_te
+
+            if "heads_sd" in locals():
+                del heads_sd
+            if "Z_tr" in locals():
+                del Z_tr
+            if "Z_te" in locals():
+                del Z_te
+            if "Z_unseen" in locals():
+                del Z_unseen
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # ==============================================================================
+        # TRUNK 8: BGE-M3 (Dense 1024-dim Bidirectional CLS Encoder)
+        # ==============================================================================
+        if "bge_m3" in ckpts:
+            bge_dir = ckpts["bge_m3"]
+            print(f"[Pipeline] Loading Trunk 8: BGE-M3 from {bge_dir}...")
+            try:
+                from transformers import AutoTokenizer, AutoModel
+                bge_tok = AutoTokenizer.from_pretrained(str(bge_dir))
+                bge_model = AutoModel.from_pretrained(
+                    str(bge_dir),
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                )
+                bge_dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                bge_model = bge_model.to(bge_dev)
+                bge_model.eval()
+
+                def _extract_bge_dense(texts: list[str], bsize: int = 16) -> np.ndarray:
+                    embs = []
+                    with torch.no_grad():
+                        for i in range(0, len(texts), bsize):
+                            batch = texts[i : i + bsize]
+                            enc = bge_tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(bge_dev)
+                            out = bge_model(**enc)
+                            cls_repr = out.last_hidden_state[:, 0]
+                            cls_norm = F.normalize(cls_repr, p=2, dim=-1)
+                            embs.append(cls_norm.cpu().float().numpy())
+                    return np.vstack(embs) if embs else np.zeros((0, 1024), dtype=np.float32)
+
+                Z_bge_te = _extract_bge_dense(test_texts)
+                Z_bge_u = _extract_bge_dense(unseen_texts) if N_unseen > 0 else np.zeros((0, 1024), dtype=np.float32)
+                Z_bge_tr = _extract_bge_dense(train_sub_texts)
+
+                if N_unseen > 0:
+                    features_unseen_dict["bge_m3"] = Z_bge_u.astype(np.float16)
+
+                # Free BGE model from GPU immediately
+                del bge_model, bge_tok
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Check if trained classification head exists for BGE-M3
+                heads_sd = load_head_file(bge_dir) if ((bge_dir / "heads.safetensors").exists() or (bge_dir / "heads.pt").exists()) else {}
+                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd) if heads_sd else (None, None, None, None)
+
+                w_bge_p = model_weights.get("bge_m3", {}).get("plain_weight", 0.12)
+                w_bge_c = model_weights.get("bge_m3", {}).get("twin_weight", 0.04)
+
+                pr_sc = prior_scales.get("bge_m3", 0.60)
+                update_hybrid_groups(Z_bge_te, pr_sc, Z_bge_u if N_unseen > 0 else None)
+
+                lp_p_bge = None
+                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                if W_p is not None:
+                    lp_p_bge = log_softmax(align_cols(Z_bge_te @ W_p.T + b_p, LABELS))
+                    comp_lora_posteriors.append((w_bge_p, softmax(lp_p_bge, axis=1)))
+                if W_c is not None:
+                    lp_c_blend = compute_multires_centered_blend(Z_bge_te, tracker_test.groups, W_c, b_c, LABELS, weights=(w85, w72, w60))
+                    comp_lora_posteriors.append((w_bge_c, softmax(lp_c_blend, axis=1)))
+
+                res_bge = fit_shared_gaussian_lowram(Z_bge_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("bge_m3", 0.20))
+                U_te = transform_lowram(Z_bge_te, res_bge)
+                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_bge, tracker_test.D_hybrid)
+                dp_posteriors.append((dp_weights.get("bge_m3", 0.10), softmax(lp_dp, axis=1)))
+
+                S_tr, S_te = make_spectral_blocks(Z_bge_tr, Z_bge_te, res_bge, pr_sc)
+                spectral_blocks_tr.append(S_tr)
+                spectral_blocks_te.append(S_te)
+
+                if N_unseen > 0 and len(Z_bge_u) == N_unseen:
+                    U_u = transform_lowram(Z_bge_u, res_bge)
+                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_bge, tracker_unseen.D_hybrid)
+                    dp_posteriors_u.append((dp_weights.get("bge_m3", 0.10), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_bge_tr, Z_bge_u, res_bge, pr_sc)
+                    spectral_blocks_u.append(S_u)
+                    del U_u
+
+                if W_p is not None and lp_p_bge is not None:
+                    w_tot_bge = w_bge_p + (w_bge_c if W_c is not None else 0.0)
+                    lp_m_u = np.zeros((0, K), dtype=np.float32)
+                    if N_unseen > 0 and len(Z_bge_u) == N_unseen:
+                        lp_u_bge = log_softmax(align_cols(Z_bge_u @ W_p.T + b_p, LABELS))
+                        lp_u_c_bge = compute_multires_centered_blend(Z_bge_u, tracker_unseen.groups, W_c, b_c, LABELS, weights=(w85, w72, w60)) if W_c is not None else None
+                        lp_m_u = _combine_plain_and_twin_lp(lp_u_bge, lp_u_c_bge, w_bge_p, w_bge_c)
+                    lp_m_te = _combine_plain_and_twin_lp(lp_p_bge, lp_c_blend if W_c is not None else None, w_bge_p, w_bge_c)
+                    auditor.add_model("BGE-M3", tier="Comp", weight=w_tot_bge, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
+
+                del Z_bge_tr, Z_bge_te, Z_bge_u, res_bge, U_te
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[Pipeline] Warning: BGE-M3 extraction failed ({e}); continuing with remaining models.")
+
         # Add Secondary LoRAs to COMP_LIST
         if comp_lora_posteriors:
             tot_w = sum(w for w, _ in comp_lora_posteriors)

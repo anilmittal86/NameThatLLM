@@ -638,6 +638,31 @@ class TestCompilerAndIntegration(unittest.TestCase):
             "anilmittal/ntl-clean-benchmark-1800 must be attached in kernels/training/kernel-metadata.json"
         )
 
+    def test_kernel_metadata_sources_for_all_models(self):
+        """Verify all new fine-tuned datasets and base models are attached in kernels/submission/kernel-metadata.json."""
+        meta_p = self.repo_root / "kernels" / "submission" / "kernel-metadata.json"
+        self.assertTrue(meta_p.exists())
+        data = json.loads(meta_p.read_text(encoding="utf-8"))
+        ds = data.get("dataset_sources", [])
+        ms = data.get("model_sources", [])
+
+        expected_datasets = [
+            "alexchilton/ntl-ts-gemma2-9b",
+            "alexchilton/ntl-ts-llama31-8b",
+            "alexchilton/ntl-ts-mistral7b",
+            "masterstar/bge-m3",
+        ]
+        for ed in expected_datasets:
+            self.assertIn(ed, ds, f"Missing required dataset {ed} in kernel-metadata.json")
+
+        expected_models = [
+            "google/gemma-2/Transformers/gemma-2-9b/2",
+            "alexchilton/llama-3-1-8b-base/Transformers/default/1",
+            "alexchilton/mistral-7b-v0-3-base/Transformers/default/1",
+        ]
+        for em in expected_models:
+            self.assertIn(em, ms, f"Missing required model {em} in kernel-metadata.json")
+
 if __name__ == "__main__":
     unittest.main()
 

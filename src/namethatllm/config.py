@@ -61,6 +61,10 @@ PRIOR_SCALES = {
     "instyle": 0.45,
     "qwen3_8b_claude": 0.30,
     "qwen3_8b_inhouse": 0.30,
+    "gemma2_9b_ts": 0.40,
+    "llama31_8b_ts": 0.40,
+    "mistral_7b_ts": 0.40,
+    "bge_m3": 0.60,
 }
 
 def align_cols(arr: np.ndarray, src_labels: list) -> np.ndarray:
@@ -132,6 +136,7 @@ def resolve_all_pool_files(input_dir: Optional[Path] = None) -> List[Path]:
 
 def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_layers: int) -> Optional[Path]:
     """Discovers base model directories from Hugging Face config.json inspection."""
+    candidates = []
     for cfg_p in input_dir.rglob('config.json'):
         try:
             cfg = json.load(open(cfg_p))
@@ -139,10 +144,13 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
             h_dim = cfg.get('hidden_size', 0)
             n_lay = cfg.get('num_hidden_layers', 0)
             if model_family.lower() in m_type and h_dim == hidden_sz and n_lay == num_layers:
-                return cfg_p.parent
+                p_str = str(cfg_p.parent).lower().replace('\\', '/')
+                if model_family.lower() in p_str:
+                    return cfg_p.parent
+                candidates.append(cfg_p.parent)
         except Exception:
             continue
-    return None
+    return candidates[0] if candidates else None
 
 class CheckpointInfo(tuple):
     """Tuple subclass supporting both 2-element (dim, keep) and 3-element (dim, keep, backbone) unpacking."""
@@ -262,6 +270,18 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
         elif 'ts_q25_7b' in p_str or 'l24x_q25_7b' in p_str:
             if 'qwen25_7b_ts' not in ckpts or (not is_fold):
                 ckpts['qwen25_7b_ts'] = p.parent
+        elif any(t in p_str for t in ('gemma2', 'gemma_2', 'gemma-2', 'ts_gemma', 'ts-gemma')):
+            if 'gemma2_9b_ts' not in ckpts or (not is_fold):
+                ckpts['gemma2_9b_ts'] = p.parent
+        elif any(t in p_str for t in ('llama31', 'llama_31', 'llama-3.1', 'ts_llama31', 'ts-llama31')):
+            if 'llama31_8b_ts' not in ckpts or (not is_fold):
+                ckpts['llama31_8b_ts'] = p.parent
+        elif any(t in p_str for t in ('mistral', 'ts_mistral', 'ts-mistral')):
+            if 'mistral_7b_ts' not in ckpts or (not is_fold):
+                ckpts['mistral_7b_ts'] = p.parent
+        elif any(t in p_str for t in ('bge_m3', 'bge-m3', 'bgem3')):
+            if 'bge_m3' not in ckpts or (not is_fold):
+                ckpts['bge_m3'] = p.parent
         elif 'instyle' in p_str:
             ckpts['instyle'] = p.parent
 
@@ -295,6 +315,14 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
             p_s = str(p).lower().replace('\\', '/')
             if 'q14v5' in p_s or 'ts_q3b14' in p_s:
                 ckpts['qwen3_14b_ts'] = p.parent
+                break
+
+    # 6. Fallback search for bge_m3 base or fine-tuned directory
+    if 'bge_m3' not in ckpts:
+        for p in input_dir.rglob('*'):
+            p_s = str(p).lower().replace('\\', '/')
+            if ('bge-m3' in p_s or 'bge_m3' in p_s or 'bgem3' in p_s) and ((p / 'config.json').exists() or (p / 'model.safetensors').exists() or (p / 'pytorch_model.bin').exists()):
+                ckpts['bge_m3'] = p
                 break
 
     return ckpts

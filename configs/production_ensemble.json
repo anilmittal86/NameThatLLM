@@ -36,7 +36,11 @@
       "qwen25_14b_inhouse",
       "deberta_inhouse",
       "qwen3_8b_v5",
-      "llama3_8b_v5"
+      "llama3_8b_v5",
+      "gemma2_9b_ts",
+      "llama31_8b_ts",
+      "mistral_7b_ts",
+      "bge_m3"
     ]
   },
   "model_weights": {
@@ -49,6 +53,10 @@
     "qwen25_14b_inhouse": { "plain_weight": 0.22, "twin_weight": 0.08 },
     "deberta_p2": { "plain_weight": 0.22, "twin_weight": 0.06 },
     "llama3_8b_v5": { "plain_weight": 0.20, "twin_weight": 0.07 },
+    "gemma2_9b_ts": { "plain_weight": 0.32, "twin_weight": 0.10 },
+    "llama31_8b_ts": { "plain_weight": 0.30, "twin_weight": 0.10 },
+    "mistral_7b_ts": { "plain_weight": 0.28, "twin_weight": 0.08 },
+    "bge_m3": { "plain_weight": 0.20, "twin_weight": 0.00 },
     "qwen3_8b_claude": { "plain_weight": 0.00, "twin_weight": 0.00 },
     "lexical_5v": { "plain_weight": 0.10, "twin_weight": 0.00 },
     "wpca_dp": { "plain_weight": 0.25, "twin_weight": 0.00 },
