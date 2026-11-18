@@ -256,6 +256,19 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         except Exception as e:
             print(f"[Lexical] Note: Could not read {unseen_parquet}: {e}")
 
+    # Compute stopword TF-IDF distance matrix and clusters on unseen holdout benchmark
+    if len(unseen_texts) >= 2:
+        Xu_tfidf = TfidfVectorizer(stop_words='english', sublinear_tf=True, max_features=100000, dtype=np.float32).fit_transform(unseen_texts)
+        D_u = np.clip(1.0 - (Xu_tfidf @ Xu_tfidf.T).toarray(), 0.0, None)
+        np.fill_diagonal(D_u, 0.0)
+        cond_du = squareform(D_u, checks=False)
+        groups_085_u = fcluster(linkage(cond_du, method='average'), 0.85, criterion='distance')
+    else:
+        D_u = np.zeros((len(unseen_texts), len(unseen_texts)), dtype=np.float32)
+        groups_085_u = np.ones(len(unseen_texts), dtype=int)
+    sz_085_u = np.bincount(groups_085_u)[groups_085_u] if len(groups_085_u) > 0 else np.array([], dtype=int)
+    twin_rows_085_u = (sz_085_u >= 2) & (sz_085_u <= 18) if len(sz_085_u) > 0 else np.zeros(0, dtype=bool)
+
     # 2. Load pool parquet files if present with source weights
     pool_candidates = [pool_file] if isinstance(pool_file, (str, Path)) else (pool_file if isinstance(pool_file, list) else [])
     for pf in pool_candidates:
@@ -391,6 +404,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
 
     lp_hw = fit_handwriting_model(hw_tr, fit_y, hw_te, df_tr, groups_085, twin_rows_085, len_tr_raw)
 
+    if unseen_texts:
+        hw_u_raw, rule_flags_u = extract_handwriting_and_orthographic_features(unseen_texts)
+        hw_u = np.clip(scaler.transform(hw_u_raw), -5.0, 5.0).astype(np.float32)
+        lp_hw_u = fit_handwriting_model(hw_tr, fit_y, hw_u, df_tr, groups_085_u, twin_rows_085_u, len_tr_raw)
+    else:
+        rule_flags_u = np.zeros((0, 4), dtype=np.float32)
+        lp_hw_u = np.zeros((0, K), dtype=np.float32)
+
     tok = None
     if qwen_tok_dir and os.path.exists(qwen_tok_dir):
         try:
@@ -444,20 +465,16 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     sgd_comp.fit(X_tr_5v, fit_y, sample_weight=fit_sw)
     P_sgd_comp = sgd_comp.predict_proba(X_te_5v)
 
+    P_unseen_svc = None
+    P_unseen_sgd = None
     if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0:
         P_unseen_svc = softmax(svc_comp.decision_function(X_unseen_5v), axis=1)
         P_unseen_sgd = sgd_comp.predict_proba(X_unseen_5v)
-        if P_unseen_distort is not None:
-            P_unseen_comp = 0.40 * P_unseen_svc + 0.25 * P_unseen_sgd + 0.15 * P_unseen_svc + 0.20 * P_unseen_distort
-        else:
-            P_unseen_comp = 0.55 * P_unseen_svc + 0.45 * P_unseen_sgd
-        log_p_unseen_comp = np.log(np.clip(P_unseen_comp, 1e-9, 1.0))
-    else:
-        log_p_unseen_comp = None
 
-    # Style Twin on groups_085
+    # Style Twin on groups_085 (test and unseen benchmark)
     P_twin_comp = P_svc_comp.copy()
-    if twin_rows_085.any() and len_tr_raw >= 18:
+    P_twin_comp_u = P_unseen_svc.copy() if P_unseen_svc is not None else None
+    if (twin_rows_085.any() or (len(twin_rows_085_u) > 0 and twin_rows_085_u.any())) and len_tr_raw >= 18:
         X_train_only = X_tr_5v[:len_tr_raw]
         u_tr, inv_tr = np.unique(df_tr['prompt_id'].values, return_inverse=True)
         counts_tr = np.bincount(inv_tr)
@@ -470,18 +487,41 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         del X_train_only, G, X_train_c
         gc.collect()
 
-        X_te_twin = X_te_5v[twin_rows_085]
-        u_t, inv_t = np.unique(groups_085[twin_rows_085], return_inverse=True)
-        counts_t = np.bincount(inv_t)
-        vals_t = (1.0 / counts_t[inv_t]).astype(np.float32)
-        G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
-        X_te_twin_c = X_te_twin - G_t @ (G_t.T @ X_te_twin)
-        P_twin_comp[twin_rows_085] = softmax(svc_twin.decision_function(X_te_twin_c), axis=1)
-        del svc_twin, X_te_twin, G_t, X_te_twin_c
+        if twin_rows_085.any():
+            X_te_twin = X_te_5v[twin_rows_085]
+            u_t, inv_t = np.unique(groups_085[twin_rows_085], return_inverse=True)
+            counts_t = np.bincount(inv_t)
+            vals_t = (1.0 / counts_t[inv_t]).astype(np.float32)
+            G_t = sparse.csr_matrix((vals_t, (np.arange(len(inv_t)), inv_t)), shape=(len(inv_t), len(u_t)), dtype=np.float32)
+            X_te_twin_c = X_te_twin - G_t @ (G_t.T @ X_te_twin)
+            P_twin_comp[twin_rows_085] = softmax(svc_twin.decision_function(X_te_twin_c), axis=1)
+            del X_te_twin, G_t, X_te_twin_c
+
+        if P_twin_comp_u is not None and len(twin_rows_085_u) > 0 and twin_rows_085_u.any():
+            X_u_twin = X_unseen_5v[twin_rows_085_u]
+            u_u, inv_u = np.unique(groups_085_u[twin_rows_085_u], return_inverse=True)
+            counts_u = np.bincount(inv_u)
+            vals_u = (1.0 / counts_u[inv_u]).astype(np.float32)
+            G_u = sparse.csr_matrix((vals_u, (np.arange(len(inv_u)), inv_u)), shape=(len(inv_u), len(u_u)), dtype=np.float32)
+            X_u_twin_c = X_u_twin - G_u @ (G_u.T @ X_u_twin)
+            P_twin_comp_u[twin_rows_085_u] = softmax(svc_twin.decision_function(X_u_twin_c), axis=1)
+            del X_u_twin, G_u, X_u_twin_c
+
+        del svc_twin
         gc.collect()
 
     P_lex_comp = 0.40 * P_svc_comp + 0.25 * P_sgd_comp + 0.15 * P_twin_comp + 0.20 * P_distort
     log_p_lex_comp = np.log(np.clip(P_lex_comp, 1e-9, 1.0))
+
+    if X_unseen_5v is not None and X_unseen_5v.shape[0] > 0 and P_unseen_svc is not None and P_unseen_sgd is not None:
+        u_twin = P_twin_comp_u if P_twin_comp_u is not None else P_unseen_svc
+        if P_unseen_distort is not None:
+            P_unseen_comp = 0.40 * P_unseen_svc + 0.25 * P_unseen_sgd + 0.15 * u_twin + 0.20 * P_unseen_distort
+        else:
+            P_unseen_comp = 0.55 * P_unseen_svc + 0.45 * P_unseen_sgd
+        log_p_unseen_comp = np.log(np.clip(P_unseen_comp, 1e-9, 1.0))
+    else:
+        log_p_unseen_comp = None
 
     # 4 Within-Family Specialist Refiners
     beta = 0.25
@@ -528,6 +568,14 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
     np.save(working_dir / 'rule_flags_test.npy', rule_flags_te)
     np.save(working_dir / 'unseen_log_p_svc_main.npy', unseen_log_p_svc_main)
     np.save(working_dir / 'unseen_p_lex_comp.npy', unseen_p_lex_comp_final)
+    if 'D_u' in locals() and D_u is not None:
+        np.save(working_dir / 'D_tfidf_unseen.npy', D_u)
+    if 'groups_085_u' in locals() and groups_085_u is not None:
+        np.save(working_dir / 'groups_085_unseen.npy', groups_085_u)
+    if 'lp_hw_u' in locals() and lp_hw_u is not None:
+        np.save(working_dir / 'log_p_handwriting_unseen.npy', lp_hw_u)
+    if 'rule_flags_u' in locals() and rule_flags_u is not None:
+        np.save(working_dir / 'rule_flags_unseen.npy', rule_flags_u)
     if log_p_distort is not None:
         np.save(working_dir / 'log_p_distort.npy', log_p_distort)
     if log_p_unseen_distort is not None:
@@ -542,6 +590,10 @@ def run_lexical_engine(train_path: Path, test_path: Path, pool_file: Optional[Pa
         "rule_flags_test": rule_flags_te,
         "unseen_log_p_svc_main": unseen_log_p_svc_main,
         "unseen_p_lex_comp": unseen_p_lex_comp_final,
+        "D_tfidf_unseen": D_u if ('D_u' in locals() and D_u is not None) else None,
+        "groups_085_unseen": groups_085_u if ('groups_085_u' in locals() and groups_085_u is not None) else None,
+        "log_p_handwriting_unseen": lp_hw_u if ('lp_hw_u' in locals() and lp_hw_u is not None) else None,
+        "rule_flags_unseen": rule_flags_u if ('rule_flags_u' in locals() and rule_flags_u is not None) else None,
         "log_p_distort": log_p_distort,
         "unseen_log_p_distort": log_p_unseen_distort,
     }

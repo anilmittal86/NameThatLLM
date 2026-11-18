@@ -23,6 +23,7 @@ from scipy import sparse
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.metrics import balanced_accuracy_score
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from .config import (
     LABELS, K, LAB2I, FAMILIES, PRIOR_SCALES,
@@ -55,6 +56,7 @@ from .postprocess import (
     apply_curly_quote_shield,
     sinkhorn_balancing,
     apply_typobayes_postprocess,
+    run_full_inference_pipeline,
     generate_submission
 )
 from .ablation import build_unseen_holdout_dataset, UnseenStepwiseAuditor
@@ -224,7 +226,17 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         unseen_texts = df_unseen["text"].fillna("").astype(str).tolist() if len(df_unseen) > 0 else []
         N_unseen = len(unseen_texts)
         y_unseen = np.array([LAB2I[m] for m in df_unseen["model"].values], dtype=int) if N_unseen > 0 else np.array([], dtype=int)
-        groups_unseen = df_unseen["prompt_id"].values if N_unseen > 0 and "prompt_id" in df_unseen.columns else np.ones(N_unseen, dtype=int)
+        if N_unseen > 0:
+            if "prompt_id" in df_unseen.columns:
+                groups_unseen = df_unseen["prompt_id"].values
+            elif "prompt_canon" in df_unseen.columns:
+                groups_unseen = (pd.factorize(df_unseen["prompt_canon"])[0] + 1).astype(int)
+            elif "prompt_text" in df_unseen.columns:
+                groups_unseen = (pd.factorize(df_unseen["prompt_text"])[0] + 1).astype(int)
+            else:
+                groups_unseen = np.ones(N_unseen, dtype=int)
+        else:
+            groups_unseen = np.array([], dtype=int)
     else:
         if not enable_ablation_probe:
             print("[Pipeline] Frozen Production Mode (enable_ablation_probe=False): Skipping unseen holdout extraction to save GPU time.")
@@ -257,14 +269,20 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     if run_lex_script.exists() and not is_smoke:
         print("[Pipeline] Module 1: Launching subprocess run_lexical.py...")
         subprocess.run([sys.executable, str(run_lex_script)], check=True)
+
+        def _load_optional_npy(p: Path, default=None) -> Optional[np.ndarray]:
+            return np.load(p) if p.exists() else default
+
         log_p_svc_main = np.load(working_dir / "log_p_svc_main.npy")
         p_lex_comp = np.load(working_dir / "p_lex_comp.npy")
         D_tfidf = np.load(working_dir / "D_tfidf.npy")
-        groups_085 = np.load(working_dir / "groups_085.npy")
-        log_p_handwriting = np.load(working_dir / "log_p_handwriting.npy") if (working_dir / "log_p_handwriting.npy").exists() else None
-        rule_flags_test = np.load(working_dir / "rule_flags_test.npy") if (working_dir / "rule_flags_test.npy").exists() else None
-        unseen_log_p_svc_main = np.load(working_dir / "unseen_log_p_svc_main.npy") if (working_dir / "unseen_log_p_svc_main.npy").exists() else np.zeros((0, K), dtype=np.float32)
-        unseen_p_lex_comp = np.load(working_dir / "unseen_p_lex_comp.npy") if (working_dir / "unseen_p_lex_comp.npy").exists() else np.zeros((0, K), dtype=np.float32)
+        log_p_handwriting = _load_optional_npy(working_dir / "log_p_handwriting.npy")
+        rule_flags_test = _load_optional_npy(working_dir / "rule_flags_test.npy")
+        unseen_log_p_svc_main = _load_optional_npy(working_dir / "unseen_log_p_svc_main.npy", default=np.zeros((0, K), dtype=np.float32))
+        unseen_p_lex_comp = _load_optional_npy(working_dir / "unseen_p_lex_comp.npy", default=np.zeros((0, K), dtype=np.float32))
+        D_tfidf_u = _load_optional_npy(working_dir / "D_tfidf_unseen.npy")
+        log_p_handwriting_unseen = _load_optional_npy(working_dir / "log_p_handwriting_unseen.npy")
+        rule_flags_unseen = _load_optional_npy(working_dir / "rule_flags_unseen.npy")
     else:
         print("[Pipeline] Module 1: Executing run_lexical_engine directly...")
         tok_paths = list(input_dir.rglob("vocab.json"))
@@ -273,11 +291,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         log_p_svc_main = lex_out["log_p_svc_main"]
         p_lex_comp = lex_out["p_lex_comp"]
         D_tfidf = lex_out["D_tfidf"]
-        groups_085 = lex_out["groups_085"]
         log_p_handwriting = lex_out.get("log_p_handwriting")
         rule_flags_test = lex_out.get("rule_flags_test")
         unseen_log_p_svc_main = lex_out.get("unseen_log_p_svc_main", np.zeros((0, K), dtype=np.float32))
         unseen_p_lex_comp = lex_out.get("unseen_p_lex_comp", np.zeros((0, K), dtype=np.float32))
+        D_tfidf_u = lex_out.get("D_tfidf_unseen")
+        log_p_handwriting_unseen = lex_out.get("log_p_handwriting_unseen")
+        rule_flags_unseen = lex_out.get("rule_flags_unseen")
 
     print(f"[Pipeline] Module 1 complete: log_p_svc_main shape = {log_p_svc_main.shape}")
 
@@ -330,49 +350,110 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         test_log_probs=np.log(np.clip(p_lex_comp, 1e-9, 1.0)),
     )
     claude_spec_logits = None
+    claude_spec_logits_u = None
     claude_classes = None
     features_unseen_dict: Dict[str, np.ndarray] = {}
 
-    D_neural_sum = np.zeros((N_test, N_test), dtype=np.float64)
-    D_neural_weight_total = 0.0
-    D_hybrid = D_tfidf.copy()
+    def compute_multires_clusters(
+        D_mat: np.ndarray,
+        thresholds: Tuple[float, ...] = (0.85, 0.72, 0.65, 0.60),
+        max_cluster_sz: int = 14
+    ) -> Dict[float, np.ndarray]:
+        n_samples = D_mat.shape[0] if (D_mat is not None and D_mat.ndim == 2) else 0
+        if n_samples < 2:
+            return {t: np.ones(max(n_samples, 1), dtype=int) for t in thresholds}
+        cond_d = squareform(D_mat, checks=False)
+        Z_link = linkage(cond_d, method="average")
+        return {
+            t: split_oversized_clusters_dist(D_mat, fcluster(Z_link, t=t, criterion="distance"), max_cluster_size=max_cluster_sz)
+            for t in thresholds
+        }
 
-    if N_test >= 2:
-        Z_link_init = linkage(squareform(D_tfidf, checks=False), method="average")
-        groups_085 = split_oversized_clusters_dist(D_tfidf, fcluster(Z_link_init, t=0.85, criterion="distance"), max_cluster_size=max_cl)
-        groups_072 = split_oversized_clusters_dist(D_tfidf, fcluster(Z_link_init, t=0.72, criterion="distance"), max_cluster_size=max_cl)
-        groups_065 = split_oversized_clusters_dist(D_tfidf, fcluster(Z_link_init, t=0.65, criterion="distance"), max_cluster_size=max_cl)
-        groups_060 = split_oversized_clusters_dist(D_tfidf, fcluster(Z_link_init, t=0.60, criterion="distance"), max_cluster_size=max_cl)
-    else:
-        groups_085 = np.ones(N_test, dtype=int)
-        groups_072 = np.ones(N_test, dtype=int)
-        groups_065 = np.ones(N_test, dtype=int)
-        groups_060 = np.ones(N_test, dtype=int)
+    class HybridDistanceTracker:
+        """Symmetric multi-resolution distance and topic cluster tracker for test and unseen benchmark."""
+        def __init__(self, D_init: Optional[np.ndarray], texts: Optional[List[str]] = None, max_cluster_sz: int = 14):
+            self.max_cluster_size = max_cluster_sz
+            if D_init is not None and D_init.ndim == 2 and D_init.shape[0] >= 2:
+                self.D_tfidf = D_init.copy()
+            elif texts is not None and len(texts) >= 2:
+                Xt = TfidfVectorizer(stop_words='english', sublinear_tf=True, max_features=100000, dtype=np.float32).fit_transform(texts)
+                d = np.clip(1.0 - (Xt @ Xt.T).toarray(), 0.0, None)
+                np.fill_diagonal(d, 0.0)
+                self.D_tfidf = d
+            elif texts is not None and len(texts) == 1:
+                self.D_tfidf = np.zeros((1, 1), dtype=np.float32)
+            else:
+                self.D_tfidf = np.zeros((0, 0), dtype=np.float32)
 
-    def update_hybrid_groups(Z_te_mat: np.ndarray, ckpt_scale: float):
-        nonlocal D_neural_sum, D_neural_weight_total, D_hybrid, groups_085, groups_072, groups_065, groups_060
-        if N_test >= 2:
-            Z_c = Z_te_mat - Z_te_mat.mean(axis=0, keepdims=True)
+            self.N = self.D_tfidf.shape[0]
+            self.D_neural_sum = np.zeros((self.N, self.N), dtype=np.float64) if self.N > 0 else np.zeros((0, 0), dtype=np.float64)
+            self.D_neural_weight_total = 0.0
+            self.D_hybrid = self.D_tfidf.copy()
+            self.groups = compute_multires_clusters(self.D_hybrid, max_cluster_sz=max_cluster_sz)
+
+        def update(self, Z_mat: np.ndarray, ckpt_scale: float) -> None:
+            if self.N < 2 or Z_mat is None or len(Z_mat) != self.N:
+                return
+            Z_c = Z_mat - Z_mat.mean(axis=0, keepdims=True)
             Z_norm = Z_c / np.linalg.norm(Z_c, axis=1, keepdims=True).clip(min=1e-6)
             D_cos = np.clip(1.0 - (Z_norm @ Z_norm.T), 0.0, None)
             np.fill_diagonal(D_cos, 0.0)
             w_d = float(ckpt_scale)
-            D_neural_sum += w_d * D_cos
-            D_neural_weight_total += w_d
-            D_neural_avg = D_neural_sum / max(1e-6, D_neural_weight_total)
-            D_hybrid = 0.55 * D_tfidf + 0.45 * D_neural_avg
-            Z_link = linkage(squareform(D_hybrid, checks=False), method="average")
-            groups_085 = split_oversized_clusters_dist(D_hybrid, fcluster(Z_link, t=0.85, criterion="distance"), max_cluster_size=max_cl)
-            groups_072 = split_oversized_clusters_dist(D_hybrid, fcluster(Z_link, t=0.72, criterion="distance"), max_cluster_size=max_cl)
-            groups_065 = split_oversized_clusters_dist(D_hybrid, fcluster(Z_link, t=0.65, criterion="distance"), max_cluster_size=max_cl)
-            groups_060 = split_oversized_clusters_dist(D_hybrid, fcluster(Z_link, t=0.60, criterion="distance"), max_cluster_size=max_cl)
+            self.D_neural_sum += w_d * D_cos
+            self.D_neural_weight_total += w_d
+            D_neural_avg = self.D_neural_sum / max(1e-6, self.D_neural_weight_total)
+            self.D_hybrid = 0.55 * self.D_tfidf + 0.45 * D_neural_avg
+            self.groups = compute_multires_clusters(self.D_hybrid, max_cluster_sz=self.max_cluster_size)
+
+    def compute_multires_centered_blend(
+        Z: np.ndarray,
+        groups_map: Dict[float, np.ndarray],
+        W_c: Optional[np.ndarray],
+        b_c: Optional[np.ndarray],
+        labels: list,
+        weights: Tuple[float, float, float] = (0.50, 0.30, 0.20),
+    ) -> np.ndarray:
+        if W_c is None or b_c is None or len(Z) == 0:
+            return np.zeros((len(Z), K), dtype=np.float32)
+        w85, w72, w60 = weights
+        lp85, _ = compute_centered_logits(Z, groups_map.get(0.85, np.ones(len(Z), dtype=int)), W_c, b_c, labels)
+        lp72, _ = compute_centered_logits(Z, groups_map.get(0.72, np.ones(len(Z), dtype=int)), W_c, b_c, labels)
+        lp60, _ = compute_centered_logits(Z, groups_map.get(0.60, np.ones(len(Z), dtype=int)), W_c, b_c, labels)
+        return (w85 * lp85 + w72 * lp72 + w60 * lp60).astype(np.float32)
+
+    tracker_test = HybridDistanceTracker(D_tfidf, texts=test_texts, max_cluster_sz=max_cl)
+    tracker_unseen = HybridDistanceTracker(D_tfidf_u if ('D_tfidf_u' in locals() and D_tfidf_u is not None) else None, texts=unseen_texts, max_cluster_sz=max_cl)
+
+    # Backward-compatible references
+    D_neural_sum = tracker_test.D_neural_sum
+    D_neural_weight_total = tracker_test.D_neural_weight_total
+    D_hybrid = tracker_test.D_hybrid
+    groups_085 = tracker_test.groups[0.85]
+    groups_072 = tracker_test.groups[0.72]
+    groups_065 = tracker_test.groups[0.65]
+    groups_060 = tracker_test.groups[0.60]
+
+    def update_hybrid_groups(Z_te_mat: np.ndarray, ckpt_scale: float, Z_u_mat: Optional[np.ndarray] = None):
+        nonlocal D_hybrid, groups_085, groups_072, groups_065, groups_060, D_neural_weight_total
+        tracker_test.update(Z_te_mat, ckpt_scale)
+        D_hybrid = tracker_test.D_hybrid
+        D_neural_weight_total = tracker_test.D_neural_weight_total
+        groups_085 = tracker_test.groups[0.85]
+        groups_072 = tracker_test.groups[0.72]
+        groups_065 = tracker_test.groups[0.65]
+        groups_060 = tracker_test.groups[0.60]
+        if Z_u_mat is not None and N_unseen >= 2:
+            tracker_unseen.update(Z_u_mat, ckpt_scale)
 
     has_neural = len(ckpts) > 0 and not is_smoke
     spectral_blocks_tr: List[np.ndarray] = []
     spectral_blocks_te: List[np.ndarray] = []
+    spectral_blocks_u: List[np.ndarray] = []
     dp_posteriors: List[Tuple[float, np.ndarray]] = []
+    dp_posteriors_u: List[Tuple[float, np.ndarray]] = []
     comp_lora_posteriors: List[Tuple[float, np.ndarray]] = []
     P_spectral = None
+    P_spectral_u = None
 
     df_train = pd.read_csv(train_path)
     train_sub_texts: List[str] = []
@@ -429,7 +510,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_tr = Z_all[N_test + N_unseen :]
                 if N_unseen > 0:
                     features_unseen_dict["qwen3_14b_p2"] = Z_unseen.astype(np.float16)
-                update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_p2", 1.00))
+                update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_p2", 1.00), Z_unseen if N_unseen > 0 else None)
 
                 # Main Stack contributions
                 w_main_p = model_weights.get("qwen3_14b_p2", {}).get("plain_weight", main_members.get("lora_qwen3_14b", {}).get("plain_weight", 0.42))
@@ -446,15 +527,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
 
                 if W_c is not None:
-                    lp_c85, valid_c85 = compute_centered_logits(Z_te, groups_085, W_c, b_c, p2_labels)
+                    lp_c85, valid_c85 = compute_centered_logits(Z_te, tracker_test.groups[0.85], W_c, b_c, p2_labels)
                     LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
-                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, p2_labels)
-                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, p2_labels)
-                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
                     w_comp_c = comp_members.get("lora_qwen3_14b", {}).get("twin_weight", 0.10)
                     comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                     if N_unseen > 0:
-                        lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
+                        lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
 
                 if W_p is not None:
                     w_tot_14b = w_main_p + (w_main_c if W_c is not None else 0.0)
@@ -462,15 +541,23 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_main_p, w_main_c)
                     auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
-                # wPCA + DP Posterior + Spectral Bank
+                # wPCA + DP Posterior + Spectral Bank (Symmetric test and unseen)
                 res_p2 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_p2", 0.10))
                 U_te = transform_lowram(Z_te, res_p2)
-                lp_dp = scores_exact_dp(U_te, groups_065, res_p2, D_hybrid)
+                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_p2, tracker_test.D_hybrid)
                 dp_posteriors.append((dp_weights.get("q3_14b", 0.38), softmax(lp_dp, axis=1)))
 
                 S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_p2, prior_scales.get("qwen3_14b_p2", 1.00))
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
+
+                if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                    U_u = transform_lowram(Z_unseen, res_p2)
+                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_p2, tracker_unseen.D_hybrid)
+                    dp_posteriors_u.append((dp_weights.get("q3_14b", 0.38), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_p2, prior_scales.get("qwen3_14b_p2", 1.00))
+                    spectral_blocks_u.append(S_u)
+                    del U_u
 
                 trunk1.restore_weights(backup_t1)
                 del backup_t1, Z_all, Z_tr, Z_te, heads_sd, res_p2, U_te
@@ -540,7 +627,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 try:
                                     trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
                                     if W_c is not None:
-                                        trial_lp_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, cand_o)
+                                        trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
                                         trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
                                     else:
                                         trial_lp = trial_lp_p
@@ -627,10 +714,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     P_p_acc += p_fold / num_14b_folds
                                 if f_W_c is not None:
                                     has_any_c = True
-                                    lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
-                                    lp_c72_f, _ = compute_centered_logits(f_Z_te, groups_072, f_W_c, f_b_c, f_labels)
-                                    lp_c60_f, _ = compute_centered_logits(f_Z_te, groups_060, f_W_c, f_b_c, f_labels)
-                                    c_blend_f = w85 * lp_c85_f + w72 * lp_c72_f + w60 * lp_c60_f
+                                    c_blend_f = compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
                                     P_c_acc += softmax(c_blend_f, axis=1) / num_14b_folds
 
                                 trunk1.restore_weights(f_backup)
@@ -677,10 +761,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
                                 lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels))
                                 if W_c is not None:
-                                    lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts14_labels)
+                                    lp_u_c_fit = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ts14_labels, weights=(w85, w72, w60))
                                     lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
                                 else:
                                     lp_u_fitted = lp_u_p_fit
+                                lp_u = lp_u_fitted
                                 fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
                                 print(f"[Post-Fit Probe] {opt_14b_key}: unseen BAcc = {fitted_bacc:.4f}")
                                 if fitted_bacc < probe_gate_min_bacc:
@@ -695,16 +780,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if gate_passed:
                                 lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
                                 if W_c is not None:
-                                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts14_labels)
-                                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts14_labels)
-                                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts14_labels)
-                                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts14_labels, weights=(w85, w72, w60))
                                 else:
                                     lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
 
                         if gate_passed:
                             pr_sc = prior_scales.get(opt_14b_key, 0.50)
-                            update_hybrid_groups(Z_te, pr_sc)
+                            update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
                             if num_14b_folds > 1:
                                 comp_lora_posteriors.append((w_comp_p, P_p_acc))
                                 if has_any_c:
@@ -719,12 +801,21 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             def_se_14b = 0.35 if opt_14b_key == "qwen3_14b_p1" else 0.25
                             res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_14b_key, def_se_14b))
                             U_te = transform_lowram(Z_te, res_ts14)
-                            lp_dp = scores_exact_dp(U_te, groups_065, res_ts14, D_hybrid)
+                            lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_ts14, tracker_test.D_hybrid)
                             dp_posteriors.append((dp_weights.get(opt_14b_key, dp_weights.get("part1_14b" if opt_14b_key == "qwen3_14b_p1" else "q3_14b_ts", def_dp_14b)), softmax(lp_dp, axis=1)))
 
                             S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, pr_sc)
                             spectral_blocks_tr.append(S_tr)
                             spectral_blocks_te.append(S_te)
+
+                            if N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                                U_u = transform_lowram(Z_unseen, res_ts14)
+                                lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_ts14, tracker_unseen.D_hybrid)
+                                dp_posteriors_u.append((dp_weights.get(opt_14b_key, dp_weights.get("part1_14b" if opt_14b_key == "qwen3_14b_p1" else "q3_14b_ts", def_dp_14b)), softmax(lp_dp_u, axis=1)))
+                                _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ts14, pr_sc)
+                                spectral_blocks_u.append(S_u)
+                                del U_u
+
                             del res_ts14, U_te
 
                             if lp_p is not None:
@@ -787,7 +878,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_tr = Z_all[N_test + N_unseen :]
                 if N_unseen > 0:
                     features_unseen_dict[q25_key] = Z_unseen.astype(np.float16)
-                update_hybrid_groups(Z_te, prior_scales.get(q25_key, 0.85))
+                update_hybrid_groups(Z_te, prior_scales.get(q25_key, 0.85), Z_unseen if N_unseen > 0 else None)
 
                 w_main_p = model_weights.get(q25_key, {}).get("plain_weight", main_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.24))
                 w_main_c = model_weights.get(q25_key, {}).get("twin_weight", main_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.10))
@@ -803,15 +894,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
 
                 if W_c is not None:
-                    lp_c85, valid_c85 = compute_centered_logits(Z_te, groups_085, W_c, b_c, p2_labels)
+                    lp_c85, valid_c85 = compute_centered_logits(Z_te, tracker_test.groups[0.85], W_c, b_c, p2_labels)
                     LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
-                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, p2_labels)
-                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, p2_labels)
-                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
                     w_comp_c = comp_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.08)
                     comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                     if N_unseen > 0:
-                        lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, p2_labels)
+                        lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
 
                 if W_p is not None:
                     w_tot_q25 = w_main_p + (w_main_c if W_c is not None else 0.0)
@@ -822,12 +911,20 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                 res_q25 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(q25_key, 0.10))
                 U_te = transform_lowram(Z_te, res_q25)
-                lp_dp = scores_exact_dp(U_te, groups_065, res_q25, D_hybrid)
+                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_q25, tracker_test.D_hybrid)
                 dp_posteriors.append((dp_weights.get("q25_14b", 0.24), softmax(lp_dp, axis=1)))
 
                 S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_q25, prior_scales.get(q25_key, 0.85))
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
+
+                if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                    U_u = transform_lowram(Z_unseen, res_q25)
+                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_q25, tracker_unseen.D_hybrid)
+                    dp_posteriors_u.append((dp_weights.get("q25_14b", 0.24), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_q25, prior_scales.get(q25_key, 0.85))
+                    spectral_blocks_u.append(S_u)
+                    del U_u
 
                 trunk2.restore_weights(backup_t2)
                 trunk2.set_final_norm(False)
@@ -879,7 +976,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     if N_unseen >= 36 and W_p is not None:
                         Z_unseen = trunk3.extract_exact(unseen_texts, batch_size=8, end_id=meta_ins["end_id"])
                         if N_unseen > 0:
-                            features_unseen_dict["qwen3_14b_inhouse"] = Z_unseen.astype(np.float16)
+                            features_unseen_dict["instyle"] = Z_unseen.astype(np.float16)
 
                         # Auto-align label order: test canonical, alphabetical, and meta labels
                         cand_orders = [meta_ins["labels"]]
@@ -895,7 +992,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             try:
                                 trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
                                 if W_c is not None:
-                                    trial_lp_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, cand_o)
+                                    trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
                                     trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
                                 else:
                                     trial_lp = trial_lp_p
@@ -937,7 +1034,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         Z_tr = Z_all[N_test + N_unseen :]
                         del Z_all
                         if N_unseen > 0:
-                            features_unseen_dict["qwen3_14b_inhouse"] = Z_unseen.astype(np.float16)
+                            features_unseen_dict["instyle"] = Z_unseen.astype(np.float16)
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"])) if (N_unseen > 0 and W_p is not None) else None
 
                     ins_labels = meta_ins["labels"]
@@ -959,7 +1056,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 instyle_pruned = True
 
                     if not instyle_pruned:
-                        update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45))
+                        update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45), Z_unseen if N_unseen > 0 else None)
 
                         lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ins_labels)) if W_p is not None else None
                         if N_unseen > 0 and W_p is not None:
@@ -971,28 +1068,32 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
 
                         if W_c is not None:
-                            lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ins_labels)
-                            lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ins_labels)
-                            lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ins_labels)
-                            lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                            lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ins_labels, weights=(w85, w72, w60))
                             comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                             if N_unseen > 0:
-                                lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ins_labels)
+                                lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ins_labels, weights=(w85, w72, w60))
                             else:
                                 lp_u_c = np.zeros((0, K), dtype=np.float32)
                         else:
-                            lp_c85 = np.zeros((N_test, K), dtype=np.float32)
                             lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                             lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                         res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
                         U_te = transform_lowram(Z_te, res_ins)
-                        lp_dp = scores_exact_dp(U_te, groups_065, res_ins, D_hybrid)
+                        lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_ins, tracker_test.D_hybrid)
                         dp_posteriors.append((dp_weights.get("instyle", 0.10), softmax(lp_dp, axis=1)))
 
                         S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ins, prior_scales.get("instyle", 0.45))
                         spectral_blocks_tr.append(S_tr)
                         spectral_blocks_te.append(S_te)
+
+                        if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                            U_u = transform_lowram(Z_unseen, res_ins)
+                            lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_ins, tracker_unseen.D_hybrid)
+                            dp_posteriors_u.append((dp_weights.get("instyle", 0.10), softmax(lp_dp_u, axis=1)))
+                            _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ins, prior_scales.get("instyle", 0.45))
+                            spectral_blocks_u.append(S_u)
+                            del U_u
                         del res_ins, U_te
 
                         if W_p is not None and lp_p is not None:
@@ -1069,7 +1170,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 try:
                                     trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
                                     if W_c is not None:
-                                        trial_lp_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, cand_o)
+                                        trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
                                         trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
                                     else:
                                         trial_lp = trial_lp_p
@@ -1156,10 +1257,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     P_p_acc += p_fold / num_8b_folds
                                 if f_W_c is not None:
                                     has_any_c = True
-                                    lp_c85_f, _ = compute_centered_logits(f_Z_te, groups_085, f_W_c, f_b_c, f_labels)
-                                    lp_c72_f, _ = compute_centered_logits(f_Z_te, groups_072, f_W_c, f_b_c, f_labels)
-                                    lp_c60_f, _ = compute_centered_logits(f_Z_te, groups_060, f_W_c, f_b_c, f_labels)
-                                    c_blend_f = w85 * lp_c85_f + w72 * lp_c72_f + w60 * lp_c60_f
+                                    c_blend_f = compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
                                     P_c_acc += softmax(c_blend_f, axis=1) / num_8b_folds
 
                                 trunk3.restore_weights(f_backup)
@@ -1206,10 +1304,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if gate_passed and N_unseen > 0 and W_p is not None and "Z_unseen" in locals():
                                 lp_u_p_fit = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels))
                                 if W_c is not None:
-                                    lp_u_c_fit, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ts8_labels)
+                                    lp_u_c_fit = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ts8_labels, weights=(w85, w72, w60))
                                     lp_u_fitted = _combine_plain_and_twin_lp(lp_u_p_fit, lp_u_c_fit, w_comp_p, w_comp_c)
                                 else:
                                     lp_u_fitted = lp_u_p_fit
+                                lp_u = lp_u_fitted
                                 fitted_bacc = float(balanced_accuracy_score(y_unseen, lp_u_fitted.argmax(axis=1)))
                                 print(f"[Post-Fit Probe] {opt_8b_key}: unseen BAcc = {fitted_bacc:.4f}")
                                 if fitted_bacc < probe_gate_min_bacc:
@@ -1224,10 +1323,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if gate_passed:
                                 lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
                                 if W_c is not None:
-                                    lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ts8_labels)
-                                    lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ts8_labels)
-                                    lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ts8_labels)
-                                    lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts8_labels, weights=(w85, w72, w60))
                                 else:
                                     lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
 
@@ -1237,7 +1333,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             pr_sc = prior_scales.get(opt_8b_key, def_pr)
                             se_fl = se_floors.get(opt_8b_key, def_se)
 
-                            update_hybrid_groups(Z_te, pr_sc)
+                            update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
                             if num_8b_folds > 1:
                                 comp_lora_posteriors.append((w_comp_p, P_p_acc))
                                 if has_any_c:
@@ -1250,12 +1346,21 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                             res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
                             U_te = transform_lowram(Z_te, res_ts8)
-                            lp_dp = scores_exact_dp(U_te, groups_065, res_ts8, D_hybrid)
+                            lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_ts8, tracker_test.D_hybrid)
                             dp_posteriors.append((dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10)), softmax(lp_dp, axis=1)))
 
                             S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, pr_sc)
                             spectral_blocks_tr.append(S_tr)
                             spectral_blocks_te.append(S_te)
+
+                            if N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                                U_u = transform_lowram(Z_unseen, res_ts8)
+                                lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_ts8, tracker_unseen.D_hybrid)
+                                dp_posteriors_u.append((dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10)), softmax(lp_dp_u, axis=1)))
+                                _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ts8, pr_sc)
+                                spectral_blocks_u.append(S_u)
+                                del U_u
+
                             del res_ts8, U_te
 
                             if lp_p is not None:
@@ -1348,10 +1453,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_tr = Z_all[N_test + N_unseen :]
                 if N_unseen > 0:
                     features_unseen_dict["qwen3_8b_claude"] = Z_unseen.astype(np.float16)
-                update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_claude", 0.30))
+                update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_claude", 0.30), Z_unseen if N_unseen > 0 else None)
 
                 if W_spec is not None and W_spec.shape[0] == 5:
                     claude_spec_logits = Z_te @ W_spec.T + b_spec
+                    if N_unseen > 0:
+                        claude_spec_logits_u = Z_unseen @ W_spec.T + b_spec
 
                 if W_p is not None and W_p.shape[0] == 18:
                     w_comp_p = model_weights.get("qwen3_8b_claude", {}).get("plain_weight", comp_members.get("ntl_claude_head", {}).get("plain_weight", 0.10))
@@ -1364,17 +1471,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         lp_u_p = np.zeros((0, K), dtype=np.float32)
 
                     if W_c is not None and W_c.shape[0] == 18:
-                        lp_c85, _ = compute_centered_logits(Z_te, groups_085, W_c, b_c, ro_labels)
-                        lp_c72, _ = compute_centered_logits(Z_te, groups_072, W_c, b_c, ro_labels)
-                        lp_c60, _ = compute_centered_logits(Z_te, groups_060, W_c, b_c, ro_labels)
-                        lp_c_blend = w85 * lp_c85 + w72 * lp_c72 + w60 * lp_c60
+                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ro_labels, weights=(w85, w72, w60))
                         comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                         if N_unseen > 0:
-                            lp_u_c, _ = compute_centered_logits(Z_unseen, groups_unseen, W_c, b_c, ro_labels)
+                            lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ro_labels, weights=(w85, w72, w60))
                         else:
                             lp_u_c = np.zeros((0, K), dtype=np.float32)
                     else:
-                        lp_c85 = np.zeros((N_test, K), dtype=np.float32)
                         lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                         lp_u_c = np.zeros((0, K), dtype=np.float32)
 
@@ -1387,12 +1490,20 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                 res_cl = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_claude", 0.35))
                 U_te = transform_lowram(Z_te, res_cl)
-                lp_dp = scores_exact_dp(U_te, groups_065, res_cl, D_hybrid)
+                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_cl, tracker_test.D_hybrid)
                 dp_posteriors.append((dp_weights.get("claude_8b", 0.04), softmax(lp_dp, axis=1)))
 
                 S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_cl, prior_scales.get("qwen3_8b_claude", 0.30))
                 spectral_blocks_tr.append(S_tr)
                 spectral_blocks_te.append(S_te)
+
+                if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                    U_u = transform_lowram(Z_unseen, res_cl)
+                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_cl, tracker_unseen.D_hybrid)
+                    dp_posteriors_u.append((dp_weights.get("claude_8b", 0.04), softmax(lp_dp_u, axis=1)))
+                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_cl, prior_scales.get("qwen3_8b_claude", 0.30))
+                    spectral_blocks_u.append(S_u)
+                    del U_u
 
                 merge_lora(trunk3.model, claude_dir, sign=-1.0)
                 del Z_all, Z_tr, Z_te, res_cl, U_te
@@ -1425,14 +1536,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
             if W_p_deb is None and not is_smoke:
                 raise RuntimeError(f"Required classification head W_p is None for {deb_dir}")
-            update_hybrid_groups(Z_te_deb, prior_scales.get(deb_key, 0.80))
+            update_hybrid_groups(Z_te_deb, prior_scales.get(deb_key, 0.80), Z_unseen_deb if N_unseen > 0 else None)
 
             w_main_deb = model_weights.get(deb_key, {}).get("plain_weight", main_members.get("deberta_v3_large", {}).get("plain_weight", 0.25))
             w_comp_deb = comp_members.get("deberta_v3_large", {}).get("plain_weight", 0.18)
             w_comp_c = model_weights.get(deb_key, {}).get("twin_weight", comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06))
             lp_p_deb = None
             lp_u_deb = np.zeros((0, K), dtype=np.float32)
-            lp_c85_deb = np.zeros((N_test, K), dtype=np.float32)
             lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
             lp_u_c_deb = np.zeros((0, K), dtype=np.float32)
 
@@ -1444,13 +1554,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     lp_u_deb = log_softmax(align_cols(Z_unseen_deb @ W_p_deb.T + b_p_deb, deb_labels))
 
             if W_c_deb is not None:
-                lp_c85_deb, _ = compute_centered_logits(Z_te_deb, groups_085, W_c_deb, b_c_deb, deb_labels)
-                lp_c72, _ = compute_centered_logits(Z_te_deb, groups_072, W_c_deb, b_c_deb, deb_labels)
-                lp_c60, _ = compute_centered_logits(Z_te_deb, groups_060, W_c_deb, b_c_deb, deb_labels)
-                lp_c_blend = w85 * lp_c85_deb + w72 * lp_c72 + w60 * lp_c60
+                lp_c_blend = compute_multires_centered_blend(Z_te_deb, tracker_test.groups, W_c_deb, b_c_deb, deb_labels, weights=(w85, w72, w60))
                 comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
                 if N_unseen > 0:
-                    lp_u_c_deb, _ = compute_centered_logits(Z_unseen_deb, groups_unseen, W_c_deb, b_c_deb, deb_labels)
+                    lp_u_c_deb = compute_multires_centered_blend(Z_unseen_deb, tracker_unseen.groups, W_c_deb, b_c_deb, deb_labels, weights=(w85, w72, w60))
 
             if W_p_deb is not None and lp_p_deb is not None:
                 w_tot_deb = w_main_deb + (w_comp_c if W_c_deb is not None else 0.0)
@@ -1461,19 +1568,22 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
             res_deb = fit_shared_gaussian_lowram(Z_tr_deb, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(deb_key, 0.10))
             U_te = transform_lowram(Z_te_deb, res_deb)
-            lp_dp = scores_exact_dp(U_te, groups_065, res_deb, D_hybrid)
+            lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_deb, tracker_test.D_hybrid)
             dp_posteriors.append((dp_weights.get("deberta", 0.20), softmax(lp_dp, axis=1)))
 
             S_tr, S_te = make_spectral_blocks(Z_tr_deb, Z_te_deb, res_deb, prior_scales.get(deb_key, 0.80))
             spectral_blocks_tr.append(S_tr)
             spectral_blocks_te.append(S_te)
 
+            if N_unseen > 0 and Z_unseen_deb is not None and len(Z_unseen_deb) == N_unseen:
+                U_u = transform_lowram(Z_unseen_deb, res_deb)
+                lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_deb, tracker_unseen.D_hybrid)
+                dp_posteriors_u.append((dp_weights.get("deberta", 0.20), softmax(lp_dp_u, axis=1)))
+                _, S_u = make_spectral_blocks(Z_tr_deb, Z_unseen_deb, res_deb, prior_scales.get(deb_key, 0.80))
+                spectral_blocks_u.append(S_u)
+                del U_u
+
             del Z_tr_deb, Z_te_deb, Z_test_all, res_deb, U_te
-            if "Z_unseen_deb" in locals():
-                del Z_unseen_deb
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             if "Z_unseen_deb" in locals():
                 del Z_unseen_deb
             gc.collect()
@@ -1493,25 +1603,33 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             COMP_LIST.append((comp_streams.get("dp_posteriors", 0.30), P_dp_comb))
 
         # Fit Joint Spectral Bank
+        P_spectral = None
+        P_spectral_u = None
         if spectral_blocks_tr and spectral_blocks_te:
             sb_cfg = comp_cfg.get("spectral_bank", {})
             plain_C = sb_cfg.get("plain_C", 0.04)
             center_C = sb_cfg.get("center_C", 0.03)
             center_blend = sb_cfg.get("center_blend", 0.35)
 
-            P_spectral, oof_score = fit_joint_spectral_bank(
+            P_spectral, oof_score, P_spectral_u = fit_joint_spectral_bank(
                 spectral_tr_blocks=spectral_blocks_tr,
                 spectral_te_blocks=spectral_blocks_te,
+                spectral_u_blocks=spectral_blocks_u if spectral_blocks_u else None,
                 y_sub=y_sub,
                 prompts_sub=prompts_sub,
-                D_tfidf=D_tfidf,
-                D_neural_sum=D_neural_sum,
-                D_neural_weight_total=D_neural_weight_total,
+                D_tfidf=tracker_test.D_tfidf,
+                D_neural_sum=tracker_test.D_neural_sum,
+                D_neural_weight_total=tracker_test.D_neural_weight_total,
+                D_tfidf_u=tracker_unseen.D_tfidf,
+                D_neural_sum_u=tracker_unseen.D_neural_sum,
+                D_neural_weight_total_u=tracker_unseen.D_neural_weight_total,
                 N_test=N_test,
+                N_unseen=N_unseen,
                 plain_C=plain_C,
                 center_C=center_C,
                 center_blend=center_blend,
-                max_cluster_size=max_cl
+                max_cluster_size=max_cl,
+                return_unseen=True,
             )
             print(f"[Pipeline] Joint Spectral Bank fitted (OOF BAcc = {oof_score:.4f})")
             COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))
@@ -1531,17 +1649,24 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     # 4. MODULE 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration
     print("[Pipeline] Module 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration...")
     extra_streams: List[Tuple[str, float, np.ndarray]] = []
+    extra_streams_u: List[Tuple[str, float, np.ndarray]] = []
     w_dp = model_weights.get("wpca_dp", {}).get("plain_weight", 0.22)
     if dp_posteriors:
         tot_dp_w = sum(w for w, _ in dp_posteriors)
         P_dp_comb = sum(w * P_dp for w, P_dp in dp_posteriors) / max(1e-8, tot_dp_w)
         extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_comb, 1e-9, 1.0))))
+        if dp_posteriors_u and N_unseen > 0:
+            tot_dp_u_w = sum(w for w, _ in dp_posteriors_u)
+            P_dp_u_comb = sum(w * P_dp for w, P_dp in dp_posteriors_u) / max(1e-8, tot_dp_u_w)
+            extra_streams_u.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_u_comb, 1e-9, 1.0))))
     elif is_smoke:
         extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(mock_p_dp, 1e-9, 1.0))))
 
     w_sb = model_weights.get("spectral_bank", {}).get("plain_weight", 0.12)
     if "P_spectral" in locals() and P_spectral is not None:
         extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral, 1e-9, 1.0))))
+        if "P_spectral_u" in locals() and P_spectral_u is not None and N_unseen > 0:
+            extra_streams_u.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral_u, 1e-9, 1.0))))
     elif is_smoke:
         extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(mock_p_spec, 1e-9, 1.0))))
 
@@ -1550,72 +1675,63 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         P_mix, active_weights_map, df_ablation = auditor.optimize_weights_and_blend(
             working_dir=working_dir,
             extra_test_log_probs=extra_streams,
+            extra_unseen_log_probs=extra_streams_u,
             optimize_on_unseen=optimize_on_unseen,
         )
         print(f"[Pipeline] Flat log-space ensemble active weights: {active_weights_map}")
         R_main = P_mix
+        P_mix_u = getattr(auditor, "P_mix_unseen", np.zeros((0, K), dtype=np.float64))
     else:
         main_ratio = fusion_cfg.get("main_ratio", 0.85)
         comp_ratio = fusion_cfg.get("comp_ratio", 0.15)
         P_mix, R_main = blend_main_and_complementary(LOGIT_MAIN, COMP_LIST, main_ratio=main_ratio, comp_ratio=comp_ratio)
+        P_mix_u = np.zeros((0, K), dtype=np.float64)
 
-    # Claude Specialist Gate (Vectorized)
-    gate_weight = post_cfg.get("claude_specialist_weight", 0.15)
-    P_mix = apply_claude_specialist_gate(
-        P_mix=P_mix,
-        R_main=R_main,
-        claude_spec_logits=claude_spec_logits,
-        claude_classes=claude_classes,
-        labels=LABELS,
-        claude_cols=FAMILIES["claude"],
-        gate_weight=gate_weight
-    )
-
-    # Unified Handwriting & Orthographic Shield (discrete Bayesian rules + continuous handwriting density)
-    default_curly_multiplier = float(np.exp(-1.0))
-    multiplier = post_cfg.get("curly_quote_multiplier", default_curly_multiplier)
-    multi_em_dash_log_pen = post_cfg.get("multi_em_dash_log_penalty", -0.45)
-    straight_contr_log_pen = post_cfg.get("straight_contr_log_penalty", -0.60)
-    curly_contr_log_pen = post_cfg.get("curly_contr_log_penalty", -0.40)
-    continuous_hw_weight = post_cfg.get("continuous_hw_weight", 0.04)
-
-    P_mix = apply_unified_handwriting_shield(
-        P_mix=P_mix,
-        test_texts=test_texts,
-        log_p_handwriting=log_p_handwriting,
-        rule_flags=rule_flags_test,
-        curly_quote_multiplier=multiplier,
-        multi_em_dash_log_penalty=multi_em_dash_log_pen,
-        straight_contr_log_penalty=straight_contr_log_pen,
-        curly_contr_log_penalty=curly_contr_log_pen,
-        continuous_hw_weight=continuous_hw_weight,
-    )
-
-    # Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
-    sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
-    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
-    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
     train_prior = np.bincount(y_sub, minlength=18).astype(np.float64) + 1.0 if len(y_sub) > 0 else None
-    P_final = sinkhorn_balancing(
-        P_mix,
-        iters=sinkhorn_iters,
-        sinkhorn_strength=sinkhorn_strength,
-        target_mix=sinkhorn_target_mix,
-        train_prior=train_prior
+    train_ref_texts = train_sub_texts if len(train_sub_texts) > 0 else df_train["text"].fillna("").astype(str).tolist()
+    train_ref_y = y_sub if len(y_sub) > 0 else df_train["model"].values
+
+    # Run full inference pipeline on TEST
+    P_final = run_full_inference_pipeline(
+        P_mix=P_mix,
+        texts=test_texts,
+        post_cfg=post_cfg,
+        R_main=R_main,
+        claude_spec_logits=claude_spec_logits if "claude_spec_logits" in locals() else None,
+        claude_classes=claude_classes if "claude_classes" in locals() else None,
+        log_p_handwriting=log_p_handwriting if "log_p_handwriting" in locals() else None,
+        rule_flags=rule_flags_test if "rule_flags_test" in locals() else None,
+        train_texts=train_ref_texts,
+        y_train=train_ref_y,
+        train_prior=train_prior,
     )
 
-    # TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
-    if post_cfg.get("enable_typobayes", True):
-        P_final = apply_typobayes_postprocess(
-            P_final,
-            train_texts=train_sub_texts if len(train_sub_texts) > 0 else df_train["text"].fillna("").astype(str).tolist(),
-            y_train=y_sub if len(y_sub) > 0 else df_train["model"].values,
-            test_texts=test_texts,
-            labels=LABELS,
-            kappa=float(post_cfg.get("typobayes_kappa", 24.0)),
-            evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
-            evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
+    # Run full inference pipeline on UNSEEN BENCHMARK (Exact parity with test inference)
+    P_final_u = np.zeros((0, K), dtype=np.float32)
+    if N_unseen > 0 and len(P_mix_u) == N_unseen:
+        P_final_u = run_full_inference_pipeline(
+            P_mix=P_mix_u,
+            texts=unseen_texts,
+            post_cfg=post_cfg,
+            R_main=P_mix_u,
+            claude_spec_logits=claude_spec_logits_u if "claude_spec_logits_u" in locals() else None,
+            claude_classes=claude_classes if "claude_classes" in locals() else None,
+            log_p_handwriting=log_p_handwriting_unseen if "log_p_handwriting_unseen" in locals() else None,
+            rule_flags=rule_flags_unseen if "rule_flags_unseen" in locals() else None,
+            train_texts=train_ref_texts,
+            y_train=train_ref_y,
+            train_prior=train_prior,
         )
+
+        raw_unseen_bacc = float(balanced_accuracy_score(y_unseen, P_mix_u.argmax(axis=1)))
+        post_unseen_bacc = float(balanced_accuracy_score(y_unseen, P_final_u.argmax(axis=1)))
+        lift_post = post_unseen_bacc - raw_unseen_bacc
+        print("=" * 70)
+        print(f"[Pipeline Benchmark Validation] 100% Symmetrical Pipeline Parity Evaluation:")
+        print(f"  - Pre-Postprocessing Ensemble Raw BAcc : {raw_unseen_bacc:.4f} ({raw_unseen_bacc*100:.2f}%)")
+        print(f"  - Full Postprocessed Benchmark BAcc     : {post_unseen_bacc:.4f} ({post_unseen_bacc*100:.2f}%)")
+        print(f"  - Downstream Postprocessing Lift       : {lift_post:+.4f} ({lift_post*100:+.2f}%)")
+        print("=" * 70)
 
     # Auditing and forward stepwise ablation report
     test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
@@ -1628,27 +1744,31 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     # Export compact local evaluation cache for sub-second offline local tuning
     try:
-        if len(groups_unseen) > 0:
-            try:
-                g_u = np.asarray(groups_unseen, dtype=np.int32)
-            except (ValueError, TypeError):
-                g_u = (pd.factorize(groups_unseen)[0] + 1).astype(np.int32)
-        else:
-            g_u = np.array([], dtype=np.int32)
-
         cache_dict = {
             "N_test": np.array([N_test], dtype=np.int32),
             "N_unseen": np.array([N_unseen], dtype=np.int32),
             "y_unseen": y_unseen.astype(np.int32) if len(y_unseen) > 0 else np.array([], dtype=np.int32),
-            "groups_unseen": g_u,
-            "D_tfidf": D_tfidf.astype(np.float32) if ("D_tfidf" in locals() and D_tfidf is not None) else np.zeros((0, 0), dtype=np.float32),
-            "D_hybrid": D_hybrid.astype(np.float32) if ("D_hybrid" in locals() and D_hybrid is not None) else np.zeros((0, 0), dtype=np.float32),
-            "groups_085": groups_085.astype(np.int32) if ("groups_085" in locals() and groups_085 is not None) else np.zeros(0, dtype=np.int32),
+            "groups_unseen": tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)),
+            "groups_085_u": tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)),
+            "groups_072_u": tracker_unseen.groups.get(0.72, np.zeros(0, dtype=np.int32)),
+            "groups_065_u": tracker_unseen.groups.get(0.65, np.zeros(0, dtype=np.int32)),
+            "groups_060_u": tracker_unseen.groups.get(0.60, np.zeros(0, dtype=np.int32)),
+            "D_tfidf": tracker_test.D_tfidf.astype(np.float32) if tracker_test.D_tfidf is not None else np.zeros((0, 0), dtype=np.float32),
+            "D_hybrid": tracker_test.D_hybrid.astype(np.float32) if tracker_test.D_hybrid is not None else np.zeros((0, 0), dtype=np.float32),
+            "D_tfidf_u": tracker_unseen.D_tfidf.astype(np.float32) if tracker_unseen.D_tfidf is not None else np.zeros((0, 0), dtype=np.float32),
+            "D_hybrid_u": tracker_unseen.D_hybrid.astype(np.float32) if tracker_unseen.D_hybrid is not None else np.zeros((0, 0), dtype=np.float32),
+            "groups_085": tracker_test.groups.get(0.85, np.zeros(0, dtype=np.int32)),
+            "groups_072": tracker_test.groups.get(0.72, np.zeros(0, dtype=np.int32)),
+            "groups_065": tracker_test.groups.get(0.65, np.zeros(0, dtype=np.int32)),
+            "groups_060": tracker_test.groups.get(0.60, np.zeros(0, dtype=np.int32)),
             "model_names": np.array([m["name"] for m in auditor.models], dtype=object),
             "model_tiers": np.array([m["tier"] for m in auditor.models], dtype=object),
             "model_prior_weights": np.array([m.get("prior_weight", m["weight"]) for m in auditor.models], dtype=np.float64),
             "model_learned_weights": np.array([m["weight"] for m in auditor.models], dtype=np.float64),
+            "P_mix": P_mix.astype(np.float32),
             "P_final": P_final.astype(np.float32),
+            "P_mix_unseen": P_mix_u.astype(np.float32) if len(P_mix_u) > 0 else np.zeros((0, K), dtype=np.float32),
+            "P_final_unseen": P_final_u.astype(np.float32) if len(P_final_u) > 0 else np.zeros((0, K), dtype=np.float32),
             "test_texts": np.array(test_texts, dtype=object),
         }
         for idx, m in enumerate(auditor.models):
@@ -1672,16 +1792,74 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         np.savez_compressed(cache_file_path, **cache_dict)
         print(f"[Pipeline] Exported compact local evaluation cache: {cache_file_path} ({cache_file_path.stat().st_size} bytes)")
 
+        # Export versioned, standardized benchmark feature bundle
         if len(features_unseen_dict) > 0 and N_unseen > 0:
+            version_str = config.get("version") or os.environ.get("EXPERIMENT_VERSION") or os.environ.get("PIPELINE_VERSION") or "latest"
+            date_str = time.strftime("%Y%m%d")
+            clean_v = version_str.lower() if version_str.lower().startswith("v") else f"v{version_str}"
+            bundle_dir_name = f"{clean_v}_{date_str}"
+
+            # Standard consolidated features file for working_dir
             feat_save_dict = {
                 "labels": y_unseen.astype(np.int32),
-                "groups": g_u,
+                "groups_085": tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)),
+                "groups_072": tracker_unseen.groups.get(0.72, np.zeros(0, dtype=np.int32)),
+                "groups_065": tracker_unseen.groups.get(0.65, np.zeros(0, dtype=np.int32)),
+                "groups_060": tracker_unseen.groups.get(0.60, np.zeros(0, dtype=np.int32)),
+                "D_tfidf": tracker_unseen.D_tfidf.astype(np.float32) if tracker_unseen.D_tfidf is not None else np.zeros((0, 0), dtype=np.float32),
+                "D_hybrid": tracker_unseen.D_hybrid.astype(np.float32) if tracker_unseen.D_hybrid is not None else np.zeros((0, 0), dtype=np.float32),
             }
             for k, v in features_unseen_dict.items():
                 feat_save_dict[f"Z_unseen_{k}"] = v
             feat_file_path = working_dir / "benchmark_1800_features.npz"
             np.savez_compressed(feat_file_path, **feat_save_dict)
             print(f"[Pipeline] Exported {len(features_unseen_dict)} benchmark feature representations to: {feat_file_path} ({feat_file_path.stat().st_size} bytes)")
+
+            # Save versioned bundle per model to target directory if available
+            target_dirs = [working_dir / "benchmark_features" / bundle_dir_name]
+            local_features_root = Path(__file__).resolve().parent.parent.parent / "local_data" / "benchmark_features"
+            if local_features_root.parent.exists():
+                target_dirs.append(local_features_root / bundle_dir_name)
+
+            for bundle_dir in target_dirs:
+                try:
+                    bundle_dir.mkdir(parents=True, exist_ok=True)
+                    models_meta = {}
+                    for model_name, Z_val in features_unseen_dict.items():
+                        model_file = f"Z_unseen_{model_name}_{clean_v}_{date_str}.npz"
+                        m_path = bundle_dir / model_file
+                        np.savez_compressed(
+                            m_path,
+                            Z_unseen=Z_val.astype(np.float16),
+                            labels=y_unseen.astype(np.int32),
+                            groups=tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)),
+                            model_name=model_name,
+                            version=clean_v,
+                            date=date_str,
+                        )
+                        models_meta[model_name] = {
+                            "filename": model_file,
+                            "shape": list(Z_val.shape),
+                            "dtype": str(Z_val.dtype),
+                            "size_mb": round(m_path.stat().st_size / (1024 * 1024), 2),
+                        }
+
+                    # Consolidated bundle archive
+                    master_file = f"benchmark_1800_features_all_models_{clean_v}_{date_str}.npz"
+                    np.savez_compressed(bundle_dir / master_file, **feat_save_dict)
+
+                    # Metadata JSON
+                    meta_content = {
+                        "version": clean_v,
+                        "date": date_str,
+                        "N_samples": int(N_unseen),
+                        "models": models_meta,
+                        "consolidated_file": master_file,
+                    }
+                    (bundle_dir / "metadata.json").write_text(json.dumps(meta_content, indent=2), encoding="utf-8")
+                    print(f"[Pipeline] Standardized benchmark feature bundle saved to: {bundle_dir}")
+                except Exception as ex_bundle:
+                    print(f"[Pipeline] Note: Could not save bundle to {bundle_dir}: {ex_bundle}")
     except Exception as e:
         print(f"[Pipeline] Note: Could not write local evaluation outputs: {e}")
 

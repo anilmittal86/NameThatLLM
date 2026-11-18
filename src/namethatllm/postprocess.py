@@ -761,6 +761,101 @@ def apply_typobayes_postprocess(
 
 
 # =============================================================================
+# 7.5. UNIFIED END-TO-END INFERENCE POSTPROCESSING PIPELINE
+# =============================================================================
+
+
+def run_full_inference_pipeline(
+    P_mix: np.ndarray,
+    texts: list[str],
+    post_cfg: dict,
+    R_main: np.ndarray | None = None,
+    claude_spec_logits: np.ndarray | None = None,
+    claude_classes: list | None = None,
+    log_p_handwriting: np.ndarray | None = None,
+    rule_flags: np.ndarray | None = None,
+    train_texts: list[str] | None = None,
+    y_train: np.ndarray | None = None,
+    train_prior: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Unified end-to-end postprocessing pipeline executing all downstream stages:
+    1. Claude Specialist Gate (Vectorized, mass-conserving)
+    2. Continuous Handwriting & Orthographic Shield (Bayesian log-penalty + continuous density)
+    3. Sinkhorn Mass Balancing (Iterative row/column equalization)
+    4. TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
+
+    Guarantees 100% mathematical parity between test inference and unseen benchmark evaluation.
+    """
+    if len(P_mix) == 0:
+        return P_mix
+
+    P_curr = P_mix.copy()
+    R_ref = R_main if R_main is not None else P_curr
+
+    # 1. Claude Specialist Gate
+    gate_weight = float(post_cfg.get("claude_specialist_weight", 0.15))
+    if claude_spec_logits is not None:
+        P_curr = apply_claude_specialist_gate(
+            P_mix=P_curr,
+            R_main=R_ref,
+            claude_spec_logits=claude_spec_logits,
+            claude_classes=claude_classes,
+            labels=LABELS,
+            claude_cols=FAMILIES["claude"],
+            gate_weight=gate_weight,
+        )
+
+    # 2. Unified Handwriting & Orthographic Shield
+    default_curly_multiplier = float(np.exp(-1.0))
+    multiplier = float(post_cfg.get("curly_quote_multiplier", default_curly_multiplier))
+    multi_em_dash_log_pen = float(post_cfg.get("multi_em_dash_log_penalty", -0.45))
+    straight_contr_log_pen = float(post_cfg.get("straight_contr_log_penalty", -0.60))
+    curly_contr_log_pen = float(post_cfg.get("curly_contr_log_penalty", -0.40))
+    continuous_hw_weight = float(post_cfg.get("continuous_hw_weight", 0.04))
+
+    P_curr = apply_unified_handwriting_shield(
+        P_mix=P_curr,
+        test_texts=texts,
+        log_p_handwriting=log_p_handwriting,
+        rule_flags=rule_flags,
+        curly_quote_multiplier=multiplier,
+        multi_em_dash_log_penalty=multi_em_dash_log_pen,
+        straight_contr_log_penalty=straight_contr_log_pen,
+        curly_contr_log_penalty=curly_contr_log_pen,
+        continuous_hw_weight=continuous_hw_weight,
+    )
+
+    # 3. Sinkhorn Mass Balancing
+    sinkhorn_iters = int(post_cfg.get("sinkhorn_iterations", 100))
+    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
+    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
+
+    P_curr = sinkhorn_balancing(
+        P_curr,
+        iters=sinkhorn_iters,
+        sinkhorn_strength=sinkhorn_strength,
+        target_mix=sinkhorn_target_mix,
+        train_prior=train_prior,
+    )
+
+    # 4. TypoBayes 37-Marker Postprocessing
+    if post_cfg.get("enable_typobayes", True) and train_texts and y_train is not None and len(train_texts) > 0:
+        P_curr = apply_typobayes_postprocess(
+            P_curr,
+            train_texts=train_texts,
+            y_train=y_train,
+            test_texts=texts,
+            labels=LABELS,
+            kappa=float(post_cfg.get("typobayes_kappa", 24.0)),
+            evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
+            evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
+        )
+
+    return P_curr
+
+
+# =============================================================================
 # 8. FINAL SUBMISSION EXPORT
 # =============================================================================
 

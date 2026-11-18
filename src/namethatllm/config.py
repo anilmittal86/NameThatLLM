@@ -176,6 +176,16 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
         except Exception:
             pass
 
+    adapter_p = ckpt_dir / "adapter_config.json"
+    if adapter_p.exists():
+        try:
+            ac = json.load(open(adapter_p))
+            base_model = str(ac.get("base_model_name_or_path", "")).lower()
+            if not backbone and base_model:
+                backbone = base_model
+        except Exception:
+            pass
+
     heads_p = ckpt_dir / "heads.safetensors"
     if heads_p.exists():
         try:
@@ -224,6 +234,8 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
         elif 'lora14b_v1' in p_str:
             ckpts['qwen3_14b_p1'] = p.parent
         elif any(token in p_str for token in ('inhouse', 'ntl-inhouse', 'export_lora24', 'export_champion', 'lora-peft-training', 'peft_training')):
+            if "family_gate" in p_str or "/gate" in p_str or "\\gate" in p_str:
+                continue
             dim, keep, backbone = _inspect_checkpoint_dim_and_keep(p.parent)
             if '2.5' in backbone or 'qwen25' in backbone or (dim == 40960 and (keep >= 30 or '25' in p_str or 'qwen25' in p_str)):
                 ckpts['qwen25_14b_inhouse'] = p.parent
@@ -231,7 +243,7 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
                 ckpts['qwen3_14b_inhouse'] = p.parent
             elif dim == 8192 or 'deberta' in p_str or 'deberta' in backbone:
                 ckpts['deberta_inhouse'] = p.parent
-            else:
+            elif dim in (32768, 28672) or ('8b' in p_str or '8b' in backbone) or ('14b' not in p_str and '14b' not in backbone and dim != 40960):
                 ckpts['qwen3_8b_inhouse'] = p.parent
         elif 'q8v5' in p_str:
             if 'qwen3_8b_v5' not in ckpts or (not is_fold):

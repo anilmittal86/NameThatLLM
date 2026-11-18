@@ -270,6 +270,7 @@ class UnseenStepwiseAuditor:
         extra_test_log_probs: Optional[List[Tuple[str, float, np.ndarray]]] = None,
         optimize_on_unseen: bool = True,
         lock_prior_weights: bool = False,
+        extra_unseen_log_probs: Optional[List[Tuple[str, float, np.ndarray]]] = None,
         **kwargs,
     ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
         if lock_prior_weights:
@@ -283,19 +284,28 @@ class UnseenStepwiseAuditor:
                LOGIT_FLAT = sum_m (w_star[m] * test_lp[m])
         """
         if len(self.models) == 0:
+            self.P_mix_unseen = np.zeros((0, K), dtype=np.float64)
             return np.ones((self.N_test, K), dtype=np.float64) / float(K), {}, pd.DataFrame()
 
         if not optimize_on_unseen or len(self.y_unseen) < 36:
             weights_map = {m["name"]: m["weight"] for m in self.models}
             logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
+            logit_flat_u = np.zeros((len(self.y_unseen), K), dtype=np.float64) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
             for m in self.models:
                 logit_flat += m["weight"] * m["test_lp"]
+                if len(m["unseen_lp"]) == len(self.y_unseen):
+                    logit_flat_u += m["weight"] * m["unseen_lp"]
             if extra_test_log_probs:
                 for ex_name, w_ex, lp_ex in extra_test_log_probs:
                     if len(lp_ex) == self.N_test and w_ex > 0.0:
                         logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
                         weights_map[ex_name] = float(w_ex)
+            if extra_unseen_log_probs:
+                for ex_name, w_ex, lp_ex in extra_unseen_log_probs:
+                    if len(lp_ex) == len(self.y_unseen) and w_ex > 0.0:
+                        logit_flat_u += float(w_ex) * log_softmax(lp_ex, axis=1)
             P_mix = softmax(logit_flat, axis=1)
+            self.P_mix_unseen = softmax(logit_flat_u, axis=1) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
             df_summary = pd.DataFrame([
                 {"model": m["name"], "tier": m["tier"], "prior_weight": m.get("prior_weight", m["weight"]), "learned_weight": m["weight"]}
                 for m in self.models
@@ -367,6 +377,7 @@ class UnseenStepwiseAuditor:
                 min_floor = 0.50 * prior_w
                 active_weights[idx] = max(active_weights[idx], min_floor)
 
+        logit_flat_u = np.zeros((len(self.y_unseen), K), dtype=np.float64) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
         for idx, m in enumerate(self.models):
             m["prior_weight"] = m.get("prior_weight", m["weight"])
             m["learned_weight"] = float(active_weights[idx])
@@ -374,6 +385,8 @@ class UnseenStepwiseAuditor:
             weights_map[m["name"]] = float(active_weights[idx])
             if active_weights[idx] > 0.0:
                 logit_flat += active_weights[idx] * m["test_lp"]
+                if len(m["unseen_lp"]) == len(self.y_unseen):
+                    logit_flat_u += active_weights[idx] * m["unseen_lp"]
 
         if extra_test_log_probs:
             for ex_name, w_ex, lp_ex in extra_test_log_probs:
@@ -381,7 +394,13 @@ class UnseenStepwiseAuditor:
                     logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
                     weights_map[ex_name] = float(w_ex)
 
+        if extra_unseen_log_probs:
+            for ex_name, w_ex, lp_ex in extra_unseen_log_probs:
+                if len(lp_ex) == len(self.y_unseen) and w_ex > 0.0:
+                    logit_flat_u += float(w_ex) * log_softmax(lp_ex, axis=1)
+
         P_mix = softmax(logit_flat, axis=1)
+        self.P_mix_unseen = softmax(logit_flat_u, axis=1) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
         df_summary = pd.DataFrame([
             {"model": m["name"], "tier": m["tier"], "prior_weight": m.get("prior_weight", m["weight"]), "learned_weight": m["weight"]}
             for m in self.models

@@ -39,16 +39,24 @@ def fit_joint_spectral_bank(
     plain_C: float = 0.04,
     center_C: float = 0.03,
     center_blend: float = 0.35,
-    max_cluster_size: int = 14
-) -> Tuple[np.ndarray, float]:
+    max_cluster_size: int = 14,
+    spectral_u_blocks: Optional[List[np.ndarray]] = None,
+    D_tfidf_u: Optional[np.ndarray] = None,
+    D_neural_sum_u: Optional[np.ndarray] = None,
+    D_neural_weight_total_u: float = 0.0,
+    N_unseen: int = 0,
+    return_unseen: bool = False,
+) -> Any:
     """
     Fits plain and prompt-centered logistic regressions on stacked unsupervised spectral features.
     Returns:
-    - P_spectral: (N_test, K) predicted probabilities
-    - oof_bacc: 5-fold GroupKFold balanced accuracy
+    - If return_unseen: (P_spectral, oof_bacc, P_spectral_u)
+    - Otherwise: (P_spectral, oof_bacc)
     """
     if len(spectral_tr_blocks) == 0:
-        return np.ones((N_test, K), dtype=np.float64) / float(K), 0.0
+        p_te = np.ones((N_test, K), dtype=np.float64) / float(K)
+        p_u = np.ones((N_unseen, K), dtype=np.float64) / float(K) if N_unseen > 0 else None
+        return (p_te, 0.0, p_u) if return_unseen else (p_te, 0.0)
 
     X_spec_tr = np.hstack(spectral_tr_blocks)
     X_spec_te = np.hstack(spectral_te_blocks)
@@ -101,5 +109,37 @@ def fit_joint_spectral_bank(
     lp_spec_joint = lp_spec_plain + center_blend * lp_spec_center
     P_spectral = softmax(lp_spec_joint, axis=1)
 
+    # Symmetrical evaluation on unseen holdout benchmark
+    P_spectral_u = None
+    if spectral_u_blocks and len(spectral_u_blocks) == len(spectral_tr_blocks) and N_unseen > 0:
+        X_spec_u = np.hstack(spectral_u_blocks)
+        lp_spec_u_plain = clf_plain.predict_log_proba(X_spec_u)
+        if hasattr(clf_plain, 'classes_'):
+            lp_spec_u_plain = align_cols(lp_spec_u_plain, [LABELS[c] for c in clf_plain.classes_])
+
+        X_spec_u_c = X_spec_u.copy()
+        D_neural_u = D_neural_sum_u / max(1e-6, D_neural_weight_total_u) if (D_neural_weight_total_u > 0 and D_neural_sum_u is not None) else (D_tfidf_u if D_tfidf_u is not None else np.zeros((N_unseen, N_unseen), dtype=np.float32))
+        D_hybrid_u = 0.55 * (D_tfidf_u if D_tfidf_u is not None else D_neural_u) + 0.45 * D_neural_u
+        if N_unseen >= 2 and D_hybrid_u.shape[0] == N_unseen:
+            g65_u = fcluster(linkage(squareform(D_hybrid_u, checks=False), method='average'), t=0.65, criterion='distance')
+            safe_groups_u = split_oversized_clusters_dist(D_hybrid_u, g65_u, max_cluster_size=max_cluster_size)
+            for g in np.unique(safe_groups_u):
+                mask = (safe_groups_u == g)
+                if mask.sum() > 1:
+                    X_spec_u_c[mask] -= X_spec_u_c[mask].mean(axis=0, keepdims=True)
+                else:
+                    X_spec_u_c[mask] = 0.0
+        else:
+            X_spec_u_c = np.zeros_like(X_spec_u)
+
+        lp_spec_u_center = clf_center.predict_log_proba(X_spec_u_c)
+        if hasattr(clf_center, 'classes_'):
+            lp_spec_u_center = align_cols(lp_spec_u_center, [LABELS[c] for c in clf_center.classes_])
+
+        lp_spec_u_joint = lp_spec_u_plain + center_blend * lp_spec_u_center
+        P_spectral_u = softmax(lp_spec_u_joint, axis=1)
+
+    if return_unseen:
+        return P_spectral, oof_bacc, P_spectral_u
     return P_spectral, oof_bacc
 
