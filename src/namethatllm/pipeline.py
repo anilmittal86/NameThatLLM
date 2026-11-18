@@ -163,14 +163,27 @@ def _combine_plain_and_twin_lp(
     w_twin: float,
 ) -> np.ndarray:
     """
-    Combines plain and prompt-centered twin log-probabilities without compressing
-    logit temperature on singleton rows (where lp_twin == 0):
-        log_softmax(lp_plain + (w_twin / w_plain) * lp_twin)
+    Combines plain and prompt-centered twin log-probabilities proportionally:
+    On rows where lp_twin is active (non-zero), blends with weights (w_plain, w_twin)
+    and normalizes via log_softmax. On singleton rows where lp_twin is zero,
+    scales by w_plain / (w_plain + w_twin) so downstream multiplication by (w_plain + w_twin)
+    yields the exact w_plain * lp_plain contribution.
     """
+    lp_p = log_softmax(lp_plain, axis=1)
     if lp_twin is None or w_twin <= 0.0 or len(lp_twin) != len(lp_plain):
-        return log_softmax(lp_plain, axis=1)
-    ratio = float(w_twin) / max(float(w_plain), 1e-6)
-    return log_softmax(lp_plain + ratio * lp_twin, axis=1)
+        return lp_p
+    w_tot = float(w_plain) + float(w_twin)
+    if w_tot <= 1e-8:
+        return lp_p
+    has_twin = np.ptp(lp_twin, axis=1) > 1e-6
+    out = np.empty_like(lp_p, dtype=np.float64)
+    # Singletons: scale so w_tot * out == w_plain * lp_p
+    out[~has_twin] = (float(w_plain) / w_tot) * lp_p[~has_twin]
+    # Multi-sample clusters: exact weighted log-probability sum
+    if has_twin.any():
+        lp_t = log_softmax(lp_twin[has_twin], axis=1)
+        out[has_twin] = (float(w_plain) * lp_p[has_twin] + float(w_twin) * lp_t) / w_tot
+    return out.astype(np.float32)
 
 def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.DataFrame, Path]:
     """
@@ -218,16 +231,18 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     N_test = len(test_texts)
     print(f"[Pipeline] Loaded test set: {N_test} rows")
 
-    # Build Zero-Leakage Unseen Holdout Benchmark (N_unseen = 360 rows) if enable_ablation_probe is True
+    # Build Zero-Leakage Unseen Holdout Benchmark (N_unseen = 1800 rows default) if enable_ablation_probe is True
     if enable_ablation_probe and not is_smoke:
-        df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=20)
+        df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=int(cfg.get("unseen_samples_per_class", 100)))
         unseen_parquet_path = working_dir / "unseen_holdout.parquet"
         df_unseen.to_parquet(unseen_parquet_path, index=False)
         unseen_texts = df_unseen["text"].fillna("").astype(str).tolist() if len(df_unseen) > 0 else []
         N_unseen = len(unseen_texts)
         y_unseen = np.array([LAB2I[m] for m in df_unseen["model"].values], dtype=int) if N_unseen > 0 else np.array([], dtype=int)
         if N_unseen > 0:
-            if "prompt_id" in df_unseen.columns:
+            if "cluster_id" in df_unseen.columns:
+                groups_unseen = df_unseen["cluster_id"].values
+            elif "prompt_id" in df_unseen.columns:
                 groups_unseen = df_unseen["prompt_id"].values
             elif "prompt_canon" in df_unseen.columns:
                 groups_unseen = (pd.factorize(df_unseen["prompt_canon"])[0] + 1).astype(int)
@@ -283,6 +298,22 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         D_tfidf_u = _load_optional_npy(working_dir / "D_tfidf_unseen.npy")
         log_p_handwriting_unseen = _load_optional_npy(working_dir / "log_p_handwriting_unseen.npy")
         rule_flags_unseen = _load_optional_npy(working_dir / "rule_flags_unseen.npy")
+
+        if unseen_log_p_svc_main.shape[0] != N_unseen or log_p_svc_main.shape[0] != N_test:
+            print(f"[Pipeline] Subprocess lexical cache shape mismatch (test: {log_p_svc_main.shape[0]} vs {N_test}, unseen: {unseen_log_p_svc_main.shape[0]} vs {N_unseen}). Falling back to in-process run_lexical_engine...")
+            tok_paths = list(input_dir.rglob("vocab.json"))
+            qwen_tok_dir = str(tok_paths[0].parent) if tok_paths else ""
+            lex_out = run_lexical_engine(train_path, test_path, all_pool_files or pool_file, qwen_tok_dir, working_dir)
+            log_p_svc_main = lex_out["log_p_svc_main"]
+            p_lex_comp = lex_out["p_lex_comp"]
+            D_tfidf = lex_out["D_tfidf"]
+            log_p_handwriting = lex_out.get("log_p_handwriting")
+            rule_flags_test = lex_out.get("rule_flags_test")
+            unseen_log_p_svc_main = lex_out.get("unseen_log_p_svc_main", np.zeros((0, K), dtype=np.float32))
+            unseen_p_lex_comp = lex_out.get("unseen_p_lex_comp", np.zeros((0, K), dtype=np.float32))
+            D_tfidf_u = lex_out.get("D_tfidf_unseen")
+            log_p_handwriting_unseen = lex_out.get("log_p_handwriting_unseen")
+            rule_flags_unseen = lex_out.get("rule_flags_unseen")
     else:
         print("[Pipeline] Module 1: Executing run_lexical_engine directly...")
         tok_paths = list(input_dir.rglob("vocab.json"))
@@ -680,9 +711,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                             P_p_acc = np.zeros((N_test, K), dtype=np.float64)
                             P_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            P_u_p_acc = np.zeros((N_unseen, K), dtype=np.float64)
+                            P_u_c_acc = np.zeros((N_unseen, K), dtype=np.float64)
                             has_any_c = False
                             Z_te = None
                             Z_tr = None
+                            Z_unseen = None
                             print(f"[Pipeline] {opt_14b_key}: extracting & averaging across {num_14b_folds} fold adapters...")
 
                             for f_idx, f_dir in enumerate(fold_dirs_14b):
@@ -701,24 +735,43 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 f_labels = f_meta["labels"]
 
                                 if is_last:
-                                    Z_te_tr = trunk1.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
-                                    f_Z_te = Z_te_tr[:N_test]
-                                    Z_tr = Z_te_tr[N_test:]
+                                    Z_all_f = trunk1.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_all_f[:N_test]
+                                    f_Z_u = Z_all_f[N_test : N_test + N_unseen]
+                                    Z_tr = Z_all_f[N_test + N_unseen :]
                                     Z_te = f_Z_te
-                                    del Z_te_tr
+                                    Z_unseen = f_Z_u
+                                    if N_unseen > 0:
+                                        features_unseen_dict[opt_14b_key] = Z_unseen.astype(np.float16)
+                                    del Z_all_f
                                 else:
-                                    f_Z_te = trunk1.extract_exact(test_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    Z_te_u = trunk1.extract_exact(test_texts + unseen_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_u[:N_test]
+                                    f_Z_u = Z_te_u[N_test : N_test + N_unseen]
+                                    del Z_te_u
+
+                                if f_idx == 0 or is_last:
+                                    update_hybrid_groups(f_Z_te, prior_scales.get(opt_14b_key, 0.50), f_Z_u if N_unseen > 0 else None)
 
                                 if f_W_p is not None:
                                     p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
                                     P_p_acc += p_fold / num_14b_folds
+                                    if N_unseen > 0 and f_Z_u is not None and len(f_Z_u) == N_unseen:
+                                        p_u_fold = softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1)
+                                        P_u_p_acc += p_u_fold / num_14b_folds
+
                                 if f_W_c is not None:
                                     has_any_c = True
                                     c_blend_f = compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
                                     P_c_acc += softmax(c_blend_f, axis=1) / num_14b_folds
+                                    if N_unseen > 0 and f_Z_u is not None and len(f_Z_u) == N_unseen:
+                                        c_u_blend_f = compute_multires_centered_blend(f_Z_u, tracker_unseen.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
+                                        P_u_c_acc += softmax(c_u_blend_f, axis=1) / num_14b_folds
 
                                 trunk1.restore_weights(f_backup)
                                 del f_backup, f_heads_sd, f_Z_te
+                                if "f_Z_u" in locals():
+                                    del f_Z_u
                                 gc.collect()
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
@@ -726,6 +779,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             trunk1.set_final_norm(False)
                             lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0))
                             lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            if N_unseen > 0:
+                                lp_u_p = np.log(np.clip(P_u_p_acc, 1e-9, 1.0))
+                                lp_u_c = np.log(np.clip(P_u_c_acc, 1e-9, 1.0)) if has_any_c else None
+                                lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
                             gate_passed = True
                             backup_t1_ts = None
                         else:
@@ -778,15 +835,23 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                         gate_passed = False
 
                             if gate_passed:
+                                pr_sc = prior_scales.get(opt_14b_key, 0.50)
+                                update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
                                 lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
                                 if W_c is not None:
                                     lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts14_labels, weights=(w85, w72, w60))
                                 else:
                                     lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                                if N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                                    lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
+                                    if W_c is not None:
+                                        lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ts14_labels, weights=(w85, w72, w60))
+                                        lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
+                                    else:
+                                        lp_u = lp_u_p if lp_u_p is not None else np.zeros((0, K), dtype=np.float32)
 
                         if gate_passed:
                             pr_sc = prior_scales.get(opt_14b_key, 0.50)
-                            update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
                             if num_14b_folds > 1:
                                 comp_lora_posteriors.append((w_comp_p, P_p_acc))
                                 if has_any_c:
@@ -1223,9 +1288,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                             P_p_acc = np.zeros((N_test, K), dtype=np.float64)
                             P_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                            P_u_p_acc = np.zeros((N_unseen, K), dtype=np.float64)
+                            P_u_c_acc = np.zeros((N_unseen, K), dtype=np.float64)
                             has_any_c = False
                             Z_te = None
                             Z_tr = None
+                            Z_unseen = None
                             print(f"[Pipeline] {opt_8b_key}: extracting & averaging across {num_8b_folds} fold adapters...")
 
                             for f_idx, f_dir in enumerate(fold_dirs_8b):
@@ -1244,24 +1312,43 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 f_labels = f_meta["labels"]
 
                                 if is_last:
-                                    Z_te_tr = trunk3.extract_exact(test_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
-                                    f_Z_te = Z_te_tr[:N_test]
-                                    Z_tr = Z_te_tr[N_test:]
+                                    Z_all_f = trunk3.extract_exact(test_texts + unseen_texts + train_sub_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_all_f[:N_test]
+                                    f_Z_u = Z_all_f[N_test : N_test + N_unseen]
+                                    Z_tr = Z_all_f[N_test + N_unseen :]
                                     Z_te = f_Z_te
-                                    del Z_te_tr
+                                    Z_unseen = f_Z_u
+                                    if N_unseen > 0:
+                                        features_unseen_dict[opt_8b_key] = Z_unseen.astype(np.float16)
+                                    del Z_all_f
                                 else:
-                                    f_Z_te = trunk3.extract_exact(test_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    Z_te_u = trunk3.extract_exact(test_texts + unseen_texts, batch_size=8, end_id=f_meta["end_id"])
+                                    f_Z_te = Z_te_u[:N_test]
+                                    f_Z_u = Z_te_u[N_test : N_test + N_unseen]
+                                    del Z_te_u
+
+                                if f_idx == 0 or is_last:
+                                    update_hybrid_groups(f_Z_te, prior_scales.get(opt_8b_key, 0.40), f_Z_u if N_unseen > 0 else None)
 
                                 if f_W_p is not None:
                                     p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
                                     P_p_acc += p_fold / num_8b_folds
+                                    if N_unseen > 0 and f_Z_u is not None and len(f_Z_u) == N_unseen:
+                                        p_u_fold = softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1)
+                                        P_u_p_acc += p_u_fold / num_8b_folds
+
                                 if f_W_c is not None:
                                     has_any_c = True
                                     c_blend_f = compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
                                     P_c_acc += softmax(c_blend_f, axis=1) / num_8b_folds
+                                    if N_unseen > 0 and f_Z_u is not None and len(f_Z_u) == N_unseen:
+                                        c_u_blend_f = compute_multires_centered_blend(f_Z_u, tracker_unseen.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
+                                        P_u_c_acc += softmax(c_u_blend_f, axis=1) / num_8b_folds
 
                                 trunk3.restore_weights(f_backup)
                                 del f_backup, f_heads_sd, f_Z_te
+                                if "f_Z_u" in locals():
+                                    del f_Z_u
                                 gc.collect()
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
@@ -1269,6 +1356,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             trunk3.set_final_norm(False)
                             lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0))
                             lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else np.zeros((N_test, K), dtype=np.float32)
+                            if N_unseen > 0:
+                                lp_u_p = np.log(np.clip(P_u_p_acc, 1e-9, 1.0))
+                                lp_u_c = np.log(np.clip(P_u_c_acc, 1e-9, 1.0)) if has_any_c else None
+                                lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
                             gate_passed = True
                             backup_t3_ts = None
                         else:
@@ -1321,11 +1412,21 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                         gate_passed = False
 
                             if gate_passed:
+                                def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
+                                pr_sc = prior_scales.get(opt_8b_key, def_pr)
+                                update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
                                 lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
                                 if W_c is not None:
                                     lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts8_labels, weights=(w85, w72, w60))
                                 else:
                                     lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                                if N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen:
+                                    lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
+                                    if W_c is not None:
+                                        lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ts8_labels, weights=(w85, w72, w60))
+                                        lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
+                                    else:
+                                        lp_u = lp_u_p if lp_u_p is not None else np.zeros((0, K), dtype=np.float32)
 
                         if gate_passed:
                             def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
@@ -1333,7 +1434,6 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             pr_sc = prior_scales.get(opt_8b_key, def_pr)
                             se_fl = se_floors.get(opt_8b_key, def_se)
 
-                            update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
                             if num_8b_folds > 1:
                                 comp_lora_posteriors.append((w_comp_p, P_p_acc))
                                 if has_any_c:
@@ -1770,22 +1870,31 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             "P_mix_unseen": P_mix_u.astype(np.float32) if len(P_mix_u) > 0 else np.zeros((0, K), dtype=np.float32),
             "P_final_unseen": P_final_u.astype(np.float32) if len(P_final_u) > 0 else np.zeros((0, K), dtype=np.float32),
             "test_texts": np.array(test_texts, dtype=object),
+            "unseen_texts": np.array(unseen_texts, dtype=object),
         }
         for idx, m in enumerate(auditor.models):
             cache_dict[f"m_{idx}_unseen_lp"] = m["unseen_lp"].astype(np.float32)
             cache_dict[f"m_{idx}_test_lp"] = m["test_lp"].astype(np.float32)
         if "rule_flags_test" in locals() and rule_flags_test is not None:
             cache_dict["rule_flags_test"] = rule_flags_test.astype(np.float32)
+        if "rule_flags_unseen" in locals() and rule_flags_unseen is not None:
+            cache_dict["rule_flags_unseen"] = rule_flags_unseen.astype(np.float32)
         if "log_p_handwriting" in locals() and log_p_handwriting is not None:
             cache_dict["log_p_handwriting"] = log_p_handwriting.astype(np.float32)
+        if "log_p_handwriting_unseen" in locals() and log_p_handwriting_unseen is not None:
+            cache_dict["log_p_handwriting_unseen"] = log_p_handwriting_unseen.astype(np.float32)
         if "claude_spec_logits" in locals() and claude_spec_logits is not None:
             cache_dict["claude_spec_logits"] = claude_spec_logits.astype(np.float32)
+        if "claude_spec_logits_u" in locals() and claude_spec_logits_u is not None:
+            cache_dict["claude_spec_logits_u"] = claude_spec_logits_u.astype(np.float32)
         if "claude_classes" in locals() and claude_classes is not None:
             cache_dict["claude_classes"] = np.array(claude_classes, dtype=object)
         for ex_idx, (ex_name, ex_w, ex_lp) in enumerate(extra_streams):
             cache_dict[f"extra_{ex_idx}_name"] = np.array([ex_name], dtype=object)
             cache_dict[f"extra_{ex_idx}_weight"] = np.array([ex_w], dtype=np.float64)
             cache_dict[f"extra_{ex_idx}_lp"] = ex_lp.astype(np.float32)
+        for ex_idx, (ex_name, ex_w, ex_lp_u) in enumerate(extra_streams_u):
+            cache_dict[f"extra_{ex_idx}_unseen_lp"] = ex_lp_u.astype(np.float32)
         cache_dict["num_extra"] = np.array([len(extra_streams)], dtype=np.int32)
 
         cache_file_path = working_dir / "local_eval_cache.npz"
@@ -1794,7 +1903,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
         # Export versioned, standardized benchmark feature bundle
         if len(features_unseen_dict) > 0 and N_unseen > 0:
-            version_str = config.get("version") or os.environ.get("EXPERIMENT_VERSION") or os.environ.get("PIPELINE_VERSION") or "latest"
+            version_str = cfg.get("version") or os.environ.get("EXPERIMENT_VERSION") or os.environ.get("PIPELINE_VERSION") or "latest"
             date_str = time.strftime("%Y%m%d")
             clean_v = version_str.lower() if version_str.lower().startswith("v") else f"v{version_str}"
             bundle_dir_name = f"{clean_v}_{date_str}"

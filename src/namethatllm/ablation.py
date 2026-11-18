@@ -12,6 +12,7 @@ those holdout passages from `lexical_engine.py` and `trainer.py`, and evaluates:
 import os
 import gc
 import hashlib
+import warnings
 from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Set
@@ -21,6 +22,7 @@ from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import balanced_accuracy_score
+from sklearn.model_selection import GroupKFold, KFold
 
 from .config import LABELS, K, LAB2I, softmax, log_softmax
 
@@ -50,7 +52,7 @@ def _text_hash(text: str) -> str:
 def build_unseen_holdout_dataset(
     input_dir: Path,
     train_path: Optional[Path] = None,
-    samples_per_class: int = 20,
+    samples_per_class: int = 100,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, Set[str]]:
     """
@@ -58,7 +60,7 @@ def build_unseen_holdout_dataset(
     1. Hashing all texts in `train.csv` and `pool_v4.parquet` (and `pool_v1.parquet`) as `contaminated_hashes`.
     2. Scanning `nlm_matched_clean.parquet`, `nlm_pool_v5.parquet`, and `openrouter-harvest`
        for passages whose text hash is strictly NOT in `contaminated_hashes`.
-    3. Sampling up to `samples_per_class` passages per class (e.g., 18 * 20 = 360 unseen passages)
+    3. Sampling up to `samples_per_class` passages per class (e.g., 18 * 100 = 1,800 unseen passages)
        and returning `(df_unseen, holdout_hashes)` so `lexical_engine.py` and `trainer.py`
        exclude `holdout_hashes` from training!
     """
@@ -77,10 +79,38 @@ def build_unseen_holdout_dataset(
                     df_bench = df_bench.dropna(subset=["text", "model"]).copy()
                     df_bench = df_bench[df_bench["model"].isin(LABELS)]
                     if len(df_bench) >= 180:
+                        needs_clustering = False
                         if "prompt_id" not in df_bench.columns and "prompt_canon" in df_bench.columns:
                             df_bench["prompt_id"] = df_bench["prompt_canon"]
-                        elif "prompt_id" not in df_bench.columns:
-                            df_bench["prompt_id"] = np.arange(len(df_bench))
+
+                        if "prompt_id" not in df_bench.columns:
+                            needs_clustering = True
+                        else:
+                            p_col = df_bench["prompt_id"]
+                            is_int = pd.api.types.is_integer_dtype(p_col) or (
+                                p_col.dropna().apply(lambda x: isinstance(x, (int, np.integer))).all()
+                                if len(p_col) > 0 else False
+                            )
+                            n_unique = p_col.nunique()
+                            if (not is_int) or (n_unique > 0.5 * len(df_bench)):
+                                needs_clustering = True
+
+                        if needs_clustering:
+                            try:
+                                tfidf = TfidfVectorizer(stop_words="english", max_features=10000, sublinear_tf=True)
+                                X_tfidf = tfidf.fit_transform(df_bench["text"].fillna("").tolist())
+                                D = 1.0 - (X_tfidf @ X_tfidf.T).toarray().clip(0.0, 1.0)
+                                np.fill_diagonal(D, 0.0)
+                                cond_d = squareform(D, checks=False)
+                                clusters = fcluster(linkage(cond_d, method="average"), t=0.85, criterion="distance")
+                            except Exception:
+                                clusters = np.arange(1, len(df_bench) + 1, dtype=int)
+                            df_bench["cluster_id"] = clusters
+                            df_bench["prompt_id"] = clusters
+                        else:
+                            if "cluster_id" not in df_bench.columns:
+                                df_bench["cluster_id"] = df_bench["prompt_id"]
+
                         df_bench["_hash"] = [_text_hash(t) for t in df_bench["text"]]
                         holdout_hashes = set(df_bench["_hash"])
                         print(f"[Unseen Benchmark] Loaded verified clean holdout benchmark: {len(df_bench)} rows across {len(set(df_bench['model']))} classes from {bench_p}")
@@ -181,12 +211,42 @@ def build_unseen_holdout_dataset(
     # Stratified balanced sampling across all 18 classes
     rng = np.random.RandomState(seed)
     sampled_parts = []
+
+    # Prompt-grouped sampling: if prompt_id exists with multi-model prompts, sample by prompt_id first
+    if "prompt_id" in df_pool_unseen.columns:
+        prompt_counts = df_pool_unseen.groupby("prompt_id")["model"].nunique()
+        multi_prompts = prompt_counts[prompt_counts > 1].index.tolist()
+        rng.shuffle(multi_prompts)
+
+        class_counts = {m: 0 for m in LABELS}
+        chosen_indices = []
+        for pid in multi_prompts:
+            sub_p = df_pool_unseen[df_pool_unseen["prompt_id"] == pid]
+            sub_m_counts = sub_p["model"].value_counts().to_dict()
+            if all(class_counts.get(m, 0) + c <= samples_per_class for m, c in sub_m_counts.items()):
+                chosen_indices.extend(sub_p.index.tolist())
+                for m, c in sub_m_counts.items():
+                    class_counts[m] = class_counts.get(m, 0) + c
+
+        if chosen_indices:
+            sampled_parts.append(df_pool_unseen.loc[chosen_indices])
+            rem_pool = df_pool_unseen.drop(index=chosen_indices)
+        else:
+            rem_pool = df_pool_unseen
+    else:
+        rem_pool = df_pool_unseen
+        class_counts = {m: 0 for m in LABELS}
+
+    # Fill remaining class quotas up to samples_per_class
     for m in LABELS:
-        sub = df_pool_unseen[df_pool_unseen["model"] == m]
-        if len(sub) > 0:
-            n_take = min(samples_per_class, len(sub))
-            idx = rng.choice(sub.index.values, size=n_take, replace=False)
-            sampled_parts.append(sub.loc[idx])
+        curr_cnt = class_counts.get(m, 0)
+        needed = samples_per_class - curr_cnt
+        if needed > 0:
+            sub = rem_pool[rem_pool["model"] == m]
+            if len(sub) > 0:
+                n_take = min(needed, len(sub))
+                idx = rng.choice(sub.index.values, size=n_take, replace=False)
+                sampled_parts.append(sub.loc[idx])
 
     if not sampled_parts:
         return pd.DataFrame(columns=["id", "prompt_id", "text", "model", "_hash"]), set()
@@ -287,10 +347,16 @@ class UnseenStepwiseAuditor:
             self.P_mix_unseen = np.zeros((0, K), dtype=np.float64)
             return np.ones((self.N_test, K), dtype=np.float64) / float(K), {}, pd.DataFrame()
 
+        extra_u_lp_base = np.zeros((len(self.y_unseen), K), dtype=np.float64)
+        if extra_unseen_log_probs and len(self.y_unseen) > 0:
+            for ex_name, w_ex, lp_ex in extra_unseen_log_probs:
+                if len(lp_ex) == len(self.y_unseen) and w_ex > 0.0:
+                    extra_u_lp_base += float(w_ex) * log_softmax(lp_ex, axis=1)
+
         if not optimize_on_unseen or len(self.y_unseen) < 36:
             weights_map = {m["name"]: m["weight"] for m in self.models}
             logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
-            logit_flat_u = np.zeros((len(self.y_unseen), K), dtype=np.float64) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
+            logit_flat_u = extra_u_lp_base.copy() if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
             for m in self.models:
                 logit_flat += m["weight"] * m["test_lp"]
                 if len(m["unseen_lp"]) == len(self.y_unseen):
@@ -300,10 +366,6 @@ class UnseenStepwiseAuditor:
                     if len(lp_ex) == self.N_test and w_ex > 0.0:
                         logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
                         weights_map[ex_name] = float(w_ex)
-            if extra_unseen_log_probs:
-                for ex_name, w_ex, lp_ex in extra_unseen_log_probs:
-                    if len(lp_ex) == len(self.y_unseen) and w_ex > 0.0:
-                        logit_flat_u += float(w_ex) * log_softmax(lp_ex, axis=1)
             P_mix = softmax(logit_flat, axis=1)
             self.P_mix_unseen = softmax(logit_flat_u, axis=1) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
             df_summary = pd.DataFrame([
@@ -312,11 +374,12 @@ class UnseenStepwiseAuditor:
             ])
             return P_mix, weights_map, df_summary
 
-        def _composite_obj(lp_mat: np.ndarray) -> Tuple[float, float]:
+        def _composite_obj(lp_mat: np.ndarray, y_target: Optional[np.ndarray] = None) -> Tuple[float, float]:
+            y_use = self.y_unseen if y_target is None else y_target
             P = softmax(lp_mat, axis=1)
             P_s = _ablation_sinkhorn(P, iters=60) if len(P) >= 18 else P
-            bacc = float(balanced_accuracy_score(self.y_unseen, P_s.argmax(axis=1)))
-            nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(self.y_unseen)), self.y_unseen], 1e-9, 1.0))))
+            bacc = float(balanced_accuracy_score(y_use, P_s.argmax(axis=1)))
+            nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(y_use)), y_use], 1e-9, 1.0))))
             return bacc - 0.015 * nll, bacc
 
         M = len(self.models)
@@ -325,7 +388,7 @@ class UnseenStepwiseAuditor:
         active_weights = np.zeros(M, dtype=np.float64)
         first_idx = order[0]
         active_weights[first_idx] = self.models[first_idx]["weight"]
-        cum_u_lp = active_weights[first_idx] * self.models[first_idx]["unseen_lp"]
+        cum_u_lp = extra_u_lp_base + active_weights[first_idx] * self.models[first_idx]["unseen_lp"]
         best_obj, best_bacc = _composite_obj(cum_u_lp)
 
         remaining = list(order[1:])
@@ -377,7 +440,7 @@ class UnseenStepwiseAuditor:
                 min_floor = 0.50 * prior_w
                 active_weights[idx] = max(active_weights[idx], min_floor)
 
-        logit_flat_u = np.zeros((len(self.y_unseen), K), dtype=np.float64) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
+        logit_flat_u = extra_u_lp_base.copy() if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
         for idx, m in enumerate(self.models):
             m["prior_weight"] = m.get("prior_weight", m["weight"])
             m["learned_weight"] = float(active_weights[idx])
@@ -394,10 +457,85 @@ class UnseenStepwiseAuditor:
                     logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
                     weights_map[ex_name] = float(w_ex)
 
-        if extra_unseen_log_probs:
-            for ex_name, w_ex, lp_ex in extra_unseen_log_probs:
-                if len(lp_ex) == len(self.y_unseen) and w_ex > 0.0:
-                    logit_flat_u += float(w_ex) * log_softmax(lp_ex, axis=1)
+        in_sample_bacc = _fast_sinkhorn_bacc(logit_flat_u, self.y_unseen, iters=200) if len(self.y_unseen) >= 18 else best_bacc
+
+        # 5-fold GroupKFold OOF Unseen BAcc calculation
+        oof_bacc = in_sample_bacc
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=UserWarning)
+                groups = self.groups_unseen if len(self.groups_unseen) == len(self.y_unseen) else np.arange(len(self.y_unseen))
+                n_groups = len(np.unique(groups))
+                if n_groups >= 2:
+                    n_splits = min(5, n_groups)
+                    gkf = GroupKFold(n_splits=n_splits)
+                    splits = list(gkf.split(self.y_unseen, self.y_unseen, groups=groups))
+                else:
+                    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+                    splits = list(kf.split(self.y_unseen))
+
+                oof_lp = np.zeros((len(self.y_unseen), K), dtype=np.float64)
+                for tr_idx, val_idx in splits:
+                    y_tr = self.y_unseen[tr_idx]
+                    ex_tr = extra_u_lp_base[tr_idx]
+                    ex_val = extra_u_lp_base[val_idx]
+
+                    fold_order = sorted(
+                        range(M),
+                        key=lambda i: _fast_sinkhorn_bacc(self.models[i]["unseen_lp"][tr_idx], y_tr, iters=40) if len(tr_idx) >= 18 else 0.0,
+                        reverse=True,
+                    )
+                    fold_w = np.zeros(M, dtype=np.float64)
+                    f_first = fold_order[0]
+                    fold_w[f_first] = self.models[f_first]["weight"]
+                    f_cum_lp = ex_tr + fold_w[f_first] * self.models[f_first]["unseen_lp"][tr_idx]
+                    f_obj, _ = _composite_obj(f_cum_lp, y_target=y_tr)
+
+                    f_rem = list(fold_order[1:])
+                    while f_rem:
+                        s_best_idx = None
+                        s_best_w = 0.0
+                        s_best_obj = f_obj
+                        for idx in f_rem:
+                            prior_w = self.models[idx]["weight"]
+                            u_lp_tr = self.models[idx]["unseen_lp"][tr_idx]
+                            for mult in multipliers:
+                                cand_w = prior_w * mult
+                                t_lp = f_cum_lp + cand_w * u_lp_tr
+                                obj_val, _ = _composite_obj(t_lp, y_target=y_tr)
+                                if obj_val > s_best_obj + 1e-6:
+                                    s_best_obj = obj_val
+                                    s_best_idx = idx
+                                    s_best_w = cand_w
+                        if s_best_idx is not None and s_best_w > 0.0:
+                            fold_w[s_best_idx] = s_best_w
+                            f_cum_lp = f_cum_lp + s_best_w * self.models[s_best_idx]["unseen_lp"][tr_idx]
+                            f_obj = s_best_obj
+                            f_rem.remove(s_best_idx)
+                        else:
+                            break
+
+                    for idx, m in enumerate(self.models):
+                        solo_acc_tr = _fast_sinkhorn_bacc(m["unseen_lp"][tr_idx], y_tr, iters=40) if len(tr_idx) >= 18 else 0.0
+                        prior_w = m.get("prior_weight", m["weight"])
+                        tier = str(m.get("tier", "main")).lower()
+                        if "main" in tier and solo_acc_tr >= 0.38:
+                            fold_w[idx] = max(fold_w[idx], 0.75 * prior_w)
+                        elif "comp" in tier and (solo_acc_tr >= 0.38 or (solo_acc_tr >= 0.28 and "spec" in m["name"].lower())):
+                            fold_w[idx] = max(fold_w[idx], 0.50 * prior_w)
+
+                    fold_val_lp = ex_val.copy()
+                    for idx, m in enumerate(self.models):
+                        if fold_w[idx] > 0.0:
+                            fold_val_lp += fold_w[idx] * m["unseen_lp"][val_idx]
+                    oof_lp[val_idx] = fold_val_lp
+
+                oof_bacc = _fast_sinkhorn_bacc(oof_lp, self.y_unseen, iters=200)
+        except Exception as e:
+            print(f"[Ablation Warning] OOF GroupKFold computation failed ({e}), using in-sample BAcc fallback.")
+            oof_bacc = in_sample_bacc
+
+        print(f"[Ablation] In-Sample Unseen BAcc: {in_sample_bacc:.4f} | 5-Fold GroupKFold OOF Unseen BAcc: {oof_bacc:.4f}")
 
         P_mix = softmax(logit_flat, axis=1)
         self.P_mix_unseen = softmax(logit_flat_u, axis=1) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)

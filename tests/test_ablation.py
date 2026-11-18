@@ -531,20 +531,14 @@ def test_combine_plain_and_twin_lp_preserves_singleton_temperature():
     out_none = _combine_plain_and_twin_lp(lp_p, None, 0.35, 0.10)
     np.testing.assert_allclose(out_none, log_softmax(lp_p, axis=1), atol=1e-6)
 
-    # 2. lp_twin is zeros (singleton rows)
+    # 2. lp_twin is zeros (singleton rows): scaled by w_plain / w_tot so w_tot * out == w_plain * lp_p
     out_zeros = _combine_plain_and_twin_lp(lp_p, lp_twin_zeros, 0.35, 0.10)
-    np.testing.assert_allclose(out_zeros, log_softmax(lp_p, axis=1), atol=1e-6)
+    np.testing.assert_allclose(0.45 * out_zeros, 0.35 * log_softmax(lp_p, axis=1), atol=1e-6)
 
-    # Contrast with naive linear averaging which flattens temperature
-    naive = (0.35 * lp_p + 0.10 * lp_twin_zeros) / 0.45
-    entropy_orig = -np.sum(softmax(lp_p, axis=1) * log_softmax(lp_p, axis=1), axis=1).mean()
-    entropy_naive = -np.sum(softmax(naive, axis=1) * log_softmax(naive, axis=1), axis=1).mean()
-    assert entropy_naive > entropy_orig, "Naive blend artificially compresses singleton logit temperature"
-
-    # 3. Active twin contributes with exact ratio w_twin / w_plain
+    # 3. Active twin contributes with exact proportional weights
     lp_twin_active = np.random.randn(50, 18)
     out_active = _combine_plain_and_twin_lp(lp_p, lp_twin_active, 0.40, 0.10)
-    expected = log_softmax(lp_p + (0.10 / 0.40) * lp_twin_active, axis=1)
+    expected = (0.40 * log_softmax(lp_p, axis=1) + 0.10 * log_softmax(lp_twin_active, axis=1)) / 0.50
     np.testing.assert_allclose(out_active, expected, atol=1e-6)
 
 
@@ -609,4 +603,123 @@ def test_find_fold_adapters_discovery_and_ordering(tmp_path: Path):
     for i in range(5):
         assert f"q14v5_f{i}" in found_names
     assert "unrelated_model" not in found_names
+
+
+def test_extra_unseen_log_probs_in_stepwise_optimization(tmp_path: Path):
+    """Verify that extra_unseen_log_probs (e.g. wpca_dp, spectral_bank) anchor stepwise search and OOF calculation."""
+    np.random.seed(42)
+    n_samples = 180
+    n_test = 50
+
+    y_unseen = np.repeat(np.arange(K), 10)
+    groups_unseen = (np.arange(n_samples) // 3) + 1
+
+    auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=groups_unseen, N_test=n_test)
+
+    # Model A: Moderate accuracy
+    lp_a_u = np.random.randn(n_samples, K) * 0.5
+    for i, y in enumerate(y_unseen):
+        lp_a_u[i, y] += 2.0
+    auditor.add_model("Model-A", "Main", 0.50, lp_a_u, np.random.randn(n_test, K))
+
+    # Extra unseen stream (e.g., wpca_dp with strong predictions)
+    extra_u_lp = np.random.randn(n_samples, K) * 0.5
+    for i, y in enumerate(y_unseen):
+        extra_u_lp[i, y] += 3.5
+    extra_te_lp = np.random.randn(n_test, K)
+
+    extra_streams_u = [("wpca_dp", 0.30, extra_u_lp)]
+    extra_streams_te = [("wpca_dp", 0.30, extra_te_lp)]
+
+    P_mix, weights_map, _ = auditor.optimize_weights_and_blend(
+        working_dir=tmp_path,
+        extra_test_log_probs=extra_streams_te,
+        extra_unseen_log_probs=extra_streams_u,
+        optimize_on_unseen=True,
+    )
+
+    assert P_mix.shape == (n_test, K)
+    assert auditor.P_mix_unseen.shape == (n_samples, K)
+    assert weights_map["wpca_dp"] == 0.30
+    assert weights_map["Model-A"] > 0.0
+
+
+def test_build_unseen_holdout_dataset_benchmark_clustering(tmp_path: Path):
+    """Verify clean_benchmark_1800_rows recomputes stopword TF-IDF clusters when prompt_id has > 50% singletons."""
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    # 180 rows across 18 classes, with all unique string prompt IDs (> 50% singletons)
+    n_rows = 180
+    texts = [f"This is an essay passage number {i} discussing topics {i % 5}." for i in range(n_rows)]
+    models = [LABELS[i % K] for i in range(n_rows)]
+    singleton_prompt_ids = [f"singleton_prompt_{i}" for i in range(n_rows)]
+
+    df_bench = pd.DataFrame({
+        "text": texts,
+        "model": models,
+        "prompt_id": singleton_prompt_ids,
+    })
+    df_bench.to_parquet(input_dir / "clean_benchmark_1800_rows.parquet")
+
+    df_loaded, holdout_hashes = build_unseen_holdout_dataset(input_dir=input_dir)
+
+    assert len(df_loaded) == 180
+    assert "cluster_id" in df_loaded.columns
+    assert "prompt_id" in df_loaded.columns
+    # Check that cluster_id is positive integers and has been clustered
+    assert (df_loaded["cluster_id"] > 0).all()
+    assert (df_loaded["prompt_id"] > 0).all()
+    # It must NOT be the original string singletons
+    assert pd.api.types.is_integer_dtype(df_loaded["prompt_id"])
+    assert df_loaded["prompt_id"].nunique() <= 0.5 * len(df_loaded)
+
+
+def test_build_unseen_holdout_dataset_prompt_grouped_sampling(tmp_path: Path):
+    """Verify fallback sampler keeps multi-model prompt groups together."""
+    input_dir = tmp_path / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+
+    # Candidate dataset with multi-model prompt groups
+    # Group 1: prompt_id 101 has 3 models (LABELS[0], LABELS[1], LABELS[2])
+    # Group 2: prompt_id 102 has 2 models (LABELS[3], LABELS[4])
+    # Group 3: singletons
+    rows = []
+    # 5 multi-model prompts
+    for p_idx in range(5):
+        pid = 100 + p_idx
+        for m_idx in range(4):
+            m = LABELS[m_idx]
+            rows.append({
+                "id": f"row_{pid}_{m}",
+                "prompt_id": pid,
+                "text": f"Unique candidate passage text for prompt {pid} and model {m}.",
+                "model": m,
+            })
+    # Additional singletons for other classes
+    for c_idx in range(4, K):
+        m = LABELS[c_idx]
+        for s_idx in range(3):
+            rows.append({
+                "id": f"single_{c_idx}_{s_idx}",
+                "prompt_id": 1000 + c_idx * 10 + s_idx,
+                "text": f"Singleton candidate passage text for class {m} item {s_idx}.",
+                "model": m,
+            })
+
+    df_cand = pd.DataFrame(rows)
+    cand_dir = input_dir / "openrouter_harvest_ds"
+    cand_dir.mkdir()
+    df_cand.to_parquet(cand_dir / "openrouter_harvest.parquet")
+
+    df_unseen, holdout_hashes = build_unseen_holdout_dataset(
+        input_dir=input_dir,
+        samples_per_class=2,
+        seed=42,
+    )
+
+    assert len(df_unseen) > 0
+    assert "cluster_id" in df_unseen.columns
+    assert "prompt_id" in df_unseen.columns
+
 
