@@ -235,3 +235,69 @@ def scores_exact_dp(U_test: np.ndarray, groups: np.ndarray, prm: dict, D_dist: n
         else:
             lp_dp[idx_g] = solver.group(U_test[idx_g], temperature=Tg)
     return lp_dp
+
+
+def save_wpca_params(prm: dict, path: Any):
+    """Serializes fitted wPCA Gaussian whitener parameters to safetensors."""
+    from pathlib import Path
+    import torch
+    from safetensors.torch import save_file
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sd = {
+        "mx": torch.from_numpy(np.asarray(prm["mx"], dtype=np.float32)),
+        "sx": torch.from_numpy(np.asarray(prm["sx"], dtype=np.float32)),
+        "W": torch.from_numpy(np.asarray(prm["W"], dtype=np.float32)),
+        "m": torch.from_numpy(np.asarray(prm["m"], dtype=np.float32)),
+        "lam": torch.from_numpy(np.asarray(prm["lam"], dtype=np.float32)),
+        "V_top64": torch.from_numpy(np.asarray(prm["V_top64"], dtype=np.float32)),
+        "scalars": torch.tensor([float(prm.get("T1", 2.40)), float(prm.get("Tg", 2.35)), float(prm.get("ae", 0.10))], dtype=torch.float32),
+    }
+    save_file(sd, str(path))
+
+
+def load_wpca_params(path: Any) -> dict:
+    """Loads fitted wPCA parameters from safetensors."""
+    from pathlib import Path
+    from safetensors.torch import load_file
+
+    sd = load_file(str(path))
+    sc = sd["scalars"].cpu().numpy()
+    return {
+        "mx": sd["mx"].cpu().numpy(),
+        "sx": sd["sx"].cpu().numpy(),
+        "W": sd["W"].cpu().numpy(),
+        "m": sd["m"].cpu().numpy().astype(np.float64),
+        "lam": sd["lam"].cpu().numpy().astype(np.float64),
+        "V_top64": sd["V_top64"].cpu().numpy(),
+        "T1": float(sc[0]),
+        "Tg": float(sc[1]),
+        "ae": float(sc[2]),
+    }
+
+
+def train_and_save_wpca(
+    Z_train: np.ndarray,
+    y_train: np.ndarray,
+    prompts_train: np.ndarray,
+    output_path: Any,
+    d_target: int = 256,
+    se_floor: float = 0.10,
+) -> dict:
+    """
+    Fits within-prompt whitened PCA (wPCA) on pre-extracted feature matrix and saves to safetensors.
+    Zero GPU requirements; executes on CPU in seconds.
+    """
+    print(f"[wPCA Trainer] Fitting wPCA on shape {Z_train.shape} with {len(np.unique(prompts_train))} prompt groups...")
+    prm = fit_shared_gaussian_lowram(
+        X_tr_f32=np.asarray(Z_train, dtype=np.float32),
+        y=np.asarray(y_train, dtype=int),
+        prompts=np.asarray(prompts_train),
+        d_target=d_target,
+        se_floor=se_floor,
+    )
+    save_wpca_params(prm, output_path)
+    print(f"[wPCA Trainer] Saved fitted wPCA parameters to {output_path}")
+    return prm
+

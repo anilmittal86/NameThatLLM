@@ -137,7 +137,8 @@
       "plain_C": 0.04,
       "center_C": 0.03,
       "center_blend": 0.35
-    }
+    },
+    "extract_train_wpca": false
   },
   "fusion": {
     "main_ratio": 0.85,

@@ -15,7 +15,9 @@ from namethatllm.wpca_gaussian import (
     transform_lowram,
     ExactAuthorPosterior,
     split_oversized_clusters_dist,
-    scores_exact_dp
+    scores_exact_dp,
+    train_and_save_wpca,
+    load_wpca_params,
 )
 from namethatllm.config import K
 
@@ -115,6 +117,29 @@ class TestWPCAGaussian(unittest.TestCase):
         lp_dp = scores_exact_dp(U_test, groups, prm, D)
         self.assertEqual(lp_dp.shape, (N, K))
         self.assertFalse(np.isnan(lp_dp).any())
+
+    def test_train_and_save_wpca_serialization(self):
+        import tempfile
+        from pathlib import Path
+
+        np.random.seed(42)
+        N, D = 90, 64
+        Z = np.random.randn(N, D).astype(np.float32)
+        y = np.tile(np.arange(18), 5)
+        prompts = np.repeat(np.arange(5), 18)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "wpca_head.safetensors"
+            prm = train_and_save_wpca(Z, y, prompts, out_path, d_target=32, se_floor=0.15)
+            self.assertTrue(out_path.exists())
+
+            loaded_prm = load_wpca_params(out_path)
+            self.assertEqual(loaded_prm["W"].shape, prm["W"].shape)
+            self.assertEqual(loaded_prm["m"].shape, prm["m"].shape)
+            self.assertTrue(np.allclose(loaded_prm["mx"], prm["mx"], atol=1e-5))
+            self.assertTrue(np.allclose(loaded_prm["W"], prm["W"], atol=1e-5))
+            self.assertAlmostEqual(loaded_prm["T1"], 2.40, places=5)
+            self.assertAlmostEqual(loaded_prm["Tg"], 2.35, places=5)
 
 if __name__ == "__main__":
     unittest.main()
