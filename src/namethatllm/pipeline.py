@@ -46,9 +46,17 @@ from .wpca_gaussian import (
     fit_shared_gaussian_lowram,
     transform_lowram,
     split_oversized_clusters_dist,
-    scores_exact_dp
+    scores_exact_dp,
+    load_wpca_bundle,
+    save_wpca_bundle
 )
-from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
+from .spectral_bank import (
+    fit_joint_spectral_bank,
+    make_spectral_blocks,
+    project_spectral_block,
+    load_spectral_params,
+    predict_spectral_bank
+)
 from .postprocess import (
     blend_main_and_complementary,
     apply_claude_specialist_gate,
@@ -493,24 +501,99 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     prompts_sub: np.ndarray = np.array([])
     N_tr_sub: int = 0
 
-    if has_neural and extract_train_wpca and df_train is not None:
+    if has_neural:
         import torch
 
-        rng = np.random.RandomState(42)
-        u_p = df_train["prompt_id"].unique()
-        sel_prompts = rng.choice(u_p, size=min(90, len(u_p)), replace=False)
-        sub_idx = df_train[df_train["prompt_id"].isin(sel_prompts)].index.values
-        train_sub = df_train.loc[sub_idx].reset_index(drop=True)
-        train_sub_texts = train_sub["text"].fillna("").astype(str).tolist()
-        y_sub = np.array([LAB2I[m] for m in train_sub["model"]])
-        prompts_sub = train_sub["prompt_id"].values
-        N_tr_sub = len(train_sub)
-        print(f"[Pipeline] Selected {N_tr_sub} training rows ({len(sel_prompts)} prompts) for wPCA")
+        if extract_train_wpca and df_train is not None:
+            rng = np.random.RandomState(42)
+            u_p = df_train["prompt_id"].unique()
+            sel_prompts = rng.choice(u_p, size=min(90, len(u_p)), replace=False)
+            sub_idx = df_train[df_train["prompt_id"].isin(sel_prompts)].index.values
+            train_sub = df_train.loc[sub_idx].reset_index(drop=True)
+            train_sub_texts = train_sub["text"].fillna("").astype(str).tolist()
+            y_sub = np.array([LAB2I[m] for m in train_sub["model"]])
+            prompts_sub = train_sub["prompt_id"].values
+            N_tr_sub = len(train_sub)
+            print(f"[Pipeline] Selected {N_tr_sub} training rows ({len(sel_prompts)} prompts) for wPCA")
 
-        spectral_blocks_tr: List[np.ndarray] = []
-        spectral_blocks_te: List[np.ndarray] = []
-        dp_posteriors: List[Tuple[float, np.ndarray]] = []
-        comp_lora_posteriors: List[Tuple[float, np.ndarray]] = []
+        # Discover pre-trained wPCA bundle
+        wpca_bundle = None
+        wpca_candidates = [
+            working_dir / "wpca_bundle.safetensors",
+            Path("local_data/statistical_heads/wpca_bundle.safetensors"),
+            Path("/kaggle/input/ntl-statistical-heads/wpca_bundle.safetensors"),
+        ]
+        if Path("/kaggle/input").exists():
+            for p in Path("/kaggle/input").rglob("wpca_bundle.safetensors"):
+                if p not in wpca_candidates:
+                    wpca_candidates.append(p)
+        for cand in wpca_candidates:
+            if cand.exists():
+                try:
+                    wpca_bundle = load_wpca_bundle(cand)
+                    print(f"[Pipeline] Loaded pre-trained wPCA bundle from {cand}")
+                    break
+                except Exception as e:
+                    print(f"[Pipeline] Note: Could not load candidate wPCA bundle {cand}: {e}")
+
+        # Discover pre-trained Spectral Bank params
+        spectral_params = None
+        spectral_candidates = [
+            working_dir / "spectral_heads.safetensors",
+            Path("local_data/statistical_heads/spectral_heads.safetensors"),
+            Path("/kaggle/input/ntl-statistical-heads/spectral_heads.safetensors"),
+        ]
+        if Path("/kaggle/input").exists():
+            for p in Path("/kaggle/input").rglob("spectral_heads.safetensors"):
+                if p not in spectral_candidates:
+                    spectral_candidates.append(p)
+        for cand in spectral_candidates:
+            if cand.exists():
+                try:
+                    spectral_params = load_spectral_params(cand)
+                    print(f"[Pipeline] Loaded pre-trained Spectral Bank params from {cand}")
+                    break
+                except Exception as e:
+                    print(f"[Pipeline] Note: Could not load candidate Spectral Bank params {cand}: {e}")
+
+        wpca_bundle_export: Dict[str, dict] = {}
+
+        def apply_wpca_and_spectral(
+            model_key: str,
+            Z_te_mat: np.ndarray,
+            Z_tr_mat: np.ndarray,
+            Z_u_mat: Optional[np.ndarray],
+            dp_w: float,
+            prior_scale: float,
+            d_target: int = 256,
+            se_floor: float = 0.10,
+        ) -> None:
+            res = None
+            if wpca_bundle is not None and model_key in wpca_bundle:
+                res = wpca_bundle[model_key]
+            elif len(Z_tr_mat) > 0:
+                res = fit_shared_gaussian_lowram(Z_tr_mat, y_sub, prompts_sub, d_target=d_target, se_floor=se_floor)
+                wpca_bundle_export[model_key] = res
+
+            if res is not None:
+                U_te = transform_lowram(Z_te_mat, res)
+                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res, tracker_test.D_hybrid)
+                dp_posteriors.append((dp_w, softmax(lp_dp, axis=1)))
+
+                S_te = project_spectral_block(Z_te_mat, res, prior_scale)
+                spectral_blocks_te.append(S_te)
+                if len(Z_tr_mat) > 0:
+                    S_tr = project_spectral_block(Z_tr_mat, res, prior_scale)
+                    spectral_blocks_tr.append(S_tr)
+
+                if N_unseen > 0 and Z_u_mat is not None and len(Z_u_mat) == N_unseen:
+                    U_u = transform_lowram(Z_u_mat, res)
+                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res, tracker_unseen.D_hybrid)
+                    dp_posteriors_u.append((dp_w, softmax(lp_dp_u, axis=1)))
+                    S_u = project_spectral_block(Z_u_mat, res, prior_scale)
+                    spectral_blocks_u.append(S_u)
+                    del U_u
+                del res, U_te
 
         # ==============================================================================
         # TRUNK 1: Qwen3-14B (40 layers, hidden=5120)
@@ -574,24 +657,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
                 # wPCA + DP Posterior + Spectral Bank (Symmetric test and unseen)
-                if len(Z_tr) > 0:
-                    res_p2 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_14b_p2", 0.10))
-                    U_te = transform_lowram(Z_te, res_p2)
-                    lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_p2, tracker_test.D_hybrid)
-                    dp_posteriors.append((dp_weights.get("q3_14b", 0.38), softmax(lp_dp, axis=1)))
-
-                    S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_p2, prior_scales.get("qwen3_14b_p2", 1.00))
-                    spectral_blocks_tr.append(S_tr)
-                    spectral_blocks_te.append(S_te)
-
-                    if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
-                        U_u = transform_lowram(Z_unseen, res_p2)
-                        lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_p2, tracker_unseen.D_hybrid)
-                        dp_posteriors_u.append((dp_weights.get("q3_14b", 0.38), softmax(lp_dp_u, axis=1)))
-                        _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_p2, prior_scales.get("qwen3_14b_p2", 1.00))
-                        spectral_blocks_u.append(S_u)
-                        del U_u
-                    del res_p2, U_te
+                apply_wpca_and_spectral(
+                    model_key="qwen3_14b_p2",
+                    Z_te_mat=Z_te,
+                    Z_tr_mat=Z_tr,
+                    Z_u_mat=Z_unseen if N_unseen > 0 else None,
+                    dp_w=dp_weights.get("q3_14b", 0.38),
+                    prior_scale=prior_scales.get("qwen3_14b_p2", 1.00),
+                    d_target=256,
+                    se_floor=se_floors.get("qwen3_14b_p2", 0.10)
+                )
 
                 trunk1.restore_weights(backup_t1)
                 del backup_t1, Z_all, Z_tr, Z_te, heads_sd
@@ -703,31 +778,24 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if W_c is not None:
                                 comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-                            if len(Z_tr) > 0:
-                                def_dp_14b = 0.08 if opt_14b_key == "qwen3_14b_p1" else 0.10
-                                def_se_14b = 0.35 if opt_14b_key == "qwen3_14b_p1" else 0.25
-                                res_ts14 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_14b_key, def_se_14b))
-                                U_te = transform_lowram(Z_te, res_ts14)
-                                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_ts14, tracker_test.D_hybrid)
-                                dp_posteriors.append((dp_weights.get(opt_14b_key, dp_weights.get("part1_14b" if opt_14b_key == "qwen3_14b_p1" else "q3_14b_ts", def_dp_14b)), softmax(lp_dp, axis=1)))
-
-                                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts14, pr_sc)
-                                spectral_blocks_tr.append(S_tr)
-                                spectral_blocks_te.append(S_te)
-
-                                if N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen:
-                                    U_u = transform_lowram(Z_unseen, res_ts14)
-                                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_ts14, tracker_unseen.D_hybrid)
-                                    dp_posteriors_u.append((dp_weights.get(opt_14b_key, dp_weights.get("part1_14b" if opt_14b_key == "qwen3_14b_p1" else "q3_14b_ts", def_dp_14b)), softmax(lp_dp_u, axis=1)))
-                                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ts14, pr_sc)
-                                    spectral_blocks_u.append(S_u)
-                                    del U_u
-                                del res_ts14, U_te
+                            def_dp_14b = 0.08 if opt_14b_key == "qwen3_14b_p1" else 0.10
+                            def_se_14b = 0.35 if opt_14b_key == "qwen3_14b_p1" else 0.25
+                            dp_w_14b = dp_weights.get(opt_14b_key, dp_weights.get("part1_14b" if opt_14b_key == "qwen3_14b_p1" else "q3_14b_ts", def_dp_14b))
+                            apply_wpca_and_spectral(
+                                model_key=opt_14b_key,
+                                Z_te_mat=Z_te,
+                                Z_tr_mat=Z_tr,
+                                Z_u_mat=Z_unseen if (N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen) else None,
+                                dp_w=dp_w_14b,
+                                prior_scale=pr_sc,
+                                d_target=256,
+                                se_floor=se_floors.get(opt_14b_key, def_se_14b)
+                            )
 
                             if lp_p is not None:
-                                w_tot_ts14 = w_comp_p + (w_comp_c if (has_any_c if num_14b_folds > 1 else W_c is not None) else 0.0)
+                                w_tot_ts14 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
                                 lp_m_u = lp_u if N_unseen > 0 and 'lp_u' in locals() else np.zeros((0, K), dtype=np.float32)
-                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if (has_any_c if num_14b_folds > 1 else W_c is not None) else None, w_comp_p, w_comp_c)
+                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c)
                                 aud_name_14b = "Qwen3-14B Part-1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
                                 auditor.add_model(name=aud_name_14b, tier="Comp", weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
@@ -815,24 +883,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     aud_name = "Qwen2.5-14B Part-2" if q25_key == "qwen25_14b_p2" else "Qwen2.5-14B In-House"
                     auditor.add_model(aud_name, tier="Main", weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
-                if len(Z_tr) > 0:
-                    res_q25 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(q25_key, 0.10))
-                    U_te = transform_lowram(Z_te, res_q25)
-                    lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_q25, tracker_test.D_hybrid)
-                    dp_posteriors.append((dp_weights.get("q25_14b", 0.24), softmax(lp_dp, axis=1)))
-
-                    S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_q25, prior_scales.get(q25_key, 0.85))
-                    spectral_blocks_tr.append(S_tr)
-                    spectral_blocks_te.append(S_te)
-
-                    if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
-                        U_u = transform_lowram(Z_unseen, res_q25)
-                        lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_q25, tracker_unseen.D_hybrid)
-                        dp_posteriors_u.append((dp_weights.get("q25_14b", 0.24), softmax(lp_dp_u, axis=1)))
-                        _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_q25, prior_scales.get(q25_key, 0.85))
-                        spectral_blocks_u.append(S_u)
-                        del U_u
-                    del res_q25, U_te
+                apply_wpca_and_spectral(
+                    model_key=q25_key,
+                    Z_te_mat=Z_te,
+                    Z_tr_mat=Z_tr,
+                    Z_u_mat=Z_unseen if N_unseen > 0 else None,
+                    dp_w=dp_weights.get("q25_14b", 0.24),
+                    prior_scale=prior_scales.get(q25_key, 0.85),
+                    d_target=256,
+                    se_floor=se_floors.get(q25_key, 0.10)
+                )
 
                 trunk2.restore_weights(backup_t2)
                 trunk2.set_final_norm(False)
@@ -949,24 +1009,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                             lp_u_c = np.zeros((0, K), dtype=np.float32)
 
-                        if len(Z_tr) > 0:
-                            res_ins = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("instyle", 0.35))
-                            U_te = transform_lowram(Z_te, res_ins)
-                            lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_ins, tracker_test.D_hybrid)
-                            dp_posteriors.append((dp_weights.get("instyle", 0.10), softmax(lp_dp, axis=1)))
-
-                            S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ins, prior_scales.get("instyle", 0.45))
-                            spectral_blocks_tr.append(S_tr)
-                            spectral_blocks_te.append(S_te)
-
-                            if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
-                                U_u = transform_lowram(Z_unseen, res_ins)
-                                lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_ins, tracker_unseen.D_hybrid)
-                                dp_posteriors_u.append((dp_weights.get("instyle", 0.10), softmax(lp_dp_u, axis=1)))
-                                _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ins, prior_scales.get("instyle", 0.45))
-                                spectral_blocks_u.append(S_u)
-                                del U_u
-                            del res_ins, U_te
+                        apply_wpca_and_spectral(
+                            model_key="instyle",
+                            Z_te_mat=Z_te,
+                            Z_tr_mat=Z_tr,
+                            Z_u_mat=Z_unseen if N_unseen > 0 else None,
+                            dp_w=dp_weights.get("instyle", 0.10),
+                            prior_scale=prior_scales.get("instyle", 0.45),
+                            d_target=256,
+                            se_floor=se_floors.get("instyle", 0.35)
+                        )
 
                         if W_p is not None and lp_p is not None:
                             w_tot_ins = w_comp_p + (w_comp_c if W_c is not None else 0.0)
@@ -1181,25 +1233,17 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 if W_c is not None:
                                     comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-                            if len(Z_tr) > 0:
-                                res_ts8 = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_fl)
-                                U_te = transform_lowram(Z_te, res_ts8)
-                                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_ts8, tracker_test.D_hybrid)
-                                dp_posteriors.append((dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10)), softmax(lp_dp, axis=1)))
-
-                                S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_ts8, pr_sc)
-                                spectral_blocks_tr.append(S_tr)
-                                spectral_blocks_te.append(S_te)
-
-                                if N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen:
-                                    U_u = transform_lowram(Z_unseen, res_ts8)
-                                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_ts8, tracker_unseen.D_hybrid)
-                                    dp_posteriors_u.append((dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10)), softmax(lp_dp_u, axis=1)))
-                                    _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_ts8, pr_sc)
-                                    spectral_blocks_u.append(S_u)
-                                    del U_u
-
-                                del res_ts8, U_te
+                            dp_w_8b = dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10))
+                            apply_wpca_and_spectral(
+                                model_key=opt_8b_key,
+                                Z_te_mat=Z_te,
+                                Z_tr_mat=Z_tr,
+                                Z_u_mat=Z_unseen if (N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen) else None,
+                                dp_w=dp_w_8b,
+                                prior_scale=pr_sc,
+                                d_target=256,
+                                se_floor=se_fl
+                            )
 
                             if lp_p is not None:
                                 w_tot_ts8 = w_comp_p + (w_comp_c if (has_any_c if num_8b_folds > 1 else W_c is not None) else 0.0)
@@ -1326,24 +1370,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     lp_m_te = _combine_plain_and_twin_lp(lp_p, twin_c_te, w_comp_p, w_comp_c)
                     auditor.add_model("Qwen3-8B Claude Head", tier="Comp", weight=w_tot_cl, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
-                if len(Z_tr) > 0:
-                    res_cl = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("qwen3_8b_claude", 0.35))
-                    U_te = transform_lowram(Z_te, res_cl)
-                    lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_cl, tracker_test.D_hybrid)
-                    dp_posteriors.append((dp_weights.get("claude_8b", 0.04), softmax(lp_dp, axis=1)))
-
-                    S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_cl, prior_scales.get("qwen3_8b_claude", 0.30))
-                    spectral_blocks_tr.append(S_tr)
-                    spectral_blocks_te.append(S_te)
-
-                    if N_unseen > 0 and Z_unseen is not None and len(Z_unseen) == N_unseen:
-                        U_u = transform_lowram(Z_unseen, res_cl)
-                        lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_cl, tracker_unseen.D_hybrid)
-                        dp_posteriors_u.append((dp_weights.get("claude_8b", 0.04), softmax(lp_dp_u, axis=1)))
-                        _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_cl, prior_scales.get("qwen3_8b_claude", 0.30))
-                        spectral_blocks_u.append(S_u)
-                        del U_u
-                    del res_cl, U_te
+                apply_wpca_and_spectral(
+                    model_key="qwen3_8b_claude",
+                    Z_te_mat=Z_te,
+                    Z_tr_mat=Z_tr,
+                    Z_u_mat=Z_unseen if N_unseen > 0 else None,
+                    dp_w=dp_weights.get("claude_8b", 0.04),
+                    prior_scale=prior_scales.get("qwen3_8b_claude", 0.30),
+                    d_target=256,
+                    se_floor=se_floors.get("qwen3_8b_claude", 0.35)
+                )
 
                 merge_lora(trunk3.model, claude_dir, sign=-1.0)
                 del Z_all, Z_tr, Z_te
@@ -1406,24 +1442,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 aud_name = "DeBERTa-v3-Large" if deb_key == "deberta_p2" else "DeBERTa-InHouse"
                 auditor.add_model(aud_name, tier="Main", weight=w_tot_deb, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
-            if len(Z_tr_deb) > 0:
-                res_deb = fit_shared_gaussian_lowram(Z_tr_deb, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(deb_key, 0.10))
-                U_te = transform_lowram(Z_te_deb, res_deb)
-                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_deb, tracker_test.D_hybrid)
-                dp_posteriors.append((dp_weights.get("deberta", 0.20), softmax(lp_dp, axis=1)))
-
-                S_tr, S_te = make_spectral_blocks(Z_tr_deb, Z_te_deb, res_deb, prior_scales.get(deb_key, 0.80))
-                spectral_blocks_tr.append(S_tr)
-                spectral_blocks_te.append(S_te)
-
-                if N_unseen > 0 and Z_unseen_deb is not None and len(Z_unseen_deb) == N_unseen:
-                    U_u = transform_lowram(Z_unseen_deb, res_deb)
-                    lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_deb, tracker_unseen.D_hybrid)
-                    dp_posteriors_u.append((dp_weights.get("deberta", 0.20), softmax(lp_dp_u, axis=1)))
-                    _, S_u = make_spectral_blocks(Z_tr_deb, Z_unseen_deb, res_deb, prior_scales.get(deb_key, 0.80))
-                    spectral_blocks_u.append(S_u)
-                    del U_u
-                del res_deb, U_te
+            apply_wpca_and_spectral(
+                model_key=deb_key,
+                Z_te_mat=Z_te_deb,
+                Z_tr_mat=Z_tr_deb,
+                Z_u_mat=Z_unseen_deb if N_unseen > 0 else None,
+                dp_w=dp_weights.get("deberta", 0.20),
+                prior_scale=prior_scales.get(deb_key, 0.80),
+                d_target=256,
+                se_floor=se_floors.get(deb_key, 0.10)
+            )
 
             del Z_tr_deb, Z_te_deb, Z_test_all
             if "Z_unseen_deb" in locals():
@@ -1550,24 +1578,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 if W_c is not None:
                     comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-                if len(Z_tr) > 0:
-                    res_opt = fit_shared_gaussian_lowram(Z_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get(opt_key, 0.25))
-                    U_te = transform_lowram(Z_te, res_opt)
-                    lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_opt, tracker_test.D_hybrid)
-                    dp_posteriors.append((dp_weights.get(opt_key, 0.05), softmax(lp_dp, axis=1)))
-
-                    S_tr, S_te = make_spectral_blocks(Z_tr, Z_te, res_opt, pr_sc)
-                    spectral_blocks_tr.append(S_tr)
-                    spectral_blocks_te.append(S_te)
-
-                    if N_unseen > 0 and "Z_unseen" in locals() and len(Z_unseen) == N_unseen:
-                        U_u = transform_lowram(Z_unseen, res_opt)
-                        lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_opt, tracker_unseen.D_hybrid)
-                        dp_posteriors_u.append((dp_weights.get(opt_key, 0.05), softmax(lp_dp_u, axis=1)))
-                        _, S_u = make_spectral_blocks(Z_tr, Z_unseen, res_opt, pr_sc)
-                        spectral_blocks_u.append(S_u)
-                        del U_u
-                    del res_opt, U_te
+                apply_wpca_and_spectral(
+                    model_key=opt_key,
+                    Z_te_mat=Z_te,
+                    Z_tr_mat=Z_tr,
+                    Z_u_mat=Z_unseen if (N_unseen > 0 and 'Z_unseen' in locals() and len(Z_unseen) == N_unseen) else None,
+                    dp_w=dp_weights.get(opt_key, 0.05),
+                    prior_scale=pr_sc,
+                    d_target=256,
+                    se_floor=se_floors.get(opt_key, 0.25)
+                )
 
                 if W_p is not None and lp_p is not None:
                     w_tot = w_comp_p + (w_comp_c if W_c is not None else 0.0)
@@ -1648,24 +1668,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     lp_c_blend = compute_multires_centered_blend(Z_bge_te, tracker_test.groups, W_c, b_c, LABELS, weights=(w85, w72, w60))
                     comp_lora_posteriors.append((w_bge_c, softmax(lp_c_blend, axis=1)))
 
-                if len(Z_bge_tr) > 0:
-                    res_bge = fit_shared_gaussian_lowram(Z_bge_tr, y_sub, prompts_sub, d_target=256, se_floor=se_floors.get("bge_m3", 0.20))
-                    U_te = transform_lowram(Z_bge_te, res_bge)
-                    lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res_bge, tracker_test.D_hybrid)
-                    dp_posteriors.append((dp_weights.get("bge_m3", 0.10), softmax(lp_dp, axis=1)))
-
-                    S_tr, S_te = make_spectral_blocks(Z_bge_tr, Z_bge_te, res_bge, pr_sc)
-                    spectral_blocks_tr.append(S_tr)
-                    spectral_blocks_te.append(S_te)
-
-                    if N_unseen > 0 and len(Z_bge_u) == N_unseen:
-                        U_u = transform_lowram(Z_bge_u, res_bge)
-                        lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res_bge, tracker_unseen.D_hybrid)
-                        dp_posteriors_u.append((dp_weights.get("bge_m3", 0.10), softmax(lp_dp_u, axis=1)))
-                        _, S_u = make_spectral_blocks(Z_bge_tr, Z_bge_u, res_bge, pr_sc)
-                        spectral_blocks_u.append(S_u)
-                        del U_u
-                    del res_bge, U_te
+                apply_wpca_and_spectral(
+                    model_key="bge_m3",
+                    Z_te_mat=Z_bge_te,
+                    Z_tr_mat=Z_bge_tr,
+                    Z_u_mat=Z_bge_u if N_unseen > 0 else None,
+                    dp_w=dp_weights.get("bge_m3", 0.10),
+                    prior_scale=pr_sc,
+                    d_target=256,
+                    se_floor=se_floors.get("bge_m3", 0.20)
+                )
 
                 if W_p is not None and lp_p_bge is not None:
                     w_tot_bge = w_bge_p + (w_bge_c if W_c is not None else 0.0)
@@ -1696,15 +1708,39 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             P_dp_comb = sum(w * P_dp for w, P_dp in dp_posteriors) / max(1e-8, tot_dp_w)
             COMP_LIST.append((comp_streams.get("dp_posteriors", 0.30), P_dp_comb))
 
-        # Fit Joint Spectral Bank
+        # Export fitted wPCA bundle if any models were fitted from scratch
+        if len(wpca_bundle_export) > 0 and not (working_dir / "wpca_bundle.safetensors").exists():
+            try:
+                save_wpca_bundle(wpca_bundle_export, working_dir / "wpca_bundle.safetensors")
+            except Exception as e:
+                print(f"[Pipeline] Note: Could not export wpca_bundle: {e}")
+
+        # Joint Spectral Bank (Predict from pre-trained params or fit)
         P_spectral = None
         P_spectral_u = None
-        if spectral_blocks_tr and spectral_blocks_te:
-            sb_cfg = comp_cfg.get("spectral_bank", {})
-            plain_C = sb_cfg.get("plain_C", 0.04)
-            center_C = sb_cfg.get("center_C", 0.03)
-            center_blend = sb_cfg.get("center_blend", 0.35)
+        sb_cfg = comp_cfg.get("spectral_bank", {})
+        plain_C = sb_cfg.get("plain_C", 0.04)
+        center_C = sb_cfg.get("center_C", 0.03)
+        center_blend = sb_cfg.get("center_blend", 0.35)
 
+        if spectral_params is not None and spectral_blocks_te:
+            print("[Pipeline] Computing Spectral Bank inference from pre-trained parameters...")
+            P_spectral, P_spectral_u = predict_spectral_bank(
+                params=spectral_params,
+                spectral_te_blocks=spectral_blocks_te,
+                spectral_u_blocks=spectral_blocks_u if spectral_blocks_u else None,
+                D_tfidf=tracker_test.D_tfidf,
+                D_neural_sum=tracker_test.D_neural_sum,
+                D_neural_weight_total=tracker_test.D_neural_weight_total,
+                D_tfidf_u=tracker_unseen.D_tfidf,
+                D_neural_sum_u=tracker_unseen.D_neural_sum,
+                D_neural_weight_total_u=tracker_unseen.D_neural_weight_total,
+                N_test=N_test,
+                N_unseen=N_unseen,
+                max_cluster_size=max_cl,
+            )
+            COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))
+        elif spectral_blocks_tr and spectral_blocks_te:
             P_spectral, oof_score, P_spectral_u = fit_joint_spectral_bank(
                 spectral_tr_blocks=spectral_blocks_tr,
                 spectral_te_blocks=spectral_blocks_te,
@@ -1724,6 +1760,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 center_blend=center_blend,
                 max_cluster_size=max_cl,
                 return_unseen=True,
+                save_path=working_dir / "spectral_heads.safetensors",
             )
             print(f"[Pipeline] Joint Spectral Bank fitted (OOF BAcc = {oof_score:.4f})")
             COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))

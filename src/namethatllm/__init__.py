@@ -12,6 +12,10 @@ from .config import (
 )
 from .lexical_engine import (
     run_lexical_engine,
+    train_lexical_engine,
+    save_lexical_bundle,
+    load_lexical_bundle,
+    predict_lexical_engine,
     extract_handwriting_features,
     extract_handwriting_and_orthographic_features,
     fit_handwriting_model,
@@ -37,9 +41,21 @@ from .wpca_gaussian import (
     transform_lowram,
     ExactAuthorPosterior,
     split_oversized_clusters_dist,
-    scores_exact_dp
+    scores_exact_dp,
+    train_and_save_wpca,
+    load_wpca_params,
+    save_wpca_bundle,
+    load_wpca_bundle,
 )
-from .spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
+from .spectral_bank import (
+    fit_joint_spectral_bank,
+    make_spectral_blocks,
+    project_spectral_block,
+    save_spectral_params,
+    load_spectral_params,
+    train_and_save_spectral_bank,
+    predict_spectral_bank,
+)
 from .trainer import (
     MultiLayerLoRAClassifier,
     compute_two_stage_loss,
@@ -67,13 +83,16 @@ __all__ = [
     "__version__",
     "LABELS", "K", "LAB2I", "FAMILIES", "align_cols", "log_softmax", "softmax",
     "resolve_dataset_paths", "resolve_all_pool_files", "validate_production_assets",
-    "run_lexical_engine", "extract_handwriting_features", "extract_handwriting_and_orthographic_features",
+    "run_lexical_engine", "train_lexical_engine", "save_lexical_bundle", "load_lexical_bundle", "predict_lexical_engine",
+    "extract_handwriting_features", "extract_handwriting_and_orthographic_features",
     "fit_handwriting_model", "shape_text", "function_text", "FUNCTION_WORDS", "STOP_WORDS",
     "forward_and_pool_batch", "load_head_file", "resolve_head_tensors", "merge_lora", "in_place_copy",
     "compute_centered_logits", "UniversalLoRATrunkLoader", "read_checkpoint_meta", "extract_deberta_checkpoint",
     "fit_shared_gaussian_lowram", "transform_lowram", "ExactAuthorPosterior",
-    "split_oversized_clusters_dist", "scores_exact_dp",
-    "fit_joint_spectral_bank", "make_spectral_blocks",
+    "split_oversized_clusters_dist", "scores_exact_dp", "train_and_save_wpca", "load_wpca_params",
+    "save_wpca_bundle", "load_wpca_bundle",
+    "fit_joint_spectral_bank", "make_spectral_blocks", "project_spectral_block", "save_spectral_params",
+    "load_spectral_params", "train_and_save_spectral_bank", "predict_spectral_bank",
     "MultiLayerLoRAClassifier", "compute_two_stage_loss", "PromptGroupBatchSampler",
     "export_compatible_checkpoint", "run_training_pipeline",
     "blend_main_and_complementary", "apply_claude_specialist_gate",

@@ -301,3 +301,54 @@ def train_and_save_wpca(
     print(f"[wPCA Trainer] Saved fitted wPCA parameters to {output_path}")
     return prm
 
+
+def save_wpca_bundle(bundle: Dict[str, dict], path: Any):
+    """Serializes a dictionary of {model_key: wpca_params} to a single safetensors file."""
+    from pathlib import Path
+    import torch
+    from safetensors.torch import save_file
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sd = {}
+    for model_key, prm in bundle.items():
+        sd[f"{model_key}__mx"] = torch.from_numpy(np.asarray(prm["mx"], dtype=np.float32))
+        sd[f"{model_key}__sx"] = torch.from_numpy(np.asarray(prm["sx"], dtype=np.float32))
+        sd[f"{model_key}__W"] = torch.from_numpy(np.asarray(prm["W"], dtype=np.float32))
+        sd[f"{model_key}__m"] = torch.from_numpy(np.asarray(prm["m"], dtype=np.float32))
+        sd[f"{model_key}__lam"] = torch.from_numpy(np.asarray(prm["lam"], dtype=np.float32))
+        sd[f"{model_key}__V_top64"] = torch.from_numpy(np.asarray(prm["V_top64"], dtype=np.float32))
+        sd[f"{model_key}__scalars"] = torch.tensor(
+            [float(prm.get("T1", 2.40)), float(prm.get("Tg", 2.35)), float(prm.get("ae", 0.10))],
+            dtype=torch.float32
+        )
+    save_file(sd, str(path))
+    sz_mb = path.stat().st_size / (1024 * 1024)
+    print(f"[wPCA] Saved {len(bundle)} models to wPCA bundle at {path} ({sz_mb:.2f} MB)")
+
+
+def load_wpca_bundle(path: Any) -> Dict[str, dict]:
+    """Loads all model wPCA parameters from a single safetensors file."""
+    from safetensors.torch import load_file
+    sd = load_file(str(path))
+    model_keys = set()
+    for k in sd.keys():
+        if "__" in k:
+            model_keys.add(k.split("__")[0])
+    bundle = {}
+    for mk in sorted(model_keys):
+        sc = sd[f"{mk}__scalars"].cpu().numpy()
+        bundle[mk] = {
+            "mx": sd[f"{mk}__mx"].cpu().numpy(),
+            "sx": sd[f"{mk}__sx"].cpu().numpy(),
+            "W": sd[f"{mk}__W"].cpu().numpy(),
+            "m": sd[f"{mk}__m"].cpu().numpy().astype(np.float64),
+            "lam": sd[f"{mk}__lam"].cpu().numpy().astype(np.float64),
+            "V_top64": sd[f"{mk}__V_top64"].cpu().numpy(),
+            "T1": float(sc[0]),
+            "Tg": float(sc[1]),
+            "ae": float(sc[2]),
+        }
+    print(f"[wPCA] Loaded {len(bundle)} models from wPCA bundle at {path}: {list(bundle.keys())}")
+    return bundle
+

@@ -18,6 +18,8 @@ from namethatllm.wpca_gaussian import (
     scores_exact_dp,
     train_and_save_wpca,
     load_wpca_params,
+    save_wpca_bundle,
+    load_wpca_bundle,
 )
 from namethatllm.config import K
 
@@ -138,8 +140,31 @@ class TestWPCAGaussian(unittest.TestCase):
             self.assertEqual(loaded_prm["m"].shape, prm["m"].shape)
             self.assertTrue(np.allclose(loaded_prm["mx"], prm["mx"], atol=1e-5))
             self.assertTrue(np.allclose(loaded_prm["W"], prm["W"], atol=1e-5))
-            self.assertAlmostEqual(loaded_prm["T1"], 2.40, places=5)
-            self.assertAlmostEqual(loaded_prm["Tg"], 2.35, places=5)
+
+    def test_save_load_wpca_bundle(self):
+        import tempfile
+        from pathlib import Path
+
+        np.random.seed(42)
+        bundle_to_save = {}
+        for m_name in ["qwen3_14b", "deberta_v3", "bge_m3"]:
+            Z = np.random.randn(36, 32).astype(np.float32)
+            y = np.tile(np.arange(18), 2)
+            prompts = np.repeat(np.arange(2), 18)
+            bundle_to_save[m_name] = fit_shared_gaussian_lowram(Z, y, prompts, d_target=16, se_floor=0.10)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_path = Path(tmpdir) / "wpca_bundle.safetensors"
+            save_wpca_bundle(bundle_to_save, bundle_path)
+            self.assertTrue(bundle_path.exists())
+
+            loaded_bundle = load_wpca_bundle(bundle_path)
+            self.assertEqual(set(loaded_bundle.keys()), {"qwen3_14b", "deberta_v3", "bge_m3"})
+            for mk in bundle_to_save:
+                self.assertEqual(loaded_bundle[mk]["W"].shape, bundle_to_save[mk]["W"].shape)
+                self.assertTrue(np.allclose(loaded_bundle[mk]["W"], bundle_to_save[mk]["W"], atol=1e-5))
+            self.assertAlmostEqual(loaded_bundle["qwen3_14b"]["T1"], 2.40, places=5)
+            self.assertAlmostEqual(loaded_bundle["qwen3_14b"]["Tg"], 2.35, places=5)
 
 if __name__ == "__main__":
     unittest.main()

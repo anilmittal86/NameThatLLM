@@ -6,7 +6,14 @@ Unit and Integration Tests for namethatllm.spectral_bank
 import unittest
 import numpy as np
 
-from namethatllm.spectral_bank import fit_joint_spectral_bank, make_spectral_blocks
+from namethatllm.spectral_bank import (
+    fit_joint_spectral_bank,
+    make_spectral_blocks,
+    project_spectral_block,
+    train_and_save_spectral_bank,
+    load_spectral_params,
+    predict_spectral_bank,
+)
 from namethatllm.wpca_gaussian import fit_shared_gaussian_lowram
 from namethatllm.config import K, PRIOR_SCALES
 
@@ -78,6 +85,33 @@ class TestSpectralBank(unittest.TestCase):
         self.assertEqual(P_spec.shape, (N_te, 18))
         self.assertTrue(np.allclose(P_spec.sum(axis=1), 1.0))
         self.assertGreater(oof_bacc, 0.0)
+
+    def test_spectral_bank_train_save_predict_serialization(self):
+        import tempfile
+        from pathlib import Path
+
+        np.random.seed(42)
+        N_tr, N_te, d = 90, 15, 64
+        tr_blocks = [np.random.randn(N_tr, d).astype(np.float32) for _ in range(2)]
+        te_blocks = [np.random.randn(N_te, d).astype(np.float32) for _ in range(2)]
+        prompts_sub = np.repeat(np.arange(5), 18)
+        y_sub = np.tile(np.arange(18), 5)
+
+        D_tfidf = np.random.uniform(0.1, 0.9, size=(N_te, N_te))
+        np.fill_diagonal(D_tfidf, 0.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "spectral_heads.safetensors"
+            prm = train_and_save_spectral_bank(tr_blocks, y_sub, prompts_sub, out_path)
+            self.assertTrue(out_path.exists())
+
+            loaded_prm = load_spectral_params(out_path)
+            self.assertEqual(loaded_prm["W_plain"].shape, (18, 128))
+            self.assertEqual(loaded_prm["W_center"].shape, (18, 128))
+
+            P_pred = predict_spectral_bank(te_blocks, loaded_prm, D_tfidf=D_tfidf)
+            self.assertEqual(P_pred.shape, (N_te, 18))
+            self.assertTrue(np.allclose(P_pred.sum(axis=1), 1.0, atol=1e-5))
 
 if __name__ == "__main__":
     unittest.main()

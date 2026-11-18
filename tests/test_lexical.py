@@ -9,7 +9,16 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
-from namethatllm.lexical_engine import shape_text, function_text, STOP_WORDS, run_lexical_engine
+from namethatllm.lexical_engine import (
+    shape_text,
+    function_text,
+    STOP_WORDS,
+    run_lexical_engine,
+    train_lexical_engine,
+    save_lexical_bundle,
+    load_lexical_bundle,
+    predict_lexical_engine
+)
 from namethatllm.config import LABELS, K
 
 class TestLexicalEngine(unittest.TestCase):
@@ -122,6 +131,60 @@ class TestLexicalEngine(unittest.TestCase):
         self.assertEqual(rules[0, 0], 0.0)  # No curly quotes in sample 0
         self.assertEqual(rules[1, 0], 1.0)  # Curly apostrophe \u2019 triggers Rule 1
         self.assertEqual(rules[1, 3], 1.0)  # Curly contraction triggers Rule 4
+
+    def test_train_save_load_predict_lexical_bundle(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bundle_file = tmp_path / "lexical_bundle.joblib"
+
+            # Create mock data
+            fit_texts = [f"This is sample document number {i} authored by target model." for i in range(54)]
+            fit_y = np.array([i % K for i in range(54)])
+            fit_sw = np.ones(54, dtype=np.float32)
+            df_tr = pd.DataFrame({"prompt_id": [i % 6 for i in range(54)], "model": [LABELS[i % K] for i in range(54)]})
+
+            # Train bundle
+            bundle = train_lexical_engine(fit_texts, fit_y, fit_sw, df_tr=df_tr)
+            self.assertIn("vectorizers_4v", bundle)
+            self.assertIn("svc_main", bundle)
+            self.assertIn("lr_distort", bundle)
+            self.assertIn("v_5th", bundle)
+
+            # Save and Load
+            save_lexical_bundle(bundle, bundle_file)
+            self.assertTrue(bundle_file.exists())
+            loaded_bundle = load_lexical_bundle(bundle_file)
+
+            # Predict
+            test_texts = [f"Mystery document {j} for testing lexical bundle inference." for j in range(12)]
+            unseen_texts = [f"Unseen holdout document {k} for auditing." for k in range(8)]
+            preds = predict_lexical_engine(
+                bundle=loaded_bundle,
+                test_texts=test_texts,
+                unseen_texts=unseen_texts,
+                working_dir=tmp_path
+            )
+
+            self.assertEqual(preds["log_p_svc_main"].shape, (12, K))
+            self.assertEqual(preds["p_lex_comp"].shape, (12, K))
+            self.assertEqual(preds["unseen_log_p_svc_main"].shape, (8, K))
+            self.assertEqual(preds["unseen_p_lex_comp"].shape, (8, K))
+            self.assertTrue(np.allclose(preds["p_lex_comp"].sum(axis=1), 1.0))
+            self.assertTrue(np.allclose(preds["unseen_p_lex_comp"].sum(axis=1), 1.0))
+
+            # Auto-discovery test via run_lexical_engine
+            # Provide dummy test.csv, no train.csv required when bundle exists!
+            te_csv = tmp_path / "test.csv"
+            pd.DataFrame({"text": test_texts}).to_csv(te_csv, index=False)
+            auto_preds = run_lexical_engine(
+                train_path=None,
+                test_path=te_csv,
+                bundle_path=bundle_file,
+                working_dir=tmp_path
+            )
+            self.assertEqual(auto_preds["log_p_svc_main"].shape, (12, K))
+            np.testing.assert_allclose(auto_preds["p_lex_comp"], preds["p_lex_comp"], atol=1e-5)
 
 if __name__ == "__main__":
     unittest.main()

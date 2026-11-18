@@ -13,19 +13,28 @@ from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import GroupKFold
 from sklearn.linear_model import LogisticRegression
 
-from .config import LABELS, K, align_cols, softmax
+from .config import LABELS, K, align_cols, softmax, log_softmax
 from .wpca_gaussian import split_oversized_clusters_dist
+
+def project_spectral_block(Z: np.ndarray, res: dict, prior_scale: float) -> np.ndarray:
+    """
+    Projects a single representation matrix onto unsupervised within-prompt V_top64
+    and scales by out-of-sample prior scale.
+    """
+    if len(Z) == 0:
+        d_out = res["V_top64"].shape[1] if "V_top64" in res else 64
+        return np.zeros((0, d_out), dtype=np.float32)
+    mx, sx, V64 = res["mx"], res["sx"], res["V_top64"]
+    S = (((Z - mx) / sx) @ V64).astype(np.float32)
+    return (S / np.linalg.norm(S, axis=1, keepdims=True).clip(min=1e-6)) * float(prior_scale)
+
 
 def make_spectral_blocks(Z_tr: np.ndarray, Z_te: np.ndarray, res: dict, prior_scale: float) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Projects train and test features onto V_top64 and scales by out-of-sample prior scale.
+    Backward-compatible wrapper projecting train and test features onto V_top64.
     """
-    mx, sx, V64 = res["mx"], res["sx"], res["V_top64"]
-    S_tr = (((Z_tr - mx) / sx) @ V64).astype(np.float32)
-    S_te = (((Z_te - mx) / sx) @ V64).astype(np.float32)
-    S_tr = (S_tr / np.linalg.norm(S_tr, axis=1, keepdims=True).clip(min=1e-6)) * float(prior_scale)
-    S_te = (S_te / np.linalg.norm(S_te, axis=1, keepdims=True).clip(min=1e-6)) * float(prior_scale)
-    return S_tr, S_te
+    return project_spectral_block(Z_tr, res, prior_scale), project_spectral_block(Z_te, res, prior_scale)
+
 
 def fit_joint_spectral_bank(
     spectral_tr_blocks: List[np.ndarray],
@@ -46,6 +55,7 @@ def fit_joint_spectral_bank(
     D_neural_weight_total_u: float = 0.0,
     N_unseen: int = 0,
     return_unseen: bool = False,
+    save_path: Optional[Any] = None,
 ) -> Any:
     """
     Fits plain and prompt-centered logistic regressions on stacked unsupervised spectral features.
@@ -84,6 +94,20 @@ def fit_joint_spectral_bank(
         X_spec_tr_c[mask] -= X_spec_tr_c[mask].mean(axis=0, keepdims=True)
     clf_center = LogisticRegression(C=center_C, max_iter=2000, random_state=42)
     clf_center.fit(X_spec_tr_c, y_sub)
+
+    if save_path:
+        spectral_params = {
+            "W_plain": clf_plain.coef_,
+            "b_plain": clf_plain.intercept_,
+            "W_center": clf_center.coef_,
+            "b_center": clf_center.intercept_,
+            "center_blend": center_blend,
+        }
+        try:
+            save_spectral_params(spectral_params, save_path)
+            print(f"[Spectral Bank] Saved fitted spectral parameters to {save_path}")
+        except Exception as e:
+            print(f"[Spectral Bank] Warning: Could not save spectral params: {e}")
 
     # Prompt-centered test features
     X_spec_te_c = X_spec_te.copy()
@@ -142,4 +166,144 @@ def fit_joint_spectral_bank(
     if return_unseen:
         return P_spectral, oof_bacc, P_spectral_u
     return P_spectral, oof_bacc
+
+
+def save_spectral_params(prm: dict, path: Any):
+    """Serializes fitted Spectral Bank linear heads to safetensors."""
+    from pathlib import Path
+    import torch
+    from safetensors.torch import save_file
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sd = {
+        "W_plain": torch.from_numpy(np.asarray(prm["W_plain"], dtype=np.float32)),
+        "b_plain": torch.from_numpy(np.asarray(prm["b_plain"], dtype=np.float32)),
+        "W_center": torch.from_numpy(np.asarray(prm["W_center"], dtype=np.float32)),
+        "b_center": torch.from_numpy(np.asarray(prm["b_center"], dtype=np.float32)),
+        "center_blend": torch.tensor([float(prm.get("center_blend", 0.35))], dtype=torch.float32),
+    }
+    save_file(sd, str(path))
+
+
+def load_spectral_params(path: Any) -> dict:
+    """Loads fitted Spectral Bank parameters from safetensors."""
+    from safetensors.torch import load_file
+
+    sd = load_file(str(path))
+    return {
+        "W_plain": sd["W_plain"].cpu().numpy(),
+        "b_plain": sd["b_plain"].cpu().numpy(),
+        "W_center": sd["W_center"].cpu().numpy(),
+        "b_center": sd["b_center"].cpu().numpy(),
+        "center_blend": float(sd["center_blend"].cpu().numpy()[0]),
+        "labels": list(LABELS),
+    }
+
+
+def train_and_save_spectral_bank(
+    spectral_tr_blocks: List[np.ndarray],
+    y_sub: np.ndarray,
+    prompts_sub: np.ndarray,
+    output_path: Any,
+    plain_C: float = 0.04,
+    center_C: float = 0.03,
+    center_blend: float = 0.35,
+) -> dict:
+    """
+    Fits plain and prompt-centered LogisticRegression heads on stacked spectral training blocks
+    and serializes the weights to safetensors. Zero GPU dependency.
+    """
+    X_spec_tr = np.hstack(spectral_tr_blocks)
+
+    clf_plain = LogisticRegression(C=plain_C, max_iter=2000, random_state=42)
+    clf_plain.fit(X_spec_tr, y_sub)
+    W_p = clf_plain.coef_
+    b_p = clf_plain.intercept_
+    if hasattr(clf_plain, 'classes_'):
+        classes = clf_plain.classes_
+        if len(classes) < K:
+            full_W = np.zeros((K, X_spec_tr.shape[1]), dtype=np.float32)
+            full_b = np.zeros(K, dtype=np.float32)
+            for idx, c in enumerate(classes):
+                full_W[c] = W_p[idx]
+                full_b[c] = b_p[idx]
+            W_p, b_p = full_W, full_b
+
+    X_spec_tr_c = X_spec_tr.copy()
+    for p in np.unique(prompts_sub):
+        mask = (prompts_sub == p)
+        X_spec_tr_c[mask] -= X_spec_tr_c[mask].mean(axis=0, keepdims=True)
+    clf_center = LogisticRegression(C=center_C, max_iter=2000, random_state=42)
+    clf_center.fit(X_spec_tr_c, y_sub)
+
+    W_c = clf_center.coef_
+    b_c = clf_center.intercept_
+    if hasattr(clf_center, 'classes_'):
+        classes = clf_center.classes_
+        if len(classes) < K:
+            full_W = np.zeros((K, X_spec_tr.shape[1]), dtype=np.float32)
+            full_b = np.zeros(K, dtype=np.float32)
+            for idx, c in enumerate(classes):
+                full_W[c] = W_c[idx]
+                full_b[c] = b_c[idx]
+            W_c, b_c = full_W, full_b
+
+    prm = {
+        "W_plain": W_p.astype(np.float32),
+        "b_plain": b_p.astype(np.float32),
+        "W_center": W_c.astype(np.float32),
+        "b_center": b_c.astype(np.float32),
+        "center_blend": center_blend,
+        "labels": list(LABELS),
+    }
+    save_spectral_params(prm, output_path)
+    print(f"[Spectral Bank Trainer] Saved fitted spectral heads to {output_path}")
+    return prm
+
+
+def predict_spectral_bank(
+    spectral_blocks: List[np.ndarray],
+    prm: dict,
+    D_tfidf: np.ndarray,
+    D_neural_sum: Optional[np.ndarray] = None,
+    D_neural_weight_total: float = 0.0,
+    max_cluster_size: int = 14,
+) -> np.ndarray:
+    """
+    Pure inference evaluation of Spectral Bank using pre-trained weights.
+    Zero training data required; executes in <1 ms on CPU.
+    """
+    if len(spectral_blocks) == 0:
+        N = D_tfidf.shape[0] if D_tfidf is not None else 0
+        return np.ones((N, K), dtype=np.float32) / float(K)
+
+    X_spec = np.hstack(spectral_blocks)
+    N = X_spec.shape[0]
+
+    W_p, b_p = prm["W_plain"], prm["b_plain"]
+    W_c, b_c = prm["W_center"], prm["b_center"]
+    blend = float(prm.get("center_blend", 0.35))
+    labels = prm.get("labels", list(LABELS))
+
+    lp_plain = log_softmax(align_cols(X_spec @ W_p.T + b_p, labels))
+
+    X_spec_c = X_spec.copy()
+    D_neural = D_neural_sum / max(1e-6, D_neural_weight_total) if (D_neural_weight_total > 0 and D_neural_sum is not None) else D_tfidf
+    D_hybrid = 0.55 * (D_tfidf if D_tfidf is not None else D_neural) + 0.45 * D_neural
+    if N >= 2 and D_hybrid is not None and D_hybrid.shape[0] == N:
+        g65 = fcluster(linkage(squareform(D_hybrid, checks=False), method='average'), t=0.65, criterion='distance')
+        safe_groups = split_oversized_clusters_dist(D_hybrid, g65, max_cluster_size=max_cluster_size)
+        for g in np.unique(safe_groups):
+            mask = (safe_groups == g)
+            if mask.sum() > 1:
+                X_spec_c[mask] -= X_spec_c[mask].mean(axis=0, keepdims=True)
+            else:
+                X_spec_c[mask] = 0.0
+    else:
+        X_spec_c = np.zeros_like(X_spec)
+
+    lp_center = log_softmax(align_cols(X_spec_c @ W_c.T + b_c, labels))
+    return softmax(lp_plain + blend * lp_center, axis=1)
+
 
