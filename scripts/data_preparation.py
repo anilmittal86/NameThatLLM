@@ -1,6 +1,6 @@
 """
-Decontamination and Master Pool Assembly Script
-==============================================
+Data Preparation, Decontamination and Master Pool Assembly Script
+=================================================================
 1. Purges corrupted Gemini 3.7 records and proxy misroutings from pool_120k.
 2. Ingests high-fidelity external datasets:
    - crtproduction/name-that-llm-open-pool
@@ -13,19 +13,19 @@ Decontamination and Master Pool Assembly Script
 5. Saves clean decontaminated master pool to local_data/clean_master_pool.parquet.
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
 import pandas as pd
 import numpy as np
 
-# Canonical 18-class labels
-LABELS = [
-    "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
-    "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
-    "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
-    "qwen3.8-max", "glm-5.3", "glm-5.3-flash", "kimi-k3"
-]
+WORKSPACE_DIR = Path(__file__).resolve().parent.parent
+if str(WORKSPACE_DIR / "src") not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_DIR / "src"))
+
+from namethatllm.config import LABELS
+
 LABEL_SET = set(LABELS)
 
 def normalize_text(text: str) -> str:

@@ -279,8 +279,10 @@ NameThatLLM/
 │   └── training/                        # Compiled Kaggle training notebook
 ├── scripts/
 │   ├── compile_notebook.py              # Single-source AST compiler
-│   ├── decontaminate_and_merge.py       # Master dataset decontamination pipeline
+│   ├── data_preparation.py             # Master dataset preparation and decontamination pipeline
 │   ├── evaluate_local.py                # Local benchmark holdout scoring
+│   ├── modal_trainer.py                 # Modal GPU serverless cloud training orchestrator
+│   ├── benchmark_feature_manager.py     # Benchmark Z matrices manager and Kaggle indexer
 │   └── push_submission.py               # Automated test, compile, and push runner
 ├── src/namethatllm/                     # Production Python package
 │   ├── config.py                        # Labels, families, path resolvers

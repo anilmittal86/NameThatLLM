@@ -18,6 +18,7 @@ Provides:
 import argparse
 import datetime
 import json
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
@@ -189,13 +190,84 @@ def load_benchmark_features(
     return features, labels, groups, metadata
 
 
+def pull_and_index_from_kaggle(
+    version_tag: str = "latest",
+    kernel_id: str = "anilmittal/name-that-llm-v2-submission",
+    output_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """
+    Downloads submission outputs from Kaggle CLI and indexes Z_unseen feature matrices.
+    """
+    clean_v = version_tag.lower() if version_tag.lower().startswith("v") else f"v{version_tag}"
+    dest_dir = WORKSPACE_DIR / "kaggle_logs" / f"submission_{clean_v}"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"=== Step 1: Downloading outputs from Kaggle ({kernel_id}) to {dest_dir} ===")
+    res = subprocess.run(["kaggle", "kernels", "output", kernel_id, "-p", str(dest_dir)], capture_output=True, text=True)
+    if res.stdout:
+        print(res.stdout)
+    if res.stderr:
+        print(res.stderr)
+
+    print("\n=== Step 2: Indexing Benchmark Features ===")
+    feat_file = dest_dir / "benchmark_1800_features.npz"
+    date_str = datetime.datetime.now().strftime("%Y%m%d")
+
+    if feat_file.exists():
+        data = np.load(str(feat_file), allow_pickle=True)
+        labels = data["labels"]
+        groups = data["groups"]
+        features = {k: data[k] for k in data.files if k not in ("labels", "groups")}
+
+        bundle_path = save_benchmark_feature_bundle(
+            features_dict=features,
+            labels=labels,
+            groups=groups,
+            version=clean_v,
+            date_str=date_str,
+            output_root=output_root,
+        )
+        print(f"[SUCCESS] Features successfully indexed to: {bundle_path}")
+        return bundle_path
+
+    cache_file = dest_dir / "local_eval_cache.npz"
+    if cache_file.exists():
+        cdata = np.load(str(cache_file), allow_pickle=True)
+        z_keys = [k for k in cdata.files if k.startswith("Z_") or "features" in k]
+        if z_keys:
+            labels = cdata.get("y_unseen", np.array([]))
+            groups = cdata.get("groups_unseen", np.array([]))
+            features = {k: cdata[k] for k in z_keys}
+            bundle_path = save_benchmark_feature_bundle(
+                features_dict=features,
+                labels=labels,
+                groups=groups,
+                version=clean_v,
+                date_str=date_str,
+                output_root=output_root,
+            )
+            print(f"[SUCCESS] Features extracted from local_eval_cache and indexed to: {bundle_path}")
+            return bundle_path
+
+    print(f"[Notice] No feature matrices found in downloaded outputs at {dest_dir}.")
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Feature Manager CLI")
     parser.add_argument("--list", action="store_true", help="List all available benchmark feature bundles")
+    parser.add_argument("--pull", action="store_true", help="Download submission outputs from Kaggle and index features")
+    parser.add_argument("--version", type=str, default="latest", help="Version tag (e.g. v83, v84)")
+    parser.add_argument("--kernel", type=str, default="anilmittal/name-that-llm-v2-submission", help="Kaggle kernel slug")
     parser.add_argument("--bundle-dir", type=str, default=str(DEFAULT_FEATURE_DIR), help="Root directory for bundles")
     args = parser.parse_args()
 
     root = Path(args.bundle_dir)
+
+    if args.pull:
+        pull_and_index_from_kaggle(version_tag=args.version, kernel_id=args.kernel, output_root=root)
+        return
+
     if not root.exists():
         print(f"Directory {root} does not exist yet.")
         return
