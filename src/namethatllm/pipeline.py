@@ -331,6 +331,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     )
     claude_spec_logits = None
     claude_classes = None
+    features_unseen_dict: Dict[str, np.ndarray] = {}
 
     D_neural_sum = np.zeros((N_test, N_test), dtype=np.float64)
     D_neural_weight_total = 0.0
@@ -426,6 +427,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_te = Z_all[:N_test]
                 Z_unseen = Z_all[N_test : N_test + N_unseen]
                 Z_tr = Z_all[N_test + N_unseen :]
+                if N_unseen > 0:
+                    features_unseen_dict["qwen3_14b_p2"] = Z_unseen.astype(np.float16)
                 update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_p2", 1.00))
 
                 # Main Stack contributions
@@ -520,6 +523,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         # Stage A: Fast 360-row probe on df_unseen
                         if N_unseen >= 36 and W_p is not None:
                             Z_unseen = trunk1.extract_exact(unseen_texts, batch_size=8, end_id=meta_ts14["end_id"])
+                            if N_unseen > 0:
+                                features_unseen_dict[opt_14b_key] = Z_unseen.astype(np.float16)
 
                             # Auto-align label order: test canonical, alphabetical, and meta labels
                             cand_orders = [ts14_labels]
@@ -651,6 +656,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 Z_unseen = Z_all[N_test : N_test + N_unseen]
                                 Z_tr = Z_all[N_test + N_unseen :]
                                 del Z_all
+                                if N_unseen > 0:
+                                    features_unseen_dict[opt_14b_key] = Z_unseen.astype(np.float16)
 
                             gate_passed = True
                             if not is_smoke and len(y_sub) >= 180:
@@ -778,6 +785,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_te = Z_all[:N_test]
                 Z_unseen = Z_all[N_test : N_test + N_unseen]
                 Z_tr = Z_all[N_test + N_unseen :]
+                if N_unseen > 0:
+                    features_unseen_dict[q25_key] = Z_unseen.astype(np.float16)
                 update_hybrid_groups(Z_te, prior_scales.get(q25_key, 0.85))
 
                 w_main_p = model_weights.get(q25_key, {}).get("plain_weight", main_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.24))
@@ -869,6 +878,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     # Stage A: Fast 360-row probe on df_unseen
                     if N_unseen >= 36 and W_p is not None:
                         Z_unseen = trunk3.extract_exact(unseen_texts, batch_size=8, end_id=meta_ins["end_id"])
+                        if N_unseen > 0:
+                            features_unseen_dict["qwen3_14b_inhouse"] = Z_unseen.astype(np.float16)
 
                         # Auto-align label order: test canonical, alphabetical, and meta labels
                         cand_orders = [meta_ins["labels"]]
@@ -925,6 +936,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         Z_unseen = Z_all[N_test : N_test + N_unseen]
                         Z_tr = Z_all[N_test + N_unseen :]
                         del Z_all
+                        if N_unseen > 0:
+                            features_unseen_dict["qwen3_14b_inhouse"] = Z_unseen.astype(np.float16)
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"])) if (N_unseen > 0 and W_p is not None) else None
 
                     ins_labels = meta_ins["labels"]
@@ -1039,6 +1052,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         # Stage A: Fast 360-row probe on df_unseen
                         if N_unseen >= 36 and W_p is not None:
                             Z_unseen = trunk3.extract_exact(unseen_texts, batch_size=8, end_id=meta_ts8["end_id"])
+                            if N_unseen > 0:
+                                features_unseen_dict[opt_8b_key] = Z_unseen.astype(np.float16)
 
                             # Auto-align label order: test canonical, alphabetical, and meta labels
                             cand_orders = [ts8_labels]
@@ -1170,6 +1185,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 Z_unseen = Z_all[N_test : N_test + N_unseen]
                                 Z_tr = Z_all[N_test + N_unseen :]
                                 del Z_all
+                                if N_unseen > 0:
+                                    features_unseen_dict[opt_8b_key] = Z_unseen.astype(np.float16)
 
                             gate_passed = True
                             if not is_smoke and len(y_sub) >= 180:
@@ -1329,6 +1346,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 Z_te = Z_all[:N_test]
                 Z_unseen = Z_all[N_test : N_test + N_unseen]
                 Z_tr = Z_all[N_test + N_unseen :]
+                if N_unseen > 0:
+                    features_unseen_dict["qwen3_8b_claude"] = Z_unseen.astype(np.float16)
                 update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_claude", 0.30))
 
                 if W_spec is not None and W_spec.shape[0] == 5:
@@ -1401,6 +1420,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             )
             Z_te_deb = Z_test_all[:N_test]
             Z_unseen_deb = Z_test_all[N_test : N_test + N_unseen]
+            if N_unseen > 0:
+                features_unseen_dict[deb_key] = Z_unseen_deb.astype(np.float16)
 
             if W_p_deb is None and not is_smoke:
                 raise RuntimeError(f"Required classification head W_p is None for {deb_dir}")
@@ -1650,7 +1671,18 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         cache_file_path = working_dir / "local_eval_cache.npz"
         np.savez_compressed(cache_file_path, **cache_dict)
         print(f"[Pipeline] Exported compact local evaluation cache: {cache_file_path} ({cache_file_path.stat().st_size} bytes)")
+
+        if len(features_unseen_dict) > 0 and N_unseen > 0:
+            feat_save_dict = {
+                "labels": y_unseen.astype(np.int32),
+                "groups": g_u,
+            }
+            for k, v in features_unseen_dict.items():
+                feat_save_dict[f"Z_unseen_{k}"] = v
+            feat_file_path = working_dir / "benchmark_1800_features.npz"
+            np.savez_compressed(feat_file_path, **feat_save_dict)
+            print(f"[Pipeline] Exported {len(features_unseen_dict)} benchmark feature representations to: {feat_file_path} ({feat_file_path.stat().st_size} bytes)")
     except Exception as e:
-        print(f"[Pipeline] Note: Could not write local_eval_cache.npz: {e}")
+        print(f"[Pipeline] Note: Could not write local evaluation outputs: {e}")
 
     return df_sub, out_parquet
