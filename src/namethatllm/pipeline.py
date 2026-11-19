@@ -1544,6 +1544,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         opt_causal_specs = [
             ("gemma2_9b_ts", "gemma2", 3584, 42, 24, "Gemma-2-9B"),
             ("llama31_8b_ts", "llama", 4096, 32, 24, "Llama-3.1-8B"),
+            ("llama3_8b_v5", "llama", 4096, 32, 24, "Llama-3-8B-v5"),
             ("mistral_7b_ts", "mistral", 4096, 32, 24, "Mistral-7B"),
         ]
         for opt_key, opt_family, opt_hidden, opt_layers, opt_default_keep, opt_disp_name in opt_causal_specs:

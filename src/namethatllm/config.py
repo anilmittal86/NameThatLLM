@@ -137,15 +137,23 @@ def resolve_all_pool_files(input_dir: Optional[Path] = None) -> List[Path]:
 def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_layers: int) -> Optional[Path]:
     """Discovers base model directories from Hugging Face config.json inspection."""
     candidates = []
+    fam_target = model_family.lower()
     for cfg_p in input_dir.rglob('config.json'):
         try:
             cfg = json.load(open(cfg_p))
             m_type = str(cfg.get('model_type', '')).lower()
             h_dim = cfg.get('hidden_size', 0)
             n_lay = cfg.get('num_hidden_layers', 0)
-            if model_family.lower() in m_type and h_dim == hidden_sz and n_lay == num_layers:
+            fam_match = (
+                fam_target in m_type or
+                m_type in fam_target or
+                ("gemma" in fam_target and "gemma" in m_type) or
+                ("llama" in fam_target and "llama" in m_type) or
+                ("qwen" in fam_target and "qwen" in m_type)
+            )
+            if fam_match and h_dim == hidden_sz and n_lay == num_layers:
                 p_str = str(cfg_p.parent).lower().replace('\\', '/')
-                if model_family.lower() in p_str:
+                if fam_target in p_str or ("gemma" in fam_target and "gemma" in p_str):
                     return cfg_p.parent
                 candidates.append(cfg_p.parent)
         except Exception:
