@@ -229,32 +229,53 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         all_pool_files = resolve_all_pool_files(input_dir)
 
     enable_ablation_probe = bool(cfg.get("enable_ablation_probe", True)) if cfg else True
-    benchmark_mode = bool(cfg.get("benchmark_mode", True)) if cfg else True
     probe_gate_min_bacc = float(cfg.get("probe_gate_min_bacc", 0.40)) if cfg else 0.40
-    print(f"[Pipeline] Startup: is_smoke={is_smoke}, enable_ablation_probe={enable_ablation_probe}, benchmark_mode={benchmark_mode}, probe_gate_min_bacc={probe_gate_min_bacc:.2f}")
-    print(f"[Pipeline] Paths: train={train_path}, test={test_path}, pool={pool_file}, all_pools={len(all_pool_files)}")
 
-    df_test = pd.read_csv(test_path)
-    test_ids = df_test["id"]
-    test_texts = df_test["text"].fillna("").astype(str).tolist()
+    df_test_raw = pd.read_csv(test_path) if test_path and Path(test_path).exists() else pd.DataFrame({"id": [], "text": []})
+    test_ids = df_test_raw["id"] if "id" in df_test_raw.columns else pd.Series(range(len(df_test_raw)))
+
+    # -------------------------------------------------------------------------
+    # Decoupled Execution Mode Architecture:
+    # "benchmark_only": Evaluates exclusively on clean 1,800 unseen samples (for fast experiments without burning GPU quota).
+    # "submission_only": Evaluates exclusively on competition test.csv (for official Kaggle leaderboard scoring).
+    # "dual": Evaluates both datasets cleanly and independently.
+    # -------------------------------------------------------------------------
+    execution_mode = cfg.get("execution_mode") if cfg else None
+    if execution_mode is None:
+        if bool(cfg.get("benchmark_mode", False)) if cfg else False:
+            execution_mode = "benchmark_only"
+        elif len(df_test_raw) <= 10 and enable_ablation_probe:
+            execution_mode = "benchmark_only"
+        elif enable_ablation_probe:
+            execution_mode = "dual"
+        else:
+            execution_mode = "submission_only"
+
+    run_benchmark = bool(cfg.get("run_benchmark", execution_mode in ("benchmark_only", "dual"))) if cfg else (execution_mode in ("benchmark_only", "dual"))
+    run_submission = bool(cfg.get("run_submission", execution_mode in ("submission_only", "dual"))) if cfg else (execution_mode in ("submission_only", "dual"))
+
+    # When competition test.csv has <= 10 dummy rows on Kaggle, auto-disable submission inference to safeguard GPU quota
+    if len(df_test_raw) <= 10 and run_benchmark:
+        run_submission = False
+
+    test_texts = df_test_raw["text"].fillna("").astype(str).tolist() if (run_submission and "text" in df_test_raw.columns) else []
     N_test = len(test_texts)
-    print(f"[Pipeline] Loaded test set: {N_test} rows")
 
     # Build Zero-Leakage Unseen Holdout Benchmark (N_unseen = 1800 rows default)
     df_unseen = pd.DataFrame()
-    unseen_texts = []
+    unseen_texts: List[str] = []
     N_unseen = 0
     y_unseen = np.array([], dtype=int)
     groups_unseen = np.array([], dtype=int)
 
-    if (enable_ablation_probe or benchmark_mode) and not is_smoke:
+    if run_benchmark and not is_smoke:
         df_unseen, holdout_hashes = build_unseen_holdout_dataset(input_dir, train_path, samples_per_class=int(cfg.get("unseen_samples_per_class", 100)))
-        unseen_parquet_path = working_dir / "unseen_holdout.parquet"
-        df_unseen.to_parquet(unseen_parquet_path, index=False)
-        unseen_texts = df_unseen["text"].fillna("").astype(str).tolist() if len(df_unseen) > 0 else []
-        N_unseen = len(unseen_texts)
-        y_unseen = np.array([LAB2I[m] for m in df_unseen["model"].values], dtype=int) if N_unseen > 0 else np.array([], dtype=int)
-        if N_unseen > 0:
+        if len(df_unseen) > 0:
+            unseen_parquet_path = working_dir / "unseen_holdout.parquet"
+            df_unseen.to_parquet(unseen_parquet_path, index=False)
+            unseen_texts = df_unseen["text"].fillna("").astype(str).tolist()
+            N_unseen = len(unseen_texts)
+            y_unseen = np.array([LAB2I[m] for m in df_unseen["model"].values], dtype=int) if "model" in df_unseen.columns else np.array([], dtype=int)
             if "cluster_id" in df_unseen.columns:
                 groups_unseen = df_unseen["cluster_id"].values
             elif "prompt_id" in df_unseen.columns:
@@ -265,29 +286,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 groups_unseen = (pd.factorize(df_unseen["prompt_text"])[0] + 1).astype(int)
             else:
                 groups_unseen = np.ones(N_unseen, dtype=int)
-        else:
-            groups_unseen = np.array([], dtype=int)
+            print(f"[Pipeline] Loaded clean benchmark dataset: {N_unseen} samples ({len(set(y_unseen))} classes).")
     else:
-        if not enable_ablation_probe and not benchmark_mode:
-            print("[Pipeline] Frozen Production Mode (enable_ablation_probe=False): Skipping unseen holdout extraction to save GPU time.")
+        if not run_benchmark:
+            print("[Pipeline] Frozen Production Mode (run_benchmark=False): Skipping unseen holdout extraction to save GPU time.")
 
-    # 1,800-Sample Pure Inference Mode:
-    # If benchmark_mode is enabled (or N_test <= 10 competition dummy rows),
-    # replace test_texts with the 1,800 unseen benchmark samples.
-    # This completely bypasses competition test.csv, saving all GPU quota!
-    is_benchmark_eval = False
-    if (benchmark_mode or N_test <= 10) and N_unseen > 0:
-        print("=" * 70)
-        print("[Pipeline] ACTIVATING 1,800-SAMPLE BENCHMARK PURE INFERENCE MODE")
-        print(f"  - Bypassing competition test.csv ({N_test} rows) to strictly preserve Kaggle GPU quota.")
-        print(f"  - Target evaluation dataset: {N_unseen} clean unseen samples ({len(set(y_unseen))} classes).")
-        print("=" * 70)
-        df_test = df_unseen
-        test_ids = df_test["id"] if "id" in df_test.columns else pd.Series(range(N_unseen))
-        test_texts = unseen_texts
-        N_test = N_unseen
-        unseen_texts = []
-        is_benchmark_eval = True
+    print("=" * 70)
+    print(f"[Pipeline] EXECUTION MODE: {execution_mode.upper()}")
+    print(f"  - run_benchmark  : {run_benchmark} ({N_unseen} unseen samples)")
+    print(f"  - run_submission : {run_submission} ({N_test} test rows)")
+    print("=" * 70)
 
     auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=groups_unseen, N_test=N_test)
 
@@ -327,7 +335,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         log_p_handwriting_unseen = _load_optional_npy(working_dir / "log_p_handwriting_unseen.npy")
         rule_flags_unseen = _load_optional_npy(working_dir / "rule_flags_unseen.npy")
 
-        if unseen_log_p_svc_main.shape[0] != N_unseen or log_p_svc_main.shape[0] != N_test:
+        if (run_benchmark and unseen_log_p_svc_main.shape[0] != N_unseen) or (run_submission and log_p_svc_main.shape[0] != N_test):
             print(f"[Pipeline] Subprocess lexical cache shape mismatch (test: {log_p_svc_main.shape[0]} vs {N_test}, unseen: {unseen_log_p_svc_main.shape[0]} vs {N_unseen}). Falling back to in-process run_lexical_engine...")
             tok_paths = list(input_dir.rglob("vocab.json"))
             qwen_tok_dir = str(tok_paths[0].parent) if tok_paths else ""
@@ -358,7 +366,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         log_p_handwriting_unseen = lex_out.get("log_p_handwriting_unseen")
         rule_flags_unseen = lex_out.get("rule_flags_unseen")
 
-    print(f"[Pipeline] Module 1 complete: log_p_svc_main shape = {log_p_svc_main.shape}")
+    print(f"[Pipeline] Module 1 complete: log_p_svc_main shape = {log_p_svc_main.shape}, unseen_log_p_svc_main shape = {unseen_log_p_svc_main.shape}")
 
     # Read configuration hierarchies from configs/production_ensemble.json
     main_cfg = cfg.get("main_stack", {})
@@ -388,25 +396,27 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     w60 = float(twin_res.get("t60", 0.20))
     max_cl = post_cfg.get("max_cluster_size", 14)
 
-    LOGIT_MAIN = log_p_svc_main * svc_weight
+    LOGIT_MAIN = log_p_svc_main * svc_weight if (run_submission and len(log_p_svc_main) == N_test) else np.zeros((N_test, K), dtype=np.float32)
     COMP_LIST: List[Tuple[float, np.ndarray]] = [
-        (lex_comp_weight, p_lex_comp)
+        (lex_comp_weight, p_lex_comp if (run_submission and len(p_lex_comp) == N_test) else np.zeros((N_test, K), dtype=np.float32))
     ]
-    u_lp_svc = unseen_log_p_svc_main if (N_unseen > 0 and len(unseen_log_p_svc_main) == N_unseen) else np.zeros((N_unseen, K), dtype=np.float32)
+    u_lp_svc = unseen_log_p_svc_main if (run_benchmark and N_unseen > 0 and len(unseen_log_p_svc_main) == N_unseen) else np.zeros((N_unseen, K), dtype=np.float32)
+    te_lp_svc = log_p_svc_main if (run_submission and N_test > 0 and len(log_p_svc_main) == N_test) else np.zeros((N_test, K), dtype=np.float32)
     auditor.add_model(
         name="LinearSVC (4-View)",
         tier="Main",
         weight=svc_weight,
         unseen_log_probs=u_lp_svc,
-        test_log_probs=log_p_svc_main,
+        test_log_probs=te_lp_svc,
     )
-    u_p_lex = unseen_p_lex_comp if (N_unseen > 0 and len(unseen_p_lex_comp) == N_unseen) else (np.ones((N_unseen, K), dtype=np.float32) / float(K))
+    u_p_lex = unseen_p_lex_comp if (run_benchmark and N_unseen > 0 and len(unseen_p_lex_comp) == N_unseen) else (np.ones((N_unseen, K), dtype=np.float32) / float(K))
+    te_p_lex = p_lex_comp if (run_submission and N_test > 0 and len(p_lex_comp) == N_test) else (np.ones((N_test, K), dtype=np.float32) / float(K))
     auditor.add_model(
         name="Lexical Comp (5-View)",
         tier="Comp",
         weight=lex_comp_weight,
         unseen_log_probs=np.log(np.clip(u_p_lex, 1e-9, 1.0)),
-        test_log_probs=np.log(np.clip(p_lex_comp, 1e-9, 1.0)),
+        test_log_probs=np.log(np.clip(te_p_lex, 1e-9, 1.0)),
     )
     claude_spec_logits = None
     claude_spec_logits_u = None
@@ -480,29 +490,38 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         lp60, _ = compute_centered_logits(Z, groups_map.get(0.60, np.ones(len(Z), dtype=int)), W_c, b_c, labels)
         return (w85 * lp85 + w72 * lp72 + w60 * lp60).astype(np.float32)
 
-    tracker_test = HybridDistanceTracker(D_tfidf, texts=test_texts, max_cluster_sz=max_cl)
-    tracker_unseen = tracker_test if is_benchmark_eval else HybridDistanceTracker(D_tfidf_u if ('D_tfidf_u' in locals() and D_tfidf_u is not None) else None, texts=unseen_texts, max_cluster_sz=max_cl)
+    tracker_test = HybridDistanceTracker(D_tfidf, texts=test_texts, max_cluster_sz=max_cl) if (run_submission and N_test > 0) else None
+    tracker_unseen = HybridDistanceTracker(D_tfidf_u if ('D_tfidf_u' in locals() and D_tfidf_u is not None) else None, texts=unseen_texts, max_cluster_sz=max_cl) if (run_benchmark and N_unseen > 0) else None
 
-    # Backward-compatible references
-    D_neural_sum = tracker_test.D_neural_sum
-    D_neural_weight_total = tracker_test.D_neural_weight_total
-    D_hybrid = tracker_test.D_hybrid
-    groups_085 = tracker_test.groups[0.85]
-    groups_072 = tracker_test.groups[0.72]
-    groups_065 = tracker_test.groups[0.65]
-    groups_060 = tracker_test.groups[0.60]
+    # Backward-compatible references (using active tracker)
+    active_tracker = tracker_test if tracker_test is not None else tracker_unseen
+    D_neural_sum = active_tracker.D_neural_sum if active_tracker else np.zeros((0, 0), dtype=np.float32)
+    D_neural_weight_total = active_tracker.D_neural_weight_total if active_tracker else 0.0
+    D_hybrid = active_tracker.D_hybrid if active_tracker else np.zeros((0, 0), dtype=np.float32)
+    groups_085 = active_tracker.groups[0.85] if active_tracker else np.zeros(0, dtype=int)
+    groups_072 = active_tracker.groups[0.72] if active_tracker else np.zeros(0, dtype=int)
+    groups_065 = active_tracker.groups[0.65] if active_tracker else np.zeros(0, dtype=int)
+    groups_060 = active_tracker.groups[0.60] if active_tracker else np.zeros(0, dtype=int)
 
-    def update_hybrid_groups(Z_te_mat: np.ndarray, ckpt_scale: float, Z_u_mat: Optional[np.ndarray] = None):
+    def update_hybrid_groups(Z_te_mat: Optional[np.ndarray], ckpt_scale: float, Z_u_mat: Optional[np.ndarray] = None):
         nonlocal D_hybrid, groups_085, groups_072, groups_065, groups_060, D_neural_weight_total
-        tracker_test.update(Z_te_mat, ckpt_scale)
-        D_hybrid = tracker_test.D_hybrid
-        D_neural_weight_total = tracker_test.D_neural_weight_total
-        groups_085 = tracker_test.groups[0.85]
-        groups_072 = tracker_test.groups[0.72]
-        groups_065 = tracker_test.groups[0.65]
-        groups_060 = tracker_test.groups[0.60]
-        if Z_u_mat is not None and N_unseen >= 2 and not is_benchmark_eval:
+        if tracker_test is not None and Z_te_mat is not None and len(Z_te_mat) > 0:
+            tracker_test.update(Z_te_mat, ckpt_scale)
+            D_hybrid = tracker_test.D_hybrid
+            D_neural_weight_total = tracker_test.D_neural_weight_total
+            groups_085 = tracker_test.groups[0.85]
+            groups_072 = tracker_test.groups[0.72]
+            groups_065 = tracker_test.groups[0.65]
+            groups_060 = tracker_test.groups[0.60]
+        if tracker_unseen is not None and Z_u_mat is not None and len(Z_u_mat) > 0:
             tracker_unseen.update(Z_u_mat, ckpt_scale)
+            if tracker_test is None:
+                D_hybrid = tracker_unseen.D_hybrid
+                D_neural_weight_total = tracker_unseen.D_neural_weight_total
+                groups_085 = tracker_unseen.groups[0.85]
+                groups_072 = tracker_unseen.groups[0.72]
+                groups_065 = tracker_unseen.groups[0.65]
+                groups_060 = tracker_unseen.groups[0.60]
 
     has_neural = len(ckpts) > 0 and not is_smoke
     spectral_blocks_tr: List[np.ndarray] = []
@@ -579,12 +598,22 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         wpca_bundle_export: Dict[str, dict] = {}
 
         def _extract_trunk(trunk_obj, end_id=None):
-            if is_benchmark_eval:
-                Z = trunk_obj.extract_exact(test_texts, batch_size=16, end_id=end_id)
-                return Z, Z, np.zeros((0, Z.shape[1]), dtype=np.float32)
-            else:
+            if run_submission and N_test > 0 and run_benchmark and N_unseen > 0:
                 Z_all = trunk_obj.extract_exact(test_texts + unseen_texts, batch_size=16, end_id=end_id)
-                return Z_all[:N_test], Z_all[N_test : N_test + N_unseen], np.zeros((0, Z_all.shape[1]), dtype=np.float32)
+                Z_te = Z_all[:N_test]
+                Z_u = Z_all[N_test : N_test + N_unseen]
+            elif run_submission and N_test > 0:
+                Z_te = trunk_obj.extract_exact(test_texts, batch_size=16, end_id=end_id)
+                Z_u = np.zeros((0, Z_te.shape[1]), dtype=np.float32)
+            elif run_benchmark and N_unseen > 0:
+                Z_u = trunk_obj.extract_exact(unseen_texts, batch_size=16, end_id=end_id)
+                Z_te = np.zeros((0, Z_u.shape[1]), dtype=np.float32)
+            else:
+                Z_te = np.zeros((0, 4096), dtype=np.float32)
+                Z_u = np.zeros((0, 4096), dtype=np.float32)
+            dim = Z_u.shape[1] if len(Z_u) > 0 else (Z_te.shape[1] if len(Z_te) > 0 else 4096)
+            Z_tr = np.zeros((0, dim), dtype=np.float32)
+            return Z_te, Z_u, Z_tr
 
         def apply_wpca_and_spectral(
             model_key: str,
@@ -604,27 +633,26 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 wpca_bundle_export[model_key] = res
 
             if res is not None:
-                U_te = transform_lowram(Z_te_mat, res)
-                lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res, tracker_test.D_hybrid)
-                dp_posteriors.append((dp_w, softmax(lp_dp, axis=1)))
+                if run_submission and len(Z_te_mat) > 0 and tracker_test is not None:
+                    U_te = transform_lowram(Z_te_mat, res)
+                    lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res, tracker_test.D_hybrid)
+                    dp_posteriors.append((dp_w, softmax(lp_dp, axis=1)))
+                    S_te = project_spectral_block(Z_te_mat, res, prior_scale)
+                    spectral_blocks_te.append(S_te)
+                    del U_te
 
-                S_te = project_spectral_block(Z_te_mat, res, prior_scale)
-                spectral_blocks_te.append(S_te)
                 if len(Z_tr_mat) > 0:
                     S_tr = project_spectral_block(Z_tr_mat, res, prior_scale)
                     spectral_blocks_tr.append(S_tr)
 
-                if is_benchmark_eval:
-                    dp_posteriors_u.append((dp_w, softmax(lp_dp, axis=1)))
-                    spectral_blocks_u.append(S_te)
-                elif N_unseen > 0 and Z_u_mat is not None and len(Z_u_mat) == N_unseen:
+                if run_benchmark and Z_u_mat is not None and len(Z_u_mat) > 0 and tracker_unseen is not None:
                     U_u = transform_lowram(Z_u_mat, res)
                     lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res, tracker_unseen.D_hybrid)
                     dp_posteriors_u.append((dp_w, softmax(lp_dp_u, axis=1)))
                     S_u = project_spectral_block(Z_u_mat, res, prior_scale)
                     spectral_blocks_u.append(S_u)
                     del U_u
-                del res, U_te
+                del res
 
         # ==============================================================================
         # TRUNK 1: Qwen3-14B (40 layers, hidden=5120)
@@ -661,31 +689,31 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 lp_u_p = np.zeros((0, K), dtype=np.float32)
                 lp_u_c = np.zeros((0, K), dtype=np.float32)
                 lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                lp_p = np.zeros((N_test, K), dtype=np.float32)
+                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                 if W_p is not None:
-                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
-                    LOGIT_MAIN += lp_p * w_main_p
-                    w_comp_p = comp_members.get("lora_qwen3_14b", {}).get("plain_weight", 0.30)
-                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                    if is_benchmark_eval:
-                        lp_u_p = lp_p
-                    elif N_unseen > 0:
+                    if run_submission and len(Z_te) > 0:
+                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
+                        LOGIT_MAIN += lp_p * w_main_p
+                        w_comp_p = comp_members.get("lora_qwen3_14b", {}).get("plain_weight", 0.30)
+                        comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                    if run_benchmark and len(Z_unseen) > 0:
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
 
                 if W_c is not None:
-                    lp_c85, valid_c85 = compute_centered_logits(Z_te, tracker_test.groups[0.85], W_c, b_c, p2_labels)
-                    LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
-                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
-                    w_comp_c = comp_members.get("lora_qwen3_14b", {}).get("twin_weight", 0.10)
-                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                    if is_benchmark_eval:
-                        lp_u_c = lp_c_blend
-                    elif N_unseen > 0:
+                    if run_submission and len(Z_te) > 0 and tracker_test is not None:
+                        lp_c85, valid_c85 = compute_centered_logits(Z_te, tracker_test.groups[0.85], W_c, b_c, p2_labels)
+                        LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
+                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
+                        w_comp_c = comp_members.get("lora_qwen3_14b", {}).get("twin_weight", 0.10)
+                        comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                    if run_benchmark and len(Z_unseen) > 0 and tracker_unseen is not None:
                         lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
 
                 if W_p is not None:
                     w_tot_14b = w_main_p + (w_main_c if W_c is not None else 0.0)
-                    lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_main_p, w_main_c)
-                    lp_model_u = lp_model_te if is_benchmark_eval else (_combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_main_p, w_main_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32))
+                    lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_main_p, w_main_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
+                    lp_model_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_main_p, w_main_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                     auditor.add_model("Qwen3-14B Part-2", tier="Main", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
                 # wPCA + DP Posterior + Spectral Bank (Symmetric test and unseen)
@@ -796,16 +824,16 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                         if gate_passed:
                             pr_sc = prior_scales.get(opt_14b_key, 0.50)
                             update_hybrid_groups(Z_te, pr_sc, Z_unseen if N_unseen > 0 else None)
-                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
-                            if W_c is not None:
-                                lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts14_labels, weights=(w85, w72, w60))
-                            else:
-                                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-
-                            if W_p is not None and lp_p is not None:
-                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                            if W_c is not None:
-                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                            lp_p = None
+                            lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                            if run_submission and len(Z_te) > 0:
+                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
+                                if W_c is not None and tracker_test is not None:
+                                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts14_labels, weights=(w85, w72, w60))
+                                if W_p is not None and lp_p is not None:
+                                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                                if W_c is not None:
+                                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
                             def_dp_14b = 0.08 if opt_14b_key == "qwen3_14b_p1" else 0.10
                             def_se_14b = 0.35 if opt_14b_key == "qwen3_14b_p1" else 0.25
@@ -821,10 +849,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 se_floor=se_floors.get(opt_14b_key, def_se_14b)
                             )
 
-                            if lp_p is not None:
+                            if W_p is not None:
                                 w_tot_ts14 = w_comp_p + (w_comp_c if W_c is not None else 0.0)
-                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c)
-                                lp_m_u = lp_m_te if is_benchmark_eval else (lp_u if N_unseen > 0 and 'lp_u' in locals() else np.zeros((0, K), dtype=np.float32))
+                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c) if (run_submission and lp_p is not None and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
+                                lp_m_u = lp_u if (run_benchmark and N_unseen > 0 and 'lp_u' in locals() and len(lp_u) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                                 aud_name_14b = "Qwen3-14B Part-1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
                                 auditor.add_model(name=aud_name_14b, tier="Comp", weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
@@ -885,31 +913,31 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 lp_u_p = np.zeros((0, K), dtype=np.float32)
                 lp_u_c = np.zeros((0, K), dtype=np.float32)
                 lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                lp_p = np.zeros((N_test, K), dtype=np.float32)
+                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
                 if W_p is not None:
-                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
-                    LOGIT_MAIN += lp_p * w_main_p
-                    w_comp_p = comp_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.20)
-                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                    if is_benchmark_eval:
-                        lp_u_p = lp_p
-                    elif N_unseen > 0:
+                    if run_submission and len(Z_te) > 0:
+                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
+                        LOGIT_MAIN += lp_p * w_main_p
+                        w_comp_p = comp_members.get("lora_qwen25_14b", {}).get("plain_weight", 0.20)
+                        comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                    if run_benchmark and len(Z_unseen) > 0:
                         lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
 
                 if W_c is not None:
-                    lp_c85, valid_c85 = compute_centered_logits(Z_te, tracker_test.groups[0.85], W_c, b_c, p2_labels)
-                    LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
-                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
-                    w_comp_c = comp_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.08)
-                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                    if is_benchmark_eval:
-                        lp_u_c = lp_c_blend
-                    elif N_unseen > 0:
+                    if run_submission and len(Z_te) > 0 and tracker_test is not None:
+                        lp_c85, valid_c85 = compute_centered_logits(Z_te, tracker_test.groups[0.85], W_c, b_c, p2_labels)
+                        LOGIT_MAIN[valid_c85] += lp_c85[valid_c85] * w_main_c
+                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
+                        w_comp_c = comp_members.get("lora_qwen25_14b", {}).get("twin_weight", 0.08)
+                        comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                    if run_benchmark and len(Z_unseen) > 0 and tracker_unseen is not None:
                         lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
 
                 if W_p is not None:
                     w_tot_q25 = w_main_p + (w_main_c if W_c is not None else 0.0)
-                    lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_main_p, w_main_c)
-                    lp_model_u = lp_model_te if is_benchmark_eval else (_combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_main_p, w_main_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32))
+                    lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_main_p, w_main_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
+                    lp_model_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_main_p, w_main_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                     aud_name = "Qwen2.5-14B Part-2" if q25_key == "qwen25_14b_p2" else "Qwen2.5-14B In-House"
                     auditor.add_model(aud_name, tier="Main", weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
 
@@ -1016,25 +1044,24 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     if gate_passed:
                         update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45), Z_unseen if N_unseen > 0 else None)
 
-                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ins_labels)) if W_p is not None else None
-                        if N_unseen > 0 and W_p is not None:
-                            lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ins_labels))
-                        else:
-                            lp_u_p = np.zeros((0, K), dtype=np.float32)
+                        lp_p = None
+                        lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                        lp_u_p = np.zeros((0, K), dtype=np.float32)
+                        lp_u_c = np.zeros((0, K), dtype=np.float32)
 
-                        if W_p is not None:
-                            comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                        if run_submission and len(Z_te) > 0:
+                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ins_labels)) if W_p is not None else None
+                            if W_p is not None and lp_p is not None:
+                                comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                            if W_c is not None and tracker_test is not None:
+                                lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ins_labels, weights=(w85, w72, w60))
+                                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-                        if W_c is not None:
-                            lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ins_labels, weights=(w85, w72, w60))
-                            comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                            if N_unseen > 0:
+                        if run_benchmark and len(Z_unseen) > 0:
+                            if W_p is not None:
+                                lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ins_labels))
+                            if W_c is not None and tracker_unseen is not None:
                                 lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ins_labels, weights=(w85, w72, w60))
-                            else:
-                                lp_u_c = np.zeros((0, K), dtype=np.float32)
-                        else:
-                            lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                            lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                         apply_wpca_and_spectral(
                             model_key="instyle",
@@ -1047,10 +1074,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             se_floor=se_floors.get("instyle", 0.35)
                         )
 
-                        if W_p is not None and lp_p is not None:
+                        if W_p is not None:
                             w_tot_ins = w_comp_p + (w_comp_c if W_c is not None else 0.0)
-                            lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c)
-                            lp_m_u = lp_m_te if is_benchmark_eval else (_combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_comp_p, w_comp_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32))
+                            lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c) if (run_submission and lp_p is not None and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
+                            lp_m_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_comp_p, w_comp_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                             auditor.add_model("Qwen3-8B In-Style", tier="Comp", weight=w_tot_ins, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                     trunk3.restore_weights(backup_t3)
@@ -1132,37 +1159,34 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                 f_W_p, f_b_p, f_W_c, f_b_c = resolve_head_tensors(f_heads_sd)
                                 f_labels = f_meta["labels"]
 
-                                if is_benchmark_eval:
-                                    f_Z_te = trunk3.extract_exact(test_texts, batch_size=16, end_id=f_meta.get("end_id"))
-                                    f_Z_u = f_Z_te
-                                else:
-                                    Z_all_f = trunk3.extract_exact(test_texts + unseen_texts, batch_size=16, end_id=f_meta.get("end_id"))
-                                    f_Z_te = Z_all_f[:N_test]
-                                    f_Z_u = Z_all_f[N_test : N_test + N_unseen]
-                                    del Z_all_f
+                                f_Z_te, f_Z_u, _ = _extract_trunk(trunk3, end_id=f_meta.get("end_id"))
 
                                 if is_last:
                                     Z_te = f_Z_te
                                     Z_unseen = f_Z_u
-                                    Z_tr = np.zeros((0, f_Z_te.shape[1]), dtype=np.float32)
+                                    dim_f = f_Z_u.shape[1] if len(f_Z_u) > 0 else (f_Z_te.shape[1] if len(f_Z_te) > 0 else 4096)
+                                    Z_tr = np.zeros((0, dim_f), dtype=np.float32)
                                     if N_unseen > 0:
                                         features_unseen_dict[opt_8b_key] = Z_unseen.astype(np.float16)
 
                                 if f_idx == 0 or is_last:
                                     update_hybrid_groups(f_Z_te, prior_scales.get(opt_8b_key, 0.40), f_Z_u if N_unseen > 0 else None)
 
-                                if f_W_p is not None:
-                                    p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
-                                    P_p_acc += p_fold / num_8b_folds
-                                    if N_unseen > 0 and f_Z_u is not None and len(f_Z_u) == N_unseen:
+                                if run_submission and len(f_Z_te) > 0:
+                                    if f_W_p is not None:
+                                        p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
+                                        P_p_acc += p_fold / num_8b_folds
+                                    if f_W_c is not None and tracker_test is not None:
+                                        has_any_c = True
+                                        c_blend_f = compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
+                                        P_c_acc += softmax(c_blend_f, axis=1) / num_8b_folds
+
+                                if run_benchmark and len(f_Z_u) > 0:
+                                    if f_W_p is not None:
                                         p_u_fold = softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1)
                                         P_u_p_acc += p_u_fold / num_8b_folds
-
-                                if f_W_c is not None:
-                                    has_any_c = True
-                                    c_blend_f = compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
-                                    P_c_acc += softmax(c_blend_f, axis=1) / num_8b_folds
-                                    if N_unseen > 0 and f_Z_u is not None and len(f_Z_u) == N_unseen:
+                                    if f_W_c is not None and tracker_unseen is not None:
+                                        has_any_c = True
                                         c_u_blend_f = compute_multires_centered_blend(f_Z_u, tracker_unseen.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
                                         P_u_c_acc += softmax(c_u_blend_f, axis=1) / num_8b_folds
 
@@ -1175,13 +1199,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                                     torch.cuda.empty_cache()
 
                             trunk3.set_final_norm(False)
-                            lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0))
-                            lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else np.zeros((N_test, K), dtype=np.float32)
-                            if is_benchmark_eval:
-                                lp_u_p = lp_p
-                                lp_u_c = lp_c_blend if has_any_c else None
-                                lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
-                            elif N_unseen > 0:
+                            lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0)) if (run_submission and len(P_p_acc) == N_test) else np.zeros((0, K), dtype=np.float32)
+                            lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if (run_submission and has_any_c and len(P_c_acc) == N_test) else np.zeros((N_test, K), dtype=np.float32)
+                            lp_u = np.zeros((0, K), dtype=np.float32)
+                            if run_benchmark and len(P_u_p_acc) == N_unseen:
                                 lp_u_p = np.log(np.clip(P_u_p_acc, 1e-9, 1.0))
                                 lp_u_c = np.log(np.clip(P_u_c_acc, 1e-9, 1.0)) if has_any_c else None
                                 lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
@@ -1278,8 +1299,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                             if lp_p is not None:
                                 w_tot_ts8 = w_comp_p + (w_comp_c if (has_any_c if num_8b_folds > 1 else W_c is not None) else 0.0)
-                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if (has_any_c if num_8b_folds > 1 else W_c is not None) else None, w_comp_p, w_comp_c)
-                                lp_m_u = lp_m_te if is_benchmark_eval else (lp_u if N_unseen > 0 and 'lp_u' in locals() else np.zeros((0, K), dtype=np.float32))
+                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if (has_any_c if num_8b_folds > 1 else W_c is not None) else None, w_comp_p, w_comp_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
+                                lp_m_u = lp_u if (run_benchmark and N_unseen > 0 and 'lp_u' in locals() and len(lp_u) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                                 auditor.add_model(name=opt_8b_key, tier="Comp", weight=w_tot_ts8, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
                         else:
                             print(f"[Pipeline] Optional checkpoint {opt_8b_key} rejected by gate; excluded from logits and spectral bank.")
@@ -1366,39 +1387,34 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_claude", 0.30), Z_unseen if N_unseen > 0 else None)
 
                 if W_spec is not None and W_spec.shape[0] == 5:
-                    claude_spec_logits = Z_te @ W_spec.T + b_spec
-                    claude_spec_logits_u = claude_spec_logits if is_benchmark_eval else (Z_unseen @ W_spec.T + b_spec if N_unseen > 0 else None)
+                    claude_spec_logits = (Z_te @ W_spec.T + b_spec) if (run_submission and len(Z_te) > 0) else None
+                    claude_spec_logits_u = (Z_unseen @ W_spec.T + b_spec) if (run_benchmark and len(Z_unseen) > 0) else None
 
                 if W_p is not None and W_p.shape[0] == 18:
                     w_comp_p = model_weights.get("qwen3_8b_claude", {}).get("plain_weight", comp_members.get("ntl_claude_head", {}).get("plain_weight", 0.10))
                     w_comp_c = model_weights.get("qwen3_8b_claude", {}).get("twin_weight", comp_members.get("ntl_claude_head", {}).get("twin_weight", 0.04))
-                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ro_labels))
-                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                    if is_benchmark_eval:
-                        lp_u_p = lp_p
-                    elif N_unseen > 0:
-                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ro_labels))
-                    else:
-                        lp_u_p = np.zeros((0, K), dtype=np.float32)
+                    lp_p = np.zeros((N_test, K), dtype=np.float32)
+                    lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                    lp_u_p = np.zeros((0, K), dtype=np.float32)
+                    lp_u_c = np.zeros((0, K), dtype=np.float32)
 
-                    if W_c is not None and W_c.shape[0] == 18:
-                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ro_labels, weights=(w85, w72, w60))
-                        comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                        if is_benchmark_eval:
-                            lp_u_c = lp_c_blend
-                        elif N_unseen > 0:
+                    if run_submission and len(Z_te) > 0:
+                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ro_labels))
+                        comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                        if W_c is not None and W_c.shape[0] == 18 and tracker_test is not None:
+                            lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ro_labels, weights=(w85, w72, w60))
+                            comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+
+                    if run_benchmark and len(Z_unseen) > 0:
+                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ro_labels))
+                        if W_c is not None and W_c.shape[0] == 18 and tracker_unseen is not None:
                             lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ro_labels, weights=(w85, w72, w60))
-                        else:
-                            lp_u_c = np.zeros((0, K), dtype=np.float32)
-                    else:
-                        lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                        lp_u_c = np.zeros((0, K), dtype=np.float32)
 
                     w_tot_cl = w_comp_p + (w_comp_c if (W_c is not None and W_c.shape[0] == 18) else 0.0)
                     twin_c_te = lp_c_blend if (W_c is not None and W_c.shape[0] == 18) else None
-                    lp_m_te = _combine_plain_and_twin_lp(lp_p, twin_c_te, w_comp_p, w_comp_c)
+                    lp_m_te = _combine_plain_and_twin_lp(lp_p, twin_c_te, w_comp_p, w_comp_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
                     twin_c_u = lp_u_c if (W_c is not None and W_c.shape[0] == 18) else None
-                    lp_m_u = lp_m_te if is_benchmark_eval else (_combine_plain_and_twin_lp(lp_u_p, twin_c_u, w_comp_p, w_comp_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32))
+                    lp_m_u = _combine_plain_and_twin_lp(lp_u_p, twin_c_u, w_comp_p, w_comp_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                     auditor.add_model("Qwen3-8B Claude Head", tier="Comp", weight=w_tot_cl, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                 apply_wpca_and_spectral(
@@ -1433,17 +1449,29 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             deb_dir = ckpts[deb_key]
             base_deb_dir = verified_bases.get("deberta_v3_large") or find_base_model(input_dir, "deberta", 1024, 24)
             print(f"[Pipeline] Loading Trunk 4: DeBERTa-v3 ({deb_key}) from {deb_dir}...")
-            deb_texts = test_texts if is_benchmark_eval else (test_texts + unseen_texts)
-            Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
-                deb_dir, base_deb_dir, deb_texts, train_sub_texts, y_sub
-            )
-            if is_benchmark_eval:
-                Z_te_deb = Z_test_all
-                Z_unseen_deb = Z_test_all
-            else:
+            if run_submission and N_test > 0 and run_benchmark and N_unseen > 0:
+                deb_texts = test_texts + unseen_texts
+                Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
+                    deb_dir, base_deb_dir, deb_texts, train_sub_texts, y_sub
+                )
                 Z_te_deb = Z_test_all[:N_test]
                 Z_unseen_deb = Z_test_all[N_test : N_test + N_unseen]
-            if N_unseen > 0:
+            elif run_submission and N_test > 0:
+                Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
+                    deb_dir, base_deb_dir, test_texts, train_sub_texts, y_sub
+                )
+                Z_te_deb = Z_test_all
+                Z_unseen_deb = np.zeros((0, Z_te_deb.shape[1]), dtype=np.float32)
+            elif run_benchmark and N_unseen > 0:
+                Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
+                    deb_dir, base_deb_dir, unseen_texts, train_sub_texts, y_sub
+                )
+                Z_unseen_deb = Z_test_all
+                Z_te_deb = np.zeros((0, Z_unseen_deb.shape[1]), dtype=np.float32)
+            else:
+                continue
+
+            if N_unseen > 0 and len(Z_unseen_deb) == N_unseen:
                 features_unseen_dict[deb_key] = Z_unseen_deb.astype(np.float16)
 
             if W_p_deb is None and not is_smoke:
@@ -1454,31 +1482,29 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             w_comp_deb = comp_members.get("deberta_v3_large", {}).get("plain_weight", 0.18)
             w_comp_c = model_weights.get(deb_key, {}).get("twin_weight", comp_members.get("deberta_v3_large", {}).get("twin_weight", 0.06))
             lp_p_deb = None
-            lp_u_deb = np.zeros((0, K), dtype=np.float32)
             lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+            lp_u_deb = np.zeros((0, K), dtype=np.float32)
             lp_u_c_deb = np.zeros((0, K), dtype=np.float32)
 
-            if W_p_deb is not None:
-                lp_p_deb = log_softmax(align_cols(Z_te_deb @ W_p_deb.T + b_p_deb, deb_labels))
-                LOGIT_MAIN += lp_p_deb * w_main_deb
-                comp_lora_posteriors.append((w_comp_deb, softmax(lp_p_deb, axis=1)))
-                if is_benchmark_eval:
-                    lp_u_deb = lp_p_deb
-                elif N_unseen > 0:
-                    lp_u_deb = log_softmax(align_cols(Z_unseen_deb @ W_p_deb.T + b_p_deb, deb_labels))
+            if run_submission and len(Z_te_deb) > 0:
+                if W_p_deb is not None:
+                    lp_p_deb = log_softmax(align_cols(Z_te_deb @ W_p_deb.T + b_p_deb, deb_labels))
+                    LOGIT_MAIN += lp_p_deb * w_main_deb
+                    comp_lora_posteriors.append((w_comp_deb, softmax(lp_p_deb, axis=1)))
+                if W_c_deb is not None and tracker_test is not None:
+                    lp_c_blend = compute_multires_centered_blend(Z_te_deb, tracker_test.groups, W_c_deb, b_c_deb, deb_labels, weights=(w85, w72, w60))
+                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
-            if W_c_deb is not None:
-                lp_c_blend = compute_multires_centered_blend(Z_te_deb, tracker_test.groups, W_c_deb, b_c_deb, deb_labels, weights=(w85, w72, w60))
-                comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
-                if is_benchmark_eval:
-                    lp_u_c_deb = lp_c_blend
-                elif N_unseen > 0:
+            if run_benchmark and len(Z_unseen_deb) > 0:
+                if W_p_deb is not None:
+                    lp_u_deb = log_softmax(align_cols(Z_unseen_deb @ W_p_deb.T + b_p_deb, deb_labels))
+                if W_c_deb is not None and tracker_unseen is not None:
                     lp_u_c_deb = compute_multires_centered_blend(Z_unseen_deb, tracker_unseen.groups, W_c_deb, b_c_deb, deb_labels, weights=(w85, w72, w60))
 
-            if W_p_deb is not None and lp_p_deb is not None:
+            if W_p_deb is not None:
                 w_tot_deb = w_main_deb + (w_comp_c if W_c_deb is not None else 0.0)
-                lp_m_te = _combine_plain_and_twin_lp(lp_p_deb, lp_c_blend if W_c_deb is not None else None, w_main_deb, w_comp_c)
-                lp_m_u = lp_m_te if is_benchmark_eval else (_combine_plain_and_twin_lp(lp_u_deb, lp_u_c_deb if W_c_deb is not None else None, w_main_deb, w_comp_c) if N_unseen > 0 else np.zeros((0, K), dtype=np.float32))
+                lp_m_te = _combine_plain_and_twin_lp(lp_p_deb, lp_c_blend if W_c_deb is not None else None, w_main_deb, w_comp_c) if (run_submission and lp_p_deb is not None and len(lp_p_deb) == N_test) else np.zeros((0, K), dtype=np.float32)
+                lp_m_u = _combine_plain_and_twin_lp(lp_u_deb, lp_u_c_deb if W_c_deb is not None else None, w_main_deb, w_comp_c) if (run_benchmark and len(lp_u_deb) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                 aud_name = "DeBERTa-v3-Large" if deb_key == "deberta_p2" else "DeBERTa-InHouse"
                 auditor.add_model(aud_name, tier="Main", weight=w_tot_deb, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
@@ -1599,25 +1625,25 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     print(f"[Pipeline] {opt_key}: marginal lift {lift:+.4f} < -0.002 -> skipping blend.")
                     gate_passed = False
 
-            if gate_passed and "Z_te" in locals():
+            if gate_passed and ("Z_te" in locals() or "Z_unseen" in locals()):
                 pr_sc = prior_scales.get(opt_key, 0.40)
-                update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
+                update_hybrid_groups(Z_te if 'Z_te' in locals() else None, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
 
-                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, opt_labels)) if W_p is not None else None
-                if W_c is not None:
-                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, opt_labels, weights=(w85, w72, w60))
-                else:
-                    lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-
-                if W_p is not None:
-                    comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
-                if W_c is not None:
-                    comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
+                lp_p = None
+                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
+                if run_submission and 'Z_te' in locals() and len(Z_te) > 0:
+                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, opt_labels)) if W_p is not None else None
+                    if W_c is not None and tracker_test is not None:
+                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, opt_labels, weights=(w85, w72, w60))
+                    if W_p is not None and lp_p is not None:
+                        comp_lora_posteriors.append((w_comp_p, softmax(lp_p, axis=1)))
+                    if W_c is not None:
+                        comp_lora_posteriors.append((w_comp_c, softmax(lp_c_blend, axis=1)))
 
                 apply_wpca_and_spectral(
                     model_key=opt_key,
-                    Z_te_mat=Z_te,
-                    Z_tr_mat=Z_tr,
+                    Z_te_mat=Z_te if 'Z_te' in locals() else np.zeros((0, 4096), dtype=np.float32),
+                    Z_tr_mat=Z_tr if 'Z_tr' in locals() else np.zeros((0, 4096), dtype=np.float32),
                     Z_u_mat=Z_unseen if (N_unseen > 0 and 'Z_unseen' in locals() and len(Z_unseen) == N_unseen) else None,
                     dp_w=dp_weights.get(opt_key, 0.05),
                     prior_scale=pr_sc,
@@ -1625,10 +1651,10 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     se_floor=se_floors.get(opt_key, 0.25)
                 )
 
-                if W_p is not None and lp_p is not None:
+                if W_p is not None:
                     w_tot = w_comp_p + (w_comp_c if W_c is not None else 0.0)
-                    lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c)
-                    lp_m_u = lp_m_te if is_benchmark_eval else (_combine_plain_and_twin_lp(lp_u, None, w_comp_p, w_comp_c) if (N_unseen > 0 and 'lp_u' in locals() and lp_u is not None) else np.zeros((0, K), dtype=np.float32))
+                    lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c) if (run_submission and lp_p is not None and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
+                    lp_m_u = _combine_plain_and_twin_lp(lp_u, None, w_comp_p, w_comp_c) if (run_benchmark and N_unseen > 0 and 'lp_u' in locals() and lp_u is not None and len(lp_u) == N_unseen) else np.zeros((0, K), dtype=np.float32)
                     auditor.add_model(opt_disp_name, tier="Comp", weight=w_tot, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
             if "heads_sd" in locals():
@@ -1672,11 +1698,11 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             embs.append(cls_norm.cpu().float().numpy())
                     return np.vstack(embs) if embs else np.zeros((0, 1024), dtype=np.float32)
 
-                Z_bge_te = _extract_bge_dense(test_texts)
-                Z_bge_u = Z_bge_te if is_benchmark_eval else (_extract_bge_dense(unseen_texts) if N_unseen > 0 else np.zeros((0, 1024), dtype=np.float32))
-                Z_bge_tr = _extract_bge_dense(train_sub_texts)
+                Z_bge_te = _extract_bge_dense(test_texts) if (run_submission and N_test > 0) else np.zeros((0, 1024), dtype=np.float32)
+                Z_bge_u = _extract_bge_dense(unseen_texts) if (run_benchmark and N_unseen > 0) else np.zeros((0, 1024), dtype=np.float32)
+                Z_bge_tr = _extract_bge_dense(train_sub_texts) if (extract_train_wpca and N_tr_sub > 0) else np.zeros((0, 1024), dtype=np.float32)
 
-                if N_unseen > 0:
+                if N_unseen > 0 and len(Z_bge_u) == N_unseen:
                     features_unseen_dict["bge_m3"] = Z_bge_u.astype(np.float16)
 
                 # Free BGE model from GPU immediately
@@ -1697,12 +1723,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
                 lp_p_bge = None
                 lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                if W_p is not None:
-                    lp_p_bge = log_softmax(align_cols(Z_bge_te @ W_p.T + b_p, LABELS))
-                    comp_lora_posteriors.append((w_bge_p, softmax(lp_p_bge, axis=1)))
-                if W_c is not None:
-                    lp_c_blend = compute_multires_centered_blend(Z_bge_te, tracker_test.groups, W_c, b_c, LABELS, weights=(w85, w72, w60))
-                    comp_lora_posteriors.append((w_bge_c, softmax(lp_c_blend, axis=1)))
+                if run_submission and len(Z_bge_te) > 0:
+                    if W_p is not None:
+                        lp_p_bge = log_softmax(align_cols(Z_bge_te @ W_p.T + b_p, LABELS))
+                        comp_lora_posteriors.append((w_bge_p, softmax(lp_p_bge, axis=1)))
+                    if W_c is not None and tracker_test is not None:
+                        lp_c_blend = compute_multires_centered_blend(Z_bge_te, tracker_test.groups, W_c, b_c, LABELS, weights=(w85, w72, w60))
+                        comp_lora_posteriors.append((w_bge_c, softmax(lp_c_blend, axis=1)))
 
                 apply_wpca_and_spectral(
                     model_key="bge_m3",
@@ -1715,17 +1742,14 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     se_floor=se_floors.get("bge_m3", 0.20)
                 )
 
-                if W_p is not None and lp_p_bge is not None:
+                if W_p is not None:
                     w_tot_bge = w_bge_p + (w_bge_c if W_c is not None else 0.0)
-                    lp_m_te = _combine_plain_and_twin_lp(lp_p_bge, lp_c_blend if W_c is not None else None, w_bge_p, w_bge_c)
-                    if is_benchmark_eval:
-                        lp_m_u = lp_m_te
-                    else:
-                        lp_m_u = np.zeros((0, K), dtype=np.float32)
-                        if N_unseen > 0 and len(Z_bge_u) == N_unseen:
-                            lp_u_bge = log_softmax(align_cols(Z_bge_u @ W_p.T + b_p, LABELS))
-                            lp_u_c_bge = compute_multires_centered_blend(Z_bge_u, tracker_unseen.groups, W_c, b_c, LABELS, weights=(w85, w72, w60)) if W_c is not None else None
-                            lp_m_u = _combine_plain_and_twin_lp(lp_u_bge, lp_u_c_bge, w_bge_p, w_bge_c)
+                    lp_m_te = _combine_plain_and_twin_lp(lp_p_bge, lp_c_blend if W_c is not None else None, w_bge_p, w_bge_c) if (run_submission and lp_p_bge is not None and len(lp_p_bge) == N_test) else np.zeros((0, K), dtype=np.float32)
+                    lp_m_u = np.zeros((0, K), dtype=np.float32)
+                    if run_benchmark and N_unseen > 0 and len(Z_bge_u) == N_unseen:
+                        lp_u_bge = log_softmax(align_cols(Z_bge_u @ W_p.T + b_p, LABELS))
+                        lp_u_c_bge = compute_multires_centered_blend(Z_bge_u, tracker_unseen.groups, W_c, b_c, LABELS, weights=(w85, w72, w60)) if (W_c is not None and tracker_unseen is not None) else None
+                        lp_m_u = _combine_plain_and_twin_lp(lp_u_bge, lp_u_c_bge, w_bge_p, w_bge_c)
                     auditor.add_model("BGE-M3", tier="Comp", weight=w_tot_bge, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
 
                 del Z_bge_tr, Z_bge_te, Z_bge_u
@@ -1762,66 +1786,57 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         center_C = sb_cfg.get("center_C", 0.03)
         center_blend = sb_cfg.get("center_blend", 0.35)
 
-        if spectral_params is not None and spectral_blocks_te:
+        if spectral_params is not None:
             print("[Pipeline] Computing Spectral Bank inference from pre-trained parameters...")
-            if is_benchmark_eval:
-                P_spectral, _ = predict_spectral_bank(
-                    params=spectral_params,
-                    spectral_te_blocks=spectral_blocks_te,
-                    spectral_u_blocks=None,
+            if run_submission and spectral_blocks_te and tracker_test is not None:
+                P_spectral = predict_spectral_bank(
+                    spectral_blocks=spectral_blocks_te,
+                    prm=spectral_params,
                     D_tfidf=tracker_test.D_tfidf,
                     D_neural_sum=tracker_test.D_neural_sum,
                     D_neural_weight_total=tracker_test.D_neural_weight_total,
-                    D_tfidf_u=None,
-                    D_neural_sum_u=None,
-                    D_neural_weight_total_u=None,
-                    N_test=N_test,
-                    N_unseen=0,
                     max_cluster_size=max_cl,
                 )
-                P_spectral_u = P_spectral
-            else:
-                P_spectral, P_spectral_u = predict_spectral_bank(
-                    params=spectral_params,
-                    spectral_te_blocks=spectral_blocks_te,
-                    spectral_u_blocks=spectral_blocks_u if spectral_blocks_u else None,
-                    D_tfidf=tracker_test.D_tfidf,
-                    D_neural_sum=tracker_test.D_neural_sum,
-                    D_neural_weight_total=tracker_test.D_neural_weight_total,
-                    D_tfidf_u=tracker_unseen.D_tfidf,
-                    D_neural_sum_u=tracker_unseen.D_neural_sum,
-                    D_neural_weight_total_u=tracker_unseen.D_neural_weight_total,
-                    N_test=N_test,
-                    N_unseen=N_unseen,
+                COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))
+            if run_benchmark and spectral_blocks_u and tracker_unseen is not None:
+                P_spectral_u = predict_spectral_bank(
+                    spectral_blocks=spectral_blocks_u,
+                    prm=spectral_params,
+                    D_tfidf=tracker_unseen.D_tfidf,
+                    D_neural_sum=tracker_unseen.D_neural_sum,
+                    D_neural_weight_total=tracker_unseen.D_neural_weight_total,
                     max_cluster_size=max_cl,
                 )
-            COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))
-        elif spectral_blocks_tr and spectral_blocks_te:
-            P_spectral, oof_score, P_spectral_u = fit_joint_spectral_bank(
+        elif spectral_blocks_tr:
+            res_spec = fit_joint_spectral_bank(
                 spectral_tr_blocks=spectral_blocks_tr,
-                spectral_te_blocks=spectral_blocks_te,
-                spectral_u_blocks=None if is_benchmark_eval else (spectral_blocks_u if spectral_blocks_u else None),
+                spectral_te_blocks=spectral_blocks_te if (run_submission and spectral_blocks_te) else [np.zeros((N_test, b.shape[1]), dtype=np.float32) for b in spectral_blocks_tr],
                 y_sub=y_sub,
                 prompts_sub=prompts_sub,
-                D_tfidf=tracker_test.D_tfidf,
-                D_neural_sum=tracker_test.D_neural_sum,
-                D_neural_weight_total=tracker_test.D_neural_weight_total,
-                D_tfidf_u=None if is_benchmark_eval else tracker_unseen.D_tfidf,
-                D_neural_sum_u=None if is_benchmark_eval else tracker_unseen.D_neural_sum,
-                D_neural_weight_total_u=None if is_benchmark_eval else tracker_unseen.D_neural_weight_total,
-                N_test=N_test,
-                N_unseen=0 if is_benchmark_eval else N_unseen,
+                D_tfidf=tracker_test.D_tfidf if tracker_test is not None else np.zeros((0, 0), dtype=np.float32),
+                D_neural_sum=tracker_test.D_neural_sum if tracker_test is not None else np.zeros((0, 0), dtype=np.float32),
+                D_neural_weight_total=tracker_test.D_neural_weight_total if tracker_test is not None else 0.0,
+                N_test=N_test if run_submission else 0,
                 plain_C=plain_C,
                 center_C=center_C,
                 center_blend=center_blend,
                 max_cluster_size=max_cl,
-                return_unseen=not is_benchmark_eval,
+                spectral_u_blocks=spectral_blocks_u if (run_benchmark and spectral_blocks_u) else None,
+                D_tfidf_u=tracker_unseen.D_tfidf if tracker_unseen is not None else None,
+                D_neural_sum_u=tracker_unseen.D_neural_sum if tracker_unseen is not None else None,
+                D_neural_weight_total_u=tracker_unseen.D_neural_weight_total if tracker_unseen is not None else 0.0,
+                N_unseen=N_unseen if run_benchmark else 0,
+                return_unseen=run_benchmark,
                 save_path=working_dir / "spectral_heads.safetensors",
             )
-            if is_benchmark_eval:
-                P_spectral_u = P_spectral
+            if run_benchmark:
+                P_spectral, oof_score, P_spectral_u = res_spec
+            else:
+                P_spectral, oof_score = res_spec
+                P_spectral_u = None
             print(f"[Pipeline] Joint Spectral Bank fitted (OOF BAcc = {oof_score:.4f})")
-            COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))
+            if run_submission and P_spectral is not None:
+                COMP_LIST.append((comp_streams.get("spectral_bank", 0.15), P_spectral))
 
     elif is_smoke:
         print("[Pipeline] Smoke mode active: synthesizing high-fidelity mock representations...")
@@ -1840,35 +1855,33 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     extra_streams: List[Tuple[str, float, np.ndarray]] = []
     extra_streams_u: List[Tuple[str, float, np.ndarray]] = []
     w_dp = model_weights.get("wpca_dp", {}).get("plain_weight", 0.22)
-    if dp_posteriors:
+    if run_submission and dp_posteriors:
         tot_dp_w = sum(w for w, _ in dp_posteriors)
         P_dp_comb = sum(w * P_dp for w, P_dp in dp_posteriors) / max(1e-8, tot_dp_w)
         extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_comb, 1e-9, 1.0))))
-        if is_benchmark_eval:
-            extra_streams_u.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_comb, 1e-9, 1.0))))
-        elif dp_posteriors_u and N_unseen > 0:
-            tot_dp_u_w = sum(w for w, _ in dp_posteriors_u)
-            P_dp_u_comb = sum(w * P_dp for w, P_dp in dp_posteriors_u) / max(1e-8, tot_dp_u_w)
-            extra_streams_u.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_u_comb, 1e-9, 1.0))))
     elif is_smoke:
         extra_streams.append(("wpca_dp", w_dp, np.log(np.clip(mock_p_dp, 1e-9, 1.0))))
-        if is_benchmark_eval:
-            extra_streams_u.append(("wpca_dp", w_dp, np.log(np.clip(mock_p_dp, 1e-9, 1.0))))
+
+    if run_benchmark and dp_posteriors_u and N_unseen > 0:
+        tot_dp_u_w = sum(w for w, _ in dp_posteriors_u)
+        P_dp_u_comb = sum(w * P_dp for w, P_dp in dp_posteriors_u) / max(1e-8, tot_dp_u_w)
+        extra_streams_u.append(("wpca_dp", w_dp, np.log(np.clip(P_dp_u_comb, 1e-9, 1.0))))
+    elif is_smoke and run_benchmark:
+        extra_streams_u.append(("wpca_dp", w_dp, np.log(np.clip(mock_p_dp, 1e-9, 1.0))))
 
     w_sb = model_weights.get("spectral_bank", {}).get("plain_weight", 0.12)
-    if "P_spectral" in locals() and P_spectral is not None:
+    if run_submission and "P_spectral" in locals() and P_spectral is not None:
         extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral, 1e-9, 1.0))))
-        if is_benchmark_eval:
-            extra_streams_u.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral, 1e-9, 1.0))))
-        elif "P_spectral_u" in locals() and P_spectral_u is not None and N_unseen > 0:
-            extra_streams_u.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral_u, 1e-9, 1.0))))
     elif is_smoke:
         extra_streams.append(("spectral_bank", w_sb, np.log(np.clip(mock_p_spec, 1e-9, 1.0))))
-        if is_benchmark_eval:
-            extra_streams_u.append(("spectral_bank", w_sb, np.log(np.clip(mock_p_spec, 1e-9, 1.0))))
+
+    if run_benchmark and "P_spectral_u" in locals() and P_spectral_u is not None and N_unseen > 0:
+        extra_streams_u.append(("spectral_bank", w_sb, np.log(np.clip(P_spectral_u, 1e-9, 1.0))))
+    elif is_smoke and run_benchmark:
+        extra_streams_u.append(("spectral_bank", w_sb, np.log(np.clip(mock_p_spec, 1e-9, 1.0))))
 
     if len(auditor.models) > 0:
-        optimize_on_unseen = (N_unseen >= 36 and not is_smoke)
+        optimize_on_unseen = (run_benchmark and N_unseen >= 36 and not is_smoke)
         P_mix, active_weights_map, df_ablation = auditor.optimize_weights_and_blend(
             working_dir=working_dir,
             extra_test_log_probs=extra_streams,
@@ -1877,69 +1890,38 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         )
         print(f"[Pipeline] Flat log-space ensemble active weights: {active_weights_map}")
         R_main = P_mix
-        P_mix_u = P_mix if is_benchmark_eval else getattr(auditor, "P_mix_unseen", np.zeros((0, K), dtype=np.float64))
+        P_mix_u = getattr(auditor, "P_mix_unseen", np.zeros((0, K), dtype=np.float64)) if run_benchmark else np.zeros((0, K), dtype=np.float64)
     else:
         main_ratio = fusion_cfg.get("main_ratio", 0.85)
         comp_ratio = fusion_cfg.get("comp_ratio", 0.15)
         P_mix, R_main = blend_main_and_complementary(LOGIT_MAIN, COMP_LIST, main_ratio=main_ratio, comp_ratio=comp_ratio)
-        P_mix_u = P_mix if is_benchmark_eval else np.zeros((0, K), dtype=np.float64)
+        P_mix_u = np.zeros((0, K), dtype=np.float64)
 
     train_prior = np.bincount(y_sub, minlength=18).astype(np.float64) + 1.0 if len(y_sub) > 0 else None
     train_ref_texts = train_sub_texts if len(train_sub_texts) > 0 else (df_train["text"].fillna("").astype(str).tolist() if df_train is not None and "text" in df_train.columns else [])
     train_ref_y = y_sub if len(y_sub) > 0 else (df_train["model"].values if df_train is not None and "model" in df_train.columns else np.array([], dtype=int))
 
-    # Run full inference pipeline on TEST
-    P_final = run_full_inference_pipeline(
-        P_mix=P_mix,
-        texts=test_texts,
-        post_cfg=post_cfg,
-        R_main=R_main,
-        claude_spec_logits=claude_spec_logits if "claude_spec_logits" in locals() else None,
-        claude_classes=claude_classes if "claude_classes" in locals() else None,
-        log_p_handwriting=log_p_handwriting if "log_p_handwriting" in locals() else None,
-        rule_flags=rule_flags_test if "rule_flags_test" in locals() else None,
-        train_texts=train_ref_texts,
-        y_train=train_ref_y,
-        train_prior=train_prior,
-    )
-
-    # Run full inference pipeline on UNSEEN BENCHMARK (Exact parity with test inference)
-    P_final_u = np.zeros((0, K), dtype=np.float32)
-    if is_benchmark_eval:
-        P_final_u = P_final
-        raw_unseen_bacc = float(balanced_accuracy_score(y_unseen, P_mix.argmax(axis=1)))
-        post_unseen_bacc = float(balanced_accuracy_score(y_unseen, P_final.argmax(axis=1)))
-        lift_post = post_unseen_bacc - raw_unseen_bacc
-        print("=" * 70)
-        print(f"[Pipeline Benchmark Validation] 100% Symmetrical Pipeline Parity Evaluation:")
-        print(f"  - Pre-Postprocessing Ensemble Raw BAcc : {raw_unseen_bacc:.4f} ({raw_unseen_bacc*100:.2f}%)")
-        print(f"  - Full Postprocessed Benchmark BAcc     : {post_unseen_bacc:.4f} ({post_unseen_bacc*100:.2f}%)")
-        print(f"  - Downstream Postprocessing Lift       : {lift_post:+.4f} ({lift_post*100:+.2f}%)")
-        print("=" * 70)
-
-        from sklearn.metrics import confusion_matrix
-        cm = confusion_matrix(y_unseen, P_final.argmax(axis=1), labels=range(K))
-        np.fill_diagonal(cm, 0)
-        top_err_indices = np.dstack(np.unravel_index(np.argsort(cm.ravel())[::-1], cm.shape))[0][:10]
-        print("[Pipeline Benchmark] Top 10 confused class pairs:")
-        for r_idx, c_idx in top_err_indices:
-            if cm[r_idx, c_idx] > 0:
-                print(f"    True: {LABELS[r_idx]:<22} -> Pred: {LABELS[c_idx]:<22} : {cm[r_idx, c_idx]} errors")
-
-        # Save clean_benchmark_1800_predictions.npz
-        bench_pred_file = working_dir / "clean_benchmark_1800_predictions.npz"
-        np.savez_compressed(
-            bench_pred_file,
-            P_mix=P_mix.astype(np.float32),
-            P_final=P_final.astype(np.float32),
-            y_unseen=y_unseen.astype(np.int32),
-            raw_bacc=np.array([raw_unseen_bacc], dtype=np.float32),
-            post_bacc=np.array([post_unseen_bacc], dtype=np.float32),
-            lift=np.array([lift_post], dtype=np.float32),
-            labels=np.array(LABELS, dtype=object),
+    # Run full inference pipeline on TEST (if run_submission)
+    if run_submission and N_test > 0:
+        P_final = run_full_inference_pipeline(
+            P_mix=P_mix,
+            texts=test_texts,
+            post_cfg=post_cfg,
+            R_main=R_main,
+            claude_spec_logits=claude_spec_logits if "claude_spec_logits" in locals() else None,
+            claude_classes=claude_classes if "claude_classes" in locals() else None,
+            log_p_handwriting=log_p_handwriting if "log_p_handwriting" in locals() else None,
+            rule_flags=rule_flags_test if "rule_flags_test" in locals() else None,
+            train_texts=train_ref_texts,
+            y_train=train_ref_y,
+            train_prior=train_prior,
         )
-        print(f"[Pipeline Benchmark] Exported clean benchmark predictions: {bench_pred_file} ({bench_pred_file.stat().st_size} bytes)")
-    elif N_unseen > 0 and len(P_mix_u) == N_unseen:
+    else:
+        P_final = np.ones((N_test, K), dtype=np.float32) / float(K)
+
+    # Run full inference pipeline on UNSEEN BENCHMARK (if run_benchmark)
+    P_final_u = np.zeros((0, K), dtype=np.float32)
+    if run_benchmark and N_unseen > 0:
         P_final_u = run_full_inference_pipeline(
             P_mix=P_mix_u,
             texts=unseen_texts,
@@ -1964,6 +1946,36 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         print(f"  - Downstream Postprocessing Lift       : {lift_post:+.4f} ({lift_post*100:+.2f}%)")
         print("=" * 70)
 
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(y_unseen, P_final_u.argmax(axis=1), labels=range(K))
+        print("[Pipeline Benchmark Validation] Class-by-Class Accuracies:")
+        for c_idx, c_name in enumerate(LABELS):
+            denom = cm[c_idx].sum()
+            c_acc = cm[c_idx, c_idx] / denom if denom > 0 else 0.0
+            print(f"  [{c_idx:02d}] {c_name:<28s}: {c_acc*100:5.1f}% ({cm[c_idx, c_idx]}/{denom})")
+
+        cm_err = cm.copy()
+        np.fill_diagonal(cm_err, 0)
+        top_err_indices = np.dstack(np.unravel_index(np.argsort(cm_err.ravel())[::-1], cm_err.shape))[0][:10]
+        print("[Pipeline Benchmark] Top 10 confused class pairs:")
+        for r_idx, c_idx in top_err_indices:
+            if cm_err[r_idx, c_idx] > 0:
+                print(f"    True: {LABELS[r_idx]:<22} -> Pred: {LABELS[c_idx]:<22} : {cm_err[r_idx, c_idx]} errors")
+
+        # Save clean_benchmark_1800_predictions.npz
+        bench_pred_file = working_dir / "clean_benchmark_1800_predictions.npz"
+        np.savez_compressed(
+            bench_pred_file,
+            P_mix=P_mix_u.astype(np.float32),
+            P_final=P_final_u.astype(np.float32),
+            y_unseen=y_unseen.astype(np.int32),
+            raw_bacc=np.array([raw_unseen_bacc], dtype=np.float32),
+            post_bacc=np.array([post_unseen_bacc], dtype=np.float32),
+            lift=np.array([lift_post], dtype=np.float32),
+            labels=np.array(LABELS, dtype=object),
+        )
+        print(f"[Pipeline Benchmark] Exported clean benchmark predictions: {bench_pred_file} ({bench_pred_file.stat().st_size} bytes)")
+
     # Auditing and forward stepwise ablation report
     test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
     auditor.print_and_save_report(working_dir, final_test_preds=test_final_preds)
@@ -1979,19 +1991,19 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             "N_test": np.array([N_test], dtype=np.int32),
             "N_unseen": np.array([N_unseen], dtype=np.int32),
             "y_unseen": y_unseen.astype(np.int32) if len(y_unseen) > 0 else np.array([], dtype=np.int32),
-            "groups_unseen": tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)),
-            "groups_085_u": tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)),
-            "groups_072_u": tracker_unseen.groups.get(0.72, np.zeros(0, dtype=np.int32)),
-            "groups_065_u": tracker_unseen.groups.get(0.65, np.zeros(0, dtype=np.int32)),
-            "groups_060_u": tracker_unseen.groups.get(0.60, np.zeros(0, dtype=np.int32)),
-            "D_tfidf": tracker_test.D_tfidf.astype(np.float32) if tracker_test.D_tfidf is not None else np.zeros((0, 0), dtype=np.float32),
-            "D_hybrid": tracker_test.D_hybrid.astype(np.float32) if tracker_test.D_hybrid is not None else np.zeros((0, 0), dtype=np.float32),
-            "D_tfidf_u": tracker_unseen.D_tfidf.astype(np.float32) if tracker_unseen.D_tfidf is not None else np.zeros((0, 0), dtype=np.float32),
-            "D_hybrid_u": tracker_unseen.D_hybrid.astype(np.float32) if tracker_unseen.D_hybrid is not None else np.zeros((0, 0), dtype=np.float32),
-            "groups_085": tracker_test.groups.get(0.85, np.zeros(0, dtype=np.int32)),
-            "groups_072": tracker_test.groups.get(0.72, np.zeros(0, dtype=np.int32)),
-            "groups_065": tracker_test.groups.get(0.65, np.zeros(0, dtype=np.int32)),
-            "groups_060": tracker_test.groups.get(0.60, np.zeros(0, dtype=np.int32)),
+            "groups_unseen": tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)) if tracker_unseen else np.zeros(0, dtype=np.int32),
+            "groups_085_u": tracker_unseen.groups.get(0.85, np.zeros(0, dtype=np.int32)) if tracker_unseen else np.zeros(0, dtype=np.int32),
+            "groups_072_u": tracker_unseen.groups.get(0.72, np.zeros(0, dtype=np.int32)) if tracker_unseen else np.zeros(0, dtype=np.int32),
+            "groups_065_u": tracker_unseen.groups.get(0.65, np.zeros(0, dtype=np.int32)) if tracker_unseen else np.zeros(0, dtype=np.int32),
+            "groups_060_u": tracker_unseen.groups.get(0.60, np.zeros(0, dtype=np.int32)) if tracker_unseen else np.zeros(0, dtype=np.int32),
+            "D_tfidf": tracker_test.D_tfidf.astype(np.float32) if (tracker_test and tracker_test.D_tfidf is not None) else np.zeros((0, 0), dtype=np.float32),
+            "D_hybrid": tracker_test.D_hybrid.astype(np.float32) if (tracker_test and tracker_test.D_hybrid is not None) else np.zeros((0, 0), dtype=np.float32),
+            "D_tfidf_u": tracker_unseen.D_tfidf.astype(np.float32) if (tracker_unseen and tracker_unseen.D_tfidf is not None) else np.zeros((0, 0), dtype=np.float32),
+            "D_hybrid_u": tracker_unseen.D_hybrid.astype(np.float32) if (tracker_unseen and tracker_unseen.D_hybrid is not None) else np.zeros((0, 0), dtype=np.float32),
+            "groups_085": tracker_test.groups.get(0.85, np.zeros(0, dtype=np.int32)) if tracker_test else np.zeros(0, dtype=np.int32),
+            "groups_072": tracker_test.groups.get(0.72, np.zeros(0, dtype=np.int32)) if tracker_test else np.zeros(0, dtype=np.int32),
+            "groups_065": tracker_test.groups.get(0.65, np.zeros(0, dtype=np.int32)) if tracker_test else np.zeros(0, dtype=np.int32),
+            "groups_060": tracker_test.groups.get(0.60, np.zeros(0, dtype=np.int32)) if tracker_test else np.zeros(0, dtype=np.int32),
             "model_names": np.array([m["name"] for m in auditor.models], dtype=object),
             "model_tiers": np.array([m["tier"] for m in auditor.models], dtype=object),
             "model_prior_weights": np.array([m.get("prior_weight", m["weight"]) for m in auditor.models], dtype=np.float64),
@@ -2001,7 +2013,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             "P_mix_unseen": P_mix_u.astype(np.float32) if len(P_mix_u) > 0 else np.zeros((0, K), dtype=np.float32),
             "P_final_unseen": P_final_u.astype(np.float32) if len(P_final_u) > 0 else np.zeros((0, K), dtype=np.float32),
             "test_texts": np.array(test_texts, dtype=object),
-            "unseen_texts": np.array(test_texts if is_benchmark_eval else unseen_texts, dtype=object),
+            "unseen_texts": np.array(unseen_texts, dtype=object),
         }
         for idx, m in enumerate(auditor.models):
             cache_dict[f"m_{idx}_unseen_lp"] = m["unseen_lp"].astype(np.float32)
