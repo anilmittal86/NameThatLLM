@@ -358,33 +358,53 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     print(f"[Pipeline] Module 1 complete: log_p_svc_main shape = {log_p_svc_main.shape}, unseen_log_p_svc_main shape = {unseen_log_p_svc_main.shape}")
 
-    # Read configuration hierarchies from configs/production_ensemble.json
+    # Unified model specifications and configuration
+    models_cfg = cfg.get("models", cfg.get("model_weights", {}))
+    model_weights = models_cfg  # Backward compatibility
+    post_cfg = cfg.get("postprocess", {})
     main_cfg = cfg.get("main_stack", {})
     comp_cfg = cfg.get("complementary_stack", {})
-    fusion_cfg = cfg.get("fusion", {})
-    post_cfg = cfg.get("postprocess", {})
-    model_weights = cfg.get("model_weights", {})
-
-    svc_weight = model_weights.get("svc_4view", {}).get("plain_weight", main_cfg.get("linear_svc_weight", 1.00))
     main_members = main_cfg.get("members", {})
     comp_streams = comp_cfg.get("stream_weights", {})
     comp_members = comp_cfg.get("lora_members", {})
-    lex_comp_weight = model_weights.get("lexical_5v", {}).get("plain_weight", comp_streams.get("lexical", 0.20))
-    se_floors = comp_cfg.get("se_floors", {
+    se_floors_legacy = comp_cfg.get("se_floors", {})
+    prior_scales_legacy = comp_cfg.get("prior_scales", {})
+    dp_weights_legacy = comp_cfg.get("dp_weights", {})
+
+    def get_model_spec(model_key: str, param: str, default: Any = 0.0) -> Any:
+        m_entry = models_cfg.get(model_key, {})
+        if isinstance(m_entry, dict) and param in m_entry:
+            return m_entry[param]
+        if isinstance(m_entry, (int, float)) and param in ("plain_weight", "weight"):
+            return float(m_entry)
+        if param == "dp_weight" and model_key in dp_weights_legacy:
+            return dp_weights_legacy[model_key]
+        if param == "se_floor" and model_key in se_floors_legacy:
+            return se_floors_legacy[model_key]
+        if param == "prior_scale" and model_key in prior_scales_legacy:
+            return prior_scales_legacy[model_key]
+        return default
+
+    default_se = {
         "qwen3_14b_p2": 0.10, "qwen25_14b_p2": 0.10, "deberta_p2": 0.10,
         "qwen3_14b_p1": 0.35, "instyle": 0.35, "qwen3_8b_claude": 0.35
-    })
-    prior_scales = comp_cfg.get("prior_scales", PRIOR_SCALES)
-    dp_weights = comp_cfg.get("dp_weights", {
+    }
+    default_dp = {
         "q3_14b": 0.38, "q25_14b": 0.24, "deberta": 0.20, "instyle": 0.10, "part1_14b": 0.08
-    })
-    twin_res = comp_cfg.get("twin_resolutions", {
-        "t85": 0.50, "t72": 0.30, "t60": 0.20
-    })
+    }
+    all_known_keys = set(list(ckpts.keys()) + list(models_cfg.keys()) + list(default_se.keys()) + list(PRIOR_SCALES.keys()))
+    se_floors = {k: get_model_spec(k, "se_floor", default_se.get(k, 0.10)) for k in all_known_keys}
+    prior_scales = {k: get_model_spec(k, "prior_scale", PRIOR_SCALES.get(k, 0.50)) for k in all_known_keys}
+    dp_weights = {k: get_model_spec(k, "dp_weight", default_dp.get(k, 0.10)) for k in all_known_keys}
+
+    twin_res = comp_cfg.get("twin_resolutions", {"t85": 0.50, "t72": 0.30, "t60": 0.20})
     w85 = float(twin_res.get("t85", 0.50))
     w72 = float(twin_res.get("t72", 0.30))
     w60 = float(twin_res.get("t60", 0.20))
     max_cl = post_cfg.get("max_cluster_size", 14)
+
+    svc_weight = get_model_spec("svc_4view", "plain_weight", main_cfg.get("linear_svc_weight", 0.30))
+    lex_comp_weight = get_model_spec("lexical_5v", "plain_weight", comp_streams.get("lexical", 0.10))
 
     LOGIT_MAIN = log_p_svc_main * svc_weight if (run_submission and len(log_p_svc_main) == N_test) else np.zeros((N_test, K), dtype=np.float32)
     COMP_LIST: List[Tuple[float, np.ndarray]] = [

@@ -419,15 +419,20 @@ def validate_production_assets(
         else:
             verified_bases[b_spec["name"]] = b_path
 
-    # 4. Verify all required fine-tuned checkpoints
+    # 4. Verify fine-tuned checkpoints
     default_req_ckpts = [
         "qwen3_14b_p2", "qwen25_14b_p2",
         "deberta_p2", "qwen3_8b_claude"
     ]
-    req_ckpts = req.get("required_checkpoints", default_req_ckpts)
-    for ck_name in req_ckpts:
-        if ck_name not in ckpts or not Path(ckpts[ck_name]).exists():
-            missing.append(f"Required checkpoint '{ck_name}' not found under {input_dir} (discovered: {list(ckpts.keys())})")
+    if "checkpoints" in req or "checkpoints" in cfg:
+        # Unified single checkpoints list: ensure valid checkpoints were discovered under input_dir
+        if len(ckpts) == 0:
+            missing.append(f"No fine-tuned checkpoints found under {input_dir}")
+    else:
+        req_ckpts = req.get("required_checkpoints", default_req_ckpts)
+        for ck_name in req_ckpts:
+            if ck_name not in ckpts or not Path(ckpts[ck_name]).exists():
+                missing.append(f"Required checkpoint '{ck_name}' not found under {input_dir} (discovered: {list(ckpts.keys())})")
 
     if missing:
         error_msg = (

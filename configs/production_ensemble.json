@@ -1,11 +1,11 @@
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "name": "production_ensemble",
-  "description": "Production Two-Tier Stack (85% Main Part-Two Baseline + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank)",
-  "probe_gate_min_bacc": 0.40,
+  "description": "Flat Log-Space Production Ensemble with Unsupervised Spectral Bank & Sinkhorn Balancing",
   "run_benchmark": true,
   "run_submission": false,
   "enable_ablation_probe": true,
+  "probe_gate_min_bacc": 0.40,
   "labels": [
     "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra",
     "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
@@ -18,141 +18,56 @@
     "claude": [9, 10, 11, 12, 13],
     "glm": [15, 16]
   },
-  "required_assets": {
-    "require_pool_parquet": true,
-    "required_base_models": [
-      { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 },
-      { "name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48 },
-      { "name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36 },
-      { "name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24 }
-    ],
-    "required_checkpoints": [
-      "qwen3_14b_p2",
-      "qwen25_14b_p2",
-      "deberta_p2",
-      "qwen3_8b_claude"
-    ],
-    "optional_checkpoints": [
-      "qwen3_14b_v5",
-      "qwen3_14b_inhouse",
-      "qwen25_14b_inhouse",
-      "deberta_inhouse",
-      "qwen3_8b_v5",
-      "llama3_8b_v5",
-      "gemma2_9b_ts",
-      "llama31_8b_ts",
-      "mistral_7b_ts",
-      "bge_m3"
-    ]
+  "required_base_models": [
+    { "name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40 },
+    { "name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48 },
+    { "name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36 },
+    { "name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24 }
+  ],
+  "checkpoints": [
+    "qwen3_14b_v5",
+    "qwen3_14b_p2",
+    "qwen3_14b_inhouse",
+    "qwen25_14b_p2",
+    "qwen25_14b_inhouse",
+    "deberta_p2",
+    "deberta_inhouse",
+    "qwen3_8b_v5",
+    "qwen3_8b_claude",
+    "gemma2_9b_ts",
+    "llama31_8b_ts",
+    "llama3_8b_v5",
+    "mistral_7b_ts",
+    "bge_m3"
+  ],
+  "models": {
+    "svc_4view": { "plain_weight": 0.30 },
+    "lexical_5v": { "plain_weight": 0.10 },
+    "wpca_dp": { "plain_weight": 0.25 },
+    "spectral_bank": { "plain_weight": 0.10 },
+    "qwen3_14b_v5": { "plain_weight": 0.48, "twin_weight": 0.16, "dp_weight": 0.10, "prior_scale": 0.50, "se_floor": 0.25 },
+    "qwen3_14b_p2": { "plain_weight": 0.42, "twin_weight": 0.14, "dp_weight": 0.38, "prior_scale": 1.00, "se_floor": 0.10 },
+    "qwen3_14b_inhouse": { "plain_weight": 0.40, "twin_weight": 0.14, "dp_weight": 0.10, "prior_scale": 0.50, "se_floor": 0.25 },
+    "qwen25_14b_p2": { "plain_weight": 0.22, "twin_weight": 0.08, "dp_weight": 0.24, "prior_scale": 0.85, "se_floor": 0.10 },
+    "qwen25_14b_inhouse": { "plain_weight": 0.22, "twin_weight": 0.08, "dp_weight": 0.24, "prior_scale": 0.85, "se_floor": 0.10 },
+    "deberta_p2": { "plain_weight": 0.22, "twin_weight": 0.06, "dp_weight": 0.20, "prior_scale": 0.80, "se_floor": 0.10 },
+    "deberta_inhouse": { "plain_weight": 0.22, "twin_weight": 0.06, "dp_weight": 0.20, "prior_scale": 0.80, "se_floor": 0.10 },
+    "qwen3_8b_v5": { "plain_weight": 0.32, "twin_weight": 0.11, "dp_weight": 0.10, "prior_scale": 0.40, "se_floor": 0.35 },
+    "qwen3_8b_claude": { "plain_weight": 0.10, "twin_weight": 0.04, "dp_weight": 0.04, "prior_scale": 0.30, "se_floor": 0.35 },
+    "gemma2_9b_ts": { "plain_weight": 0.32, "twin_weight": 0.10, "dp_weight": 0.05, "prior_scale": 0.40, "se_floor": 0.25 },
+    "llama31_8b_ts": { "plain_weight": 0.30, "twin_weight": 0.10, "dp_weight": 0.05, "prior_scale": 0.40, "se_floor": 0.25 },
+    "llama3_8b_v5": { "plain_weight": 0.20, "twin_weight": 0.07, "dp_weight": 0.05, "prior_scale": 0.40, "se_floor": 0.25 },
+    "mistral_7b_ts": { "plain_weight": 0.28, "twin_weight": 0.08, "dp_weight": 0.05, "prior_scale": 0.40, "se_floor": 0.25 },
+    "bge_m3": { "plain_weight": 0.20, "twin_weight": 0.04, "dp_weight": 0.10, "prior_scale": 0.60, "se_floor": 0.20 }
   },
-  "model_weights": {
-    "svc_4view": { "plain_weight": 0.30, "twin_weight": 0.00 },
-    "qwen3_14b_v5": { "plain_weight": 0.48, "twin_weight": 0.16 },
-    "qwen3_14b_p2": { "plain_weight": 0.42, "twin_weight": 0.14 },
-    "qwen3_14b_inhouse": { "plain_weight": 0.40, "twin_weight": 0.14 },
-    "qwen3_8b_v5": { "plain_weight": 0.32, "twin_weight": 0.11 },
-    "qwen25_14b_p2": { "plain_weight": 0.22, "twin_weight": 0.08 },
-    "qwen25_14b_inhouse": { "plain_weight": 0.22, "twin_weight": 0.08 },
-    "deberta_p2": { "plain_weight": 0.22, "twin_weight": 0.06 },
-    "llama3_8b_v5": { "plain_weight": 0.20, "twin_weight": 0.07 },
-    "gemma2_9b_ts": { "plain_weight": 0.32, "twin_weight": 0.10 },
-    "llama31_8b_ts": { "plain_weight": 0.30, "twin_weight": 0.10 },
-    "mistral_7b_ts": { "plain_weight": 0.28, "twin_weight": 0.08 },
-    "bge_m3": { "plain_weight": 0.20, "twin_weight": 0.00 },
-    "qwen3_8b_claude": { "plain_weight": 0.00, "twin_weight": 0.00 },
-    "lexical_5v": { "plain_weight": 0.10, "twin_weight": 0.00 },
-    "wpca_dp": { "plain_weight": 0.25, "twin_weight": 0.00 },
-    "spectral_bank": { "plain_weight": 0.10, "twin_weight": 0.00 }
-  },
-  "main_stack": {
-    "linear_svc_weight": 1.00,
-    "members": {
-      "lora_qwen3_14b": {
-        "plain_weight": 0.40,
-        "twin_weight": 0.10,
-        "twin_clustering": "groups_085"
-      },
-      "lora_qwen25_14b": {
-        "plain_weight": 0.20,
-        "twin_weight": 0.10,
-        "twin_clustering": "groups_085"
-      },
-      "deberta_v3_large": {
-        "plain_weight": 0.25,
-        "twin_weight": 0.00
-      }
-    }
-  },
-  "complementary_stack": {
-    "stream_weights": {
-      "lora_and_twins": 0.35,
-      "lexical": 0.20,
-      "dp_posteriors": 0.30,
-      "spectral_bank": 0.15
-    },
-    "lora_members": {
-      "lora_qwen3_14b": { "plain_weight": 0.30, "twin_weight": 0.10 },
-      "lora14b_v1": { "plain_weight": 0.14, "twin_weight": 0.05 },
-      "qwen3_14b_ts": { "plain_weight": 0.20, "twin_weight": 0.08 },
-      "lora_qwen25_14b": { "plain_weight": 0.20, "twin_weight": 0.08 },
-      "instyle": { "plain_weight": 0.22, "twin_weight": 0.08 },
-      "qwen3_8b_ts": { "plain_weight": 0.20, "twin_weight": 0.08 },
-      "ntl_claude_head": { "plain_weight": 0.14, "twin_weight": 0.05 },
-      "deberta_v3_large": { "plain_weight": 0.18, "twin_weight": 0.06 }
-    },
-    "twin_resolutions": {
-      "t85": 0.50,
-      "t72": 0.30,
-      "t60": 0.20
-    },
-    "dp_weights": {
-      "q3_14b": 0.38,
-      "q25_14b": 0.24,
-      "deberta": 0.20,
-      "instyle": 0.10,
-      "part1_14b": 0.08,
-      "q3_14b_ts": 0.10,
-      "q3_8b_ts": 0.10,
-      "claude_8b": 0.04
-    },
-    "se_floors": {
-      "qwen3_14b_p2": 0.10,
-      "qwen25_14b_p2": 0.10,
-      "deberta_p2": 0.10,
-      "qwen3_14b_p1": 0.35,
-      "qwen3_14b_ts": 0.25,
-      "instyle": 0.35,
-      "qwen3_8b_ts": 0.35,
-      "qwen3_8b_claude": 0.35
-    },
-    "prior_scales": {
-      "qwen3_14b_p2": 1.00,
-      "qwen25_14b_p2": 0.85,
-      "deberta_p2": 0.80,
-      "qwen3_14b_p1": 0.50,
-      "qwen3_14b_ts": 0.50,
-      "instyle": 0.45,
-      "qwen3_8b_ts": 0.40,
-      "qwen3_8b_claude": 0.30
-    },
-    "spectral_bank": {
-      "plain_C": 0.04,
-      "center_C": 0.03,
-      "center_blend": 0.35
-    },
-    "extract_train_wpca": false
-  },
-  "fusion": {
-    "main_ratio": 0.85,
-    "comp_ratio": 0.15
+  "spectral_bank": {
+    "plain_C": 0.04,
+    "center_C": 0.03,
+    "center_blend": 0.35
   },
   "postprocess": {
     "claude_specialist_weight": 0.15,
     "curly_quote_multiplier": 0.36787944117144233,
-    "multi_em_dash_log_penalty": 0.0,
-    "straight_contr_log_penalty": 0.0,
-    "curly_contr_log_penalty": 0.0,
-    "continuous_hw_weight": 0.0,
     "sinkhorn_iterations": 100,
     "sinkhorn_strength": 0.65,
     "sinkhorn_target_mix": 0.35,
@@ -163,4 +78,3 @@
     "max_cluster_size": 14
   }
 }
-
