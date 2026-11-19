@@ -235,28 +235,18 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
     test_ids = df_test_raw["id"] if "id" in df_test_raw.columns else pd.Series(range(len(df_test_raw)))
 
     # -------------------------------------------------------------------------
-    # Decoupled Execution Mode Architecture:
-    # "benchmark_only": Evaluates exclusively on clean 1,800 unseen samples (for fast experiments without burning GPU quota).
-    # "submission_only": Evaluates exclusively on competition test.csv (for official Kaggle leaderboard scoring).
-    # "dual": Evaluates both datasets cleanly and independently.
+    # Decoupled Execution Controls:
+    # run_benchmark : Evaluates on clean 1,800 unseen samples (fast experiment evaluation).
+    # run_submission: Evaluates on competition test.csv (for official Kaggle leaderboard scoring).
     # -------------------------------------------------------------------------
-    execution_mode = cfg.get("execution_mode") if cfg else None
-    if execution_mode is None:
-        if bool(cfg.get("benchmark_mode", False)) if cfg else False:
-            execution_mode = "benchmark_only"
-        elif len(df_test_raw) <= 10 and enable_ablation_probe:
-            execution_mode = "benchmark_only"
-        elif enable_ablation_probe:
-            execution_mode = "dual"
-        else:
-            execution_mode = "submission_only"
-
-    run_benchmark = bool(cfg.get("run_benchmark", execution_mode in ("benchmark_only", "dual"))) if cfg else (execution_mode in ("benchmark_only", "dual"))
-    run_submission = bool(cfg.get("run_submission", execution_mode in ("submission_only", "dual"))) if cfg else (execution_mode in ("submission_only", "dual"))
+    run_benchmark = bool(cfg.get("run_benchmark", True)) if cfg else True
+    run_submission = bool(cfg.get("run_submission", len(df_test_raw) > 10)) if cfg else (len(df_test_raw) > 10)
 
     # When competition test.csv has <= 10 dummy rows on Kaggle, auto-disable submission inference to safeguard GPU quota
     if len(df_test_raw) <= 10 and run_benchmark:
         run_submission = False
+
+    mode_label = "DUAL" if (run_benchmark and run_submission) else ("BENCHMARK_ONLY" if run_benchmark else ("SUBMISSION_ONLY" if run_submission else "IDLE"))
 
     test_texts = df_test_raw["text"].fillna("").astype(str).tolist() if (run_submission and "text" in df_test_raw.columns) else []
     N_test = len(test_texts)
@@ -292,7 +282,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             print("[Pipeline] Frozen Production Mode (run_benchmark=False): Skipping unseen holdout extraction to save GPU time.")
 
     print("=" * 70)
-    print(f"[Pipeline] EXECUTION MODE: {execution_mode.upper()}")
+    print(f"[Pipeline] EXECUTION MODE: {mode_label}")
     print(f"  - run_benchmark  : {run_benchmark} ({N_unseen} unseen samples)")
     print(f"  - run_submission : {run_submission} ({N_test} test rows)")
     print("=" * 70)

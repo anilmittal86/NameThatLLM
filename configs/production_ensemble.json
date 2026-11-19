@@ -3,7 +3,6 @@
   "name": "production_ensemble",
   "description": "Production Two-Tier Stack (85% Main Part-Two Baseline + 15% Prior-Scaled Complementary Stack + Unsupervised Spectral Bank)",
   "probe_gate_min_bacc": 0.40,
-  "execution_mode": "benchmark_only",
   "run_benchmark": true,
   "run_submission": false,
   "enable_ablation_probe": true,
