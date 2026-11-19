@@ -411,6 +411,7 @@ def predict_lexical_engine(
     unseen_texts: Optional[List[str]] = None,
     qwen_tok_dir: Optional[str] = None,
     working_dir: Optional[Path | str] = None,
+    is_benchmark: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Executes fast inference using a pre-trained lexical bundle on test_texts and optional unseen_texts.
@@ -652,7 +653,16 @@ def predict_lexical_engine(
             log_p_unseen_comp[:, fam_cols] += log_ratio_u
 
     P_lex_comp_final = softmax(log_p_lex_comp, axis=1)
-    unseen_p_lex_comp_final = softmax(log_p_unseen_comp, axis=1) if log_p_unseen_comp is not None else np.zeros((0, K), dtype=np.float32)
+    if is_benchmark:
+        unseen_log_p_svc_main = log_p_svc_main
+        unseen_p_lex_comp_final = P_lex_comp_final
+        D_u = D
+        groups_085_u = groups_085
+        lp_hw_u = lp_hw
+        rule_flags_u = rule_flags_te
+        log_p_unseen_distort = log_p_distort
+    else:
+        unseen_p_lex_comp_final = softmax(log_p_unseen_comp, axis=1) if log_p_unseen_comp is not None else np.zeros((0, K), dtype=np.float32)
 
     # Save to disk if working_dir provided
     if working_dir is not None:
@@ -666,18 +676,18 @@ def predict_lexical_engine(
         np.save(working_dir / 'rule_flags_test.npy', rule_flags_te)
         np.save(working_dir / 'unseen_log_p_svc_main.npy', unseen_log_p_svc_main)
         np.save(working_dir / 'unseen_p_lex_comp.npy', unseen_p_lex_comp_final)
-        if 'D_u' in locals() and D_u is not None:
-            np.save(working_dir / 'D_tfidf_unseen.npy', D_u)
-        if 'groups_085_u' in locals() and groups_085_u is not None:
-            np.save(working_dir / 'groups_085_unseen.npy', groups_085_u)
-        if 'lp_hw_u' in locals() and lp_hw_u is not None:
-            np.save(working_dir / 'log_p_handwriting_unseen.npy', lp_hw_u)
-        if 'rule_flags_u' in locals() and rule_flags_u is not None:
-            np.save(working_dir / 'rule_flags_unseen.npy', rule_flags_u)
+        if is_benchmark or ('D_u' in locals() and D_u is not None):
+            np.save(working_dir / 'D_tfidf_unseen.npy', D_u if ('D_u' in locals() and D_u is not None) else D)
+        if is_benchmark or ('groups_085_u' in locals() and groups_085_u is not None):
+            np.save(working_dir / 'groups_085_unseen.npy', groups_085_u if ('groups_085_u' in locals() and groups_085_u is not None) else groups_085)
+        if is_benchmark or ('lp_hw_u' in locals() and lp_hw_u is not None):
+            np.save(working_dir / 'log_p_handwriting_unseen.npy', lp_hw_u if ('lp_hw_u' in locals() and lp_hw_u is not None) else lp_hw)
+        if is_benchmark or ('rule_flags_u' in locals() and rule_flags_u is not None):
+            np.save(working_dir / 'rule_flags_unseen.npy', rule_flags_u if ('rule_flags_u' in locals() and rule_flags_u is not None) else rule_flags_te)
         if log_p_distort is not None:
             np.save(working_dir / 'log_p_distort.npy', log_p_distort)
-        if log_p_unseen_distort is not None:
-            np.save(working_dir / 'unseen_log_p_distort.npy', log_p_unseen_distort)
+        if is_benchmark or (log_p_unseen_distort is not None):
+            np.save(working_dir / 'unseen_log_p_distort.npy', log_p_unseen_distort if log_p_unseen_distort is not None else log_p_distort)
 
     print(f"[Lexical] predict_lexical_engine completed in {time.time() - t0:.2f}s")
     return {
@@ -739,22 +749,34 @@ def run_lexical_engine(
                 print(f"[Lexical] Could not load candidate bundle {cand}: {e}")
 
     # 2. Extract test and unseen texts
-    df_te = pd.read_csv(test_path) if test_path and Path(test_path).exists() else pd.DataFrame({"text": []})
+    if test_path and str(test_path).endswith('.parquet') and Path(test_path).exists():
+        df_te = pd.read_parquet(test_path)
+    elif test_path and Path(test_path).exists():
+        df_te = pd.read_csv(test_path)
+    else:
+        df_te = pd.DataFrame({"text": []})
     test_texts = df_te['text'].fillna('').astype(str).tolist()
 
     unseen_parquet = working_dir / "unseen_holdout.parquet"
     unseen_texts: List[str] = []
     unseen_hashes = set()
+    is_benchmark = False
     if unseen_parquet.exists():
         try:
             df_unseen_holdout = pd.read_parquet(unseen_parquet)
             if len(df_unseen_holdout) > 0 and "text" in df_unseen_holdout.columns:
-                unseen_texts = df_unseen_holdout["text"].fillna("").astype(str).tolist()
+                u_texts = df_unseen_holdout["text"].fillna("").astype(str).tolist()
+                if test_texts == u_texts or (test_path and str(test_path) == str(unseen_parquet)):
+                    is_benchmark = True
+                    unseen_texts = []
+                    print(f"[Lexical] Benchmark Pure Inference Parity active ({len(u_texts)} samples).")
+                else:
+                    unseen_texts = u_texts
                 if "_hash" in df_unseen_holdout.columns:
                     unseen_hashes = set(df_unseen_holdout["_hash"].tolist())
                 else:
-                    unseen_hashes = set(_text_hash(t) for t in unseen_texts)
-                print(f"[Lexical] Found unseen holdout set: {len(unseen_texts)} rows quarantined from training.")
+                    unseen_hashes = set(_text_hash(t) for t in u_texts)
+                print(f"[Lexical] Found unseen holdout set: {len(u_texts)} rows quarantined from training.")
         except Exception as e:
             print(f"[Lexical] Note: Could not read {unseen_parquet}: {e}")
 
@@ -763,9 +785,10 @@ def run_lexical_engine(
         return predict_lexical_engine(
             bundle=bundle,
             test_texts=test_texts,
-            unseen_texts=unseen_texts,
+            unseen_texts=unseen_texts if not is_benchmark else None,
             qwen_tok_dir=qwen_tok_dir,
             working_dir=working_dir,
+            is_benchmark=is_benchmark,
         )
 
     # 4. Fall back to training from scratch
@@ -859,6 +882,20 @@ if __name__ == "__main__":
         train_path = Path('local_data') / 'train.csv'
     if test_path is None:
         test_path = Path('local_data') / 'test.csv'
+
+    # Benchmark Pure Inference Check:
+    # If unseen_holdout.parquet exists and competition test.csv has <= 10 rows,
+    # redirect lexical test target to unseen_holdout.parquet to preserve GPU quota!
+    unseen_parquet = working_dir / "unseen_holdout.parquet"
+    if unseen_parquet.exists():
+        try:
+            df_u_chk = pd.read_parquet(unseen_parquet)
+            df_te_chk = pd.read_csv(test_path) if test_path and Path(test_path).exists() else pd.DataFrame()
+            if len(df_u_chk) >= 180 and len(df_te_chk) <= 10:
+                print(f"[Module 1 CLI] Benchmark Pure Inference Mode: Redirecting lexical test target to {unseen_parquet} ({len(df_u_chk)} rows).")
+                test_path = unseen_parquet
+        except Exception as e:
+            print(f"[Module 1 CLI] Note: {e}")
 
     pool_files: List[Path] = []
     for pat in ['nlm_pool_v5.parquet', 'pool_v4.parquet', 'nlm_matched_clean.parquet', 'nlm_pool_v2.parquet']:
