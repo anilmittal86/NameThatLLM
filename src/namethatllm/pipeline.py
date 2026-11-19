@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 
+import torch
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from scipy import sparse
@@ -2079,9 +2081,13 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
             # Save versioned bundle per model to target directory if available
             target_dirs = [working_dir / "benchmark_features" / bundle_dir_name]
-            local_features_root = Path(__file__).resolve().parent.parent.parent / "local_data" / "benchmark_features"
-            if local_features_root.parent.exists():
-                target_dirs.append(local_features_root / bundle_dir_name)
+            try:
+                this_file = Path(__file__).resolve() if "__file__" in globals() or "__file__" in locals() else None
+                local_features_root = (this_file.parent.parent.parent / "local_data" / "benchmark_features") if this_file is not None else Path("local_data/benchmark_features")
+                if local_features_root.parent.exists():
+                    target_dirs.append(local_features_root / bundle_dir_name)
+            except Exception:
+                pass
 
             for bundle_dir in target_dirs:
                 try:

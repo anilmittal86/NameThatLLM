@@ -25,6 +25,7 @@
     { "name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24 }
   ],
   "checkpoints": [
+    "qwen3_14b_ts",
     "qwen3_14b_v5",
     "qwen3_14b_p2",
     "qwen3_14b_inhouse",
@@ -45,6 +46,7 @@
     "lexical_5v": { "plain_weight": 0.10 },
     "wpca_dp": { "plain_weight": 0.25 },
     "spectral_bank": { "plain_weight": 0.10 },
+    "qwen3_14b_ts": { "plain_weight": 0.35, "twin_weight": 0.12, "dp_weight": 0.10, "prior_scale": 0.50, "se_floor": 0.25 },
     "qwen3_14b_v5": { "plain_weight": 0.48, "twin_weight": 0.16, "dp_weight": 0.10, "prior_scale": 0.50, "se_floor": 0.25 },
     "qwen3_14b_p2": { "plain_weight": 0.42, "twin_weight": 0.14, "dp_weight": 0.38, "prior_scale": 1.00, "se_floor": 0.10 },
     "qwen3_14b_inhouse": { "plain_weight": 0.40, "twin_weight": 0.14, "dp_weight": 0.10, "prior_scale": 0.50, "se_floor": 0.25 },

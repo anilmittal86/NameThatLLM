@@ -177,6 +177,7 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         model.to(torch.bfloat16)
+        setattr(model, "_in_bf16", True)
         enc_bad = {k: v[bad_rows] for k, v in enc.items()}
         hs_bad = model(**enc_bad, output_hidden_states=True, use_cache=False).hidden_states
         bad_rows_dev = bad_rows.to(first_norm_dev)
@@ -185,7 +186,6 @@ def forward_and_pool_batch(model: nn.Module, enc: dict, layers: List[int], norms
             h_b = torch.nan_to_num(h_b, nan=0.0, posinf=1e4, neginf=-1e4)
             pooled_layers[idx_l][bad_rows_dev] = (h_b * m[bad_rows_dev]).sum(dim=1) / den[bad_rows_dev]
         del hs_bad
-        model.to(dtype)
 
     out = torch.cat([nm(pooled_layers[idx_l]) for idx_l, nm in enumerate(norms)], dim=-1)
     return out.cpu().numpy(), n_bad
@@ -484,6 +484,13 @@ class UniversalLoRATrunkLoader:
             out_np, n_bad = forward_and_pool_batch(self.model, enc, self.layers, self.norms, torch.float16, drop_first_token=True)
             self.total_rescued += n_bad
             Z[idx] = out_np
+
+        if getattr(self.model, "_in_bf16", False):
+            self.model.to(torch.float16)
+            self.model._in_bf16 = False
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         return Z
 
     @torch.no_grad()
