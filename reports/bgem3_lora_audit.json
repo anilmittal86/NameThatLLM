@@ -1,0 +1,686 @@
+{
+  "timestamp": "2026-11-23 08:58:18",
+  "device": "cuda:0",
+  "checkpoints_dir": "/checkpoints/export_bge_m3_lora",
+  "datasets_dir": "/datasets",
+  "check1_code_inspection": {
+    "num_classes_plain": 18,
+    "num_classes_centered": 18,
+    "canonical_K": 18,
+    "theoretical_constant_floor": 0.05555555555555555,
+    "stage1_centered_bacc_logged": 0.013333333333333332,
+    "stage1_centered_explanation": "In Stage 1, centered_head was randomly initialized and received 0 gradient updates (optimizer_s1 only tracked plain_head). During evaluation, batch-mean centering on random non-clustered validation texts caused the untrained linear layer to predict a single dominant class for 24 samples (recall 24/100 = 0.24), with 0 recall on the other 17 classes, producing exactly balanced_accuracy = 0.24 / 18 = 0.01333 (1.33%).",
+    "merge_equation": "prob_m = 0.5 * softmax(logits_p) + 0.5 * softmax(logits_c)",
+    "merge_loss_equation": "loss = F.cross_entropy(logits_p, labels)",
+    "merge_explanation": "Merged predictions were computed as a simple probability blend: prob_m = 0.5 * prob_p + 0.5 * prob_c. Validation loss was computed STRICTLY on plain_head (loss = F.cross_entropy(logits_p, labels)), never evaluating cross-entropy on centered_head or merged probabilities.",
+    "stage2_optimization_setup": {
+      "lr_lora": 3e-05,
+      "lr_head": 0.0002,
+      "warmup_steps": 30,
+      "scheduler": "cosine",
+      "weight_decay": 0.01,
+      "loss_weights": {
+        "centered_weight": 0.65,
+        "supcon_weight": 0.2,
+        "plain_weight": 0.15
+      },
+      "precision_mode": "torch.amp.autocast('cuda', dtype=torch.float16) + GradScaler",
+      "skipped_optimizer_steps_detected": 0,
+      "loss_increase_root_cause": "In Stage 2, plain_head received only 15% weight while centered_head received 65% and SupCon received 20%. Fine-tuning for 2 epochs on the small 2,699-row train.csv prompt-grouped subset shifted the LoRA backbone representations away from the 36k master pool, causing plain_head cross-entropy on the 1,800 unseen benchmark to increase slightly from 2.0188 to 2.0396."
+    }
+  },
+  "check2_head_parity_and_calibration": {
+    "norm_parity": {
+      "plain_norm_mean": 1.0,
+      "plain_norm_std": 3.1098675634666506e-08,
+      "plain_norm_min": 0.9999998807907104,
+      "plain_norm_max": 1.0000001192092896,
+      "centered_norm_mean": 0.9601094126701355,
+      "centered_norm_std": 0.11754275113344193,
+      "centered_norm_min": 0.5190883278846741,
+      "centered_norm_max": 1.3619731664657593,
+      "norm_ratio_centered_to_plain": 0.9601094126701355,
+      "flag_norm_parity_fail": false
+    },
+    "head_stats": {
+      "plain": {
+        "logit_mean": -0.011236992664635181,
+        "logit_std": 1.2634590864181519,
+        "weight_row_norm_min": 1.630375623703003,
+        "weight_row_norm_median": 2.0559046268463135,
+        "weight_row_norm_max": 2.8887767791748047,
+        "bias_min": -0.05646467208862305,
+        "bias_median": -0.002550192642956972,
+        "bias_max": 0.0691918209195137,
+        "bias_std": 0.025342101231217384
+      },
+      "centered": {
+        "logit_mean": 0.0009633582085371017,
+        "logit_std": 0.02446487918496132,
+        "weight_row_norm_min": 0.562694251537323,
+        "weight_row_norm_median": 0.5769122838973999,
+        "weight_row_norm_max": 0.5943348407745361,
+        "bias_min": -0.030536971986293793,
+        "bias_median": 0.0022171884775161743,
+        "bias_max": 0.027995549142360687,
+        "bias_std": 0.017115462571382523
+      }
+    },
+    "calibration": {
+      "plain": {
+        "T_optimal": 0.6537251510619114,
+        "pre_ece": 0.048015398946073325,
+        "post_ece": 0.018365024493800272,
+        "pre_nll": 2.046083450317383,
+        "post_nll": 1.9937688112258911,
+        "bacc": 0.22777777777777775
+      },
+      "centered": {
+        "T_optimal": 23.031505755184376,
+        "pre_ece": 0.04573057295547591,
+        "post_ece": 0.04343586491213904,
+        "pre_nll": 2.895620346069336,
+        "post_nll": 2.890587568283081,
+        "bacc": 0.012222222222222223
+      }
+    },
+    "complementarity": {
+      "agreement_rate": 0.0038888888888888888,
+      "pearson_correlation": -0.16367581969446338,
+      "oracle_accuracy": 0.23944444444444443,
+      "oracle_bacc": 0.23944444444444443
+    },
+    "merge_sweep": {
+      "sweep_grid": [
+        {
+          "w": 0.0,
+          "bacc": 0.012222222222222223,
+          "nll": 2.890587368038005
+        },
+        {
+          "w": 0.1,
+          "bacc": 0.22611111111111112,
+          "nll": 2.660752109878261
+        },
+        {
+          "w": 0.2,
+          "bacc": 0.22499999999999998,
+          "nll": 2.470763734627597
+        },
+        {
+          "w": 0.3,
+          "bacc": 0.22666666666666668,
+          "nll": 2.320513948110315
+        },
+        {
+          "w": 0.4,
+          "bacc": 0.22722222222222221,
+          "nll": 2.206956013194439
+        },
+        {
+          "w": 0.5,
+          "bacc": 0.22666666666666668,
+          "nll": 2.124868080550044
+        },
+        {
+          "w": 0.6,
+          "bacc": 0.22722222222222221,
+          "nll": 2.068157925028876
+        },
+        {
+          "w": 0.7,
+          "bacc": 0.22722222222222221,
+          "nll": 2.031025652055322
+        },
+        {
+          "w": 0.8,
+          "bacc": 0.22722222222222221,
+          "nll": 2.0086040303855506
+        },
+        {
+          "w": 0.9,
+          "bacc": 0.22722222222222221,
+          "nll": 1.9971170600955939
+        },
+        {
+          "w": 1.0,
+          "bacc": 0.22777777777777775,
+          "nll": 1.9937687783013138
+        }
+      ],
+      "optimal_w": 1.0,
+      "optimal_bacc": 0.22777777777777775,
+      "optimal_nll": 1.9937687783013138,
+      "logged_raw_merged_bacc": 0.22499999999999998,
+      "logged_val_loss": 2.045365182976974
+    }
+  },
+  "check3_prompt_centering_and_leakage": {
+    "cluster_size_stratification": {
+      "N_p_eq_1": {
+        "count": 1316,
+        "plain_bacc": 0.22318709057515398,
+        "centered_bacc": 0.016251632164829277,
+        "merged_bacc": 0.22122828322418975
+      },
+      "N_p_2_to_4": {
+        "count": 476,
+        "plain_bacc": 0.24482825368981556,
+        "centered_bacc": 0.0030092592592592593,
+        "merged_bacc": 0.24000021136177324
+      },
+      "N_p_5_to_9": {
+        "count": 8,
+        "plain_bacc": 0.125,
+        "centered_bacc": 0.0,
+        "merged_bacc": 0.125
+      },
+      "N_p_ge_10": {
+        "count": 0,
+        "plain_bacc": null,
+        "centered_bacc": null,
+        "merged_bacc": null
+      }
+    },
+    "n_p_eq_1_count": 1316,
+    "n_p_eq_1_flag": true,
+    "split_disjointness": {
+      "overlap_train_val_responses": 0,
+      "overlap_train_val_prompts": 0,
+      "overlap_pool_val_responses": 0,
+      "flag_split_disjointness_pass": true
+    },
+    "train_val_test_parity": {
+      "train_stage2_grouping": "PromptGroupBatchSampler: guaranteed batches of identical prompt clusters (N_p >= 2)",
+      "validation_grouping": "Sequential batches of 32 unrelated prompts: in-batch centering subtracted cross-prompt noise",
+      "test_time_implication": "Single-sample test inference cannot use batch-mean centering; requires either test-set prompt clustering or plain_head."
+    }
+  },
+  "check4_lora_adapter_health": {
+    "num_adapted_modules": 145,
+    "ratio_min": 0.007820963831916841,
+    "ratio_median": 0.019144094917539017,
+    "ratio_max": 0.06342293370638342,
+    "top5_modules_by_ratio": [
+      {
+        "module": "base_model.model.encoder.layer.22.intermediate.dense",
+        "norm_delta": 3.5161166191101074,
+        "norm_w0": 69.68781280517578,
+        "relative_ratio": 0.050455258639556015,
+        "effective_rank": 5.658376216888428,
+        "top1_energy_fraction": 0.8841589689254761,
+        "top2_energy_fraction": 0.9479533433914185
+      },
+      {
+        "module": "base_model.model.encoder.layer.22.attention.self.query",
+        "norm_delta": 2.6148979663848877,
+        "norm_w0": 50.204044342041016,
+        "relative_ratio": 0.05208540468511945,
+        "effective_rank": 2.604975938796997,
+        "top1_energy_fraction": 0.9846488237380981,
+        "top2_energy_fraction": 0.9970124363899231
+      },
+      {
+        "module": "base_model.model.encoder.layer.23.attention.output.dense",
+        "norm_delta": 1.8701857328414917,
+        "norm_w0": 33.18311309814453,
+        "relative_ratio": 0.05635956238675102,
+        "effective_rank": 5.455615043640137,
+        "top1_energy_fraction": 0.5597599744796753,
+        "top2_energy_fraction": 0.9810561537742615
+      },
+      {
+        "module": "base_model.model.encoder.layer.23.intermediate.dense",
+        "norm_delta": 4.311387062072754,
+        "norm_w0": 68.57107543945312,
+        "relative_ratio": 0.06287471845005001,
+        "effective_rank": 5.318475246429443,
+        "top1_energy_fraction": 0.8212074041366577,
+        "top2_energy_fraction": 0.9315274953842163
+      },
+      {
+        "module": "base_model.model.encoder.layer.23.output.dense",
+        "norm_delta": 3.8168959617614746,
+        "norm_w0": 60.181636810302734,
+        "relative_ratio": 0.06342293370638342,
+        "effective_rank": 4.261983394622803,
+        "top1_energy_fraction": 0.8072406053543091,
+        "top2_energy_fraction": 0.9455302357673645
+      }
+    ],
+    "bottom5_modules_by_ratio": [
+      {
+        "module": "base_model.model.pooler.dense",
+        "norm_delta": 0.0,
+        "norm_w0": 20.3211727142334,
+        "relative_ratio": 0.0,
+        "effective_rank": 1.0,
+        "top1_energy_fraction": 0.0,
+        "top2_energy_fraction": 0.0
+      },
+      {
+        "module": "base_model.model.encoder.layer.0.output.dense",
+        "norm_delta": 0.8857545852661133,
+        "norm_w0": 113.25389099121094,
+        "relative_ratio": 0.007820963831916841,
+        "effective_rank": 12.778399467468262,
+        "top1_energy_fraction": 0.5565732717514038,
+        "top2_energy_fraction": 0.6623382568359375
+      },
+      {
+        "module": "base_model.model.encoder.layer.1.output.dense",
+        "norm_delta": 0.7674768567085266,
+        "norm_w0": 92.58779907226562,
+        "relative_ratio": 0.008289179183420311,
+        "effective_rank": 12.959458351135254,
+        "top1_energy_fraction": 0.4800013601779938,
+        "top2_energy_fraction": 0.6401543021202087
+      },
+      {
+        "module": "base_model.model.encoder.layer.3.output.dense",
+        "norm_delta": 0.7307177186012268,
+        "norm_w0": 83.71897888183594,
+        "relative_ratio": 0.0087282206300269,
+        "effective_rank": 12.050755500793457,
+        "top1_energy_fraction": 0.6125548481941223,
+        "top2_energy_fraction": 0.7069898247718811
+      },
+      {
+        "module": "base_model.model.encoder.layer.6.output.dense",
+        "norm_delta": 0.7846028804779053,
+        "norm_w0": 88.96778106689453,
+        "relative_ratio": 0.00881895525626255,
+        "effective_rank": 13.68017864227295,
+        "top1_energy_fraction": 0.28841933608055115,
+        "top2_energy_fraction": 0.5181580781936646
+      }
+    ],
+    "flag_dead_adapters": false,
+    "flag_excessive_drift": false,
+    "median_effective_rank": 10.496286392211914,
+    "median_top2_energy_fraction": 0.7992620468139648,
+    "flag_spectral_collapse": false,
+    "numerical_integrity": {
+      "has_nan_or_inf": false,
+      "has_exact_zero": true,
+      "status": "FAIL"
+    },
+    "stage1_checkpoint_persistence": "Stage 1 weights were overwritten by Stage 2 in output_dir (Stage 1 checkpoint not archived separately)."
+  },
+  "check5_frozen_baseline_and_confounders": {
+    "frozen_probe": {
+      "best_C": 10.0,
+      "plain_bacc": 0.2594444444444444,
+      "plain_nll": 2.0333268642425537,
+      "centered_bacc": 0.08222222222222222,
+      "centered_nll": 3.008242130279541,
+      "net_lift_from_lora": -0.031666666666666676
+    },
+    "per_class_collapse": {
+      "per_class_table": [
+        {
+          "class_name": "gpt-5.5",
+          "true_count": 100,
+          "plain_pred_count": 1,
+          "plain_recall": 0.0,
+          "plain_precision": 0.0,
+          "centered_pred_count": 1,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "gpt-5.6-luna",
+          "true_count": 100,
+          "plain_pred_count": 0,
+          "plain_recall": 0.0,
+          "plain_precision": 0.0,
+          "centered_pred_count": 110,
+          "centered_recall": 0.01,
+          "centered_precision": 0.00909090909090909
+        },
+        {
+          "class_name": "gpt-5.6-sol",
+          "true_count": 100,
+          "plain_pred_count": 0,
+          "plain_recall": 0.0,
+          "plain_precision": 0.0,
+          "centered_pred_count": 0,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "gpt-5.6-terra",
+          "true_count": 100,
+          "plain_pred_count": 260,
+          "plain_recall": 0.39,
+          "plain_precision": 0.15,
+          "centered_pred_count": 34,
+          "centered_recall": 0.01,
+          "centered_precision": 0.029411764705882353
+        },
+        {
+          "class_name": "gpt-6-astra",
+          "true_count": 100,
+          "plain_pred_count": 247,
+          "plain_recall": 0.59,
+          "plain_precision": 0.2388663967611336,
+          "centered_pred_count": 0,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "gemini-3.1-pro-preview",
+          "true_count": 100,
+          "plain_pred_count": 304,
+          "plain_recall": 0.73,
+          "plain_precision": 0.24013157894736842,
+          "centered_pred_count": 100,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "gemini-3.6-flash",
+          "true_count": 100,
+          "plain_pred_count": 6,
+          "plain_recall": 0.03,
+          "plain_precision": 0.5,
+          "centered_pred_count": 0,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "gemini-3.7-flash",
+          "true_count": 100,
+          "plain_pred_count": 1,
+          "plain_recall": 0.0,
+          "plain_precision": 0.0,
+          "centered_pred_count": 134,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "gemini-3.8-flash",
+          "true_count": 100,
+          "plain_pred_count": 50,
+          "plain_recall": 0.12,
+          "plain_precision": 0.24,
+          "centered_pred_count": 740,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "claude-opus-4-6",
+          "true_count": 100,
+          "plain_pred_count": 351,
+          "plain_recall": 0.78,
+          "plain_precision": 0.2222222222222222,
+          "centered_pred_count": 1,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "claude-opus-4-8",
+          "true_count": 100,
+          "plain_pred_count": 11,
+          "plain_recall": 0.01,
+          "plain_precision": 0.09090909090909091,
+          "centered_pred_count": 279,
+          "centered_recall": 0.01,
+          "centered_precision": 0.0035842293906810036
+        },
+        {
+          "class_name": "claude-opus-5",
+          "true_count": 100,
+          "plain_pred_count": 244,
+          "plain_recall": 0.75,
+          "plain_precision": 0.3073770491803279,
+          "centered_pred_count": 0,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "claude-sonnet-5",
+          "true_count": 100,
+          "plain_pred_count": 72,
+          "plain_recall": 0.14,
+          "plain_precision": 0.19444444444444445,
+          "centered_pred_count": 0,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "claude-fable-5",
+          "true_count": 100,
+          "plain_pred_count": 11,
+          "plain_recall": 0.02,
+          "plain_precision": 0.18181818181818182,
+          "centered_pred_count": 43,
+          "centered_recall": 0.03,
+          "centered_precision": 0.06976744186046512
+        },
+        {
+          "class_name": "qwen3.8-max",
+          "true_count": 100,
+          "plain_pred_count": 162,
+          "plain_recall": 0.3,
+          "plain_precision": 0.18518518518518517,
+          "centered_pred_count": 122,
+          "centered_recall": 0.04,
+          "centered_precision": 0.03278688524590164
+        },
+        {
+          "class_name": "glm-5.3",
+          "true_count": 100,
+          "plain_pred_count": 16,
+          "plain_recall": 0.06,
+          "plain_precision": 0.375,
+          "centered_pred_count": 0,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        },
+        {
+          "class_name": "glm-5.3-flash",
+          "true_count": 100,
+          "plain_pred_count": 60,
+          "plain_recall": 0.18,
+          "plain_precision": 0.3,
+          "centered_pred_count": 236,
+          "centered_recall": 0.12,
+          "centered_precision": 0.05084745762711865
+        },
+        {
+          "class_name": "kimi-k3",
+          "true_count": 100,
+          "plain_pred_count": 4,
+          "plain_recall": 0.0,
+          "plain_precision": 0.0,
+          "centered_pred_count": 0,
+          "centered_recall": 0.0,
+          "centered_precision": 0.0
+        }
+      ],
+      "zero_recall_classes": [
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-6-astra",
+        "gemini-3.1-pro-preview",
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "claude-opus-4-6",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "glm-5.3",
+        "kimi-k3"
+      ],
+      "frequency_skew_classes": [
+        {
+          "class": "gpt-5.5",
+          "pred_to_true_ratio": 0.01
+        },
+        {
+          "class": "gpt-5.6-luna",
+          "pred_to_true_ratio": 0.0
+        },
+        {
+          "class": "gpt-5.6-sol",
+          "pred_to_true_ratio": 0.0
+        },
+        {
+          "class": "gpt-5.6-terra",
+          "pred_to_true_ratio": 2.6
+        },
+        {
+          "class": "gpt-6-astra",
+          "pred_to_true_ratio": 2.47
+        },
+        {
+          "class": "gemini-3.1-pro-preview",
+          "pred_to_true_ratio": 3.04
+        },
+        {
+          "class": "gemini-3.6-flash",
+          "pred_to_true_ratio": 0.06
+        },
+        {
+          "class": "gemini-3.7-flash",
+          "pred_to_true_ratio": 0.01
+        },
+        {
+          "class": "claude-opus-4-6",
+          "pred_to_true_ratio": 3.51
+        },
+        {
+          "class": "claude-opus-4-8",
+          "pred_to_true_ratio": 0.11
+        },
+        {
+          "class": "claude-opus-5",
+          "pred_to_true_ratio": 2.44
+        },
+        {
+          "class": "claude-fable-5",
+          "pred_to_true_ratio": 0.11
+        },
+        {
+          "class": "glm-5.3",
+          "pred_to_true_ratio": 0.16
+        },
+        {
+          "class": "kimi-k3",
+          "pred_to_true_ratio": 0.04
+        }
+      ],
+      "top10_confused_pairs": [
+        {
+          "true_class": "gemini-3.7-flash",
+          "pred_class": "gemini-3.1-pro-preview",
+          "count": 82
+        },
+        {
+          "true_class": "gemini-3.8-flash",
+          "pred_class": "gemini-3.1-pro-preview",
+          "count": 76
+        },
+        {
+          "true_class": "gemini-3.6-flash",
+          "pred_class": "gemini-3.1-pro-preview",
+          "count": 69
+        },
+        {
+          "true_class": "claude-opus-4-8",
+          "pred_class": "claude-opus-4-6",
+          "count": 62
+        },
+        {
+          "true_class": "claude-sonnet-5",
+          "pred_class": "claude-opus-4-6",
+          "count": 59
+        },
+        {
+          "true_class": "gpt-5.5",
+          "pred_class": "gpt-5.6-terra",
+          "count": 50
+        },
+        {
+          "true_class": "gpt-5.6-luna",
+          "pred_class": "gpt-5.6-terra",
+          "count": 43
+        },
+        {
+          "true_class": "gpt-5.6-sol",
+          "pred_class": "gpt-6-astra",
+          "count": 43
+        },
+        {
+          "true_class": "gpt-5.6-terra",
+          "pred_class": "gpt-6-astra",
+          "count": 40
+        },
+        {
+          "true_class": "claude-fable-5",
+          "pred_class": "claude-opus-4-6",
+          "count": 40
+        }
+      ],
+      "bias_freq_correlation": -0.16884445399023087
+    },
+    "anisotropy": {
+      "frozen_cosine_mean": -0.009744832292199135,
+      "frozen_cosine_std": 0.5538028478622437,
+      "stage2_plain_cosine_mean": -0.0097206961363554,
+      "stage2_plain_cosine_std": 0.5537932515144348,
+      "stage2_centered_cosine_mean": -0.028792008757591248,
+      "stage2_centered_cosine_std": 0.5586158037185669,
+      "flag_anisotropy_warn": false
+    },
+    "length_confounder": {
+      "max_len_configured": 512,
+      "p50_length": 164.0,
+      "p90_length": 286.0,
+      "p99_length": 391.0,
+      "max_length_observed": 467,
+      "truncation_pct": 0.0,
+      "quartile_bacc": [
+        {
+          "quartile": "Q1 (<= p25)",
+          "count": 450,
+          "bacc": 0.18677287596676587
+        },
+        {
+          "quartile": "Q2 (p25 - p50)",
+          "count": 456,
+          "bacc": 0.24245262602353243
+        },
+        {
+          "quartile": "Q3 (p50 - p75)",
+          "count": 445,
+          "bacc": 0.21112727783270419
+        },
+        {
+          "quartile": "Q4 (> p75)",
+          "count": 449,
+          "bacc": 0.2416925743984105
+        }
+      ]
+    }
+  },
+  "check6_serialization_and_determinism": {
+    "saved_head_keys": [
+      "centered.bias",
+      "centered.weight",
+      "plain.bias",
+      "plain.weight"
+    ],
+    "num_lora_keys": 290,
+    "explicit_heads_persisted": true,
+    "logged_loss": 2.0395995022957787,
+    "reloaded_loss": 2.045365182976974,
+    "loss_diff": 0.005765680681195207,
+    "logged_plain_bacc": 0.23166666666666672,
+    "reloaded_plain_bacc": 0.22777777777777775,
+    "bacc_diff": 0.0038888888888889694,
+    "flag_reproducibility_pass": true
+  }
+}
