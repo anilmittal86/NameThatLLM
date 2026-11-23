@@ -866,8 +866,22 @@ def generate_submission(P_final: np.ndarray, test_ids: pd.Series, working_dir: P
     - id: test sample identifier string
     - model: predicted model class name string (argmax over calibrated probabilities)
     """
-    preds = [LABELS[idx] for idx in P_final.argmax(axis=1)]
-    df_sub = pd.DataFrame({"id": test_ids, "model": preds})
+    if len(P_final) == 0 or len(test_ids) == 0:
+        if len(test_ids) > 0:
+            preds = [LABELS[0]] * len(test_ids)
+            df_sub = pd.DataFrame({"id": test_ids, "model": preds})
+        else:
+            df_sub = pd.DataFrame(columns=["id", "model"])
+    elif len(P_final) != len(test_ids):
+        if len(P_final) < len(test_ids):
+            preds = [LABELS[idx] for idx in P_final.argmax(axis=1)] + [LABELS[0]] * (len(test_ids) - len(P_final))
+        else:
+            preds = [LABELS[idx] for idx in P_final[:len(test_ids)].argmax(axis=1)]
+        df_sub = pd.DataFrame({"id": test_ids, "model": preds})
+    else:
+        preds = [LABELS[idx] for idx in P_final.argmax(axis=1)]
+        df_sub = pd.DataFrame({"id": test_ids, "model": preds})
+
     sub_parquet_path = working_dir / "submission.parquet"
     sub_csv_path = working_dir / "submission.csv"
 

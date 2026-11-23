@@ -1166,9 +1166,9 @@ def evaluate_from_cache(
 
     post_cfg = cfg.get("postprocess", cfg.get("postprocessing", {}))
 
-    cfg_weights = cfg.get("model_weights", {})
+    cfg_weights = cfg.get("models", cfg.get("model_weights", {}))
 
-    lock_priors = bool(cfg.get("lock_prior_weights", True))
+    lock_priors = bool(cfg.get("lock_prior_weights", False))
 
     N_test = int(data["N_test"][0])
 
@@ -1202,8 +1202,12 @@ def evaluate_from_cache(
         if strict_config and cfg_weights:
             if canon_name in cfg_weights:
                 mw = cfg_weights[canon_name]
-
-                cfg_w = float(mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0))
+                if isinstance(mw, (int, float)):
+                    cfg_w = float(mw)
+                elif isinstance(mw, dict):
+                    cfg_w = float(mw.get("weight", mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0)))
+                else:
+                    cfg_w = 0.0
 
                 if cfg_w > 0.0:
                     auditor.add_model(name=canon_name, tier=tier, weight=cfg_w, unseen_log_probs=u_lp, test_log_probs=t_lp)
@@ -1244,7 +1248,13 @@ def evaluate_from_cache(
 
         if strict_config and cfg_weights:
             if canon_ex_name in cfg_weights:
-                cfg_ex_w = float(cfg_weights[canon_ex_name].get("plain_weight", ex_w))
+                ex_entry = cfg_weights[canon_ex_name]
+                if isinstance(ex_entry, (int, float)):
+                    cfg_ex_w = float(ex_entry)
+                elif isinstance(ex_entry, dict):
+                    cfg_ex_w = float(ex_entry.get("weight", ex_entry.get("plain_weight", ex_w)))
+                else:
+                    cfg_ex_w = float(ex_w)
 
                 if cfg_ex_w > 0.0:
                     extra_streams.append((canon_ex_name, cfg_ex_w, ex_lp))
@@ -1270,7 +1280,12 @@ def evaluate_from_cache(
 
     if strict_config and cfg_weights:
         for k, mw in cfg_weights.items():
-            tot_w = float(mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0))
+            if isinstance(mw, (int, float)):
+                tot_w = float(mw)
+            elif isinstance(mw, dict):
+                tot_w = float(mw.get("weight", mw.get("plain_weight", 0.0) + mw.get("twin_weight", 0.0)))
+            else:
+                tot_w = 0.0
 
             if tot_w > 0.0 and k not in added_names:
                 missing_models_summary.append((k, tot_w))

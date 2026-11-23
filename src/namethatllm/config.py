@@ -144,16 +144,28 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
             m_type = str(cfg.get('model_type', '')).lower()
             h_dim = cfg.get('hidden_size', 0)
             n_lay = cfg.get('num_hidden_layers', 0)
+            text_cfg = cfg.get('text_config', {})
+            if isinstance(text_cfg, dict):
+                if not h_dim:
+                    h_dim = text_cfg.get('hidden_size', 0)
+                if not n_lay:
+                    n_lay = text_cfg.get('num_hidden_layers', 0)
+                if not m_type or m_type == 'none':
+                    m_type = str(text_cfg.get('model_type', '')).lower()
+
+            p_str = str(cfg_p.parent).lower().replace('\\', '/')
             fam_match = (
                 fam_target in m_type or
                 m_type in fam_target or
-                ("gemma" in fam_target and "gemma" in m_type) or
-                ("llama" in fam_target and "llama" in m_type) or
-                ("qwen" in fam_target and "qwen" in m_type)
+                ("gemma" in fam_target and ("gemma" in m_type or "gemma" in p_str)) or
+                ("llama" in fam_target and ("llama" in m_type or "llama" in p_str)) or
+                ("qwen" in fam_target and ("qwen" in m_type or "qwen" in p_str)) or
+                ("mistral" in fam_target and ("mistral" in m_type or "mistral" in p_str))
             )
             if fam_match and h_dim == hidden_sz and n_lay == num_layers:
-                p_str = str(cfg_p.parent).lower().replace('\\', '/')
-                if fam_target in p_str or ("gemma" in fam_target and "gemma" in p_str):
+                p_str_norm = p_str.replace('-', '').replace('_', '')
+                fam_target_norm = fam_target.replace('-', '').replace('_', '')
+                if fam_target_norm in p_str_norm or fam_target in p_str or fam_target in m_type:
                     return cfg_p.parent
                 candidates.append(cfg_p.parent)
         except Exception:
@@ -327,11 +339,25 @@ def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
 
     # 6. Fallback search for bge_m3 base or fine-tuned directory
     if 'bge_m3' not in ckpts:
-        for p in input_dir.rglob('*'):
-            p_s = str(p).lower().replace('\\', '/')
-            if ('bge-m3' in p_s or 'bge_m3' in p_s or 'bgem3' in p_s) and ((p / 'config.json').exists() or (p / 'model.safetensors').exists() or (p / 'pytorch_model.bin').exists()):
-                ckpts['bge_m3'] = p
+        for p in input_dir.rglob('config.json'):
+            p_s = str(p.parent).lower().replace('\\', '/')
+            if any(t in p_s for t in ('bge-m3', 'bge_m3', 'bgem3')):
+                ckpts['bge_m3'] = p.parent
                 break
+
+    # 7. Fallback search for gemma2_9b adapter
+    if 'gemma2_9b_ts' not in ckpts:
+        for p in input_dir.rglob('heads.safetensors'):
+            p_s = str(p.parent).lower().replace('\\', '/')
+            if any(t in p_s for t in ('gemma2', 'gemma_2', 'gemma-2', 'ts_gemma', 'ts-gemma')):
+                ckpts['gemma2_9b_ts'] = p.parent
+                break
+        if 'gemma2_9b_ts' not in ckpts:
+            for p in input_dir.rglob('adapter_model.safetensors'):
+                p_s = str(p.parent).lower().replace('\\', '/')
+                if any(t in p_s for t in ('gemma2', 'gemma_2', 'gemma-2', 'ts_gemma', 'ts-gemma')):
+                    ckpts['gemma2_9b_ts'] = p.parent.parent if p.parent.name == 'adapter' else p.parent
+                    break
 
     return ckpts
 
@@ -410,7 +436,29 @@ def validate_production_assets(
         {"name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36},
         {"name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24},
     ]
-    base_specs = req.get("required_base_models", default_bases)
+    if "required_base_models" in req:
+        base_specs = req["required_base_models"]
+    elif "checkpoints" in cfg or "checkpoints" in req:
+        # Dynamically infer required base trunks from active checkpoints
+        active_cks = cfg.get("checkpoints", req.get("checkpoints", []))
+        inferred_bases = []
+        if any("qwen3_14b" in str(c) for c in active_cks):
+            inferred_bases.append({"name": "qwen3_14b", "family": "qwen3", "hidden_size": 5120, "num_layers": 40})
+        if any("qwen25_14b" in str(c) for c in active_cks):
+            inferred_bases.append({"name": "qwen25_14b", "family": "qwen2", "hidden_size": 5120, "num_layers": 48})
+        if any("qwen3_8b" in str(c) for c in active_cks):
+            inferred_bases.append({"name": "qwen3_8b", "family": "qwen3", "hidden_size": 4096, "num_layers": 36})
+        if any("deberta" in str(c) for c in active_cks):
+            inferred_bases.append({"name": "deberta_v3_large", "family": "deberta", "hidden_size": 1024, "num_layers": 24})
+        if any("gemma2" in str(c) or "gemma" in str(c) for c in active_cks):
+            inferred_bases.append({"name": "gemma2_9b", "family": "gemma2", "hidden_size": 3584, "num_layers": 42})
+        if any("llama" in str(c) for c in active_cks):
+            inferred_bases.append({"name": "llama3_8b", "family": "llama", "hidden_size": 4096, "num_layers": 32})
+        if any("mistral" in str(c) for c in active_cks):
+            inferred_bases.append({"name": "mistral_7b", "family": "mistral", "hidden_size": 4096, "num_layers": 32})
+        base_specs = inferred_bases
+    else:
+        base_specs = default_bases
     verified_bases: Dict[str, Path] = {}
     for b_spec in base_specs:
         b_path = find_base_model(

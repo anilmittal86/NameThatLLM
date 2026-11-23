@@ -1,7 +1,7 @@
 """
 Single-Source-of-Truth Kaggle Notebook Compiler.
 Reads modular Python source files directly from `src/namethatllm/*.py` and
-config JSONs to assemble `kaggle_submission.ipynb` and `lora_training.ipynb`.
+config JSONs to assemble Kaggle notebooks (`kaggle_submission.ipynb`, `lora_training.ipynb`).
 """
 
 import ast
@@ -9,7 +9,7 @@ import json
 import re
 import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
 
 SUBMISSION_MODULES = [
     "config.py",
@@ -44,25 +44,25 @@ def strip_internal_imports(source: str) -> str:
         lines.append(line)
     return "\n".join(lines).strip() + "\n"
 
-def _build_notebook(cells_code: List[str], output_path: Path) -> Path:
+def _build_notebook(cells_code: List[Dict[str, Any]], output_path: Path) -> Path:
     nb = {
         "cells": [
             {
-                "cell_type": "code",
+                "cell_type": item.get("type", "code"),
                 "execution_count": None,
                 "id": f"cell_{idx}",
                 "metadata": {},
                 "outputs": [],
-                "source": [line + "\n" for line in code.splitlines()]
+                "source": [line + "\n" for line in item["source"].splitlines()]
             }
-            for idx, code in enumerate(cells_code)
+            for idx, item in enumerate(cells_code)
         ],
         "metadata": {
             "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-            "language_info": {"name": "python", "version": "3.10.12"},
+            "language_info": {"name": "python", "version": "3.10.0"}
         },
         "nbformat": 4,
-        "nbformat_minor": 5,
+        "nbformat_minor": 5
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(nb, indent=2), encoding="utf-8")
@@ -75,18 +75,18 @@ def compile_submission_notebook(config_path: Path, output_path: Path) -> Path:
 
     lex_src = strip_internal_imports((pkg_dir / "lexical_engine.py").read_text(encoding="utf-8"))
     ast.parse(lex_src, filename="lexical_engine.py")
-    cells = [f"%%writefile /kaggle/working/run_lexical.py\n{lex_src}"]
+    cells = [{"type": "code", "source": f"%%writefile /kaggle/working/run_lexical.py\n{lex_src}"}]
 
     for mod in SUBMISSION_MODULES:
         raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
         if mod == "config.py":
             raw = f"ENSEMBLE_CONFIG = {repr(cfg_data)}\n\n" + raw
         ast.parse(raw, filename=mod)
-        cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
+        cells.append({"type": "code", "source": f"# === MODULE: src/namethatllm/{mod} ===\n{raw}"})
 
     entry = "if __name__ == '__main__':\n    run_submission_pipeline(ENSEMBLE_CONFIG)\n"
     ast.parse(entry, filename="entrypoint")
-    cells.append(entry)
+    cells.append({"type": "code", "source": entry})
     return _build_notebook(cells, output_path)
 
 compile_notebook = compile_submission_notebook
@@ -101,12 +101,14 @@ def compile_training_notebook(config_path: Path, output_path: Path) -> Path:
         raw = strip_internal_imports((pkg_dir / mod).read_text(encoding="utf-8"))
         if mod == "config.py":
             raw = f"TRAINING_CONFIG = {repr(cfg_data)}\n\n" + raw
+        elif mod == "trainer.py":
+            raw = re.sub(r'if __name__ == ["\']__main__["\'][\s\S]*$', '', raw).strip() + "\n"
         ast.parse(raw, filename=mod)
-        cells.append(f"# === MODULE: src/namethatllm/{mod} ===\n{raw}")
+        cells.append({"type": "code", "source": f"# === MODULE: src/namethatllm/{mod} ===\n{raw}"})
 
     entry = "if __name__ == '__main__':\n    run_training_pipeline(TRAINING_CONFIG)\n"
     ast.parse(entry, filename="entrypoint_training")
-    cells.append(entry)
+    cells.append({"type": "code", "source": entry})
     return _build_notebook(cells, output_path)
 
 if __name__ == "__main__":

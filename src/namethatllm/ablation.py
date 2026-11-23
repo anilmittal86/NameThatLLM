@@ -299,15 +299,38 @@ class UnseenStepwiseAuditor:
             self.groups_unseen = np.array([], dtype=int)
         self.N_test = int(N_test)
         self.models: List[Dict[str, Any]] = []
+        self.greedy_model_indices: List[int] = []
+        self.greedy_model_names: List[str] = []
+        self.greedy_unseen_lp: np.ndarray = np.zeros((len(self.y_unseen), K), dtype=np.float64)
+        self.greedy_test_lp: np.ndarray = np.zeros((self.N_test, K), dtype=np.float64)
 
     def add_model(
         self,
         name: str,
-        tier: str,
-        weight: float,
-        unseen_log_probs: np.ndarray,
-        test_log_probs: np.ndarray,
+        *args,
+        tier: str = "Flat",
+        weight: Optional[float] = None,
+        unseen_log_probs: Optional[np.ndarray] = None,
+        test_log_probs: Optional[np.ndarray] = None,
+        **kwargs,
     ):
+        if len(args) == 4:
+            tier, weight, unseen_log_probs, test_log_probs = args
+        elif len(args) == 3:
+            weight, unseen_log_probs, test_log_probs = args
+        elif len(args) == 1:
+            if isinstance(args[0], (int, float)):
+                weight = float(args[0])
+            elif isinstance(args[0], str):
+                tier = args[0]
+
+        if weight is None:
+            weight = float(kwargs.get("weight", 1.0))
+        if unseen_log_probs is None:
+            unseen_log_probs = kwargs.get("unseen_log_probs", np.zeros((0, K), dtype=np.float64))
+        if test_log_probs is None:
+            test_log_probs = kwargs.get("test_log_probs", np.zeros((self.N_test, K), dtype=np.float64))
+
         if len(self.y_unseen) > 0 and len(unseen_log_probs) != len(self.y_unseen):
             return
         u_lp = log_softmax(np.asarray(unseen_log_probs, dtype=np.float64), axis=1) if len(self.y_unseen) > 0 and len(unseen_log_probs) == len(self.y_unseen) else np.zeros((0, K), dtype=np.float64)
@@ -316,13 +339,21 @@ class UnseenStepwiseAuditor:
         solo_sink = _fast_sinkhorn_bacc(u_lp, self.y_unseen, iters=200) if len(self.y_unseen) >= 18 else solo_raw
         self.models.append({
             "name": name,
-            "tier": tier,
+            "tier": tier if tier else "Flat",
             "weight": float(weight),
             "unseen_lp": u_lp,
             "test_lp": t_lp,
             "solo_unseen_bacc": solo_raw,
             "solo_unseen_sinkhorn_bacc": solo_sink,
         })
+
+    def get_greedy_ensemble(self) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Returns (greedy_test_lp, greedy_unseen_lp, greedy_model_names)."""
+        return (
+            getattr(self, "greedy_test_lp", np.zeros((self.N_test, K), dtype=np.float64)),
+            getattr(self, "greedy_unseen_lp", np.zeros((len(self.y_unseen), K), dtype=np.float64)),
+            getattr(self, "greedy_model_names", []),
+        )
 
     def optimize_weights_and_blend(
         self,
@@ -354,7 +385,7 @@ class UnseenStepwiseAuditor:
                     extra_u_lp_base += float(w_ex) * log_softmax(lp_ex, axis=1)
 
         if not optimize_on_unseen or len(self.y_unseen) < 36:
-            weights_map = {m["name"]: m["weight"] for m in self.models}
+            weights_map = {m["name"]: float(m["weight"]) for m in self.models}
             logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
             logit_flat_u = extra_u_lp_base.copy() if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
             for m in self.models:
@@ -387,15 +418,28 @@ class UnseenStepwiseAuditor:
 
         active_weights = np.zeros(M, dtype=np.float64)
         first_idx = order[0]
-        active_weights[first_idx] = self.models[first_idx]["weight"]
+        anchor_w = 1.0 if self.models[first_idx]["weight"] <= 0.0 else float(self.models[first_idx]["weight"])
+        active_weights[first_idx] = anchor_w
         cum_u_lp = extra_u_lp_base + active_weights[first_idx] * self.models[first_idx]["unseen_lp"]
         best_obj, best_bacc = _composite_obj(cum_u_lp)
 
         remaining = list(order[1:])
-        multipliers = [0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 1.25]
+        base_grid = [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50, 0.65, 0.80, 1.00, 1.25, 1.50]
 
-        # At each step, test ALL remaining models across all weight multipliers
-        # and add the (model, weight) pair that maximizes the composite objective
+        chosen_indices = [first_idx]
+        cur_test_lp = active_weights[first_idx] * self.models[first_idx]["test_lp"].copy()
+        prev_test_preds = _ablation_sinkhorn(softmax(cur_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
+        step_records = [{
+            "step": 1,
+            "model": self.models[first_idx]["name"],
+            "raw_weight": anchor_w,
+            "cumul_raw": float(balanced_accuracy_score(self.y_unseen, cum_u_lp.argmax(axis=1))),
+            "cumul_sink": best_bacc,
+            "marginal_lift": 0.0,
+            "test_rows_flipped": self.N_test,
+        }]
+
+        step_idx = 2
         while remaining:
             step_best_idx = None
             step_best_w = 0.0
@@ -403,10 +447,15 @@ class UnseenStepwiseAuditor:
             step_best_bacc = best_bacc
 
             for idx in remaining:
-                prior_w = self.models[idx]["weight"]
                 u_lp = self.models[idx]["unseen_lp"]
-                for mult in multipliers:
-                    cand_w = prior_w * mult
+                p_w = self.models[idx]["weight"]
+                weights_to_test = list(base_grid)
+                if p_w > 0.0:
+                    for mult in [0.25, 0.50, 1.00, 1.25]:
+                        weights_to_test.append(round(p_w * mult, 3))
+                weights_to_test = sorted(list(set(w for w in weights_to_test if w > 0.0)))
+
+                for cand_w in weights_to_test:
                     trial_lp = cum_u_lp + cand_w * u_lp
                     obj_val, bacc_val = _composite_obj(trial_lp)
                     if obj_val > step_best_obj + 1e-6:
@@ -416,46 +465,74 @@ class UnseenStepwiseAuditor:
                         step_best_w = cand_w
 
             if step_best_idx is not None and step_best_w > 0.0:
+                lift = step_best_bacc - best_bacc
                 active_weights[step_best_idx] = step_best_w
                 cum_u_lp = cum_u_lp + step_best_w * self.models[step_best_idx]["unseen_lp"]
                 best_obj = step_best_obj
                 best_bacc = step_best_bacc
                 remaining.remove(step_best_idx)
+                chosen_indices.append(step_best_idx)
+
+                cur_test_lp += step_best_w * self.models[step_best_idx]["test_lp"]
+                cur_test_preds = _ablation_sinkhorn(softmax(cur_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
+                flips = int((cur_test_preds != prev_test_preds).sum()) if len(cur_test_preds) == len(prev_test_preds) else 0
+                prev_test_preds = cur_test_preds
+
+                step_records.append({
+                    "step": step_idx,
+                    "model": self.models[step_best_idx]["name"],
+                    "raw_weight": step_best_w,
+                    "cumul_raw": float(balanced_accuracy_score(self.y_unseen, cum_u_lp.argmax(axis=1))),
+                    "cumul_sink": best_bacc,
+                    "marginal_lift": lift,
+                    "test_rows_flipped": flips,
+                })
+                step_idx += 1
             else:
                 break
 
+        # Calculate single-truth normalized weights across active models
+        tot_act = sum(active_weights[ci] for ci in chosen_indices)
+        if extra_test_log_probs:
+            tot_act += sum(max(0.0, float(w_ex)) for _, w_ex, _ in extra_test_log_probs)
+        act_scale = (1.0 / tot_act) if tot_act > 0.0 else 1.0
+
         weights_map: Dict[str, float] = {}
+        normalized_weights_map: Dict[str, float] = {}
         logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
+        logit_flat_u = (extra_u_lp_base * act_scale) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
 
-        # Safeguard: Apply minimum weight floors for models with validated solo accuracy (>= 0.38 for main, >= 0.38 or valid specialist for comp)
-        # to prevent holdout set leakage (e.g. from pool training data) from zeroing out genuine ensemble models:
-        for idx, m in enumerate(self.models):
-            solo_acc = m.get("solo_unseen_sinkhorn_bacc", m.get("solo_unseen_bacc", 0.0))
-            prior_w = m.get("prior_weight", m["weight"])
-            tier = str(m.get("tier", "main")).lower()
-            if "main" in tier and solo_acc >= 0.38:
-                min_floor = 0.75 * prior_w
-                active_weights[idx] = max(active_weights[idx], min_floor)
-            elif "comp" in tier and (solo_acc >= 0.38 or (solo_acc >= 0.28 and "spec" in m["name"].lower())):
-                min_floor = 0.50 * prior_w
-                active_weights[idx] = max(active_weights[idx], min_floor)
-
-        logit_flat_u = extra_u_lp_base.copy() if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
         for idx, m in enumerate(self.models):
             m["prior_weight"] = m.get("prior_weight", m["weight"])
-            m["learned_weight"] = float(active_weights[idx])
-            m["weight"] = float(active_weights[idx])
-            weights_map[m["name"]] = float(active_weights[idx])
-            if active_weights[idx] > 0.0:
-                logit_flat += active_weights[idx] * m["test_lp"]
+            raw_w = float(active_weights[idx])
+            norm_w = float(raw_w * act_scale)
+            m["learned_weight"] = norm_w
+            m["weight"] = norm_w
+            weights_map[m["name"]] = raw_w
+            normalized_weights_map[m["name"]] = norm_w
+            if norm_w > 0.0:
+                logit_flat += norm_w * m["test_lp"]
                 if len(m["unseen_lp"]) == len(self.y_unseen):
-                    logit_flat_u += active_weights[idx] * m["unseen_lp"]
+                    logit_flat_u += norm_w * m["unseen_lp"]
 
         if extra_test_log_probs:
             for ex_name, w_ex, lp_ex in extra_test_log_probs:
                 if len(lp_ex) == self.N_test and w_ex > 0.0:
-                    logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
+                    norm_ex_w = float(w_ex) * act_scale
+                    logit_flat += norm_ex_w * log_softmax(lp_ex, axis=1)
                     weights_map[ex_name] = float(w_ex)
+                    normalized_weights_map[ex_name] = norm_ex_w
+
+        self.greedy_step_records = step_records
+        self.greedy_model_indices = chosen_indices
+        self.greedy_model_names = [self.models[ci]["name"] for ci in chosen_indices]
+        self.greedy_raw_weights = {self.models[ci]["name"]: float(active_weights[ci]) for ci in chosen_indices}
+        self.greedy_norm_weights = {self.models[ci]["name"]: normalized_weights_map[self.models[ci]["name"]] for ci in chosen_indices}
+        self.greedy_unseen_lp = logit_flat_u
+        self.greedy_test_lp = logit_flat
+        self.greedy_unseen_bacc_raw = float(balanced_accuracy_score(self.y_unseen, logit_flat_u.argmax(axis=1))) if len(self.y_unseen) > 0 else 0.0
+        self.greedy_unseen_bacc_sink = best_bacc
+        self.normalized_weights_map = normalized_weights_map
 
         in_sample_bacc = _fast_sinkhorn_bacc(logit_flat_u, self.y_unseen, iters=200) if len(self.y_unseen) >= 18 else best_bacc
 
@@ -497,10 +574,8 @@ class UnseenStepwiseAuditor:
                         s_best_w = 0.0
                         s_best_obj = f_obj
                         for idx in f_rem:
-                            prior_w = self.models[idx]["weight"]
                             u_lp_tr = self.models[idx]["unseen_lp"][tr_idx]
-                            for mult in multipliers:
-                                cand_w = prior_w * mult
+                            for cand_w in base_grid:
                                 t_lp = f_cum_lp + cand_w * u_lp_tr
                                 obj_val, _ = _composite_obj(t_lp, y_target=y_tr)
                                 if obj_val > s_best_obj + 1e-6:
@@ -515,19 +590,12 @@ class UnseenStepwiseAuditor:
                         else:
                             break
 
-                    for idx, m in enumerate(self.models):
-                        solo_acc_tr = _fast_sinkhorn_bacc(m["unseen_lp"][tr_idx], y_tr, iters=40) if len(tr_idx) >= 18 else 0.0
-                        prior_w = m.get("prior_weight", m["weight"])
-                        tier = str(m.get("tier", "main")).lower()
-                        if "main" in tier and solo_acc_tr >= 0.38:
-                            fold_w[idx] = max(fold_w[idx], 0.75 * prior_w)
-                        elif "comp" in tier and (solo_acc_tr >= 0.38 or (solo_acc_tr >= 0.28 and "spec" in m["name"].lower())):
-                            fold_w[idx] = max(fold_w[idx], 0.50 * prior_w)
-
-                    fold_val_lp = ex_val.copy()
+                    f_tot = sum(fold_w)
+                    f_scale = (1.0 / f_tot) if f_tot > 0.0 else 1.0
+                    fold_val_lp = (ex_val.copy() * f_scale) if len(ex_val) > 0 else np.zeros((len(val_idx), K), dtype=np.float64)
                     for idx, m in enumerate(self.models):
                         if fold_w[idx] > 0.0:
-                            fold_val_lp += fold_w[idx] * m["unseen_lp"][val_idx]
+                            fold_val_lp += (fold_w[idx] * f_scale) * m["unseen_lp"][val_idx]
                     oof_lp[val_idx] = fold_val_lp
 
                 oof_bacc = _fast_sinkhorn_bacc(oof_lp, self.y_unseen, iters=200)
@@ -587,6 +655,8 @@ class UnseenStepwiseAuditor:
             print("[Ablation] No models or unseen holdout samples available; skipping report.")
             return pd.DataFrame()
 
+        M = len(self.models)
+
         # Part 1: Standalone (Solo) Accuracy, sorted descending
         print("\n" + "=" * 105)
         print(f" PART 1: STANDALONE (SOLO) ACCURACY ON STRICTLY UNSEEN HOLDOUT ({len(self.y_unseen)} Disjoint Passages)")
@@ -596,7 +666,7 @@ class UnseenStepwiseAuditor:
         sorted_solo = sorted(self.models, key=lambda m: m["solo_unseen_sinkhorn_bacc"], reverse=True)
         for m in sorted_solo:
             agree_str = "N/A"
-            if final_test_preds is not None and len(final_test_preds) == self.N_test:
+            if final_test_preds is not None and self.N_test > 0 and len(final_test_preds) == self.N_test:
                 pct = 100.0 * float((m["test_lp"].argmax(axis=1) == final_test_preds).mean())
                 agree_str = f"{pct:5.1f}%"
             print(
@@ -604,97 +674,119 @@ class UnseenStepwiseAuditor:
                 f"{m['solo_unseen_bacc']:<16.4f} | {m['solo_unseen_sinkhorn_bacc']:<20.4f} | {agree_str}"
             )
 
-        # Part 2: Greedy Forward Stepwise Selection (starts with strongest solo model, tests all candidates at each step)
-        print("\n" + "=" * 105)
+        # Part 2: Greedy Forward Stepwise Selection (Single Truth from Caruana selection)
+        print("\n" + "=" * 115)
         print(" PART 2: GREEDY FORWARD STEPWISE SELECTION ON STRICTLY UNSEEN HOLDOUT (Optimal Combinations)")
-        print("=" * 105)
-        print(f"{'Step':<5} | {'Added Model':<28} | {'Wt':<5} | {'Cumul Raw':<10} | {'Cumul+Sink':<11} | {'Marginal Lift':<13} | {'Test Rows Flipped'}")
-        print("-" * 105)
+        print("=" * 115)
+        print(f"{'Step':<5} | {'Added Model':<26} | {'Raw Wt':<7} | {'Share (%)':<10} | {'Cumul Raw':<10} | {'Cumul+Sink':<11} | {'Marginal Lift':<13} | {'Test Rows Flipped'}")
+        print("-" * 115)
 
-        M = len(self.models)
-        remaining = list(range(M))
-        cum_unseen_lp = np.zeros((len(self.y_unseen), K), dtype=np.float64)
-        cum_test_lp = np.zeros((self.N_test, K), dtype=np.float64)
-        prev_bacc = 0.0
-        prev_test_preds = None
-        records = []
+        records = list(getattr(self, "greedy_step_records", []))
+        if records:
+            tot_gw = sum(r.get("raw_weight", r.get("weight", 0.0)) for r in records)
+            for r in records:
+                w_val = r.get("raw_weight", r.get("weight", 0.0))
+                pct = (w_val / tot_gw * 100.0) if tot_gw > 0 else 0.0
+                lift_str = f"{r['marginal_lift']:+.4f}" if r["step"] > 1 else "BASELINE"
+                flips = r.get("test_rows_flipped", 0)
+                flip_str = f"{flips} (Init)" if r["step"] == 1 else f"{flips:4d} ({100.0 * flips / max(1, self.N_test):4.1f}%)"
+                c_raw = r.get("cumul_raw", r.get("cumul_unseen_raw_bacc", 0.0))
+                c_sink = r.get("cumul_sink", r.get("cumul_unseen_sinkhorn_bacc", 0.0))
+                print(
+                    f"{r['step']:<5} | + {r['model']:<24} | {w_val:<7.2f} | {pct:>7.1f}%   | "
+                    f"{c_raw:<10.4f} | {c_sink:<11.4f} | {lift_str:<13} | {flip_str}"
+                )
+            print("-" * 115)
+            print(f"Total | {len(getattr(self, 'greedy_model_indices', []))} Active Models{'':<13} | {tot_gw:<7.2f} |   100.0%   | Final Greedy Optimal Subset (+Sinkhorn BAcc: {getattr(self, 'greedy_unseen_bacc_sink', 0.0):.4f})")
+            print("=" * 115 + "\n")
+        else:
+            M = len(self.models)
+            remaining = list(range(M))
+            cum_unseen_lp = np.zeros((len(self.y_unseen), K), dtype=np.float64)
+            cum_test_lp = np.zeros((self.N_test, K), dtype=np.float64)
+            prev_bacc = 0.0
+            prev_test_preds = None
+            chosen_indices = []
 
-        step_idx = 1
-        while remaining:
-            best_cand_idx = None
-            best_cand_bacc = -1.0
-            best_cand_raw = 0.0
+            step_idx = 1
+            while remaining:
+                best_cand_idx = None
+                best_cand_bacc = -1.0
+                best_cand_raw = 0.0
 
-            if step_idx == 1:
-                # Pick model with highest solo unseen sinkhorn bacc
-                for idx in remaining:
-                    cand = self.models[idx]
-                    cand_w = cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15)
-                    cand_lp = cand_w * cand["unseen_lp"]
-                    cand_bacc = _fast_sinkhorn_bacc(cand_lp, self.y_unseen, iters=40)
-                    if cand_bacc > best_cand_bacc:
-                        best_cand_bacc = cand_bacc
-                        best_cand_idx = idx
-                        best_cand_raw = float(balanced_accuracy_score(self.y_unseen, cand_lp.argmax(axis=1)))
-            else:
-                # Test all remaining candidate models
-                for idx in remaining:
-                    cand = self.models[idx]
-                    cand_w = cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15)
-                    cand_lp = cum_unseen_lp + cand_w * cand["unseen_lp"]
-                    cand_bacc = _fast_sinkhorn_bacc(cand_lp, self.y_unseen, iters=40)
-                    if cand_bacc > best_cand_bacc:
-                        best_cand_bacc = cand_bacc
-                        best_cand_idx = idx
-                        best_cand_raw = float(balanced_accuracy_score(self.y_unseen, cand_lp.argmax(axis=1)))
+                if step_idx == 1:
+                    for idx in remaining:
+                        cand = self.models[idx]
+                        cand_w = cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15)
+                        cand_lp = cand_w * cand["unseen_lp"]
+                        cand_bacc = _fast_sinkhorn_bacc(cand_lp, self.y_unseen, iters=40)
+                        if cand_bacc > best_cand_bacc:
+                            best_cand_bacc = cand_bacc
+                            best_cand_idx = idx
+                            best_cand_raw = float(balanced_accuracy_score(self.y_unseen, cand_lp.argmax(axis=1)))
+                else:
+                    for idx in remaining:
+                        cand = self.models[idx]
+                        cand_w = cand["weight"] if cand["weight"] > 0 else cand.get("prior_weight", 0.15)
+                        cand_lp = cum_unseen_lp + cand_w * cand["unseen_lp"]
+                        cand_bacc = _fast_sinkhorn_bacc(cand_lp, self.y_unseen, iters=40)
+                        if cand_bacc > best_cand_bacc:
+                            best_cand_bacc = cand_bacc
+                            best_cand_idx = idx
+                            best_cand_raw = float(balanced_accuracy_score(self.y_unseen, cand_lp.argmax(axis=1)))
 
-            if best_cand_idx is None:
-                break
+                if best_cand_idx is None:
+                    break
 
-            lift = best_cand_bacc - prev_bacc if step_idx > 1 else 0.0
-            if step_idx > 1 and lift < 0.0:
-                print(f"[Greedy Forward Selection] Best remaining candidate '{self.models[best_cand_idx]['name']}' gives negative lift ({lift:+.4f}); stopping forward selection.")
-                break
+                lift = best_cand_bacc - prev_bacc if step_idx > 1 else 0.0
+                if step_idx > 1 and lift < 0.0:
+                    print(f"[Greedy Forward Selection] Best remaining candidate '{self.models[best_cand_idx]['name']}' gives negative lift ({lift:+.4f}); stopping forward selection.")
+                    break
 
-            m = self.models[best_cand_idx]
-            remaining.remove(best_cand_idx)
+                m = self.models[best_cand_idx]
+                remaining.remove(best_cand_idx)
+                chosen_indices.append(best_cand_idx)
 
-            w = m["weight"] if m["weight"] > 0 else m.get("prior_weight", 0.15)
-            cum_unseen_lp = cum_unseen_lp + w * m["unseen_lp"]
-            cum_test_lp = cum_test_lp + w * m["test_lp"]
+                w = m["weight"] if m["weight"] > 0 else m.get("prior_weight", 0.15)
+                cum_unseen_lp = cum_unseen_lp + w * m["unseen_lp"]
+                cum_test_lp = cum_test_lp + w * m["test_lp"]
 
-            lift_str = f"{lift:+.4f}" if step_idx > 1 else "BASELINE"
-            cur_test_preds = _ablation_sinkhorn(softmax(cum_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
-            if prev_test_preds is None:
-                flips = self.N_test
-                flip_str = f"{flips} (Init)"
-            else:
-                flips = int((cur_test_preds != prev_test_preds).sum()) if len(cur_test_preds) == len(prev_test_preds) else 0
-                flip_pct = 100.0 * flips / max(1, self.N_test)
-                flip_str = f"{flips:4d} ({flip_pct:4.1f}%)"
+                lift_str = f"{lift:+.4f}" if step_idx > 1 else "BASELINE"
+                cur_test_preds = _ablation_sinkhorn(softmax(cum_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
+                flips = self.N_test if prev_test_preds is None else int((cur_test_preds != prev_test_preds).sum())
+                flip_str = f"{flips} (Init)" if prev_test_preds is None else f"{flips:4d} ({100.0 * flips / max(1, self.N_test):4.1f}%)"
 
-            print(
-                f"{step_idx:<5} | + {m['name']:<26} | {w:<5.2f} | "
-                f"{best_cand_raw:<10.4f} | {best_cand_bacc:<11.4f} | {lift_str:<13} | {flip_str}"
-            )
-            prev_bacc = best_cand_bacc
-            prev_test_preds = cur_test_preds
-            records.append({
-                "step": step_idx,
-                "model": m["name"],
-                "added_model": m["name"],
-                "tier": m["tier"],
-                "weight": w,
-                "solo_unseen_bacc": m["solo_unseen_bacc"],
-                "solo_unseen_sinkhorn_bacc": m["solo_unseen_sinkhorn_bacc"],
-                "cumul_unseen_raw_bacc": best_cand_raw,
-                "cumul_unseen_sinkhorn_bacc": best_cand_bacc,
-                "marginal_lift": lift,
-                "test_rows_flipped": flips,
-            })
-            step_idx += 1
+                print(
+                    f"{step_idx:<5} | + {m['name']:<24} | {w:<7.2f} |       -    | "
+                    f"{best_cand_raw:<10.4f} | {best_cand_bacc:<11.4f} | {lift_str:<13} | {flip_str}"
+                )
+                prev_bacc = best_cand_bacc
+                prev_test_preds = cur_test_preds
+                records.append({
+                    "step": step_idx,
+                    "model": m["name"],
+                    "added_model": m["name"],
+                    "tier": m["tier"],
+                    "weight": w,
+                    "raw_weight": w,
+                    "solo_unseen_bacc": m["solo_unseen_bacc"],
+                    "solo_unseen_sinkhorn_bacc": m["solo_unseen_sinkhorn_bacc"],
+                    "cumul_unseen_raw_bacc": best_cand_raw,
+                    "cumul_unseen_sinkhorn_bacc": best_cand_bacc,
+                    "marginal_lift": lift,
+                    "test_rows_flipped": flips,
+                })
+                step_idx += 1
 
-        print("=" * 105 + "\n")
+            total_gw = sum(max(0.0, float(self.models[i]["weight"] if self.models[i]["weight"] > 0 else self.models[i].get("prior_weight", 0.15))) for i in chosen_indices)
+            gw_scale = (1.0 / total_gw) if total_gw > 0.0 else 1.0
+            self.greedy_model_indices = chosen_indices
+            self.greedy_model_names = [self.models[i]["name"] for i in chosen_indices]
+            self.greedy_unseen_lp = cum_unseen_lp * gw_scale
+            self.greedy_test_lp = cum_test_lp * gw_scale
+            self.greedy_unseen_bacc_raw = float(balanced_accuracy_score(self.y_unseen, cum_unseen_lp.argmax(axis=1))) if len(self.y_unseen) > 0 else 0.0
+            self.greedy_unseen_bacc_sink = prev_bacc
+            print("=" * 115 + "\n")
 
         # Part 3: Exhaustive All 2^M Subset Search & LOO Attribution (for M <= 12)
         if 2 <= M <= 12:

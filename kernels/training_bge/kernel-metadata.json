@@ -1,0 +1,19 @@
+{
+  "id": "anilmittal/ntl-bge-m3-lora-training",
+  "title": "NTL BGE-M3 LoRA Training",
+  "code_file": "train_bge_m3_lora.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "anilmittal/ntl-clean-master-pool",
+    "anilmittal/ntl-clean-benchmark-1800",
+    "masterstar/bge-m3"
+  ],
+  "competition_sources": [
+    "name-that-llm"
+  ]
+}

@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemini Family Embedding Separability Dashboard</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-3 m-0 text-xs font-sans selection:bg-[var(--primary)] selection:text-white">
+
+  <div class="space-y-4 max-w-5xl mx-auto">
+    <!-- Header -->
+    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--card-border)] pb-3">
+      <div>
+        <h1 class="text-base font-bold tracking-tight text-[var(--foreground)] flex items-center gap-2">
+          <span>✨</span> Gemini Family Embedding Separability & Disambiguation
+        </h1>
+        <p class="text-[var(--muted-foreground)] text-xs mt-0.5">
+          Intra-Family Version Classification, Cluster Purity & Fisher Discriminant Analysis (400 Holdout Samples)
+        </p>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="px-2 py-1 rounded bg-[var(--card)] border border-[var(--card-border)] font-mono text-[11px] text-[var(--foreground)]">
+          4 Gemini Versions
+        </span>
+        <span class="px-2 py-1 rounded bg-[var(--card)] border border-[var(--card-border)] font-mono text-[11px] text-teal-400 font-semibold">
+          Family AUC: 0.9997
+        </span>
+        <span class="px-2 py-1 rounded bg-[var(--card)] border border-[var(--card-border)] font-mono text-[11px] text-[var(--accent)] font-semibold">
+          Top BAcc: 60.25%
+        </span>
+      </div>
+    </div>
+
+    <!-- Core Takeaway Banner -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="bg-[var(--card)] p-2.5 rounded-lg border border-[var(--card-border)]">
+        <div class="text-[10px] font-mono uppercase text-[var(--muted-foreground)]">Best Intra-Gemini Classifier</div>
+        <div class="text-sm font-bold text-emerald-400 mt-0.5">qwen3_8b_v5 (60.25%)</div>
+        <div class="text-[11px] text-[var(--muted-foreground)] mt-1">Sharpest decision boundaries across 3.6, 3.7, and 3.8 Flash releases.</div>
+      </div>
+      <div class="bg-[var(--card)] p-2.5 rounded-lg border border-[var(--card-border)]">
+        <div class="text-[10px] font-mono uppercase text-[var(--muted-foreground)]">Tightest Cluster Geometry</div>
+        <div class="text-sm font-bold text-indigo-400 mt-0.5">DeBERTa-v3 (Fisher: 0.1631)</div>
+        <div class="text-[11px] text-[var(--muted-foreground)] mt-1">3.4x higher between-class scatter ratio; 96% accuracy on 3.1 Pro Preview.</div>
+      </div>
+      <div class="bg-[var(--card)] p-2.5 rounded-lg border border-[var(--card-border)]">
+        <div class="text-[10px] font-mono uppercase text-[var(--muted-foreground)]">Flash 3.8 Specialist</div>
+        <div class="text-sm font-bold text-amber-400 mt-0.5">LinearSVC 4-View (57.0%)</div>
+        <div class="text-[11px] text-[var(--muted-foreground)] mt-1">Outperforms all neural models on 3.8 Flash via stylometric n-gram cues.</div>
+      </div>
+    </div>
+
+    <!-- Interactive Model Selector & Confusion Matrix -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+      <!-- Left: Confusion Matrix & Per-Class Bars (Cols 7) -->
+      <div class="lg:col-span-7 bg-[var(--card)] p-3 rounded-lg border border-[var(--card-border)] space-y-3">
+        <div class="flex items-center justify-between border-b border-[var(--card-border)] pb-2">
+          <span class="font-bold text-xs uppercase tracking-wide text-[var(--foreground)]">Intra-Gemini Confusion Matrix</span>
+          <div class="flex items-center gap-1.5">
+            <span class="text-[11px] text-[var(--muted-foreground)]">Model:</span>
+            <select id="model-select" onchange="renderActiveModel(this.value)" class="bg-[var(--background)] border border-[var(--card-border)] text-[var(--foreground)] rounded px-2 py-1 text-xs font-semibold focus:outline-none focus:border-[var(--primary)]">
+              <option value="prod_blend">Production 6-Model Blend (60.0%)</option>
+              <option value="qwen3_8b_v5">qwen3_8b_v5 (60.25%)</option>
+              <option value="qwen3_14b_inhouse">qwen3_14b_inhouse (56.75%)</option>
+              <option value="svc_4view">LinearSVC 4-View (55.50%)</option>
+              <option value="qwen3_14b_p2">Qwen3-14B Part-2 (55.00%)</option>
+              <option value="deberta_p2">DeBERTa-v3-Large (49.25%)</option>
+              <option value="gemma2_9b_ts">Gemma-2-9B TS (52.25%)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- 4x4 Grid -->
+        <div class="flex justify-center py-1">
+          <div id="confusion-grid" class="inline-block"></div>
+        </div>
+
+        <!-- Per-Class Accuracy Bars -->
+        <div class="space-y-2 border-t border-[var(--card-border)] pt-2.5">
+          <div class="text-[11px] font-semibold text-[var(--muted-foreground)] uppercase">Per-Version Recall (100 samples each):</div>
+          <div id="per-class-bars" class="space-y-1.5"></div>
+        </div>
+      </div>
+
+      <!-- Right: Geometric Separability Rankings (Cols 5) -->
+      <div class="lg:col-span-5 bg-[var(--card)] p-3 rounded-lg border border-[var(--card-border)] space-y-3">
+        <div class="border-b border-[var(--card-border)] pb-2">
+          <span class="font-bold text-xs uppercase tracking-wide text-[var(--accent)]">Representation Separability Metrics</span>
+          <div class="text-[11px] text-[var(--muted-foreground)] mt-0.5">Computed directly on 400 Gemini embedding vectors</div>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="w-full text-left border-collapse text-[11px]">
+            <thead>
+              <tr class="border-b border-[var(--card-border)] text-[var(--muted-foreground)] font-mono text-[10px] uppercase">
+                <th class="py-1 px-1.5">Model</th>
+                <th class="py-1 px-1.5 text-right" title="Supervised 5-Fold Linear Probe">Probe</th>
+                <th class="py-1 px-1.5 text-right" title="Between-to-Within Scatter Ratio Tr(Sb)/Tr(Sw)">Fisher</th>
+                <th class="py-1 px-1.5 text-right" title="5-Nearest Neighbor Class Purity">kNN-5</th>
+              </tr>
+            </thead>
+            <tbody id="metrics-table-body" class="divide-y divide-[var(--card-border)] font-mono">
+              <!-- Dynamically populated -->
+            </tbody>
+          </table>
+        </div>
+
+        <div class="p-2.5 rounded bg-[var(--background)] border border-[var(--card-border)] space-y-1 text-[11px] text-[var(--muted-foreground)]">
+          <div class="font-bold text-[var(--foreground)]">Why Gemini 3.1 Pro is 92-96% Solved:</div>
+          <p class="leading-relaxed">
+            Gemini 3.1 Pro Preview operates on a noticeably different chain-of-thought structure with explicit reasoning tags and distinct hedging syntax. DeBERTa (96%) and Qwen (93%) effortlessly isolate it.
+          </p>
+          <div class="font-bold text-[var(--foreground)] pt-1">The True Bottleneck: 3.7 vs 3.8 Flash</div>
+          <p class="leading-relaxed">
+            The primary confusion across all models is <strong>3.7 Flash vs 3.8 Flash</strong> (29 errors in blend). LinearSVC's 57% recall on 3.8 Flash provides the vital distinguishing anchor.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const modelsData = {
+      prod_blend: {
+        name: "Production 6-Model Blend",
+        mean_bacc: 60.0,
+        cm: [
+          [92,  7,  1,  0],
+          [23, 62, 11,  4],
+          [12, 24, 47, 17],
+          [11, 21, 29, 39]
+        ],
+        classes: ["3.1-pro", "3.6-flash", "3.7-flash", "3.8-flash"]
+      },
+      qwen3_8b_v5: {
+        name: "qwen3_8b_v5",
+        mean_bacc: 60.25,
+        cm: [
+          [93,  5,  2,  0],
+          [24, 57, 13,  6],
+          [14, 21, 48, 17],
+          [12, 20, 25, 43]
+        ],
+        classes: ["3.1-pro", "3.6-flash", "3.7-flash", "3.8-flash"]
+      },
+      qwen3_14b_inhouse: {
+        name: "qwen3_14b_inhouse",
+        mean_bacc: 56.75,
+        cm: [
+          [86, 12,  1,  1],
+          [21, 63, 11,  5],
+          [17, 31, 34, 18],
+          [16, 22, 18, 44]
+        ],
+        classes: ["3.1-pro", "3.6-flash", "3.7-flash", "3.8-flash"]
+      },
+      svc_4view: {
+        name: "LinearSVC (4-View)",
+        mean_bacc: 55.50,
+        cm: [
+          [65, 23,  6,  6],
+          [17, 65,  9,  9],
+          [13, 31, 35, 21],
+          [ 9, 17, 17, 57]
+        ],
+        classes: ["3.1-pro", "3.6-flash", "3.7-flash", "3.8-flash"]
+      },
+      qwen3_14b_p2: {
+        name: "Qwen3-14B Part-2",
+        mean_bacc: 55.00,
+        cm: [
+          [92,  7,  1,  0],
+          [25, 56, 11,  8],
+          [16, 32, 37, 15],
+          [15, 29, 21, 35]
+        ],
+        classes: ["3.1-pro", "3.6-flash", "3.7-flash", "3.8-flash"]
+      },
+      deberta_p2: {
+        name: "DeBERTa-v3-Large",
+        mean_bacc: 49.25,
+        cm: [
+          [96,  3,  1,  0],
+          [35, 52,  8,  5],
+          [28, 25, 34, 13],
+          [28, 31, 26, 15]
+        ],
+        classes: ["3.1-pro", "3.6-flash", "3.7-flash", "3.8-flash"]
+      },
+      gemma2_9b_ts: {
+        name: "Gemma-2-9B TS",
+        mean_bacc: 52.25,
+        cm: [
+          [84, 11,  4,  1],
+          [24, 55, 12,  9],
+          [18, 31, 38, 13],
+          [19, 28, 21, 32]
+        ],
+        classes: ["3.1-pro", "3.6-flash", "3.7-flash", "3.8-flash"]
+      }
+    };
+
+    const separabilityTable = [
+      { name: "DeBERTa-v3-Large", probe: "50.75%", fisher: "0.16314", knn: "43.7%", highlight: true },
+      { name: "qwen3_14b_inhouse", probe: "51.00%", fisher: "0.04577", knn: "42.9%", highlight: true },
+      { name: "qwen3_8b_v5", probe: "51.00%", fisher: "0.03016", knn: "39.4%", highlight: true },
+      { name: "qwen3_14b_ts / v5", probe: "51.75%", fisher: "0.04740", knn: "38.5%", highlight: false },
+      { name: "qwen3_14b_p2", probe: "52.00%", fisher: "0.03347", knn: "37.9%", highlight: false },
+      { name: "Mistral-7B TS", probe: "49.50%", fisher: "0.04796", knn: "37.9%", highlight: false },
+      { name: "Llama-3-8B-v5", probe: "49.75%", fisher: "0.02427", knn: "37.0%", highlight: false },
+      { name: "Llama-3.1-8B TS", probe: "44.25%", fisher: "0.01992", knn: "33.7%", highlight: false },
+      { name: "Gemma-2-9B TS", probe: "46.00%", fisher: "0.02155", knn: "32.2%", highlight: false },
+      { name: "BGE-M3 (Encoder)", probe: "32.50%", fisher: "0.01043", knn: "28.0%", highlight: false }
+    ];
+
+    function renderActiveModel(key) {
+      const m = modelsData[key];
+      const cm = m.cm;
+      const classes = m.classes;
+
+      // Render Confusion Matrix
+      let gridHtml = `
+        <div class="grid grid-cols-5 gap-1 text-center font-mono">
+          <div class="h-6"></div>
+          ${classes.map(c => `<div class="h-6 flex items-end justify-center text-[10px] text-[var(--muted-foreground)] font-bold pb-1 truncate" title="Predicted ${c}">${c}</div>`).join('')}
+      `;
+
+      for (let i = 0; i < 4; i++) {
+        gridHtml += `<div class="h-8 flex items-center justify-end pr-1 text-[10px] text-[var(--muted-foreground)] font-bold truncate" title="Actual ${classes[i]}">${classes[i]}</div>`;
+        for (let j = 0; j < 4; j++) {
+          const val = cm[i][j];
+          const isDiag = (i === j);
+          let bg = 'bg-slate-900 text-slate-400';
+          if (isDiag) {
+            if (val >= 80) bg = 'bg-emerald-600 text-white font-bold';
+            else if (val >= 55) bg = 'bg-teal-600 text-white font-bold';
+            else if (val >= 40) bg = 'bg-cyan-700 text-white font-bold';
+            else bg = 'bg-amber-700 text-white font-bold';
+          } else {
+            if (val >= 25) bg = 'bg-rose-950 text-rose-300 font-semibold';
+            else if (val >= 15) bg = 'bg-orange-950/70 text-orange-300';
+            else if (val > 0) bg = 'bg-slate-900 text-slate-300';
+          }
+
+          gridHtml += `
+            <div class="h-8 w-14 rounded flex flex-col items-center justify-center ${bg} border ${isDiag ? 'border-white/30' : 'border-transparent'}">
+              <span class="text-xs">${val}</span>
+              <span class="text-[9px] opacity-75">${val}%</span>
+            </div>
+          `;
+        }
+      }
+      gridHtml += '</div>';
+      document.getElementById('confusion-grid').innerHTML = gridHtml;
+
+      // Render Per-Class Recall Bars
+      let barsHtml = '';
+      const barColors = ['bg-emerald-500', 'bg-teal-500', 'bg-cyan-500', 'bg-amber-500'];
+      for (let i = 0; i < 4; i++) {
+        const recall = cm[i][i];
+        barsHtml += `
+          <div>
+            <div class="flex justify-between items-center text-[11px] mb-0.5">
+              <span class="font-mono font-medium text-[var(--foreground)]">${classes[i]}</span>
+              <span class="font-mono font-bold ${recall >= 80 ? 'text-emerald-400' : (recall >= 50 ? 'text-teal-400' : 'text-amber-400')}">${recall}% Recall</span>
+            </div>
+            <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+              <div class="h-full ${barColors[i]}" style="width: ${recall}%"></div>
+            </div>
+          </div>
+        `;
+      }
+      document.getElementById('per-class-bars').innerHTML = barsHtml;
+    }
+
+    function renderTable() {
+      const tbody = document.getElementById('metrics-table-body');
+      let html = '';
+      separabilityTable.forEach(row => {
+        html += `
+          <tr class="hover:bg-[var(--background)] transition-colors ${row.highlight ? 'bg-indigo-950/20' : ''}">
+            <td class="py-1 px-1.5 font-semibold text-[var(--foreground)] truncate max-w-[130px]">${row.name}</td>
+            <td class="py-1 px-1.5 text-right font-bold ${parseFloat(row.probe) > 50 ? 'text-teal-400' : 'text-[var(--muted-foreground)]'}">${row.probe}</td>
+            <td class="py-1 px-1.5 text-right font-bold ${parseFloat(row.fisher) > 0.05 ? 'text-amber-400' : 'text-[var(--foreground)]'}">${row.fisher}</td>
+            <td class="py-1 px-1.5 text-right font-bold ${parseFloat(row.knn) > 40 ? 'text-emerald-400' : 'text-[var(--muted-foreground)]'}">${row.knn}</td>
+          </tr>
+        `;
+      });
+      tbody.innerHTML = html;
+    }
+
+    // Init
+    renderActiveModel('prod_blend');
+    renderTable();
+  </script>
+</body>
+</html>

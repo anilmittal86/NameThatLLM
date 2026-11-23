@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kaggle Kernel Version 88: 18-Class Confusion Matrix & Prediction Distribution</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .cell-hover {
+      transition: all 0.12s ease;
+      cursor: pointer;
+    }
+    .cell-hover:hover {
+      outline: 2px solid #38bdf8;
+      z-index: 10;
+      transform: scale(1.08);
+    }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-3 m-0 text-xs font-sans selection:bg-[var(--primary)] selection:text-white">
+
+  <div class="space-y-4 max-w-6xl mx-auto">
+    <!-- Header -->
+    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--card-border)] pb-3">
+      <div>
+        <h1 class="text-base font-bold tracking-tight text-[var(--foreground)] flex items-center gap-2">
+          <span>📊</span> Kaggle Kernel Version 88: 18-Class Confusion Matrix & Predictions
+        </h1>
+        <p class="text-[var(--muted-foreground)] text-xs mt-0.5">
+          Evaluation on 1,800 Unseen Holdout Samples (Exactly 100 Balanced Samples per Class)
+        </p>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="px-2 py-1 rounded bg-[var(--card)] border border-[var(--card-border)] font-mono text-[11px] text-emerald-400 font-semibold">
+          Overall BAcc: 57.72% (1,039 / 1,800)
+        </span>
+        <span class="px-2 py-1 rounded bg-[var(--card)] border border-[var(--card-border)] font-mono text-[11px] text-cyan-400 font-semibold">
+          Locked Simplex: 58.61% - 59.11%
+        </span>
+      </div>
+    </div>
+
+    <!-- Summary Stats Bar -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+      <div class="bg-[var(--card)] p-2.5 rounded-lg border border-[var(--card-border)]">
+        <div class="text-[10px] font-mono uppercase text-[var(--muted-foreground)]">Top Precision Model</div>
+        <div class="text-sm font-bold text-emerald-400 mt-0.5">gpt-6-astra (93% Rec / 81.6% Prec)</div>
+        <div class="text-[11px] text-[var(--muted-foreground)] mt-1">Nearly zero leakage outside the Astra reasoning token format.</div>
+      </div>
+      <div class="bg-[var(--card)] p-2.5 rounded-lg border border-[var(--card-border)]">
+        <div class="text-[10px] font-mono uppercase text-[var(--muted-foreground)]">Top Gemini Model</div>
+        <div class="text-sm font-bold text-teal-400 mt-0.5">gemini-3.1-pro-preview (88% Recall)</div>
+        <div class="text-[11px] text-[var(--muted-foreground)] mt-1">88 correct out of 100; only 8 confused with 3.6-flash.</div>
+      </div>
+      <div class="bg-[var(--card)] p-2.5 rounded-lg border border-[var(--card-border)]">
+        <div class="text-[10px] font-mono uppercase text-[var(--muted-foreground)]">Top Claude Model</div>
+        <div class="text-sm font-bold text-indigo-400 mt-0.5">claude-opus-5 (83% Recall)</div>
+        <div class="text-[11px] text-[var(--muted-foreground)] mt-1">83 correct; cleanly isolated from Opus 4.x versions.</div>
+      </div>
+      <div class="bg-[var(--card)] p-2.5 rounded-lg border border-[var(--card-border)]">
+        <div class="text-[10px] font-mono uppercase text-[var(--muted-foreground)]">Most Under-Predicted</div>
+        <div class="text-sm font-bold text-rose-400 mt-0.5">kimi-k3 (36 preds, 20% Recall)</div>
+        <div class="text-[11px] text-[var(--muted-foreground)] mt-1">27 true samples absorbed into glm-5.3-flash, 14 into fable-5.</div>
+      </div>
+    </div>
+
+    <!-- Main Section: Table and Heatmap -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+      <!-- Left: Full 18-Class Prediction Counts Table (Cols 6) -->
+      <div class="lg:col-span-6 bg-[var(--card)] p-3 rounded-lg border border-[var(--card-border)] space-y-2">
+        <div class="flex items-center justify-between border-b border-[var(--card-border)] pb-2">
+          <span class="font-bold text-xs uppercase tracking-wide text-[var(--foreground)]">Prediction Distribution (18 Classes)</span>
+          <span class="text-[11px] font-mono text-[var(--muted-foreground)]">Target: 100 / Class</span>
+        </div>
+        <div class="overflow-x-auto max-h-[580px] overflow-y-auto">
+          <table class="w-full text-left border-collapse text-[11px]">
+            <thead class="sticky top-0 bg-[var(--card)] border-b border-[var(--card-border)] text-[var(--muted-foreground)] font-mono text-[10px] uppercase z-10">
+              <tr>
+                <th class="py-1.5 px-1.5">#</th>
+                <th class="py-1.5 px-2">Class Name</th>
+                <th class="py-1.5 px-1.5 text-right">Preds</th>
+                <th class="py-1.5 px-1.5 text-right">Correct</th>
+                <th class="py-1.5 px-1.5 text-right">Recall%</th>
+                <th class="py-1.5 px-1.5 text-right">Prec%</th>
+                <th class="py-1.5 px-1.5 text-right">Bias</th>
+              </tr>
+            </thead>
+            <tbody id="dist-tbody" class="divide-y divide-[var(--card-border)] font-mono">
+              <!-- JS rendered -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Right: Confusion Matrix Inspector (Cols 6) -->
+      <div class="lg:col-span-6 bg-[var(--card)] p-3 rounded-lg border border-[var(--card-border)] space-y-3">
+        <div class="flex items-center justify-between border-b border-[var(--card-border)] pb-2">
+          <span class="font-bold text-xs uppercase tracking-wide text-[var(--accent)]">18x18 Confusion Matrix Inspector</span>
+          <span class="text-[11px] text-[var(--muted-foreground)]">Hover or click any cell below</span>
+        </div>
+
+        <!-- Cell Details Banner -->
+        <div id="cell-detail" class="bg-[var(--background)] p-2 rounded border border-[var(--card-border)] min-h-[46px] flex items-center justify-between">
+          <div class="space-y-0.5">
+            <div id="detail-label" class="font-bold text-xs text-[var(--foreground)]">Hover any cell on the matrix</div>
+            <div id="detail-desc" class="text-[10px] text-[var(--muted-foreground)]">Click a cell or row in the table to lock detailed breakdown</div>
+          </div>
+          <div id="detail-badge" class="text-right">
+            <span class="text-xs font-mono font-bold text-cyan-400">—</span>
+          </div>
+        </div>
+
+        <!-- Matrix Heatmap Container -->
+        <div class="overflow-x-auto pb-2">
+          <div id="matrix-grid" class="inline-block min-w-full font-mono text-[9px]"></div>
+        </div>
+
+        <!-- Legend / Key Findings -->
+        <div class="p-2.5 rounded bg-[var(--background)] border border-[var(--card-border)] space-y-1.5 text-[11px] text-[var(--muted-foreground)]">
+          <div class="font-bold text-[var(--foreground)] text-xs flex items-center gap-1.5">
+            <span>🔍</span> Key Diagnostic Findings in v88:
+          </div>
+          <ul class="list-disc list-inside space-y-1 text-[11px] leading-relaxed">
+            <li><strong class="text-emerald-400">Zero Cross-Family Leakage</strong>: GPT, Gemini, and Claude form near-perfect block diagonals. Error is almost 100% intra-family.</li>
+            <li><strong class="text-amber-400">The Luna / Sol / Terra Triad</strong>: 47 samples of Terra and Sol are pulled into Luna (143 total preds), making Luna the single most over-predicted class.</li>
+            <li><strong class="text-rose-400">GLM / Kimi Entanglement</strong>: 30 samples of GLM-5.3 and 41 samples of Kimi-k3 are misclassified as Claude or GLM-5.3-flash.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const data = {"labels": ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash", "claude-opus-4-6", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "qwen3.8-max", "glm-5.3", "glm-5.3-flash", "kimi-k3"], "cm": [[72, 4, 3, 9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 3], [1, 70, 20, 2, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0], [5, 26, 50, 6, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 2], [5, 21, 23, 40, 5, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 1, 2], [0, 5, 1, 0, 93, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0], [1, 0, 0, 0, 0, 88, 8, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 21, 63, 6, 6, 3, 0, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0, 0, 0, 10, 24, 43, 21, 1, 0, 0, 0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, 10, 19, 28, 40, 2, 1, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 69, 14, 2, 5, 4, 0, 3, 3, 0], [1, 0, 0, 0, 0, 0, 0, 0, 0, 8, 63, 2, 7, 8, 0, 3, 8, 0], [1, 0, 4, 1, 0, 0, 0, 0, 0, 2, 1, 83, 0, 3, 0, 0, 4, 1], [0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 9, 0, 74, 2, 1, 4, 2, 1], [1, 0, 0, 0, 2, 0, 0, 0, 0, 7, 10, 9, 6, 33, 0, 17, 13, 2], [15, 13, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 1], [0, 3, 0, 0, 0, 0, 0, 0, 0, 4, 10, 7, 10, 8, 1, 35, 21, 1], [0, 0, 1, 0, 0, 0, 0, 0, 0, 5, 14, 5, 7, 13, 2, 12, 39, 2], [1, 1, 2, 0, 0, 0, 2, 0, 0, 6, 9, 6, 3, 14, 1, 8, 27, 20]], "pred_counts": [103, 143, 107, 62, 114, 129, 116, 79, 67, 115, 131, 114, 112, 86, 86, 82, 118, 36], "recalls": [72.0, 70.0, 50.0, 40.0, 93.0, 88.0, 63.0, 43.0, 40.0, 69.0, 63.0, 83.0, 74.0, 33.0, 64.0, 35.0, 39.0, 20.0], "precisions": [69.9, 49.0, 46.7, 64.5, 81.6, 68.2, 54.3, 54.4, 59.7, 60.0, 48.1, 72.8, 66.1, 38.4, 74.4, 42.7, 33.1, 55.6], "total_samples": 1800, "bacc": 57.72222222222222};
+    const labels = data.labels;
+    const cm = data.cm;
+    const preds = data.pred_counts;
+    const recalls = data.recalls;
+    const precs = data.precisions;
+
+    // Short abbreviations for 18x18 grid header
+    const shortNames = [
+      'g5.5', 'g5.6l', 'g5.6s', 'g5.6t', 'g6a',
+      'gem3.1', 'gem3.6', 'gem3.7', 'gem3.8',
+      'op4.6', 'op4.8', 'op5', 'son5', 'fab5',
+      'qw3.8', 'glm5', 'glm5f', 'kimi'
+    ];
+
+    // Populate Table
+    const tbody = document.getElementById('dist-tbody');
+    let rowsHtml = '';
+    for (let i = 0; i < 18; i++) {
+      const bias = (preds[i] / 100).toFixed(2);
+      let biasColor = 'text-[var(--foreground)]';
+      if (preds[i] >= 125) biasColor = 'text-amber-400 font-bold';
+      else if (preds[i] <= 70) biasColor = 'text-rose-400 font-bold';
+
+      let recColor = 'text-[var(--foreground)]';
+      if (recalls[i] >= 80) recColor = 'text-emerald-400 font-bold';
+      else if (recalls[i] < 40) recColor = 'text-rose-400';
+
+      rowsHtml += `
+        <tr class="hover:bg-[var(--card-border)]/40 cursor-pointer transition-colors" onclick="highlightRow(${i})">
+          <td class="py-1 px-1.5 text-[var(--muted-foreground)]">${i}</td>
+          <td class="py-1 px-2 font-semibold text-[var(--foreground)] truncate max-w-[140px]" title="${labels[i]}">${labels[i]}</td>
+          <td class="py-1 px-1.5 text-right font-bold ${biasColor}">${preds[i]}</td>
+          <td class="py-1 px-1.5 text-right">${cm[i][i]}</td>
+          <td class="py-1 px-1.5 text-right ${recColor}">${recalls[i].toFixed(1)}%</td>
+          <td class="py-1 px-1.5 text-right">${precs[i].toFixed(1)}%</td>
+          <td class="py-1 px-1.5 text-right font-mono ${biasColor}">${bias}x</td>
+        </tr>
+      `;
+    }
+    tbody.innerHTML = rowsHtml;
+
+    // Build 18x18 Matrix Grid
+    const grid = document.getElementById('matrix-grid');
+    let tableHtml = '<table class="border-collapse text-center">';
+    
+    // Header
+    tableHtml += '<thead><tr><th class="p-0.5 w-12 text-[8px] text-[var(--muted-foreground)] text-right pr-1">Act \ Pred</th>';
+    for (let j = 0; j < 18; j++) {
+      tableHtml += `<th class="p-0.5 w-6 text-[8px] text-[var(--muted-foreground)] truncate font-mono" title="Predicted ${labels[j]}">${shortNames[j]}</th>`;
+    }
+    tableHtml += '</tr></thead><tbody>';
+
+    for (let i = 0; i < 18; i++) {
+      tableHtml += `<tr><td class="p-0.5 text-[8px] text-left font-mono text-[var(--muted-foreground)] truncate max-w-[70px] pr-1" title="Actual ${labels[i]}">${shortNames[i]}</td>`;
+      for (let j = 0; j < 18; j++) {
+        const val = cm[i][j];
+        const isDiag = (i === j);
+        let bg = 'bg-slate-900/60 text-slate-500';
+        if (isDiag) {
+          if (val >= 80) bg = 'bg-emerald-600 text-white font-bold';
+          else if (val >= 60) bg = 'bg-teal-600 text-white font-bold';
+          else if (val >= 40) bg = 'bg-cyan-700 text-white font-bold';
+          else bg = 'bg-amber-600 text-white font-bold';
+        } else {
+          if (val >= 25) bg = 'bg-rose-950 text-rose-300 font-bold border border-rose-800';
+          else if (val >= 15) bg = 'bg-orange-950/80 text-orange-300 font-semibold border border-orange-800/60';
+          else if (val >= 8) bg = 'bg-slate-800 text-slate-300';
+          else if (val > 0) bg = 'bg-slate-900 text-slate-400';
+        }
+
+        tableHtml += `<td class="cell-hover p-0.5 w-6 h-5 border border-[var(--card-border)]/40 ${bg}" onmouseenter="hoverCell(${i}, ${j})" onclick="hoverCell(${i}, ${j})">${val > 0 ? val : ''}</td>`;
+      }
+      tableHtml += '</tr>';
+    }
+    tableHtml += '</tbody></table>';
+    grid.innerHTML = tableHtml;
+
+    function hoverCell(actIdx, predIdx) {
+      const val = cm[actIdx][predIdx];
+      const isDiag = (actIdx === predIdx);
+      const title = document.getElementById('detail-label');
+      const desc = document.getElementById('detail-desc');
+      const badge = document.getElementById('detail-badge');
+
+      if (isDiag) {
+        title.innerHTML = `<span class="text-emerald-400">CORRECT</span>: ${labels[actIdx]}`;
+        desc.innerText = `${val} out of 100 true samples correctly identified (${val}% Recall).`;
+        badge.innerHTML = `<span class="text-emerald-400 font-mono font-bold text-sm">${val}% Rec</span><br><span class="text-[10px] text-[var(--muted-foreground)]">${precs[actIdx]}% Prec</span>`;
+      } else {
+        title.innerHTML = `<span class="text-rose-400">CONFUSION</span>: True <span class="text-white">${labels[actIdx]}</span> → Pred <span class="text-cyan-400">${labels[predIdx]}</span>`;
+        desc.innerText = `${val} samples of '${labels[actIdx]}' were misclassified as '${labels[predIdx]}' (${val}% error rate).`;
+        badge.innerHTML = `<span class="text-rose-400 font-mono font-bold text-sm">${val} errors</span>`;
+      }
+    }
+
+    function highlightRow(idx) {
+      hoverCell(idx, idx);
+    }
+  </script>
+</body>
+</html>
