@@ -19,6 +19,7 @@ LABELS = [
 ]
 K = len(LABELS)
 LAB2I = {l: i for i, l in enumerate(LABELS)}
+LABEL2ID = LAB2I
 
 FAMILIES = {
     "gpt": [0, 1, 2, 3, 4],

@@ -54,6 +54,25 @@ if modal is not None:
     checkpoints_volume = modal.Volume.from_name("ntl-checkpoints", create_if_missing=True)
     datasets_volume = modal.Volume.from_name("ntl-datasets", create_if_missing=True)
 
+    bge_image = (
+        modal.Image.debian_slim(python_version="3.11")
+        .pip_install(
+            "torch>=2.6.0",
+            "transformers>=4.45.0",
+            "peft>=0.12.0",
+            "accelerate>=0.34.0",
+            "pandas>=2.0.0",
+            "numpy>=1.24.0",
+            "scikit-learn>=1.3.0",
+            "pyarrow>=14.0.0",
+            "safetensors>=0.4.0",
+            "huggingface_hub>=0.24.0",
+            "fastparquet>=2024.5.0",
+        )
+        .add_local_python_source("namethatllm")
+        .add_local_dir(str(repo_root / "configs"), remote_path="/root/configs")
+    )
+
     data_image = (
         modal.Image.debian_slim(python_version="3.11")
         .pip_install("kaggle", "six", "pandas", "pyarrow", "fastparquet")
@@ -1430,6 +1449,225 @@ if modal is not None:
         res["gemini_classes"] = res.get("spec_classes", [])
         return res
 
+    @app.function(
+        gpu="A10G",
+        timeout=7200,  # 2 hours execution budget
+        image=bge_image,
+        volumes={
+            "/checkpoints": checkpoints_volume,
+            "/datasets": datasets_volume,
+        },
+    )
+    def train_bge_cloud_worker(
+        config_path: str = "configs/training_bge.json",
+        max_samples: int | None = None,
+    ) -> dict[str, Any]:
+        """Ephemeral Two-Stage LoRA fine-tuning for BGE-M3 (560M) on an NVIDIA A10G."""
+        from namethatllm.bge_trainer import run_bge_training_pipeline
+
+        p_cfg = Path(config_path)
+        if not p_cfg.exists():
+            p_cfg = Path("/root") / config_path
+        if not p_cfg.exists():
+            p_cfg = repo_root / config_path
+        with open(p_cfg, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        if max_samples is not None:
+            cfg.setdefault("stage1", {})["max_samples"] = max_samples
+
+        out_p = Path("/checkpoints/export_bge_m3_lora")
+        out_p.mkdir(parents=True, exist_ok=True)
+        cfg["output_dir"] = str(out_p)
+
+        datasets_dir = Path("/datasets")
+        print(f"[Modal BGE Worker] Starting BGE-M3 training with datasets in {datasets_dir}...")
+        meta = run_bge_training_pipeline(
+            config=cfg,
+            datasets_dir=datasets_dir,
+            output_dir=out_p,
+        )
+        checkpoints_volume.commit()
+        print(f"[Modal BGE Worker] Checkpoints committed successfully to {out_p}!")
+        return meta
+
+    @app.function(
+        gpu="A10G",
+        timeout=1200,
+        image=bge_image,
+        volumes={
+            "/checkpoints": checkpoints_volume,
+            "/datasets": datasets_volume,
+        },
+    )
+    def eval_bge_cloud_worker(
+        checkpoint_dir: str = "/checkpoints/export_bge_m3_lora",
+        eval_path: str = "/datasets/clean_benchmark_1800_rows.parquet",
+    ) -> dict[str, Any]:
+        """Runs fast inference on the clean 1,800-sample benchmark using BGE-M3 LoRA + Dual Heads on an A10G GPU."""
+        import json
+        import torch
+        import torch.nn.functional as F
+        import numpy as np
+        import pandas as pd
+        from pathlib import Path
+        from torch.utils.data import DataLoader
+        from transformers import AutoTokenizer, AutoModel
+        from peft import PeftModel
+        from safetensors.torch import load_file
+        from sklearn.metrics import balanced_accuracy_score, confusion_matrix, classification_report
+        from namethatllm.config import LABELS, LAB2I, FAMILIES
+        from namethatllm.bge_trainer import BGEClassifier, NTLDataset, make_collate_fn
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"[Modal BGE Eval] Running on device: {device}")
+
+        ckpt = Path(checkpoint_dir)
+        meta_p = ckpt / "training_meta.json"
+        if meta_p.exists():
+            with open(meta_p, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        else:
+            meta = {}
+
+        backbone_name = meta.get("backbone", "BAAI/bge-m3")
+        max_len = int(meta.get("config", {}).get("max_len", 512))
+        hidden_size = int(meta.get("hidden_size", 1024))
+        num_classes = int(meta.get("num_classes", 18))
+
+        print(f"[Modal BGE Eval] Loading tokenizer and base model: {backbone_name}...")
+        tokenizer = AutoTokenizer.from_pretrained(backbone_name)
+        base_model = AutoModel.from_pretrained(backbone_name).to(device)
+
+        print(f"[Modal BGE Eval] Loading LoRA adapter from {ckpt}...")
+        peft_backbone = PeftModel.from_pretrained(base_model, str(ckpt)).to(device)
+
+        model = BGEClassifier(backbone=peft_backbone, hidden_size=hidden_size, num_classes=num_classes)
+
+        heads_p = ckpt / "heads_best.safetensors"
+        if not heads_p.exists():
+            heads_p = ckpt / "heads.safetensors"
+        print(f"[Modal BGE Eval] Loading classification heads from {heads_p}...")
+        head_tensors = load_file(str(heads_p))
+        model.plain_head.weight.data.copy_(head_tensors["plain.weight"])
+        model.plain_head.bias.data.copy_(head_tensors["plain.bias"])
+        model.centered_head.weight.data.copy_(head_tensors["centered.weight"])
+        model.centered_head.bias.data.copy_(head_tensors["centered.bias"])
+        model.to(device)
+        model.eval()
+
+        print(f"[Modal BGE Eval] Loading benchmark dataset from {eval_path}...")
+        p_eval = Path(eval_path)
+        if not p_eval.exists():
+            p_eval = Path("/root") / eval_path
+        df_eval = pd.read_parquet(p_eval) if str(p_eval).endswith(".parquet") else pd.read_csv(p_eval)
+        print(f"[Modal BGE Eval] Loaded {len(df_eval)} samples across {df_eval['model'].nunique()} classes.")
+
+        val_pids = (
+            df_eval["prompt_canon"].values
+            if "prompt_canon" in df_eval.columns
+            else (df_eval["prompt_id"].values if "prompt_id" in df_eval.columns else np.zeros(len(df_eval), dtype=np.int64))
+        )
+        val_dataset = NTLDataset(
+            texts=df_eval["text"].tolist(),
+            labels=df_eval["model"].map(LAB2I).values,
+            prompt_ids=val_pids,
+            tokenizer=tokenizer,
+            max_len=max_len,
+        )
+        collate = make_collate_fn(tokenizer, max_len=max_len)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate, num_workers=2)
+
+        all_logits_p, all_logits_c, all_probs_m, all_labels = [], [], [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    Z = model.forward_features(input_ids, attention_mask)
+                    logits_p = model.predict_plain(Z)
+                    Z_c = Z - Z.mean(dim=0, keepdim=True)
+                    logits_c = model.predict_centered(Z_c)
+
+                    prob_p = F.softmax(logits_p, dim=-1)
+                    prob_c = F.softmax(logits_c, dim=-1)
+                    prob_m = 0.5 * prob_p + 0.5 * prob_c
+
+                all_logits_p.append(logits_p.cpu().float().numpy())
+                all_logits_c.append(logits_c.cpu().float().numpy())
+                all_probs_m.append(prob_m.cpu().float().numpy())
+                all_labels.append(labels.cpu().numpy())
+
+        y_true = np.concatenate(all_labels)
+        logits_p = np.concatenate(all_logits_p, axis=0)
+        logits_c = np.concatenate(all_logits_c, axis=0)
+        probs_m = np.concatenate(all_probs_m, axis=0)
+
+        preds_p = logits_p.argmax(axis=-1)
+        preds_c = logits_c.argmax(axis=-1)
+        preds_m = probs_m.argmax(axis=-1)
+
+        bacc_p = float(balanced_accuracy_score(y_true, preds_p))
+        bacc_c = float(balanced_accuracy_score(y_true, preds_c))
+        bacc_m = float(balanced_accuracy_score(y_true, preds_m))
+
+        # Sinkhorn-balanced accuracy
+        def sinkhorn_knopp(P: np.ndarray, max_iter: int = 50) -> np.ndarray:
+            N, K_dim = P.shape
+            r = np.ones(N) / N
+            c = np.ones(K_dim) / K_dim
+            P_adj = np.copy(P)
+            for _ in range(max_iter):
+                u = r / (P_adj.sum(axis=1) + 1e-12)
+                P_adj = P_adj * u[:, None]
+                v = c / (P_adj.sum(axis=0) + 1e-12)
+                P_adj = P_adj * v[None, :]
+            return P_adj
+
+        probs_sinkhorn = sinkhorn_knopp(probs_m)
+        preds_sinkhorn = probs_sinkhorn.argmax(axis=-1)
+        bacc_sinkhorn = float(balanced_accuracy_score(y_true, preds_sinkhorn))
+
+        cm_p = confusion_matrix(y_true, preds_p, labels=list(range(num_classes))).tolist()
+        cm_c = confusion_matrix(y_true, preds_c, labels=list(range(num_classes))).tolist()
+        cm_m = confusion_matrix(y_true, preds_m, labels=list(range(num_classes))).tolist()
+        cm_s = confusion_matrix(y_true, preds_sinkhorn, labels=list(range(num_classes))).tolist()
+
+        # Gemini Family Analysis
+        gemini_indices = FAMILIES["gemini"]  # [5, 6, 7, 8]
+        gemini_names = [LABELS[i] for i in gemini_indices]
+        cm_m_np = np.array(cm_m)
+        gemini_cm = cm_m_np[np.ix_(gemini_indices, gemini_indices)].tolist()
+
+        # Detailed per-class metrics
+        report_m = classification_report(y_true, preds_m, target_names=LABELS, output_dict=True)
+
+        return {
+            "bacc_plain": bacc_p,
+            "bacc_centered": bacc_c,
+            "bacc_merged": bacc_m,
+            "bacc_sinkhorn": bacc_sinkhorn,
+            "confusion_matrix_plain": cm_p,
+            "confusion_matrix_centered": cm_c,
+            "confusion_matrix_merged": cm_m,
+            "confusion_matrix_sinkhorn": cm_s,
+            "gemini_confusion_matrix": gemini_cm,
+            "gemini_classes": gemini_names,
+            "classification_report": report_m,
+            "labels": LABELS,
+            "y_true": y_true.tolist(),
+            "preds_merged": preds_m.tolist(),
+            "preds_plain": preds_p.tolist(),
+            "preds_centered": preds_c.tolist(),
+            "preds_sinkhorn": preds_sinkhorn.tolist(),
+            "logits_plain": logits_p.tolist(),
+            "logits_centered": logits_c.tolist(),
+            "probs_merged": probs_m.tolist(),
+            "probs_sinkhorn": probs_sinkhorn.tolist(),
+        }
+
     @app.local_entrypoint()
     def main(
         mode: str = "run",
@@ -1613,6 +1851,56 @@ if modal is not None:
                     curr_data[f"spec_classes_{fam_name}"] = np.array(res["spec_classes"])
                     np.savez_compressed(out_p, **curr_data)
                     print(f"[Modal Launcher] Updated {fam_name.upper()} Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
+        elif mode == "train-bge":
+            cfg_p = "configs/training_bge.json" if config == "configs/training_lora.json" else config
+            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Training with config: {cfg_p}...")
+            res = train_bge_cloud_worker.remote(config_path=cfg_p)
+            print(f"[Modal Launcher] BGE-M3 Training Complete! Best Val BAcc: {res.get('best_val_bacc', 0.0):.4f}")
+        elif mode == "eval-bge":
+            import numpy as np
+            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Benchmark Evaluation...")
+            cloud_eval_p = "/datasets/clean_benchmark_1800_rows.parquet"
+            res = eval_bge_cloud_worker.remote(
+                checkpoint_dir="/checkpoints/export_bge_m3_lora",
+                eval_path=cloud_eval_p,
+            )
+            print("\n" + "=" * 80)
+            print("[Modal Launcher] BGE-M3 1,800 Clean Benchmark Evaluation Results:")
+            print(f"  Plain Head BAcc       : {res.get('bacc_plain', 0.0)*100:.2f}%")
+            print(f"  Centered Head BAcc    : {res.get('bacc_centered', 0.0)*100:.2f}%")
+            print(f"  Merged Dual Head BAcc : {res.get('bacc_merged', 0.0)*100:.2f}%")
+            print(f"  Sinkhorn Balanced BAcc: {res.get('bacc_sinkhorn', 0.0)*100:.2f}%")
+            print("=" * 80)
+
+            gem_cm = np.array(res.get("gemini_confusion_matrix", []))
+            gem_names = res.get("gemini_classes", [])
+            print("\n[Gemini Family Confusion Matrix (Rows: Ground Truth, Cols: Predicted)]")
+            hdr = f"{'True / Pred':<24} | " + " | ".join(f"{name[:12]:<12}" for name in gem_names)
+            print(hdr)
+            print("-" * len(hdr))
+            for i, name in enumerate(gem_names):
+                row_str = " | ".join(f"{gem_cm[i, j]:<12}" for j in range(len(gem_names)))
+                print(f"{name:<24} | {row_str}")
+
+            save_path = save_preds or "local_data/bge_clean_benchmark_1800_predictions.npz"
+            if save_path:
+                out_p = Path(save_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    out_p,
+                    labels=np.array(res.get("y_true", [])),
+                    preds_plain=np.array(res.get("preds_plain", [])),
+                    preds_centered=np.array(res.get("preds_centered", [])),
+                    preds_merged=np.array(res.get("preds_merged", [])),
+                    preds_sinkhorn=np.array(res.get("preds_sinkhorn", [])),
+                    probs_merged=np.array(res.get("probs_merged", [])),
+                    probs_sinkhorn=np.array(res.get("probs_sinkhorn", [])),
+                    confusion_matrix_merged=np.array(res.get("confusion_matrix_merged", [])),
+                    confusion_matrix_plain=np.array(res.get("confusion_matrix_plain", [])),
+                    confusion_matrix_centered=np.array(res.get("confusion_matrix_centered", [])),
+                    gemini_confusion_matrix=gem_cm,
+                )
+                print(f"\n[Modal Launcher] Saved BGE benchmark predictions to {out_p} ({out_p.stat().st_size:,} bytes).")
         else:
             print(f"[Modal Launcher] Launching A100-80GB cloud training with config: {config}")
             res = train_cloud_worker.remote(config_path=config)
@@ -1623,7 +1911,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Modal Cloud Launcher for NameThatLLM Training")
-    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval", "reexport", "push-dataset", "train-gemini-gate", "train-family-gate"], help="Command (run, smoke, test, sync, eval, reexport, push-dataset, train-gemini-gate, train-family-gate)")
+    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval", "reexport", "push-dataset", "train-gemini-gate", "train-family-gate", "train-bge", "eval-bge"], help="Command (run, smoke, test, sync, eval, reexport, push-dataset, train-gemini-gate, train-family-gate, train-bge, eval-bge)")
     parser.add_argument("--family", default="all", choices=["all", "glm", "gpt", "claude", "gemini"], help="Target family for gate training (glm, gpt, claude, gemini, all)")
     parser.add_argument("--samples-per-class", type=int, default=0, help="Samples per family class (0 = default)")
     parser.add_argument("--config", default="configs/training_lora.json", help="Path to training config json")
@@ -1811,5 +2099,55 @@ if __name__ == "__main__":
                     curr_data[f"spec_classes_{fam_name}"] = np.array(res["spec_classes"])
                     np.savez_compressed(out_p, **curr_data)
                     print(f"[Modal Launcher] Updated {fam_name.upper()} Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
+        elif args.cmd == "train-bge":
+            cfg_p = "configs/training_bge.json" if args.config == "configs/training_lora.json" else args.config
+            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Training with config: {cfg_p}...")
+            res = train_bge_cloud_worker.remote(config_path=cfg_p)
+            print(f"[Modal Launcher] BGE-M3 Training Complete! Best Val BAcc: {res.get('best_val_bacc', 0.0):.4f}")
+        elif args.cmd == "eval-bge":
+            import numpy as np
+            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Benchmark Evaluation...")
+            cloud_eval_p = "/datasets/clean_benchmark_1800_rows.parquet"
+            res = eval_bge_cloud_worker.remote(
+                checkpoint_dir="/checkpoints/export_bge_m3_lora",
+                eval_path=cloud_eval_p,
+            )
+            print("\n" + "=" * 80)
+            print("[Modal Launcher] BGE-M3 1,800 Clean Benchmark Evaluation Results:")
+            print(f"  Plain Head BAcc       : {res.get('bacc_plain', 0.0)*100:.2f}%")
+            print(f"  Centered Head BAcc    : {res.get('bacc_centered', 0.0)*100:.2f}%")
+            print(f"  Merged Dual Head BAcc : {res.get('bacc_merged', 0.0)*100:.2f}%")
+            print(f"  Sinkhorn Balanced BAcc: {res.get('bacc_sinkhorn', 0.0)*100:.2f}%")
+            print("=" * 80)
+
+            gem_cm = np.array(res.get("gemini_confusion_matrix", []))
+            gem_names = res.get("gemini_classes", [])
+            print("\n[Gemini Family Confusion Matrix (Rows: Ground Truth, Cols: Predicted)]")
+            hdr = f"{'True / Pred':<24} | " + " | ".join(f"{name[:12]:<12}" for name in gem_names)
+            print(hdr)
+            print("-" * len(hdr))
+            for i, name in enumerate(gem_names):
+                row_str = " | ".join(f"{gem_cm[i, j]:<12}" for j in range(len(gem_names)))
+                print(f"{name:<24} | {row_str}")
+
+            save_path = args.save_preds or "local_data/bge_clean_benchmark_1800_predictions.npz"
+            if save_path:
+                out_p = Path(save_path)
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    out_p,
+                    labels=np.array(res.get("y_true", [])),
+                    preds_plain=np.array(res.get("preds_plain", [])),
+                    preds_centered=np.array(res.get("preds_centered", [])),
+                    preds_merged=np.array(res.get("preds_merged", [])),
+                    preds_sinkhorn=np.array(res.get("preds_sinkhorn", [])),
+                    probs_merged=np.array(res.get("probs_merged", [])),
+                    probs_sinkhorn=np.array(res.get("probs_sinkhorn", [])),
+                    confusion_matrix_merged=np.array(res.get("confusion_matrix_merged", [])),
+                    confusion_matrix_plain=np.array(res.get("confusion_matrix_plain", [])),
+                    confusion_matrix_centered=np.array(res.get("confusion_matrix_centered", [])),
+                    gemini_confusion_matrix=gem_cm,
+                )
+                print(f"\n[Modal Launcher] Saved BGE benchmark predictions to {out_p} ({out_p.stat().st_size:,} bytes).")
         else:
             train_cloud_worker.remote(config_path=args.config)
