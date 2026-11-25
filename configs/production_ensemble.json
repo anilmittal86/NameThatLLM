@@ -2,9 +2,9 @@
   "version": "2.2.0",
   "name": "production_ensemble",
   "description": "6-Model L2-Regularized Simplex Log-Linear Ensemble (BGE-M3 v2 + Qwen3-14B In-House/TS/Part-2 + Qwen3-8B v5 + LinearSVC) with Nested Claude Specialist Gate, Curly-Quote Shield, and Damped Sinkhorn",
-  "run_benchmark": true,
+  "run_benchmark": false,
   "run_submission": true,
-  "lock_prior_weights": false,
+  "lock_prior_weights": true,
   "enable_ablation_probe": true,
   "probe_gate_min_bacc": 0.4,
   "labels": [
