@@ -72,6 +72,7 @@ Config Schema Summary:
 import copy
 import functools
 import gc
+import hashlib
 import importlib.util
 import json
 import math
@@ -86,7 +87,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix, log_loss
 from sklearn.model_selection import GroupKFold
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -1352,6 +1353,16 @@ def run_training_pipeline(
     target_family = train_cfg.get("target_family")
     if train_cfg.get("pipeline_mode") == "deberta_specialist_suite":
         return run_deberta_specialist_suite(train_cfg, step_callback=step_callback)
+    if train_cfg.get("pipeline_mode") in ("encoder_stage1", "bge_v2_stage1") or (
+        "bge" in str(backbone_name).lower() and "stage1" in train_cfg and "stage2" not in train_cfg
+    ):
+        res_enc = run_encoder_stage1(
+            config=train_cfg,
+            datasets_dir=Path(train_cfg.get("datasets_dir", input_dir)),
+            checkpoint_base=out_dir if "output_dir" in train_cfg else None,
+            on_checkpoint_saved=getattr(checkpoints_volume, "commit", None),
+        )
+        return Path(res_enc.get("checkpoint_dir", out_dir))
     is_gate_or_export = bool(
         train_cfg.get("pipeline_mode") in ("family_gate", "export_embeddings", "extract_features")
         or train_cfg.get("mode") == "family_gate"
@@ -5602,6 +5613,735 @@ def run_deberta_specialist_suite(
         "embeddings_dir": str(emb_out_dir),
         "sweep_summary": sweep_summary,
     }
+
+
+# =============================================================================
+# 6. UNIFIED ENCODER STAGE-1 QUOTA LORA TRAINING & TRACE-RIDGE PACKAGING
+# =============================================================================
+
+
+def norm_text_hash(text: str) -> str:
+    """Normalized whitespace SHA-1 hash for strict zero-leak deduplication."""
+    norm = " ".join(str(text).strip().split())
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()
+
+
+def load_zero_leak_stage1_pool(
+    datasets_dir: Path,
+    weight_clip: tuple[float, float] = (0.5, 2.5),
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Loads clean_benchmark_1800_rows.parquet, train.csv, and builds the deduplicated
+    Stage-1 pool strictly excluding all normalized text hashes in Bench-1800 or train.csv.
+    """
+    df_bench = pd.read_parquet(datasets_dir / "clean_benchmark_1800_rows.parquet")
+    df_bench = df_bench[df_bench["model"].isin(LABELS)].reset_index(drop=True)
+    bench_hashes = set(df_bench["text"].map(norm_text_hash))
+
+    df_train = pd.read_csv(datasets_dir / "train.csv")
+    df_train = df_train[df_train["model"].isin(LABELS)].reset_index(drop=True)
+    df_train = df_train[~df_train["text"].map(norm_text_hash).isin(bench_hashes)].reset_index(drop=True)
+    train_hashes = set(df_train["text"].map(norm_text_hash))
+
+    excl_hashes = bench_hashes | train_hashes
+    df_master = pd.read_parquet(
+        datasets_dir / "clean_master_pool.parquet",
+        columns=["text", "model", "priority", "match_weight"],
+    )
+    df_master = df_master[df_master["model"].isin(LABELS)].copy()
+    df_master["nh"] = df_master["text"].map(norm_text_hash)
+    df_master = df_master[~df_master["nh"].isin(excl_hashes)].drop_duplicates("nh").reset_index(drop=True)
+
+    master_hashes = set(df_master["nh"])
+    parts = [df_master]
+    pool_v4_path = datasets_dir / "pool_v4.parquet"
+    if pool_v4_path.exists():
+        df_v4 = pd.read_parquet(pool_v4_path, columns=["text", "model"])
+        df_v4 = df_v4[df_v4["model"].isin(LABELS)].copy()
+        df_v4["nh"] = df_v4["text"].map(norm_text_hash)
+        df_extra = df_v4[~df_v4["nh"].isin(excl_hashes | master_hashes)].drop_duplicates("nh").copy()
+        if len(df_extra) > 0:
+            df_extra["priority"] = 2
+            df_extra["match_weight"] = 1.0
+            parts.append(df_extra[["text", "model", "priority", "match_weight", "nh"]])
+
+    df_pool = pd.concat(parts, ignore_index=True).drop(columns=["nh"]).reset_index(drop=True)
+    lo, hi = float(weight_clip[0]), float(weight_clip[1])
+    raw_w = pd.to_numeric(df_pool["match_weight"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32)
+    clipped_w = np.clip(raw_w, lo, hi)
+    clipped_w = clipped_w / max(float(clipped_w.mean()), 1e-6)
+    df_pool["sample_weight"] = clipped_w
+    df_pool["label_idx"] = np.array([LAB2I[m] for m in df_pool["model"]], dtype=np.int64)
+
+    pool_hashes = set(df_pool["text"].map(norm_text_hash))
+    assert len(pool_hashes & bench_hashes) == 0, "Leak detected against Bench-1800!"
+    assert len(pool_hashes & train_hashes) == 0, "Leak detected against train.csv!"
+    return df_pool, df_train, df_bench
+
+
+def build_targeted_epoch_indices(
+    labels: np.ndarray,
+    class_quotas: dict[str, int],
+    epoch: int,
+    seed: int = 42,
+) -> np.ndarray:
+    """Builds one epoch's index list matching per-class quotas via modular sliding slices."""
+    chosen_parts: list[np.ndarray] = []
+    rng_ep = np.random.RandomState(seed + 1009 * (epoch + 1))
+    for c_idx, name in enumerate(LABELS):
+        pool_idx = np.where(labels == c_idx)[0]
+        n_avail = len(pool_idx)
+        assert n_avail > 0, f"Class {name} has 0 examples in Stage-1 pool!"
+        quota = int(class_quotas.get(name, n_avail))
+        perm = pool_idx[np.random.RandomState(seed + 97 * c_idx).permutation(n_avail)]
+        if quota <= n_avail:
+            start = (epoch * quota) % n_avail
+            if start + quota <= n_avail:
+                sel = perm[start : start + quota]
+            else:
+                first = perm[start:]
+                sel = np.concatenate([first, perm[: quota - len(first)]])
+        else:
+            reps = [perm] * (quota // n_avail)
+            rem = quota % n_avail
+            if rem > 0:
+                reps.append(rng_ep.choice(perm, size=rem, replace=False))
+            sel = np.concatenate(reps)
+        chosen_parts.append(sel)
+
+    out = np.concatenate(chosen_parts)
+    rng_ep.shuffle(out)
+    return out
+
+
+def compute_detailed_metrics(logits: np.ndarray, y_true: np.ndarray) -> dict[str, Any]:
+    """Computes BAcc, NLL, Gemini 4-class metrics, sister pair accuracy, and per-class recall/precision."""
+    preds = logits.argmax(axis=1)
+    bacc = float(balanced_accuracy_score(y_true, preds))
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    probs = np.exp(shifted) / np.sum(np.exp(shifted), axis=1, keepdims=True)
+    nll = float(log_loss(y_true, probs, labels=list(range(K))))
+
+    gem_idx = FAMILIES["gemini"]
+    gem_mask = np.isin(y_true, gem_idx)
+    gem_sub_preds = logits[gem_mask][:, gem_idx].argmax(axis=1)
+    gem_y = np.array([gem_idx.index(int(v)) for v in y_true[gem_mask]])
+    gem_within_bacc = float(balanced_accuracy_score(gem_y, gem_sub_preds))
+    gem_ret = float(np.mean(np.isin(preds[gem_mask], gem_idx)))
+    gem_cm = confusion_matrix(gem_y, gem_sub_preds, labels=list(range(len(gem_idx))))
+
+    pair_mask = (y_true == 7) | (y_true == 8)
+    pair_preds = np.where(logits[pair_mask, 7] >= logits[pair_mask, 8], 7, 8)
+    sister_acc = float(balanced_accuracy_score(y_true[pair_mask], pair_preds)) if pair_mask.any() else 0.0
+
+    cm = confusion_matrix(y_true, preds, labels=list(range(K)))
+    per_class = []
+    zero_recall = []
+    for i, name in enumerate(LABELS):
+        true_n = int(cm[i, :].sum())
+        pred_n = int(cm[:, i].sum())
+        correct_n = int(cm[i, i])
+        if correct_n == 0:
+            zero_recall.append(name)
+        per_class.append({
+            "idx": i,
+            "model": name,
+            "true": true_n,
+            "preds": pred_n,
+            "correct": correct_n,
+            "recall": float(correct_n / max(true_n, 1)),
+            "precision": float(correct_n / max(pred_n, 1)) if pred_n > 0 else 0.0,
+            "bias": float(pred_n / max(true_n, 1)),
+        })
+
+    return {
+        "bacc": bacc,
+        "nll": nll,
+        "gem_within_bacc": gem_within_bacc,
+        "gem_retention": gem_ret,
+        "sister_37_38_acc": sister_acc,
+        "zero_recall_classes": zero_recall,
+        "per_class": per_class,
+        "gemini_4x4": gem_cm.tolist(),
+        "confusion_matrix": cm.tolist(),
+    }
+
+
+def print_prediction_table(metrics: dict[str, Any], header: str) -> None:
+    """Prints a compact 18-class diagnostic breakdown table."""
+    print(f"\n=== {header} ===")
+    print(
+        f"BAcc={metrics['bacc']*100:.2f}% | NLL={metrics['nll']:.4f} | "
+        f"Gem4={metrics['gem_within_bacc']*100:.2f}% | GemRet={metrics['gem_retention']*100:.2f}% | "
+        f"3.7v3.8={metrics['sister_37_38_acc']*100:.2f}% | ZeroRec={len(metrics['zero_recall_classes'])}"
+    )
+    print("  # | CLASS NAME               | PREDS | CORRECT | RECALL% |  PREC% |  BIAS")
+    print("----+--------------------------+-------+---------+---------+--------+------")
+    for row in metrics["per_class"]:
+        print(
+            f" {row['idx']:2d} | {row['model']:<24} | {row['preds']:5d} | {row['correct']:7d} | "
+            f"{row['recall']*100:6.1f}% | {row['precision']*100:5.1f}% | {row['bias']:4.2f}x"
+        )
+
+
+@torch.no_grad()
+def extract_features_and_logits(
+    model: MultiLayerLoRAClassifier,
+    texts: list[str],
+    tok: Any,
+    max_len: int,
+    device: torch.device,
+    batch_size: int = 64,
+    drop_first_token: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Length-sorted evaluation returning float32 multi-layer features Z (N, D) and plain logits (N, K)."""
+    model.eval()
+    n = len(texts)
+    order = np.argsort([len(str(t)) for t in texts], kind="stable")
+    feats = np.zeros((n, model.total_dim), dtype=np.float32)
+    logits_out = np.zeros((n, model.num_classes), dtype=np.float32)
+
+    for s in range(0, n, batch_size):
+        idx = order[s : s + batch_size]
+        chunk = [str(texts[i]) for i in idx]
+        enc = tok(chunk, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+        enc = {k: v.to(device) if hasattr(v, "to") else v for k, v in enc.items()}
+        Z = model.forward_features(enc["input_ids"], enc["attention_mask"], drop_first_token=drop_first_token)
+        lg = model.predict_plain(Z)
+        feats[idx] = Z.cpu().numpy().astype(np.float32)
+        logits_out[idx] = lg.cpu().numpy().astype(np.float32)
+
+    return feats, logits_out
+
+
+def solve_trace_ridge_wb(
+    Z_tr_np: np.ndarray,
+    y_tr_np: np.ndarray,
+    alphas: list[float],
+    device: torch.device,
+    label_smoothing: float = 0.05,
+) -> dict[float, tuple[np.ndarray, np.ndarray]]:
+    """
+    Canonical trace-scaled float64 closed-form Ridge solver (primal when N>=D else dual Gram).
+    Computes the eigendecomposition once and solves linear weights (W [K, D], b [K]) per alpha.
+    """
+    n_tr, dim = Z_tr_np.shape
+    y_oh = np.zeros((n_tr, K), dtype=np.float32)
+    y_oh[np.arange(n_tr), y_tr_np] = 1.0
+    if label_smoothing > 0.0:
+        y_oh = (1.0 - label_smoothing) * y_oh + (label_smoothing / float(K))
+
+    X_tr = torch.from_numpy(Z_tr_np).to(device, dtype=torch.float32)
+    Y_t = torch.from_numpy(y_oh).to(device, dtype=torch.float32)
+    mu_x = X_tr.mean(dim=0, keepdim=True)
+    mu_y = Y_t.mean(dim=0, keepdim=True)
+    X_c = X_tr - mu_x
+    Y_c = Y_t - mu_y
+    trace_xx = float((X_c * X_c).sum().item())
+    mean_eig = max(trace_xx / float(min(n_tr, dim)), 1e-8)
+
+    out: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+    if n_tr >= dim:
+        Cov = (X_c.T @ X_c).double()
+        XtY = (X_c.T @ Y_c).double()
+        evals, evecs = torch.linalg.eigh(Cov)
+        evals = evals.clamp(min=0.0)
+        proj = evecs.T @ XtY
+        mu_x_d, mu_y_d = mu_x.double(), mu_y.double()
+        for a in alphas:
+            lam = max(float(a) * (trace_xx / float(dim)), 1e-5)
+            W = evecs @ (proj / (evals.unsqueeze(1) + lam))
+            b = (mu_y_d - mu_x_d @ W).squeeze(0)
+            out[a] = (W.T.float().cpu().numpy().astype(np.float32), b.float().cpu().numpy().astype(np.float32))
+        del Cov, XtY, evals, evecs, proj
+    else:
+        Gram = (X_c @ X_c.T).double()
+        Y_cd = Y_c.double()
+        evals, evecs = torch.linalg.eigh(Gram)
+        evals = evals.clamp(min=0.0)
+        proj = evecs.T @ Y_cd
+        X_c_d = X_c.T.double()
+        mu_x_d, mu_y_d = mu_x.double(), mu_y.double()
+        for a in alphas:
+            lam = max(float(a) * mean_eig, 1e-5)
+            A = evecs @ (proj / (evals.unsqueeze(1) + lam))
+            W = X_c_d @ A
+            b = (mu_y_d - mu_x_d @ W).squeeze(0)
+            out[a] = (W.T.float().cpu().numpy().astype(np.float32), b.float().cpu().numpy().astype(np.float32))
+        del Gram, Y_cd, evals, evecs, proj, X_c_d
+
+    del X_tr, Y_t, X_c, Y_c
+    return out
+
+
+def gpu_trace_ridge_eval(
+    Z_tr_np: np.ndarray,
+    y_tr_np: np.ndarray,
+    Z_te_np: np.ndarray,
+    alphas: list[float],
+    device: torch.device,
+    label_smoothing: float = 0.05,
+) -> dict[float, np.ndarray]:
+    """Evaluate trace-scaled closed-form Ridge regression across alpha candidates on Z_te_np."""
+    wb_map = solve_trace_ridge_wb(Z_tr_np, y_tr_np, alphas, device=device, label_smoothing=label_smoothing)
+    return {a: (Z_te_np @ W.T + b).astype(np.float32) for a, (W, b) in wb_map.items()}
+
+
+def run_encoder_stage1(
+    config: dict[str, Any],
+    datasets_dir: Path,
+    checkpoint_base: Path | None = None,
+    on_checkpoint_saved: Any = None,
+) -> dict[str, Any]:
+    """
+    Unified Stage-1 Multi-Layer LoRA trainer for bidirectional/encoder backbones (e.g. BAAI/bge-m3):
+    trains with per-class quotas on zero-leak Stage-1 data, tracks Bench-1800 scaling, exports
+    compatible multi-layer checkpoints, and computes closed-form Ridge + 5-fold GroupKFold OOF diagnostics.
+    """
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
+
+    t0 = time.time()
+    s1_cfg = config["stage1"]
+    seed = int(s1_cfg["seed"])
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    backbone_name = str(config["backbone"])
+    max_len = int(config["max_len"])
+    arch_cfg = config["architecture"]
+    tap_layers = [int(x) for x in arch_cfg["tap_layers"]]
+    drop_first = bool(arch_cfg.get("drop_first_token", True))
+    lora_cfg = config["lora"]
+    loss_cfg = config["loss"]
+    out_cfg = config["output"]
+
+    save_root = Path(checkpoint_base) if checkpoint_base is not None else Path(out_cfg["checkpoint_dir"])
+    save_root.mkdir(parents=True, exist_ok=True)
+    df_pool, df_train, df_bench = load_zero_leak_stage1_pool(
+        datasets_dir=datasets_dir,
+        weight_clip=tuple(loss_cfg["match_weight_clip"]),
+    )
+    y_bench = np.array([LAB2I[m] for m in df_bench["model"]], dtype=np.int64)
+    y_train_gold = np.array([LAB2I[m] for m in df_train["model"]], dtype=np.int64)
+    prompts_gold = df_train["prompt_id"].values
+    pool_labels = df_pool["label_idx"].to_numpy()
+    pool_weights = df_pool["sample_weight"].to_numpy()
+    pool_texts = df_pool["text"].astype(str).tolist()
+
+    tok = AutoTokenizer.from_pretrained(backbone_name)
+    pool_tok_lens: list[int] = []
+    for i in range(0, len(pool_texts), 4096):
+        pool_tok_lens.extend(tok(pool_texts[i : i + 4096], truncation=True, max_length=max_len, return_length=True)["length"])
+
+    dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8) else torch.float32
+    base_model = AutoModel.from_pretrained(backbone_name, torch_dtype=dtype)
+    peft_backbone = get_peft_model(
+        base_model,
+        LoraConfig(
+            r=int(lora_cfg["r"]),
+            lora_alpha=int(lora_cfg["alpha"]),
+            lora_dropout=float(lora_cfg["dropout"]),
+            bias="none",
+            target_modules=list(lora_cfg["target_modules"]),
+            layers_to_transform=[int(i) for i in lora_cfg["layers_to_transform"]],
+            layers_pattern=str(lora_cfg.get("layers_pattern", "layer")),
+        ),
+    )
+
+    max_active_block = max(tap_layers)
+    active_encoder = base_model.encoder
+    orig_encoder_layers = active_encoder.layer
+    active_encoder.layer = torch.nn.ModuleList(list(orig_encoder_layers)[:max_active_block])
+
+    def _safe_export(out_p: Path, Z_tr: np.ndarray | None = None, y_tr: np.ndarray | None = None, p_tr: np.ndarray | None = None) -> None:
+        active_encoder.layer = orig_encoder_layers
+        try:
+            export_compatible_checkpoint(
+                model=model,
+                output_dir=out_p,
+                layers=tap_layers,
+                keep=len(tap_layers),
+                max_len=max_len,
+                end_id=int(tok.eos_token_id or 2),
+                backbone_name=backbone_name,
+                Z_train=Z_tr,
+                y_train=y_tr,
+                prompts_train=p_tr,
+            )
+        finally:
+            active_encoder.layer = torch.nn.ModuleList(list(orig_encoder_layers)[:max_active_block])
+
+    model = MultiLayerLoRAClassifier(
+        backbone=peft_backbone,
+        hidden_size=int(config["hidden_size"]),
+        layers=tap_layers,
+        num_classes=K,
+    ).to(device)
+    model.norms.float()
+    model.plain_head.float()
+    model.centered_head.float()
+    for p in model.centered_head.parameters():
+        p.requires_grad = False
+
+    epochs = int(s1_cfg["epochs"])
+    batch_size = int(s1_cfg["batch_size"])
+    max_toks_fwd = int(s1_cfg.get("max_tokens_per_forward", 4096))
+    class_quotas = dict(s1_cfg["class_quotas"])
+    epoch_plans = [build_targeted_epoch_indices(pool_labels, class_quotas, epoch=e, seed=seed) for e in range(epochs)]
+    total_steps = sum(math.ceil(len(ep_idx) / batch_size) for ep_idx in epoch_plans)
+    warmup_steps = max(1, int(round(total_steps * float(s1_cfg["warmup_ratio"]))))
+
+    param_groups = _get_loraplus_param_groups(
+        model,
+        lr_lora=float(s1_cfg["lr_lora"]),
+        lr_head=float(s1_cfg["lr_head"]),
+        lora_plus_ratio=float(lora_cfg["lora_plus_ratio"]),
+        include_centered_head=False,
+    )
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=float(loss_cfg["weight_decay"]))
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+    trainable_params = [p for grp in param_groups for p in grp["params"]]
+    max_grad_norm = float(loss_cfg["max_grad_norm"])
+
+    eval_every_samples = int(s1_cfg.get("eval_every_samples", 0))
+    bench_texts_list = df_bench["text"].astype(str).tolist()
+    watch_models = ("kimi-k3", "gpt-5.6-terra", "gemini-3.8-flash", "gemini-3.7-flash", "claude-fable-5", "glm-5.3", "qwen3.8-max", "gpt-5.6-luna")
+
+    epoch_logs, scaling_curve = [], []
+    best_bacc, best_epoch, best_samples_seen = -1.0, -1, -1
+    total_samples_seen, global_step = 0, 0
+    next_eval_target = eval_every_samples if eval_every_samples > 0 else 10**12
+    best_dir, last_dir = save_root / "stage1_best", save_root / "stage1_last"
+
+    def _record_scaling_point(tag: str, win_loss: float, ep_num: int) -> dict[str, Any]:
+        nonlocal best_bacc, best_epoch, best_samples_seen
+        _, b_logits = extract_features_and_logits(model, bench_texts_list, tok, max_len=max_len, device=device, batch_size=64, drop_first_token=drop_first)
+        m = compute_detailed_metrics(b_logits, y_bench)
+        pc_map = {r["model"]: r for r in m["per_class"]}
+        pt = {
+            "tag": tag, "epoch": ep_num, "step": global_step, "samples_seen": total_samples_seen,
+            "elapsed_sec": float(time.time() - t0), "train_loss": float(win_loss),
+            "bacc": m["bacc"], "nll": m["nll"], "gem_within_bacc": m["gem_within_bacc"],
+            "gem_retention": m["gem_retention"], "sister_37_38_acc": m["sister_37_38_acc"],
+            "zero_recall_classes": m["zero_recall_classes"],
+            "watch_recall": {k: pc_map[k]["recall"] for k in watch_models if k in pc_map},
+            "watch_bias": {k: pc_map[k]["bias"] for k in watch_models if k in pc_map},
+        }
+        scaling_curve.append(pt)
+        if m["bacc"] > best_bacc:
+            best_bacc, best_epoch, best_samples_seen = m["bacc"], ep_num, total_samples_seen
+            _safe_export(best_dir)
+            print(f"  -> [New Best Saved] {tag} ({total_samples_seen:,} samples): BAcc={best_bacc*100:.2f}% -> {best_dir}", flush=True)
+        model.train()
+        return m
+
+    for ep in range(epochs):
+        ep_t0 = time.time()
+        ep_indices = epoch_plans[ep]
+        sampler = BucketedLengthBatchSampler(
+            lengths=[pool_tok_lens[int(i)] for i in ep_indices],
+            batch_size=batch_size,
+            bucket_size_multiplier=60,
+            shuffle=True,
+            seed=seed + ep * 31,
+        )
+        model.train()
+        running_loss = 0.0
+        n_batches = len(sampler)
+        for step_i, rel_batch in enumerate(sampler):
+            abs_batch = ep_indices[np.asarray(rel_batch, dtype=np.int64)]
+            b_texts = [pool_texts[int(i)] for i in abs_batch]
+            b_labels = torch.from_numpy(pool_labels[abs_batch]).to(device, dtype=torch.long)
+            b_weights = torch.from_numpy(pool_weights[abs_batch]).to(device, dtype=torch.float32)
+            enc = tok(b_texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+            seq_len, bsz = int(enc["input_ids"].shape[1]), len(abs_batch)
+            optimizer.zero_grad(set_to_none=True)
+
+            chunk_sz = max(2, min(bsz, max_toks_fwd // max(seq_len, 1)))
+            total_w = b_weights.sum().clamp(min=1e-6)
+            step_loss_val = 0.0
+            for start in range(0, bsz, chunk_sz):
+                end = min(start + chunk_sz, bsz)
+                sub_ids = enc["input_ids"][start:end].to(device)
+                sub_mask = enc["attention_mask"][start:end].to(device)
+                sub_y, sub_w = b_labels[start:end], b_weights[start:end]
+                w_frac = sub_w.sum() / total_w
+                feats = model.forward_features(sub_ids, sub_mask, drop_first_token=drop_first)
+                loss = family_margin_cross_entropy(
+                    model.predict_plain(feats),
+                    sub_y,
+                    family_margin=float(loss_cfg["family_margin"]),
+                    label_smoothing=float(loss_cfg["label_smoothing"]),
+                    boost_hard_sisters=bool(loss_cfg["boost_hard_sisters"]),
+                    sample_weight=sub_w,
+                )
+                (loss * w_frac).backward()
+                step_loss_val += float(loss.item()) * float(w_frac.item())
+
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            running_loss += step_loss_val
+            global_step += 1
+            total_samples_seen += bsz
+
+            if total_samples_seen >= next_eval_target and (step_i + 1) < (n_batches - 15):
+                _record_scaling_point(f"{total_samples_seen//1000}k", running_loss / float(step_i + 1), ep + 1)
+                next_eval_target += eval_every_samples
+
+        ep_metrics = _record_scaling_point(f"Ep{ep+1}_End", running_loss / max(n_batches, 1), ep + 1)
+        ep_metrics["epoch"] = ep + 1
+        ep_metrics["train_avg_loss"] = float(running_loss / max(n_batches, 1))
+        ep_metrics["epoch_sec"] = float(time.time() - ep_t0)
+        print_prediction_table(ep_metrics, header=f"Epoch {ep+1} Bench-1800")
+        epoch_logs.append(ep_metrics)
+        _safe_export(last_dir)
+        if on_checkpoint_saved is not None:
+            on_checkpoint_saved()
+
+    if best_samples_seen != total_samples_seen and (best_dir / "heads.safetensors").exists():
+        from peft import PeftModel
+        from safetensors.torch import load_file
+
+        del model, peft_backbone, base_model, optimizer, scheduler
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        base_re = AutoModel.from_pretrained(backbone_name, torch_dtype=dtype)
+        peft_re = PeftModel.from_pretrained(base_re, str(best_dir / "adapter"))
+        active_encoder = base_re.encoder
+        orig_encoder_layers = active_encoder.layer
+        active_encoder.layer = torch.nn.ModuleList(list(orig_encoder_layers)[:max_active_block])
+        model = MultiLayerLoRAClassifier(backbone=peft_re, hidden_size=int(config["hidden_size"]), layers=tap_layers, num_classes=K).to(device)
+        model.norms.float()
+        model.plain_head.float()
+        model.centered_head.float()
+        hd = load_file(str(best_dir / "heads.safetensors"), device=str(device))
+        for i in range(len(tap_layers)):
+            model.norms[i].weight.data.copy_(hd[f"norms.{i}.weight"].float())
+            if f"norms.{i}.bias" in hd:
+                model.norms[i].bias.data.copy_(hd[f"norms.{i}.bias"].float())
+        model.plain_head.weight.data.copy_(hd["plain.weight"].float())
+        model.plain_head.bias.data.copy_(hd["plain.bias"].float())
+
+    n_probe_per_cls = max(1, int(out_cfg.get("ridge_probe_samples", 36000)) // K)
+    rng_pr = np.random.RandomState(42)
+    probe_idxs = np.concatenate([
+        rng_pr.choice(np.where(pool_labels == c_i)[0], size=min(n_probe_per_cls, int((pool_labels == c_i).sum())), replace=False)
+        for c_i in range(K)
+    ])
+    Z_bench, lg_bench_neural = extract_features_and_logits(model, bench_texts_list, tok, max_len=max_len, device=device, batch_size=64, drop_first_token=drop_first)
+    Z_gold, lg_gold_neural = extract_features_and_logits(model, df_train["text"].astype(str).tolist(), tok, max_len=max_len, device=device, batch_size=64, drop_first_token=drop_first)
+    Z_probe, _ = extract_features_and_logits(model, [pool_texts[int(i)] for i in probe_idxs], tok, max_len=max_len, device=device, batch_size=64, drop_first_token=drop_first)
+
+    ridge_map = gpu_trace_ridge_eval(Z_probe, pool_labels[probe_idxs], Z_bench, alphas=[0.05, 0.25, 1.0, 5.0], device=device)
+    best_r_alpha, best_r_logits = max(ridge_map.items(), key=lambda kv: balanced_accuracy_score(y_bench, kv[1].argmax(axis=1)))
+
+    def _row_z(x: np.ndarray) -> np.ndarray:
+        return (x - x.mean(axis=1, keepdims=True)) / np.clip(x.std(axis=1, keepdims=True), 1e-5, None)
+
+    best_w_neural, best_blend_logits = max(
+        ((w_n, w_n * _row_z(lg_bench_neural) + (1.0 - w_n) * _row_z(best_r_logits)) for w_n in [0.0, 0.25, 0.5, 0.7, 0.85, 1.0]),
+        key=lambda item: balanced_accuracy_score(y_bench, item[1].argmax(axis=1)),
+    )
+
+    Z_gold_cent = Z_gold.copy()
+    for pid in np.unique(prompts_gold):
+        m = prompts_gold == pid
+        if m.sum() > 1:
+            Z_gold_cent[m] -= Z_gold_cent[m].mean(axis=0, keepdims=True)
+
+    oof_alphas = [0.05, 0.25, 1.0, 5.0]
+    oof_p_map = {a: np.zeros((len(y_train_gold), K), dtype=np.float32) for a in oof_alphas}
+    oof_c_map = {a: np.zeros((len(y_train_gold), K), dtype=np.float32) for a in oof_alphas}
+    for tr_i, val_i in GroupKFold(n_splits=5).split(Z_gold, y_train_gold, groups=prompts_gold):
+        rp = gpu_trace_ridge_eval(Z_gold[tr_i], y_train_gold[tr_i], Z_gold[val_i], oof_alphas, device=device)
+        rc = gpu_trace_ridge_eval(Z_gold_cent[tr_i], y_train_gold[tr_i], Z_gold_cent[val_i], oof_alphas, device=device)
+        for a in oof_alphas:
+            oof_p_map[a][val_i] = rp[a]
+            oof_c_map[a][val_i] = rc[a]
+
+    _safe_export(best_dir, Z_tr=Z_gold, y_tr=y_train_gold, p_tr=prompts_gold)
+    best_oof_c = max(oof_c_map.values(), key=lambda lg: balanced_accuracy_score(y_train_gold, lg.argmax(axis=1)))
+    return {
+        "checkpoint_dir": str(best_dir),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "elapsed_sec": float(time.time() - t0),
+        "config": config,
+        "best_epoch": best_epoch,
+        "best_samples_seen": best_samples_seen,
+        "best_neural_bench_bacc": float(best_bacc),
+        "scaling_curve": scaling_curve,
+        "epoch_logs": epoch_logs,
+        "bench_ridge": {"best_alpha": float(best_r_alpha), **compute_detailed_metrics(best_r_logits, y_bench)},
+        "bench_neural_ridge_blend": {"w_neural": float(best_w_neural), **compute_detailed_metrics(best_blend_logits, y_bench)},
+        "gold_train_eval": {
+            "neural_plain_bacc": float(balanced_accuracy_score(y_train_gold, lg_gold_neural.argmax(axis=1))),
+            "oof5_ridge_plain_bacc": max(float(balanced_accuracy_score(y_train_gold, oof_p_map[a].argmax(axis=1))) for a in oof_alphas),
+            "oof5_ridge_centered_bacc": max(float(balanced_accuracy_score(y_train_gold, oof_c_map[a].argmax(axis=1))) for a in oof_alphas),
+        },
+        "arrays": {
+            "y_bench": y_bench.tolist(),
+            "bench_neural_logits": lg_bench_neural.astype(np.float16).tolist(),
+            "bench_ridge_logits": best_r_logits.astype(np.float16).tolist(),
+            "y_gold": y_train_gold.tolist(),
+            "gold_oof_centered_logits": best_oof_c.astype(np.float16).tolist(),
+        },
+    }
+
+
+run_bge_v2_stage1 = run_encoder_stage1
+
+
+def package_encoder_ridge_checkpoint(
+    cfg: dict[str, Any],
+    datasets_dir: Path,
+    checkpoint_root: Path | None = None,
+    on_checkpoint_saved: Any = None,
+) -> dict[str, Any]:
+    """
+    Merges an encoder Stage-1 LoRA checkpoint to standalone FP16 weights, calibrates Frobenius-matched
+    Plain + Prompt-Centered trace-scaled Ridge classification heads, writes wPCA_bank.npz and meta.json,
+    and returns summary metrics and serialized artifact bytes.
+    """
+    from peft import PeftModel
+    from safetensors.torch import load_file, save_file
+    from transformers import AutoModel, AutoTokenizer
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    tap_layers = [int(x) for x in cfg["architecture"]["tap_layers"]]
+    max_len = int(cfg["max_len"])
+    hidden_size = int(cfg["hidden_size"])
+    backbone_name = str(cfg["backbone"])
+
+    ckpt_root = Path(checkpoint_root) if checkpoint_root is not None else Path(cfg.get("output", {}).get("checkpoint_dir", "checkpoints/export_bge_m3_v2"))
+    stage1_dir = ckpt_root / "stage1_best"
+    final_dir = ckpt_root / "final"
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    tok = AutoTokenizer.from_pretrained(backbone_name)
+    base_f32 = AutoModel.from_pretrained(backbone_name, torch_dtype=torch.float32)
+    peft_m = PeftModel.from_pretrained(base_f32, str(stage1_dir / "adapter"))
+    merged = peft_m.merge_and_unload().half()
+    merged.save_pretrained(str(final_dir), safe_serialization=True)
+    tok.save_pretrained(str(final_dir))
+    del peft_m, base_f32, merged
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    reloaded = AutoModel.from_pretrained(str(final_dir), torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(device).eval()
+    stage1_heads = load_file(str(stage1_dir / "heads.safetensors"), device="cpu")
+    model = MultiLayerLoRAClassifier(backbone=reloaded, hidden_size=hidden_size, layers=tap_layers, num_classes=K).to(device).eval()
+    model.norms.float()
+    with torch.no_grad():
+        for i in range(len(tap_layers)):
+            model.norms[i].weight.copy_(stage1_heads[f"norms.{i}.weight"].to(device, dtype=torch.float32))
+            model.norms[i].bias.copy_(stage1_heads[f"norms.{i}.bias"].to(device, dtype=torch.float32))
+    W_neural = stage1_heads["plain.weight"].float().numpy().astype(np.float32)
+    b_neural = stage1_heads["plain.bias"].float().numpy().astype(np.float32)
+
+    df_pool, df_train, df_bench = load_zero_leak_stage1_pool(datasets_dir)
+    y_bench = np.array([LAB2I[m] for m in df_bench["model"]], dtype=np.int64)
+    y_gold = np.array([LAB2I[m] for m in df_train["model"]], dtype=np.int64)
+    prompts_gold = df_train["prompt_id"].values
+    pool_labels = df_pool["label_idx"].to_numpy()
+
+    rng = np.random.RandomState(42)
+    n_per = max(1, int(cfg.get("output", {}).get("ridge_probe_samples", 36000)) // K)
+    probe_idxs = np.concatenate([rng.choice(np.where(pool_labels == c_i)[0], size=min(n_per, int((pool_labels == c_i).sum())), replace=False) for c_i in range(K)])
+    Z_bench, _ = extract_features_and_logits(model, df_bench["text"].astype(str).tolist(), tok, max_len=max_len, device=device)
+    Z_gold, _ = extract_features_and_logits(model, df_train["text"].astype(str).tolist(), tok, max_len=max_len, device=device)
+    Z_probe, _ = extract_features_and_logits(model, [str(df_pool["text"].iloc[int(i)]) for i in probe_idxs], tok, max_len=max_len, device=device)
+
+    alpha_p = 0.25
+    W_rp, b_rp = solve_trace_ridge_wb(Z_probe, pool_labels[probe_idxs], alphas=[alpha_p], device=device)[alpha_p]
+    scale_rp = float(np.linalg.norm(W_neural)) / max(float(np.linalg.norm(W_rp)), 1e-8)
+    W_rp_s, b_rp_s = W_rp * scale_rp, (b_rp - b_rp.mean()) * scale_rp + b_neural.mean()
+    best_wn, W_plain, b_plain = max(
+        ((wn, wn * W_neural + (1.0 - wn) * W_rp_s, wn * b_neural + (1.0 - wn) * b_rp_s) for wn in [0.0, 0.35, 0.50, 0.65, 0.80, 1.0]),
+        key=lambda item: balanced_accuracy_score(y_bench, (Z_bench @ item[1].T + item[2]).argmax(axis=1)),
+    )
+    blend_detail = compute_detailed_metrics(Z_bench @ W_plain.T + b_plain, y_bench)
+
+    Z_gold_cent = Z_gold.copy()
+    for pid in np.unique(prompts_gold):
+        m = prompts_gold == pid
+        if m.sum() > 1:
+            Z_gold_cent[m] -= Z_gold_cent[m].mean(axis=0, keepdims=True)
+    cand_alphas = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0]
+    splits = list(GroupKFold(n_splits=5).split(Z_gold, y_gold, groups=prompts_gold))
+    oof_p_map = {a: np.zeros((len(y_gold), K), dtype=np.float32) for a in cand_alphas}
+    oof_c_map = {a: np.zeros((len(y_gold), K), dtype=np.float32) for a in cand_alphas}
+    for tr_i, val_i in splits:
+        wp = solve_trace_ridge_wb(Z_gold[tr_i], y_gold[tr_i], cand_alphas, device=device)
+        wc = solve_trace_ridge_wb(Z_gold_cent[tr_i], y_gold[tr_i], cand_alphas, device=device)
+        for a in cand_alphas:
+            oof_p_map[a][val_i] = Z_gold[val_i] @ wp[a][0].T + wp[a][1]
+            oof_c_map[a][val_i] = Z_gold_cent[val_i] @ wc[a][0].T + wc[a][1]
+    oof_p_best = max(float(balanced_accuracy_score(y_gold, oof_p_map[a].argmax(axis=1))) for a in cand_alphas)
+    best_alpha_c, oof_c_best = max(
+        ((a, float(balanced_accuracy_score(y_gold, oof_c_map[a].argmax(axis=1)))) for a in cand_alphas),
+        key=lambda item: item[1],
+    )
+    W_cent_raw, b_cent_raw = solve_trace_ridge_wb(Z_gold_cent, y_gold, [best_alpha_c], device=device)[best_alpha_c]
+    scale_c = float(np.linalg.norm(W_plain)) / max(float(np.linalg.norm(W_cent_raw)), 1e-8)
+
+    heads_dict = {
+        **{f"norms.{i}.weight": ln.weight.detach().cpu().contiguous() for i, ln in enumerate(model.norms)},
+        **{f"norms.{i}.bias": ln.bias.detach().cpu().contiguous() for i, ln in enumerate(model.norms)},
+        "plain.weight": torch.from_numpy(np.ascontiguousarray(W_plain)).float(),
+        "plain.bias": torch.from_numpy(np.ascontiguousarray(b_plain)).float(),
+        "centered.weight": torch.from_numpy(np.ascontiguousarray((W_cent_raw * scale_c).astype(np.float32))).float(),
+        "centered.bias": torch.from_numpy(np.ascontiguousarray((b_cent_raw * scale_c).astype(np.float32))).float(),
+    }
+    save_file(heads_dict, str(final_dir / "heads.safetensors"))
+
+    wpca = fit_shared_gaussian_lowram(Z_gold, y_gold, prompts_gold, d_target=min(256, Z_gold.shape[1]))
+    np.savez_compressed(
+        str(final_dir / "wPCA_bank.npz"),
+        mx=wpca["mx"].astype(np.float32), sx=wpca["sx"].astype(np.float32),
+        mu=wpca["mx"].astype(np.float32), sd=wpca["sx"].astype(np.float32),
+        W=wpca["W"].astype(np.float32), m=wpca["m"].astype(np.float32),
+        lam=wpca["lam"].astype(np.float32), V_top64=wpca["V_top64"].astype(np.float32),
+        layers=np.array(tap_layers, dtype=np.int32),
+    )
+
+    metrics = {
+        "bench_neural_bacc": float(balanced_accuracy_score(y_bench, (Z_bench @ W_neural.T + b_neural).argmax(axis=1))),
+        "bench_plain_ridge_bacc": float(balanced_accuracy_score(y_bench, (Z_bench @ W_rp.T + b_rp).argmax(axis=1))),
+        "bench_plain_blend_bacc": float(blend_detail["bacc"]),
+        "bench_plain_blend_nll": float(blend_detail["nll"]),
+        "bench_plain_blend_gem4": float(blend_detail["gem_within_bacc"]),
+        "bench_plain_blend_gem_ret": float(blend_detail["gem_retention"]),
+        "bench_plain_blend_sister_37_38": float(blend_detail["sister_37_38_acc"]),
+        "plain_blend_w_neural": float(best_wn),
+        "plain_ridge_alpha": float(alpha_p),
+        "gold_oof5_plain_bacc": oof_p_best,
+        "gold_oof5_centered_bacc": oof_c_best,
+        "centered_ridge_alpha": float(best_alpha_c),
+    }
+    meta_json = {
+        "labels": list(LABELS), "classes": list(LABELS), "target_family": "", "backbone": backbone_name,
+        "cfg": {
+            "keep": len(tap_layers), "layers": tap_layers, "max_len": max_len, "end_token_id": int(tok.eos_token_id or 2),
+            "backbone": backbone_name, "pooling": "mean_drop_cls", "drop_first_token": True,
+            "per_layer_layernorm": True, "feature_dim": len(tap_layers) * hidden_size, "metrics": metrics,
+        },
+    }
+    (final_dir / "meta.json").write_text(json.dumps(meta_json, indent=2), encoding="utf-8")
+    (final_dir / "training_report.json").write_text(json.dumps({"metrics": metrics, "bench_blend_detail": blend_detail}, indent=2), encoding="utf-8")
+    if on_checkpoint_saved is not None:
+        on_checkpoint_saved()
+    return {"final_dir": str(final_dir), "metrics": metrics, "meta_json": meta_json, "training_report": {"metrics": metrics, "bench_blend_detail": blend_detail}}
 
 
 if __name__ == "__main__":

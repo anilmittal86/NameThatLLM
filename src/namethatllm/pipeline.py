@@ -61,14 +61,133 @@ from .spectral_bank import (
 )
 from .postprocess import (
     apply_claude_specialist_gate,
-    apply_unified_handwriting_shield,
-    apply_curly_quote_shield,
-    sinkhorn_balancing,
-    apply_typobayes_postprocess,
+    damped_sinkhorn,
     run_full_inference_pipeline,
     generate_submission
 )
 from .ablation import build_unseen_holdout_dataset, UnseenStepwiseAuditor, _fast_sinkhorn_bacc
+
+
+def _auto_align_labels_on_unseen(
+    Z_unseen: np.ndarray,
+    W_p: Optional[np.ndarray],
+    b_p: Optional[np.ndarray],
+    W_c: Optional[np.ndarray],
+    b_c: Optional[np.ndarray],
+    default_labels: list,
+    tracker_unseen: Any,
+    y_unseen: np.ndarray,
+    w_p: float,
+    w_c: float,
+    blend_weights: Tuple[float, float, float],
+    compute_centered_fn: Any,
+) -> Tuple[list, np.ndarray, float]:
+    """Selects canonical vs alphabetical label order maximizing solo BAcc on unseen holdout."""
+    if W_p is None or len(Z_unseen) == 0 or len(y_unseen) == 0:
+        return list(default_labels), np.zeros((0, K), dtype=np.float32), 0.0
+
+    cand_orders = [list(default_labels)]
+    for candidate in (sorted(LABELS), list(LABELS)):
+        if candidate not in cand_orders:
+            cand_orders.append(candidate)
+
+    best_order = list(default_labels)
+    best_bacc = -1.0
+    best_lp = None
+    for cand_o in cand_orders:
+        try:
+            trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
+            if W_c is not None and tracker_unseen is not None and w_c > 0.0:
+                trial_lp_c = compute_centered_fn(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=blend_weights)
+                trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_p, w_c)
+            else:
+                trial_lp = trial_lp_p
+            acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
+            if acc > best_bacc:
+                best_bacc = acc
+                best_order = cand_o
+                best_lp = trial_lp
+        except Exception:
+            continue
+
+    if best_lp is None:
+        best_lp = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, default_labels))
+        best_bacc = float(balanced_accuracy_score(y_unseen, best_lp.argmax(axis=1)))
+    return best_order, best_lp, max(best_bacc, 0.0)
+
+
+def _extract_bge_features(
+    bge_model: Any,
+    bge_tok: Any,
+    bge_dev: torch.device,
+    texts: List[str],
+    heads_sd: dict,
+    meta_bge: dict,
+    bsize: int = 32,
+) -> Tuple[np.ndarray, bool]:
+    """
+    Extracts BGE-M3 representations:
+    - v2 Multi-Layer: Drop-<s> Mean-Pool across tapped layers + per-layer LayerNorm(H) -> D = len(layers)*H.
+    - v1 Fallback (legacy mocks / CLS): L2-normalized last_hidden_state[:, 0].
+    """
+    if len(texts) == 0:
+        return np.zeros((0, 1024), dtype=np.float32), False
+
+    raw_layers = meta_bge.get("layers", [])
+    has_norms = any(k.startswith("norms.0.") or k.startswith("layer_norms.0.") for k in heads_sd.keys())
+    W_p_shape = heads_sd.get("plain.weight").shape if "plain.weight" in heads_sd else None
+    is_v2 = (isinstance(raw_layers, list) and len(raw_layers) > 1) or has_norms or (
+        W_p_shape is not None and max(W_p_shape) > 1024
+    )
+
+    if not is_v2:
+        embs = []
+        with torch.no_grad():
+            for i in range(0, len(texts), 16):
+                batch = texts[i : i + 16]
+                enc = bge_tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+                if hasattr(enc, "to"):
+                    enc = enc.to(bge_dev)
+                out = bge_model(**enc)
+                cls_repr = out.last_hidden_state[:, 0]
+                cls_norm = F.normalize(cls_repr, p=2, dim=-1)
+                embs.append(cls_norm.cpu().float().numpy())
+        return (np.vstack(embs) if embs else np.zeros((0, 1024), dtype=np.float32)), False
+
+    tap_layers = [int(l) for l in raw_layers] if raw_layers else [5, 6, 8, 10, 11, 15, 17, 20]
+    max_len = int(meta_bge.get("max_len", 512))
+    drop_first = bool(meta_bge.get("drop_first_token", True))
+    hidden_sz = int(getattr(getattr(bge_model, "config", None), "hidden_size", 1024))
+    norms = torch.nn.ModuleList([torch.nn.LayerNorm(hidden_sz) for _ in tap_layers]).to(bge_dev).float().eval()
+    with torch.no_grad():
+        for li, ln in enumerate(norms):
+            for pref in (f"norms.{li}", f"layer_norms.{li}"):
+                if f"{pref}.weight" in heads_sd:
+                    ln.weight.copy_(heads_sd[f"{pref}.weight"].to(device=bge_dev, dtype=torch.float32))
+                if f"{pref}.bias" in heads_sd:
+                    ln.bias.copy_(heads_sd[f"{pref}.bias"].to(device=bge_dev, dtype=torch.float32))
+
+    dim = len(tap_layers) * hidden_sz
+    order = np.argsort([len(str(t)) for t in texts], kind="stable")
+    Z_out = np.zeros((len(texts), dim), dtype=np.float32)
+    with torch.no_grad():
+        for s in range(0, len(texts), bsize):
+            idx = order[s : s + bsize]
+            chunk = [str(texts[i]) for i in idx]
+            enc = bge_tok(chunk, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+            enc = {k: v.to(bge_dev) if hasattr(v, "to") else v for k, v in enc.items()}
+            hs = bge_model(**enc, output_hidden_states=True).hidden_states
+            m = enc["attention_mask"].unsqueeze(-1).float()
+            if drop_first and m.shape[1] > 1:
+                m[:, 0, :] = 0.0
+            den = m.sum(dim=1).clamp(min=1e-5)
+            parts = []
+            for li, l_idx in enumerate(tap_layers):
+                pooled = (hs[l_idx].float() * m).sum(dim=1) / den
+                pooled = torch.nan_to_num(pooled, nan=0.0, posinf=65000.0, neginf=-65000.0)
+                parts.append(norms[li](pooled))
+            Z_out[idx] = torch.cat(parts, dim=-1).cpu().numpy().astype(np.float32)
+    return Z_out, True
 
 def verify_checkpoint_gate(
     Z_tr: np.ndarray,
@@ -290,9 +409,15 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
 
     auditor = UnseenStepwiseAuditor(y_unseen=y_unseen, groups_unseen=groups_unseen, N_test=N_test)
 
-    # Discover fine-tuned checkpoints early for pre-flight validation
+    # Discover fine-tuned checkpoints early and honor explicit config checkpoint selection
     ckpts = find_checkpoints(input_dir)
-    print(f"[Pipeline] Discovered checkpoints ({len(ckpts)}): {list(ckpts.keys())}")
+    configured_ckpts = cfg.get("checkpoints")
+    if configured_ckpts:
+        allowed_ckpts = set(configured_ckpts)
+        if float(cfg.get("postprocess", {}).get("claude_specialist_weight", 0.15)) > 0.0:
+            allowed_ckpts.add("qwen3_8b_claude")
+        ckpts = {k: v for k, v in ckpts.items() if k in allowed_ckpts}
+    print(f"[Pipeline] Active checkpoints ({len(ckpts)}): {list(ckpts.keys())}")
 
     if not is_smoke:
         verified_bases = validate_production_assets(
@@ -649,6 +774,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             Z_tr = np.zeros((0, dim), dtype=np.float32)
             return Z_te, Z_u, Z_tr
 
+        use_stat_heads = (
+            (not models_cfg)
+            or get_model_weight("wpca_dp", 0.0) > 0.0
+            or get_model_weight("spectral_bank", 0.0) > 0.0
+        )
+
         def apply_wpca_and_spectral(
             model_key: str,
             Z_te_mat: np.ndarray,
@@ -659,6 +790,8 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             d_target: int = 256,
             se_floor: float = 0.10,
         ) -> None:
+            if not use_stat_heads:
+                return
             res = None
             if wpca_bundle is not None and model_key in wpca_bundle:
                 res = wpca_bundle[model_key]
@@ -671,229 +804,206 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                     U_te = transform_lowram(Z_te_mat, res)
                     lp_dp = scores_exact_dp(U_te, tracker_test.groups[0.65], res, tracker_test.D_hybrid)
                     dp_posteriors.append((dp_w, softmax(lp_dp, axis=1)))
-                    S_te = project_spectral_block(Z_te_mat, res, prior_scale)
-                    spectral_blocks_te.append(S_te)
+                    spectral_blocks_te.append(project_spectral_block(Z_te_mat, res, prior_scale))
                     del U_te
 
                 if len(Z_tr_mat) > 0:
-                    S_tr = project_spectral_block(Z_tr_mat, res, prior_scale)
-                    spectral_blocks_tr.append(S_tr)
+                    spectral_blocks_tr.append(project_spectral_block(Z_tr_mat, res, prior_scale))
 
                 if run_benchmark and Z_u_mat is not None and len(Z_u_mat) > 0 and tracker_unseen is not None:
                     U_u = transform_lowram(Z_u_mat, res)
                     lp_dp_u = scores_exact_dp(U_u, tracker_unseen.groups[0.65], res, tracker_unseen.D_hybrid)
                     dp_posteriors_u.append((dp_w, softmax(lp_dp_u, axis=1)))
-                    S_u = project_spectral_block(Z_u_mat, res, prior_scale)
-                    spectral_blocks_u.append(S_u)
+                    spectral_blocks_u.append(project_spectral_block(Z_u_mat, res, prior_scale))
                     del U_u
                 del res
+
+        def _discover_fold_dirs(ckpt_key: str, fallback_dir: Path) -> List[Path]:
+            prefix = "q14v5" if "14b_v5" in ckpt_key else "ts_q3b14" if "14b_ts" in ckpt_key else "q8v5" if "8b_v5" in ckpt_key else "ts_q3b8" if "8b_ts" in ckpt_key else ckpt_key
+            found = find_fold_adapters(input_dir, prefix)
+            def _is_fold(p: Path) -> bool:
+                nm = p.name.lower()
+                return any(f"_f{i}" in nm or f"-f{i}" in nm or f"_fold{i}" in nm for i in range(10))
+            folds_only = sorted([p for p in found if _is_fold(p)], key=lambda x: str(x).lower())
+            full_only = [p for p in found if not _is_fold(p)] or [fallback_dir]
+            return folds_only + full_only
+
+        def _register_checkpoint_outputs(
+            model_key: str,
+            disp_name: str,
+            Z_te: np.ndarray,
+            Z_u: np.ndarray,
+            Z_tr: np.ndarray,
+            W_p: Optional[np.ndarray],
+            b_p: Optional[np.ndarray],
+            W_c: Optional[np.ndarray],
+            b_c: Optional[np.ndarray],
+            ckpt_labels: list,
+            w_tot: float,
+            dp_key: Optional[str] = None,
+            dp_default: float = 0.10,
+            prior_default: float = 0.50,
+            se_default: float = 0.25,
+            auto_align: bool = True,
+        ) -> None:
+            twin_ratio = get_model_twin_ratio(model_key, default=0.25)
+            w_p = w_tot * (1.0 - twin_ratio)
+            w_c = w_tot * twin_ratio
+
+            if N_unseen > 0 and len(Z_u) == N_unseen:
+                features_unseen_dict[model_key] = Z_u.astype(np.float16)
+
+            eff_labels = list(ckpt_labels)
+            lp_u = np.zeros((0, K), dtype=np.float32)
+            gate_passed = True
+
+            if W_p is not None and run_benchmark and N_unseen > 0 and len(Z_u) == N_unseen:
+                if auto_align:
+                    eff_labels, lp_u, solo_bacc = _auto_align_labels_on_unseen(
+                        Z_u, W_p, b_p, W_c, b_c, ckpt_labels,
+                        tracker_unseen, y_unseen, w_p, w_c, (w85, w72, w60), compute_multires_centered_blend,
+                    )
+                    align_tag = "canonical" if eff_labels == list(LABELS) else "alphabetical" if eff_labels == sorted(LABELS) else "custom"
+                    print(f"[Pipeline] {model_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_tag})")
+                    if solo_bacc <= 1.0 / float(K):
+                        print(f"[Pipeline] {model_key}: degenerate head (solo={solo_bacc:.4f} <= chance) -> excluding from active blend.")
+                        gate_passed = False
+                else:
+                    lp_u_p = log_softmax(align_cols(Z_u @ W_p.T + b_p, eff_labels))
+                    lp_u_c = compute_multires_centered_blend(Z_u, tracker_unseen.groups, W_c, b_c, eff_labels, weights=(w85, w72, w60)) if (W_c is not None and tracker_unseen is not None) else None
+                    lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_p, w_c)
+
+            pr_sc = prior_scales.get(model_key, prior_default)
+            if gate_passed:
+                update_hybrid_groups(Z_te, pr_sc, Z_u if (N_unseen > 0 and len(Z_u) == N_unseen) else None)
+                dp_w = dp_weights.get(dp_key or model_key, dp_default)
+                apply_wpca_and_spectral(
+                    model_key=model_key,
+                    Z_te_mat=Z_te,
+                    Z_tr_mat=Z_tr,
+                    Z_u_mat=Z_u if (N_unseen > 0 and len(Z_u) == N_unseen) else None,
+                    dp_w=dp_w,
+                    prior_scale=pr_sc,
+                    d_target=256,
+                    se_floor=se_floors.get(model_key, se_default),
+                )
+                if W_p is not None:
+                    lp_m_te = np.zeros((0, K), dtype=np.float32)
+                    if run_submission and len(Z_te) == N_test and N_test > 0:
+                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, eff_labels))
+                        lp_c_te = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, eff_labels, weights=(w85, w72, w60)) if (W_c is not None and tracker_test is not None) else None
+                        lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_te, w_p, w_c)
+                    lp_m_u = lp_u if (run_benchmark and N_unseen > 0 and len(lp_u) == N_unseen) else np.zeros((0, K), dtype=np.float32)
+                    auditor.add_model(disp_name, weight=w_tot, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
+            elif W_p is not None and len(lp_u) == N_unseen:
+                auditor.add_model(disp_name, weight=0.0, unseen_log_probs=lp_u, test_log_probs=np.zeros((N_test, K), dtype=np.float32))
+
+        def _extract_shared_lora_ckpt(trunk_obj: Any, ckpt_key: str, ckpt_dir: Path, disp_name: str, default_keep: int, default_layers: List[int], weight_def: float, dp_key: Optional[str] = None, dp_def: float = 0.10, prior_def: float = 0.50, se_def: float = 0.25, allow_multifold: bool = False, auto_align: bool = True, required: bool = False) -> None:
+            fold_dirs = _discover_fold_dirs(ckpt_key, ckpt_dir) if allow_multifold else [ckpt_dir]
+            target_dir = fold_dirs[-1]
+            meta = read_checkpoint_meta(target_dir, default_keep=default_keep, default_layers=default_layers, default_max_len=447)
+
+            if allow_multifold and len(fold_dirs) > 1:
+                w_tot = get_model_weight(ckpt_key, default=weight_def)
+                twin_ratio = get_model_twin_ratio(ckpt_key, default=0.25)
+                w_p, w_c = w_tot * (1.0 - twin_ratio), w_tot * twin_ratio
+                P_p_acc = np.zeros((N_test, K), dtype=np.float64)
+                P_c_acc = np.zeros((N_test, K), dtype=np.float64)
+                P_u_p_acc = np.zeros((N_unseen, K), dtype=np.float64)
+                P_u_c_acc = np.zeros((N_unseen, K), dtype=np.float64)
+                has_any_c = False
+                Z_te_last = np.zeros((0, 4096), dtype=np.float32)
+                Z_u_last = np.zeros((0, 4096), dtype=np.float32)
+                Z_tr_last = np.zeros((0, 4096), dtype=np.float32)
+                print(f"[Pipeline] {ckpt_key}: extracting & averaging across {len(fold_dirs)} fold adapters...")
+                for f_idx, f_dir in enumerate(fold_dirs):
+                    is_last = f_idx == len(fold_dirs) - 1
+                    f_meta = read_checkpoint_meta(f_dir, default_keep=default_keep, default_layers=default_layers, default_max_len=447)
+                    trunk_obj.set_active_layers(f_meta["layers"], f_meta["max_len"])
+                    trunk_obj.set_final_norm(not f_meta["no_final_norm"])
+                    f_backup = trunk_obj.snapshot_weights(f_dir)
+                    if not merge_lora(trunk_obj.model, f_dir, sign=+1.0):
+                        trunk_obj.restore_weights(f_backup)
+                        continue
+                    f_heads = load_head_file(f_dir)
+                    trunk_obj.load_norm_weights(f_heads)
+                    f_Wp, f_bp, f_Wc, f_bc = resolve_head_tensors(f_heads)
+                    f_lbls = f_meta["labels"]
+                    f_Z_te, f_Z_u, f_Z_tr = _extract_trunk(trunk_obj, end_id=f_meta.get("end_id"))
+                    if is_last:
+                        Z_te_last, Z_u_last, Z_tr_last = f_Z_te, f_Z_u, f_Z_tr
+                        if N_unseen > 0 and len(f_Z_u) == N_unseen:
+                            features_unseen_dict[ckpt_key] = f_Z_u.astype(np.float16)
+                    if f_idx == 0 or is_last:
+                        update_hybrid_groups(f_Z_te, prior_scales.get(ckpt_key, prior_def), f_Z_u if N_unseen > 0 else None)
+                    if run_submission and len(f_Z_te) > 0:
+                        if f_Wp is not None:
+                            P_p_acc += softmax(align_cols(f_Z_te @ f_Wp.T + f_bp, f_lbls), axis=1) / len(fold_dirs)
+                        if f_Wc is not None and tracker_test is not None:
+                            has_any_c = True
+                            P_c_acc += softmax(compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_Wc, f_bc, f_lbls, weights=(w85, w72, w60)), axis=1) / len(fold_dirs)
+                    if run_benchmark and len(f_Z_u) > 0:
+                        if f_Wp is not None:
+                            P_u_p_acc += softmax(align_cols(f_Z_u @ f_Wp.T + f_bp, f_lbls), axis=1) / len(fold_dirs)
+                        if f_Wc is not None and tracker_unseen is not None:
+                            has_any_c = True
+                            P_u_c_acc += softmax(compute_multires_centered_blend(f_Z_u, tracker_unseen.groups, f_Wc, f_bc, f_lbls, weights=(w85, w72, w60)), axis=1) / len(fold_dirs)
+                    trunk_obj.restore_weights(f_backup)
+                    del f_backup, f_heads
+                trunk_obj.set_final_norm(False)
+                apply_wpca_and_spectral(ckpt_key, Z_te_last, Z_tr_last, Z_u_last if N_unseen > 0 else None, dp_weights.get(dp_key or ckpt_key, dp_def), prior_scales.get(ckpt_key, prior_def), se_floor=se_floors.get(ckpt_key, se_def))
+                lp_m_te = _combine_plain_and_twin_lp(np.log(np.clip(P_p_acc, 1e-9, 1.0)), np.log(np.clip(P_c_acc, 1e-9, 1.0)) if has_any_c else None, w_p, w_c) if (run_submission and N_test > 0) else np.zeros((0, K), dtype=np.float32)
+                lp_m_u = _combine_plain_and_twin_lp(np.log(np.clip(P_u_p_acc, 1e-9, 1.0)), np.log(np.clip(P_u_c_acc, 1e-9, 1.0)) if has_any_c else None, w_p, w_c) if (run_benchmark and N_unseen > 0) else np.zeros((0, K), dtype=np.float32)
+                auditor.add_model(disp_name, weight=w_tot, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
+                return
+
+            trunk_obj.set_active_layers(meta["layers"], meta["max_len"])
+            trunk_obj.set_final_norm(not meta["no_final_norm"])
+            backup = trunk_obj.snapshot_weights(target_dir)
+            merged = merge_lora(trunk_obj.model, target_dir, sign=+1.0)
+            if not merged:
+                trunk_obj.restore_weights(backup)
+                trunk_obj.set_final_norm(False)
+                if required and not is_smoke:
+                    raise RuntimeError(f"Failed to merge required LoRA adapter at {target_dir}")
+                print(f"[Pipeline] Optional checkpoint {ckpt_key} failed to merge LoRA; skipping.")
+                return
+            heads_sd = load_head_file(target_dir)
+            trunk_obj.load_norm_weights(heads_sd)
+            W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
+            if required and W_p is None and not is_smoke:
+                raise RuntimeError(f"Required classification head W_p is None for {target_dir}")
+            Z_te, Z_u, Z_tr = _extract_trunk(trunk_obj, end_id=meta.get("end_id"))
+            _register_checkpoint_outputs(
+                model_key=ckpt_key, disp_name=disp_name,
+                Z_te=Z_te, Z_u=Z_u, Z_tr=Z_tr, W_p=W_p, b_p=b_p, W_c=W_c, b_c=b_c,
+                ckpt_labels=meta["labels"], w_tot=get_model_weight(ckpt_key, default=weight_def),
+                dp_key=dp_key, dp_default=dp_def, prior_default=prior_def, se_default=se_def, auto_align=auto_align,
+            )
+            trunk_obj.restore_weights(backup)
+            trunk_obj.set_final_norm(False)
+            del backup, heads_sd, Z_te, Z_u, Z_tr
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # ==============================================================================
         # TRUNK 1: Qwen3-14B (40 layers, hidden=5120)
         # ==============================================================================
         base_q3_14b = verified_bases.get("qwen3_14b") or find_base_model(input_dir, "qwen3", 5120, 40)
-        if base_q3_14b and ("qwen3_14b_p2" in ckpts or "qwen3_14b_p1" in ckpts or "qwen3_14b_ts" in ckpts or "qwen3_14b_v5" in ckpts or "qwen3_14b_inhouse" in ckpts):
+        q3_14b_specs = [
+            ("qwen3_14b_p2", "Qwen3-14B Part-2", 27, [2, 4, 6, 9, 13, 17, 22, 27], 0.54, "q3_14b", 0.38, 1.00, 0.10, False, True),
+            ("qwen3_14b_inhouse", "qwen3_14b_inhouse", 24, [2, 4, 6, 8, 12, 16, 20, 24], 0.45, None, 0.10, 0.50, 0.25, True, False),
+            ("qwen3_14b_ts", "qwen3_14b_ts", 24, [2, 4, 6, 8, 12, 16, 20, 24], 0.45, "q3_14b_ts", 0.10, 0.50, 0.25, True, False),
+            ("qwen3_14b_v5", "qwen3_14b_v5", 24, [2, 4, 6, 8, 12, 16, 20, 24], 0.45, "q3_14b_ts", 0.10, 0.50, 0.25, True, False),
+            ("qwen3_14b_p1", "Qwen3-14B Part-1", 24, [2, 4, 6, 9, 13, 17, 21, 24], 0.16, "part1_14b", 0.08, 0.50, 0.35, True, False),
+        ]
+        if base_q3_14b and any(k in ckpts for k, *_ in q3_14b_specs):
             print(f"[Pipeline] Loading Trunk 1: Qwen3-14B from {base_q3_14b}...")
             trunk1 = UniversalLoRATrunkLoader(base_q3_14b, keep_layers=27, layers=[2, 4, 6, 9, 13, 17, 22, 27], max_len=447)
-
-            # Checkpoint 1A: Part 2 (lora_qwen3_14b)
-            if "qwen3_14b_p2" in ckpts:
-                p2_dir = ckpts["qwen3_14b_p2"]
-                meta_p2 = read_checkpoint_meta(p2_dir, default_keep=27, default_layers=[2, 4, 6, 9, 13, 17, 22, 27], default_max_len=447)
-                trunk1.set_active_layers(meta_p2["layers"], meta_p2["max_len"])
-                backup_t1 = trunk1.snapshot_weights(p2_dir)
-                merged = merge_lora(trunk1.model, p2_dir, sign=+1.0)
-                if not merged and not is_smoke:
-                    raise RuntimeError(f"Failed to merge required LoRA adapter at {p2_dir}")
-                heads_sd = load_head_file(p2_dir)
-                trunk1.load_norm_weights(heads_sd)
-                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                if W_p is None and not is_smoke:
-                    raise RuntimeError(f"Required classification head W_p is None for {p2_dir}")
-                p2_labels = meta_p2["labels"]
-
-                Z_te, Z_unseen, Z_tr = _extract_trunk(trunk1, end_id=meta_p2.get("end_id"))
-                if N_unseen > 0:
-                    features_unseen_dict["qwen3_14b_p2"] = Z_unseen.astype(np.float16)
-                update_hybrid_groups(Z_te, prior_scales.get("qwen3_14b_p2", 1.00), Z_unseen if N_unseen > 0 else None)
-
-                w_tot_14b = get_model_weight("qwen3_14b_p2", default=0.54)
-                twin_ratio_14b = get_model_twin_ratio("qwen3_14b_p2", default=0.25)
-                w_p = w_tot_14b * (1.0 - twin_ratio_14b)
-                w_c = w_tot_14b * twin_ratio_14b
-                lp_u_p = np.zeros((0, K), dtype=np.float32)
-                lp_u_c = np.zeros((0, K), dtype=np.float32)
-                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                lp_p = np.zeros((N_test, K), dtype=np.float32)
-                if W_p is not None:
-                    if run_submission and len(Z_te) > 0:
-                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
-                    if run_benchmark and len(Z_unseen) > 0:
-                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
-
-                if W_c is not None:
-                    if run_submission and len(Z_te) > 0 and tracker_test is not None:
-                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
-                    if run_benchmark and len(Z_unseen) > 0 and tracker_unseen is not None:
-                        lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
-
-                if W_p is not None:
-                    lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_p, w_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
-                    lp_model_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_p, w_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                    auditor.add_model("Qwen3-14B Part-2", weight=w_tot_14b, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
-
-                # wPCA + DP Posterior + Spectral Bank (Symmetric test and unseen)
-                apply_wpca_and_spectral(
-                    model_key="qwen3_14b_p2",
-                    Z_te_mat=Z_te,
-                    Z_tr_mat=Z_tr,
-                    Z_u_mat=Z_unseen if N_unseen > 0 else None,
-                    dp_w=dp_weights.get("q3_14b", 0.38),
-                    prior_scale=prior_scales.get("qwen3_14b_p2", 1.00),
-                    d_target=256,
-                    se_floor=se_floors.get("qwen3_14b_p2", 0.10)
-                )
-
-                trunk1.restore_weights(backup_t1)
-                del backup_t1, Z_tr, Z_te, heads_sd
-                if "Z_unseen" in locals():
-                    del Z_unseen
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            # Checkpoint 1B / Optional Two-Stage LoRA24 & Part-1
-            for opt_14b_key in ("qwen3_14b_inhouse", "qwen3_14b_ts", "qwen3_14b_v5", "qwen3_14b_p1"):
-                if opt_14b_key in ckpts:
-                    primary_ts14_dir = ckpts[opt_14b_key]
-                    prefix_14b = "q14v5" if "v5" in opt_14b_key else "ts_q3b14" if "ts" in opt_14b_key else opt_14b_key
-                    found_14b_folds = find_fold_adapters(input_dir, prefix_14b)
-
-                    def _is_fold_14b(p: Path) -> bool:
-                        nm = p.name.lower()
-                        return any(f"_f{i}" in nm or f"-f{i}" in nm or f"_fold{i}" in nm for i in range(10))
-
-                    folds_only_14b = sorted([p for p in found_14b_folds if _is_fold_14b(p)], key=lambda x: str(x).lower())
-                    full_only_14b = [p for p in found_14b_folds if not _is_fold_14b(p)]
-                    if not full_only_14b:
-                        full_only_14b = [primary_ts14_dir]
-                    fold_dirs_14b = folds_only_14b + full_only_14b
-                    ts14_dir = fold_dirs_14b[-1]
-
-                    def_layers_14b = [2, 4, 6, 9, 13, 17, 21, 24] if opt_14b_key == "qwen3_14b_p1" else [2, 4, 6, 8, 12, 16, 20, 24]
-                    meta_ts14 = read_checkpoint_meta(ts14_dir, default_keep=24, default_layers=def_layers_14b, default_max_len=447)
-                    trunk1.set_active_layers(meta_ts14["layers"], meta_ts14["max_len"])
-                    trunk1.set_final_norm(not meta_ts14["no_final_norm"])
-                    backup_t1_ts = trunk1.snapshot_weights(ts14_dir)
-                    merged = merge_lora(trunk1.model, ts14_dir, sign=+1.0)
-                    if not merged:
-                        print(f"[Pipeline] Optional checkpoint {opt_14b_key} failed to merge LoRA; skipping.")
-                        trunk1.restore_weights(backup_t1_ts)
-                        trunk1.set_final_norm(False)
-                    else:
-                        heads_sd = load_head_file(ts14_dir)
-                        trunk1.load_norm_weights(heads_sd)
-                        W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                        ts14_labels = meta_ts14["labels"]
-                        p_comp_def = 0.12 if opt_14b_key == "qwen3_14b_p1" else 0.35
-                        c_comp_def = 0.04 if opt_14b_key == "qwen3_14b_p1" else 0.10
-                        w_tot_ts14 = get_model_weight(opt_14b_key, default=p_comp_def + c_comp_def)
-                        twin_ratio_ts14 = get_model_twin_ratio(opt_14b_key, default=0.25)
-                        w_comp_p = w_tot_ts14 * (1.0 - twin_ratio_ts14)
-                        w_comp_c = w_tot_ts14 * twin_ratio_ts14
-                        w_comp_tot = w_tot_ts14
-
-                        # Single pass for test + unseen benchmark (Pure Inference)
-                        Z_te, Z_unseen, Z_tr = _extract_trunk(trunk1, end_id=meta_ts14.get("end_id"))
-                        if N_unseen > 0:
-                            features_unseen_dict[opt_14b_key] = Z_unseen.astype(np.float16)
-
-                        # Auto-align label order directly on Z_unseen
-                        cand_orders = [ts14_labels]
-                        if sorted(LABELS) not in cand_orders:
-                            cand_orders.append(sorted(LABELS))
-                        if list(LABELS) not in cand_orders:
-                            cand_orders.append(list(LABELS))
-
-                        best_align_order = ts14_labels
-                        best_solo_bacc = -1.0
-                        best_lp_u = None
-                        if W_p is not None and N_unseen > 0:
-                            for cand_o in cand_orders:
-                                try:
-                                    trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
-                                    if W_c is not None:
-                                        trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
-                                        trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
-                                    else:
-                                        trial_lp = trial_lp_p
-                                    trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
-                                    if trial_acc > best_solo_bacc:
-                                        best_solo_bacc = trial_acc
-                                        best_align_order = cand_o
-                                        best_lp_u = trial_lp
-                                except Exception:
-                                    continue
-
-                        solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
-                        lp_u = best_lp_u if best_lp_u is not None else (log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts14_labels)) if (W_p is not None and N_unseen > 0) else np.zeros((0, K), dtype=np.float32))
-                        ts14_labels = best_align_order
-                        align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
-                        print(f"[Pipeline] {opt_14b_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
-
-                        gate_passed = True
-                        if len(auditor.models) > 0 and N_unseen > 0:
-                            lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u, weight=w_comp_tot)
-                            if lift < -0.002:
-                                print(f"[Pipeline] {opt_14b_key}: marginal lift {lift:+.4f} < -0.002 -> skipping blend.")
-                                gate_passed = False
-
-                        if gate_passed:
-                            pr_sc = prior_scales.get(opt_14b_key, 0.50)
-                            update_hybrid_groups(Z_te, pr_sc, Z_unseen if N_unseen > 0 else None)
-                            lp_p = None
-                            lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                            if run_submission and len(Z_te) > 0:
-                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts14_labels)) if W_p is not None else None
-                                if W_c is not None and tracker_test is not None:
-                                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts14_labels, weights=(w85, w72, w60))
-
-                            def_dp_14b = 0.08 if opt_14b_key == "qwen3_14b_p1" else 0.10
-                            def_se_14b = 0.35 if opt_14b_key == "qwen3_14b_p1" else 0.25
-                            dp_w_14b = dp_weights.get(opt_14b_key, dp_weights.get("part1_14b" if opt_14b_key == "qwen3_14b_p1" else "q3_14b_ts", def_dp_14b))
-                            apply_wpca_and_spectral(
-                                model_key=opt_14b_key,
-                                Z_te_mat=Z_te,
-                                Z_tr_mat=Z_tr,
-                                Z_u_mat=Z_unseen if (N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen) else None,
-                                dp_w=dp_w_14b,
-                                prior_scale=pr_sc,
-                                d_target=256,
-                                se_floor=se_floors.get(opt_14b_key, def_se_14b)
-                            )
-
-                            if W_p is not None:
-                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c) if (run_submission and lp_p is not None and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
-                                lp_m_u = lp_u if (run_benchmark and N_unseen > 0 and 'lp_u' in locals() and len(lp_u) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                                aud_name_14b = "Qwen3-14B Part-1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
-                                auditor.add_model(name=aud_name_14b, weight=w_tot_ts14, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
-                        else:
-                            print(f"[Pipeline] Optional checkpoint {opt_14b_key} rejected by gate; excluded from active blend, but preserving inference for cache.")
-                            if W_p is not None and "lp_u" in locals() and lp_u is not None and len(lp_u) == N_unseen:
-                                aud_name_14b = "Qwen3-14B Part-1" if opt_14b_key == "qwen3_14b_p1" else opt_14b_key
-                                auditor.add_model(name=aud_name_14b, weight=0.0, unseen_log_probs=lp_u, test_log_probs=np.zeros((N_test, K), dtype=np.float32))
-
-                        if backup_t1_ts is not None:
-                            trunk1.restore_weights(backup_t1_ts)
-                            del backup_t1_ts
-                        trunk1.set_final_norm(False)
-                        del Z_tr, Z_te, heads_sd
-                        if "Z_unseen" in locals():
-                            del Z_unseen
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
+            for k, disp, k_def, l_def, w_def, dp_k, dp_d, pr_d, se_d, align_f, req_f in q3_14b_specs:
+                if k in ckpts:
+                    _extract_shared_lora_ckpt(trunk1, k, ckpts[k], disp, k_def, l_def, w_def, dp_k, dp_d, pr_d, se_d, allow_multifold=False, auto_align=align_f, required=req_f)
             trunk1.free_memory()
             del trunk1
             gc.collect()
@@ -904,454 +1014,58 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # TRUNK 2: Qwen2.5-14B (48 layers, hidden=5120)
         # ==============================================================================
         base_q25_14b = verified_bases.get("qwen25_14b") or find_base_model(input_dir, "qwen2", 5120, 48)
-        if base_q25_14b and any(k in ckpts for k in ("qwen25_14b_p2", "qwen25_14b_inhouse")):
-            trunk2 = None
-            for q25_key in ("qwen25_14b_p2", "qwen25_14b_inhouse"):
-                if q25_key not in ckpts:
-                    continue
-                p2_dir = ckpts[q25_key]
-                meta_q25 = read_checkpoint_meta(p2_dir, default_keep=32, default_layers=[3, 5, 8, 11, 16, 21, 27, 32], default_max_len=447)
-                if trunk2 is None:
-                    print(f"[Pipeline] Loading Trunk 2: Qwen2.5-14B ({q25_key}) from {base_q25_14b}...")
-                    trunk2 = UniversalLoRATrunkLoader(base_q25_14b, keep_layers=meta_q25["keep"], layers=meta_q25["layers"], max_len=meta_q25["max_len"])
-                else:
-                    trunk2.set_active_layers(meta_q25["layers"], meta_q25["max_len"])
-                trunk2.set_final_norm(not meta_q25["no_final_norm"])
-                backup_t2 = trunk2.snapshot_weights(p2_dir)
-                merged = merge_lora(trunk2.model, p2_dir, sign=+1.0)
-                if not merged and not is_smoke:
-                    raise RuntimeError(f"Failed to merge required LoRA adapter at {p2_dir}")
-                heads_sd = load_head_file(p2_dir)
-                trunk2.load_norm_weights(heads_sd)
-                W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                if W_p is None and not is_smoke:
-                    raise RuntimeError(f"Required classification head W_p is None for {p2_dir}")
-                p2_labels = meta_q25["labels"]
-
-                Z_te, Z_unseen, Z_tr = _extract_trunk(trunk2, end_id=meta_q25.get("end_id"))
-                if N_unseen > 0:
-                    features_unseen_dict[q25_key] = Z_unseen.astype(np.float16)
-                update_hybrid_groups(Z_te, prior_scales.get(q25_key, 0.85), Z_unseen if N_unseen > 0 else None)
-
-                w_tot_q25 = get_model_weight(q25_key, default=0.34)
-                twin_ratio_q25 = get_model_twin_ratio(q25_key, default=0.25)
-                w_p = w_tot_q25 * (1.0 - twin_ratio_q25)
-                w_c = w_tot_q25 * twin_ratio_q25
-                lp_u_p = np.zeros((0, K), dtype=np.float32)
-                lp_u_c = np.zeros((0, K), dtype=np.float32)
-                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                lp_p = np.zeros((N_test, K), dtype=np.float32)
-                if W_p is not None:
-                    if run_submission and len(Z_te) > 0:
-                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, p2_labels))
-                    if run_benchmark and len(Z_unseen) > 0:
-                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, p2_labels))
-
-                if W_c is not None:
-                    if run_submission and len(Z_te) > 0 and tracker_test is not None:
-                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
-                    if run_benchmark and len(Z_unseen) > 0 and tracker_unseen is not None:
-                        lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, p2_labels, weights=(w85, w72, w60))
-
-                if W_p is not None:
-                    lp_model_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_p, w_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
-                    lp_model_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_p, w_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                    aud_name = "Qwen2.5-14B Part-2" if q25_key == "qwen25_14b_p2" else "Qwen2.5-14B In-House"
-                    auditor.add_model(aud_name, weight=w_tot_q25, unseen_log_probs=lp_model_u, test_log_probs=lp_model_te)
-
-                apply_wpca_and_spectral(
-                    model_key=q25_key,
-                    Z_te_mat=Z_te,
-                    Z_tr_mat=Z_tr,
-                    Z_u_mat=Z_unseen if N_unseen > 0 else None,
-                    dp_w=dp_weights.get("q25_14b", 0.24),
-                    prior_scale=prior_scales.get(q25_key, 0.85),
-                    d_target=256,
-                    se_floor=se_floors.get(q25_key, 0.10)
-                )
-
-                trunk2.restore_weights(backup_t2)
-                trunk2.set_final_norm(False)
-                del backup_t2, Z_tr, Z_te, heads_sd
-                if "Z_unseen" in locals():
-                    del Z_unseen
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            if trunk2 is not None:
-                trunk2.free_memory()
-                del trunk2
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        q25_specs = [
+            ("qwen25_14b_p2", "Qwen2.5-14B Part-2", True),
+            ("qwen25_14b_inhouse", "Qwen2.5-14B In-House", False),
+        ]
+        if base_q25_14b and any(k in ckpts for k, _, _ in q25_specs):
+            print(f"[Pipeline] Loading Trunk 2: Qwen2.5-14B from {base_q25_14b}...")
+            trunk2 = UniversalLoRATrunkLoader(base_q25_14b, keep_layers=32, layers=[3, 5, 8, 11, 16, 21, 27, 32], max_len=447)
+            for k, disp, align_f in q25_specs:
+                if k in ckpts:
+                    _extract_shared_lora_ckpt(trunk2, k, ckpts[k], disp, 32, [3, 5, 8, 11, 16, 21, 27, 32], 0.34, "q25_14b", 0.24, 0.85, 0.10, allow_multifold=False, auto_align=align_f, required=True)
+            trunk2.free_memory()
+            del trunk2
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # ==============================================================================
         # TRUNK 3: Qwen3-8B (36 layers, hidden=4096)
         # ==============================================================================
         base_q3_8b = verified_bases.get("qwen3_8b") or find_base_model(input_dir, "qwen3", 4096, 36)
-        if base_q3_8b and ("instyle" in ckpts or "qwen3_8b_claude" in ckpts or "qwen3_8b_ts" in ckpts or "qwen3_8b_v5" in ckpts or "qwen3_8b_inhouse" in ckpts):
+        q3_8b_specs = [
+            ("instyle", "Qwen3-8B In-Style", 0.22, "instyle", 0.10, 0.45, 0.35, False),
+            ("qwen3_8b_ts", "qwen3_8b_ts", 0.22, "q3_8b_ts", 0.10, 0.40, 0.35, True),
+            ("qwen3_8b_v5", "qwen3_8b_v5", 0.22, "q3_8b_ts", 0.10, 0.40, 0.35, True),
+            ("qwen3_8b_inhouse", "qwen3_8b_inhouse", 0.22, "q3_8b_ts", 0.10, 0.35, 0.40, True),
+        ]
+        if base_q3_8b and (any(k in ckpts for k, *_ in q3_8b_specs) or "qwen3_8b_claude" in ckpts):
             print(f"[Pipeline] Loading Trunk 3: Qwen3-8B from {base_q3_8b}...")
             trunk3 = UniversalLoRATrunkLoader(base_q3_8b, keep_layers=24, layers=[2, 4, 6, 8, 12, 16, 20, 24], max_len=447)
+            for k, disp, w_def, dp_k, dp_d, pr_d, se_d, mf_f in q3_8b_specs:
+                if k in ckpts:
+                    _extract_shared_lora_ckpt(trunk3, k, ckpts[k], disp, 24, [2, 4, 6, 8, 12, 16, 20, 24], w_def, dp_k, dp_d, pr_d, se_d, allow_multifold=mf_f, auto_align=True, required=False)
 
-            # In-Style LoRA
-            if "instyle" in ckpts:
-                instyle_dir = ckpts["instyle"]
-                meta_ins = read_checkpoint_meta(instyle_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
-                trunk3.set_active_layers(meta_ins["layers"], meta_ins["max_len"])
-                backup_t3 = trunk3.snapshot_weights(instyle_dir)
-                merged = merge_lora(trunk3.model, instyle_dir, sign=+1.0)
-                if not merged:
-                    print(f"[Pipeline] Optional checkpoint instyle failed to merge LoRA; skipping.")
-                    trunk3.restore_weights(backup_t3)
-                else:
-                    heads_sd = load_head_file(instyle_dir)
-                    trunk3.load_norm_weights(heads_sd)
-                    W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                    if W_p is None:
-                        print(f"[Pipeline] In-Style checkpoint has no plain classification head W_p; computing density and spectral features.")
-
-                    w_tot_ins = get_model_weight("instyle", default=0.22)
-                    twin_ratio_ins = get_model_twin_ratio("instyle", default=0.25)
-                    w_comp_p = w_tot_ins * (1.0 - twin_ratio_ins)
-                    w_comp_c = w_tot_ins * twin_ratio_ins
-                    w_comp_tot = w_tot_ins
-                    # Single pass for test + unseen benchmark (Pure Inference)
-                    Z_te, Z_unseen, Z_tr = _extract_trunk(trunk3, end_id=meta_ins.get("end_id"))
-                    if N_unseen > 0:
-                        features_unseen_dict["instyle"] = Z_unseen.astype(np.float16)
-
-                    # Auto-align label order directly on Z_unseen
-                    cand_orders = [meta_ins["labels"]]
-                    if sorted(LABELS) not in cand_orders:
-                        cand_orders.append(sorted(LABELS))
-                    if list(LABELS) not in cand_orders:
-                        cand_orders.append(list(LABELS))
-
-                    best_align_order = meta_ins["labels"]
-                    best_solo_bacc = -1.0
-                    best_lp_u = None
-                    if W_p is not None and N_unseen > 0:
-                        for cand_o in cand_orders:
-                            try:
-                                trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
-                                if W_c is not None:
-                                    trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
-                                    trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
-                                else:
-                                    trial_lp = trial_lp_p
-                                trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
-                                if trial_acc > best_solo_bacc:
-                                    best_solo_bacc = trial_acc
-                                    best_align_order = cand_o
-                                    best_lp_u = trial_lp
-                            except Exception:
-                                continue
-
-                    solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
-                    lp_u = best_lp_u if best_lp_u is not None else (log_softmax(align_cols(Z_unseen @ W_p.T + b_p, meta_ins["labels"])) if (W_p is not None and N_unseen > 0) else np.zeros((0, K), dtype=np.float32))
-                    ins_labels = best_align_order
-                    align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
-                    print(f"[Pipeline] instyle: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
-
-                    gate_passed = True
-                    if len(auditor.models) > 0 and N_unseen > 0:
-                        lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u, weight=w_comp_tot)
-                        if lift < -0.002:
-                            print(f"[Pipeline] instyle: marginal lift {lift:+.4f} < -0.002 -> skipping blend.")
-                            gate_passed = False
-
-                    if gate_passed:
-                        update_hybrid_groups(Z_te, prior_scales.get("instyle", 0.45), Z_unseen if N_unseen > 0 else None)
-
-                        lp_p = None
-                        lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                        lp_u_p = np.zeros((0, K), dtype=np.float32)
-                        lp_u_c = np.zeros((0, K), dtype=np.float32)
-
-                        if run_submission and len(Z_te) > 0:
-                            lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ins_labels)) if W_p is not None else None
-                            if W_c is not None and tracker_test is not None:
-                                lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ins_labels, weights=(w85, w72, w60))
-
-                        if run_benchmark and len(Z_unseen) > 0:
-                            if W_p is not None:
-                                lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ins_labels))
-                            if W_c is not None and tracker_unseen is not None:
-                                lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ins_labels, weights=(w85, w72, w60))
-
-                        apply_wpca_and_spectral(
-                            model_key="instyle",
-                            Z_te_mat=Z_te,
-                            Z_tr_mat=Z_tr,
-                            Z_u_mat=Z_unseen if N_unseen > 0 else None,
-                            dp_w=dp_weights.get("instyle", 0.10),
-                            prior_scale=prior_scales.get("instyle", 0.45),
-                            d_target=256,
-                            se_floor=se_floors.get("instyle", 0.35)
-                        )
-
-                        if W_p is not None:
-                            lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c) if (run_submission and lp_p is not None and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
-                            lp_m_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c if W_c is not None else None, w_comp_p, w_comp_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                            auditor.add_model("Qwen3-8B In-Style", weight=w_tot_ins, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
-                    else:
-                        print(f"[Pipeline] instyle rejected by gate; excluded from active blend, but preserving inference for cache.")
-                        if W_p is not None and "lp_u" in locals() and lp_u is not None and len(lp_u) == N_unseen:
-                            auditor.add_model("Qwen3-8B In-Style", weight=0.0, unseen_log_probs=lp_u, test_log_probs=np.zeros((N_test, K), dtype=np.float32))
-
-                    trunk3.restore_weights(backup_t3)
-                    del backup_t3, heads_sd, Z_te, Z_tr
-                    if "Z_tr" in locals():
-                        del Z_tr
-                    if "Z_te" in locals():
-                        del Z_te
-                    if "Z_unseen" in locals():
-                        del Z_unseen
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-            # Optional Checkpoints on Trunk 3: Two-Stage LoRA24 (qwen3_8b_ts, qwen3_8b_v5, qwen3_8b_inhouse)
-            for opt_8b_key in ("qwen3_8b_ts", "qwen3_8b_v5", "qwen3_8b_inhouse"):
-                if opt_8b_key in ckpts:
-                    primary_ts8_dir = ckpts[opt_8b_key]
-                    prefix_8b = "q8v5" if "v5" in opt_8b_key else "ts_q3b8" if "ts" in opt_8b_key else opt_8b_key
-                    found_8b_folds = find_fold_adapters(input_dir, prefix_8b)
-
-                    def _is_fold_8b(p: Path) -> bool:
-                        nm = p.name.lower()
-                        return any(f"_f{i}" in nm or f"-f{i}" in nm or f"_fold{i}" in nm for i in range(10))
-
-                    folds_only_8b = sorted([p for p in found_8b_folds if _is_fold_8b(p)], key=lambda x: str(x).lower())
-                    full_only_8b = [p for p in found_8b_folds if not _is_fold_8b(p)]
-                    if not full_only_8b:
-                        full_only_8b = [primary_ts8_dir]
-                    fold_dirs_8b = folds_only_8b + full_only_8b
-                    ts8_dir = fold_dirs_8b[-1]
-
-                    meta_ts8 = read_checkpoint_meta(ts8_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
-                    trunk3.set_active_layers(meta_ts8["layers"], meta_ts8["max_len"])
-                    trunk3.set_final_norm(not meta_ts8["no_final_norm"])
-                    backup_t3_ts = trunk3.snapshot_weights(ts8_dir)
-                    merged = merge_lora(trunk3.model, ts8_dir, sign=+1.0)
-                    if not merged:
-                        print(f"[Pipeline] Optional checkpoint {opt_8b_key} failed to merge LoRA; skipping.")
-                        trunk3.restore_weights(backup_t3_ts)
-                        trunk3.set_final_norm(False)
-                    else:
-                        heads_sd = load_head_file(ts8_dir)
-                        trunk3.load_norm_weights(heads_sd)
-                        W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-                        ts8_labels = meta_ts8["labels"]
-                        w_tot_ts8 = get_model_weight(opt_8b_key, default=0.22)
-                        twin_ratio_ts8 = get_model_twin_ratio(opt_8b_key, default=0.25)
-                        w_comp_p = w_tot_ts8 * (1.0 - twin_ratio_ts8)
-                        w_comp_c = w_tot_ts8 * twin_ratio_ts8
-                        w_comp_tot = w_tot_ts8
-
-                        # Single pass extraction (with multi-fold averaging if multiple folds discovered)
-                        num_8b_folds = len(fold_dirs_8b)
-                        if num_8b_folds > 1:
-                            trunk3.restore_weights(backup_t3_ts)
-                            del backup_t3_ts
-
-                            P_p_acc = np.zeros((N_test, K), dtype=np.float64)
-                            P_c_acc = np.zeros((N_test, K), dtype=np.float64)
-                            P_u_p_acc = np.zeros((N_unseen, K), dtype=np.float64)
-                            P_u_c_acc = np.zeros((N_unseen, K), dtype=np.float64)
-                            has_any_c = False
-                            Z_te = None
-                            Z_tr = np.zeros((0, 4096), dtype=np.float32)
-                            Z_unseen = None
-                            print(f"[Pipeline] {opt_8b_key}: extracting & averaging across {num_8b_folds} fold adapters...")
-
-                            for f_idx, f_dir in enumerate(fold_dirs_8b):
-                                is_last = (f_idx == num_8b_folds - 1)
-                                f_meta = read_checkpoint_meta(f_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
-                                trunk3.set_active_layers(f_meta["layers"], f_meta["max_len"])
-                                trunk3.set_final_norm(not f_meta["no_final_norm"])
-                                f_backup = trunk3.snapshot_weights(f_dir)
-                                f_merged = merge_lora(trunk3.model, f_dir, sign=+1.0)
-                                if not f_merged:
-                                    trunk3.restore_weights(f_backup)
-                                    continue
-                                f_heads_sd = load_head_file(f_dir)
-                                trunk3.load_norm_weights(f_heads_sd)
-                                f_W_p, f_b_p, f_W_c, f_b_c = resolve_head_tensors(f_heads_sd)
-                                f_labels = f_meta["labels"]
-
-                                f_Z_te, f_Z_u, _ = _extract_trunk(trunk3, end_id=f_meta.get("end_id"))
-
-                                if is_last:
-                                    Z_te = f_Z_te
-                                    Z_unseen = f_Z_u
-                                    dim_f = f_Z_u.shape[1] if len(f_Z_u) > 0 else (f_Z_te.shape[1] if len(f_Z_te) > 0 else 4096)
-                                    Z_tr = np.zeros((0, dim_f), dtype=np.float32)
-                                    if N_unseen > 0:
-                                        features_unseen_dict[opt_8b_key] = Z_unseen.astype(np.float16)
-
-                                if f_idx == 0 or is_last:
-                                    update_hybrid_groups(f_Z_te, prior_scales.get(opt_8b_key, 0.40), f_Z_u if N_unseen > 0 else None)
-
-                                if run_submission and len(f_Z_te) > 0:
-                                    if f_W_p is not None:
-                                        p_fold = softmax(align_cols(f_Z_te @ f_W_p.T + f_b_p, f_labels), axis=1)
-                                        P_p_acc += p_fold / num_8b_folds
-                                    if f_W_c is not None and tracker_test is not None:
-                                        has_any_c = True
-                                        c_blend_f = compute_multires_centered_blend(f_Z_te, tracker_test.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
-                                        P_c_acc += softmax(c_blend_f, axis=1) / num_8b_folds
-
-                                if run_benchmark and len(f_Z_u) > 0:
-                                    if f_W_p is not None:
-                                        p_u_fold = softmax(align_cols(f_Z_u @ f_W_p.T + f_b_p, f_labels), axis=1)
-                                        P_u_p_acc += p_u_fold / num_8b_folds
-                                    if f_W_c is not None and tracker_unseen is not None:
-                                        has_any_c = True
-                                        c_u_blend_f = compute_multires_centered_blend(f_Z_u, tracker_unseen.groups, f_W_c, f_b_c, f_labels, weights=(w85, w72, w60))
-                                        P_u_c_acc += softmax(c_u_blend_f, axis=1) / num_8b_folds
-
-                                trunk3.restore_weights(f_backup)
-                                del f_backup, f_heads_sd, f_Z_te
-                                if "f_Z_u" in locals():
-                                    del f_Z_u
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-
-                            trunk3.set_final_norm(False)
-                            lp_p = np.log(np.clip(P_p_acc, 1e-9, 1.0)) if (run_submission and len(P_p_acc) == N_test) else np.zeros((0, K), dtype=np.float32)
-                            lp_c_blend = np.log(np.clip(P_c_acc, 1e-9, 1.0)) if (run_submission and has_any_c and len(P_c_acc) == N_test) else np.zeros((N_test, K), dtype=np.float32)
-                            lp_u = np.zeros((0, K), dtype=np.float32)
-                            if run_benchmark and len(P_u_p_acc) == N_unseen:
-                                lp_u_p = np.log(np.clip(P_u_p_acc, 1e-9, 1.0))
-                                lp_u_c = np.log(np.clip(P_u_c_acc, 1e-9, 1.0)) if has_any_c else None
-                                lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
-                            gate_passed = True
-                            backup_t3_ts = None
-                        else:
-                            Z_te, Z_unseen, Z_tr = _extract_trunk(trunk3, end_id=meta_ts8.get("end_id"))
-                            if N_unseen > 0:
-                                features_unseen_dict[opt_8b_key] = Z_unseen.astype(np.float16)
-
-                            # Auto-align label order directly on Z_unseen
-                            cand_orders = [ts8_labels]
-                            if sorted(LABELS) not in cand_orders:
-                                cand_orders.append(sorted(LABELS))
-                            if list(LABELS) not in cand_orders:
-                                cand_orders.append(list(LABELS))
-
-                            best_align_order = ts8_labels
-                            best_solo_bacc = -1.0
-                            best_lp_u = None
-                            if W_p is not None and N_unseen > 0:
-                                for cand_o in cand_orders:
-                                    try:
-                                        trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
-                                        if W_c is not None:
-                                            trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
-                                            trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
-                                        else:
-                                            trial_lp = trial_lp_p
-                                        trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
-                                        if trial_acc > best_solo_bacc:
-                                            best_solo_bacc = trial_acc
-                                            best_align_order = cand_o
-                                            best_lp_u = trial_lp
-                                    except Exception:
-                                        continue
-
-                            solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
-                            lp_u = best_lp_u if best_lp_u is not None else (log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels)) if (W_p is not None and N_unseen > 0) else np.zeros((0, K), dtype=np.float32))
-                            ts8_labels = best_align_order
-                            align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
-                            print(f"[Pipeline] {opt_8b_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
-
-                            gate_passed = True
-                            if len(auditor.models) > 0 and N_unseen > 0:
-                                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u, weight=w_comp_tot)
-                                if lift < -0.002:
-                                    print(f"[Pipeline] {opt_8b_key}: marginal lift {lift:+.4f} < -0.002 -> skipping blend.")
-                                    gate_passed = False
-                            if gate_passed:
-                                def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
-                                pr_sc = prior_scales.get(opt_8b_key, def_pr)
-                                update_hybrid_groups(Z_te, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
-                                lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
-                                if W_c is not None:
-                                    lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ts8_labels, weights=(w85, w72, w60))
-                                else:
-                                    lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                                if N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen:
-                                    lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ts8_labels)) if W_p is not None else None
-                                    if W_c is not None:
-                                        lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ts8_labels, weights=(w85, w72, w60))
-                                        lp_u = _combine_plain_and_twin_lp(lp_u_p, lp_u_c, w_comp_p, w_comp_c)
-                                    else:
-                                        lp_u = lp_u_p if lp_u_p is not None else np.zeros((0, K), dtype=np.float32)
-
-                        if gate_passed:
-                            def_pr = 0.35 if opt_8b_key == "qwen3_8b_inhouse" else 0.40
-                            def_se = 0.40 if opt_8b_key == "qwen3_8b_inhouse" else 0.35
-                            pr_sc = prior_scales.get(opt_8b_key, def_pr)
-                            se_fl = se_floors.get(opt_8b_key, def_se)
-
-                            dp_w_8b = dp_weights.get(opt_8b_key, dp_weights.get("q3_8b_ts", 0.10))
-                            apply_wpca_and_spectral(
-                                model_key=opt_8b_key,
-                                Z_te_mat=Z_te,
-                                Z_tr_mat=Z_tr,
-                                Z_u_mat=Z_unseen if (N_unseen > 0 and 'Z_unseen' in locals() and Z_unseen is not None and len(Z_unseen) == N_unseen) else None,
-                                dp_w=dp_w_8b,
-                                prior_scale=pr_sc,
-                                d_target=256,
-                                se_floor=se_fl
-                            )
-
-                            if lp_p is not None:
-                                lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if (has_any_c if num_8b_folds > 1 else W_c is not None) else None, w_comp_p, w_comp_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
-                                lp_m_u = lp_u if (run_benchmark and N_unseen > 0 and 'lp_u' in locals() and len(lp_u) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                                auditor.add_model(name=opt_8b_key, weight=w_tot_ts8, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
-                        else:
-                            print(f"[Pipeline] Optional checkpoint {opt_8b_key} rejected by gate; excluded from active blend, but preserving inference for cache.")
-                            if "lp_u" in locals() and lp_u is not None and len(lp_u) == N_unseen:
-                                auditor.add_model(name=opt_8b_key, weight=0.0, unseen_log_probs=lp_u, test_log_probs=np.zeros((N_test, K), dtype=np.float32))
-
-                        if backup_t3_ts is not None:
-                            trunk3.restore_weights(backup_t3_ts)
-                            del backup_t3_ts
-                        trunk3.set_final_norm(False)
-                        del Z_tr, Z_te, heads_sd
-                        if "Z_unseen" in locals():
-                            del Z_unseen
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-            # Claude Head LoRA
+            # Claude Specialist Gate LoRA
             if "qwen3_8b_claude" in ckpts:
                 claude_dir = ckpts["qwen3_8b_claude"]
                 meta_cl = read_checkpoint_meta(claude_dir, default_keep=24, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
                 trunk3.set_active_layers(meta_cl["layers"], meta_cl["max_len"])
-                merged = merge_lora(trunk3.model, claude_dir, sign=+1.0)
-                if not merged and not is_smoke:
+                if not merge_lora(trunk3.model, claude_dir, sign=+1.0) and not is_smoke:
                     raise RuntimeError(f"Failed to merge required LoRA adapter at {claude_dir}")
-
                 heads_sd_cl = load_head_file(claude_dir)
                 if heads_sd_cl:
                     trunk3.load_norm_weights(heads_sd_cl)
-
                 W_p, b_p, W_c, b_c = None, None, None, None
-                W_spec, b_spec = None, None
-                ro_labels = None
+                W_spec, b_spec, ro_labels = None, None, None
                 readouts_file = claude_dir / "readouts.npz"
                 if readouts_file.exists():
                     with np.load(str(readouts_file), allow_pickle=True) as rnpz:
-                        if "classes" in rnpz:
-                            ro_labels = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in rnpz["classes"]]
-                        elif "labels" in rnpz:
-                            ro_labels = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in rnpz["labels"]]
+                        for lk in ("classes", "labels"):
+                            if lk in rnpz:
+                                ro_labels = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in rnpz[lk]]
+                                break
                         for wk, bk in [("plain_coef", "plain_intercept"), ("plain.weight", "plain.bias")]:
                             if wk in rnpz and bk in rnpz and rnpz[wk].shape[0] == 18:
                                 W_p, b_p = np.array(rnpz[wk]), np.array(rnpz[bk])
@@ -1360,91 +1074,42 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                             if wk in rnpz and bk in rnpz and rnpz[wk].shape[0] == 18:
                                 W_c, b_c = np.array(rnpz[wk]), np.array(rnpz[bk])
                                 break
-                        if "claude_coef" in rnpz and "claude_intercept" in rnpz:
-                            if rnpz["claude_coef"].shape[0] == 5:
-                                W_spec, b_spec = np.array(rnpz["claude_coef"]), np.array(rnpz["claude_intercept"])
-                                if "claude_classes" in rnpz:
-                                    claude_classes = list(rnpz["claude_classes"])
+                        if "claude_coef" in rnpz and "claude_intercept" in rnpz and rnpz["claude_coef"].shape[0] == 5:
+                            W_spec, b_spec = np.array(rnpz["claude_coef"]), np.array(rnpz["claude_intercept"])
+                            if "claude_classes" in rnpz:
+                                claude_classes = list(rnpz["claude_classes"])
                 if W_p is None and heads_sd_cl:
-                    cand_W, cand_b, cand_Wc, cand_bc = resolve_head_tensors(heads_sd_cl)
-                    if cand_W is not None and cand_W.shape[0] == 18:
-                        W_p, b_p = cand_W, cand_b
-                        if cand_Wc is not None and cand_Wc.shape[0] == 18:
-                            W_c, b_c = cand_Wc, cand_bc
-
-                # Ensure ro_labels is a valid 18-class label list (defaults to sorted(LABELS) alphabetical order)
+                    cw, cb, cwc, cbc = resolve_head_tensors(heads_sd_cl)
+                    if cw is not None and cw.shape[0] == 18:
+                        W_p, b_p = cw, cb
+                    if cwc is not None and cwc.shape[0] == 18:
+                        W_c, b_c = cwc, cbc
                 if ro_labels is None or len(ro_labels) != 18 or set(ro_labels) != set(LABELS):
-                    cand_meta = meta_cl.get("labels", [])
-                    if len(cand_meta) == 18 and set(cand_meta) == set(LABELS):
-                        ro_labels = list(cand_meta)
-                    else:
-                        ro_labels = sorted(LABELS)
-
-                if W_spec is None:
-                    spec_file = claude_dir / "claude_head.safetensors"
-                    if spec_file.exists():
-                        ch_sd = load_head_file(spec_file)
-                        for wk, bk in [("weight", "bias"), ("plain.weight", "plain.bias")]:
-                            if wk in ch_sd and ch_sd[wk].shape[0] == 5:
-                                W_spec = ch_sd[wk].cpu().numpy()
-                                b_spec = ch_sd[bk].cpu().numpy() if bk in ch_sd else np.zeros(5, dtype=np.float32)
-                                break
+                    cand_m = meta_cl.get("labels", [])
+                    ro_labels = list(cand_m) if (len(cand_m) == 18 and set(cand_m) == set(LABELS)) else sorted(LABELS)
+                if W_spec is None and (claude_dir / "claude_head.safetensors").exists():
+                    ch_sd = load_head_file(claude_dir / "claude_head.safetensors")
+                    for wk, bk in [("weight", "bias"), ("plain.weight", "plain.bias")]:
+                        if wk in ch_sd and ch_sd[wk].shape[0] == 5:
+                            W_spec = ch_sd[wk].cpu().numpy()
+                            b_spec = ch_sd[bk].cpu().numpy() if bk in ch_sd else np.zeros(5, dtype=np.float32)
+                            break
                 if W_spec is None and not is_smoke:
                     raise RuntimeError(f"Required specialist head W_spec is None for {claude_dir}")
                 if claude_classes is None:
                     claude_classes = [LABELS[i] for i in FAMILIES["claude"]]
-
-                Z_te, Z_unseen, Z_tr = _extract_trunk(trunk3, end_id=meta_cl.get("end_id"))
-                if N_unseen > 0:
-                    features_unseen_dict["qwen3_8b_claude"] = Z_unseen.astype(np.float16)
-                update_hybrid_groups(Z_te, prior_scales.get("qwen3_8b_claude", 0.30), Z_unseen if N_unseen > 0 else None)
-
+                Z_te, Z_u, Z_tr = _extract_trunk(trunk3, end_id=meta_cl.get("end_id"))
                 if W_spec is not None and W_spec.shape[0] == 5:
                     claude_spec_logits = (Z_te @ W_spec.T + b_spec) if (run_submission and len(Z_te) > 0) else None
-                    claude_spec_logits_u = (Z_unseen @ W_spec.T + b_spec) if (run_benchmark and len(Z_unseen) > 0) else None
-
-                if W_p is not None and W_p.shape[0] == 18:
-                    w_tot_cl = get_model_weight("qwen3_8b_claude", default=0.14)
-                    twin_ratio_cl = get_model_twin_ratio("qwen3_8b_claude", default=0.25)
-                    w_comp_p = w_tot_cl * (1.0 - twin_ratio_cl)
-                    w_comp_c = w_tot_cl * twin_ratio_cl
-                    lp_p = np.zeros((N_test, K), dtype=np.float32)
-                    lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                    lp_u_p = np.zeros((0, K), dtype=np.float32)
-                    lp_u_c = np.zeros((0, K), dtype=np.float32)
-
-                    if run_submission and len(Z_te) > 0:
-                        lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, ro_labels))
-                        if W_c is not None and W_c.shape[0] == 18 and tracker_test is not None:
-                            lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, ro_labels, weights=(w85, w72, w60))
-
-                    if run_benchmark and len(Z_unseen) > 0:
-                        lp_u_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, ro_labels))
-                        if W_c is not None and W_c.shape[0] == 18 and tracker_unseen is not None:
-                            lp_u_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, ro_labels, weights=(w85, w72, w60))
-
-                    twin_c_te = lp_c_blend if (W_c is not None and W_c.shape[0] == 18) else None
-                    lp_m_te = _combine_plain_and_twin_lp(lp_p, twin_c_te, w_comp_p, w_comp_c) if (run_submission and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
-                    twin_c_u = lp_u_c if (W_c is not None and W_c.shape[0] == 18) else None
-                    lp_m_u = _combine_plain_and_twin_lp(lp_u_p, twin_c_u, w_comp_p, w_comp_c) if (run_benchmark and len(lp_u_p) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                    auditor.add_model("Qwen3-8B Claude Head", weight=w_tot_cl, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
-
-                apply_wpca_and_spectral(
-                    model_key="qwen3_8b_claude",
-                    Z_te_mat=Z_te,
-                    Z_tr_mat=Z_tr,
-                    Z_u_mat=Z_unseen if N_unseen > 0 else None,
-                    dp_w=dp_weights.get("claude_8b", 0.04),
-                    prior_scale=prior_scales.get("qwen3_8b_claude", 0.30),
-                    d_target=256,
-                    se_floor=se_floors.get("qwen3_8b_claude", 0.35)
+                    claude_spec_logits_u = (Z_u @ W_spec.T + b_spec) if (run_benchmark and len(Z_u) > 0) else None
+                _register_checkpoint_outputs(
+                    model_key="qwen3_8b_claude", disp_name="Qwen3-8B Claude Head",
+                    Z_te=Z_te, Z_u=Z_u, Z_tr=Z_tr, W_p=W_p, b_p=b_p, W_c=W_c, b_c=b_c,
+                    ckpt_labels=ro_labels, w_tot=get_model_weight("qwen3_8b_claude", default=0.0),
+                    dp_key="claude_8b", dp_default=0.04, prior_default=0.30, se_default=0.35, auto_align=False,
                 )
-
                 merge_lora(trunk3.model, claude_dir, sign=-1.0)
-                del Z_tr, Z_te
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                del Z_te, Z_u, Z_tr
 
             trunk3.free_memory()
             del trunk3
@@ -1453,7 +1118,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
                 torch.cuda.empty_cache()
 
         # ==============================================================================
-        # TRUNK 4: DeBERTa-v3-Large
+        # TRUNK 4: DeBERTa-v3-Large (Optional / Fallback)
         # ==============================================================================
         for deb_key in ("deberta_p2", "deberta_inhouse"):
             if deb_key not in ckpts:
@@ -1462,75 +1127,25 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             base_deb_dir = verified_bases.get("deberta_v3_large") or find_base_model(input_dir, "deberta", 1024, 24)
             print(f"[Pipeline] Loading Trunk 4: DeBERTa-v3 ({deb_key}) from {deb_dir}...")
             if run_submission and N_test > 0 and run_benchmark and N_unseen > 0:
-                deb_texts = test_texts + unseen_texts
-                Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
-                    deb_dir, base_deb_dir, deb_texts, train_sub_texts, y_sub
-                )
-                Z_te_deb = Z_test_all[:N_test]
-                Z_unseen_deb = Z_test_all[N_test : N_test + N_unseen]
+                Z_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(deb_dir, base_deb_dir, test_texts + unseen_texts, train_sub_texts, y_sub)
+                Z_te_deb, Z_u_deb = Z_all[:N_test], Z_all[N_test : N_test + N_unseen]
             elif run_submission and N_test > 0:
-                Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
-                    deb_dir, base_deb_dir, test_texts, train_sub_texts, y_sub
-                )
-                Z_te_deb = Z_test_all
-                Z_unseen_deb = np.zeros((0, Z_te_deb.shape[1]), dtype=np.float32)
+                Z_te_deb, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(deb_dir, base_deb_dir, test_texts, train_sub_texts, y_sub)
+                Z_u_deb = np.zeros((0, Z_te_deb.shape[1]), dtype=np.float32)
             elif run_benchmark and N_unseen > 0:
-                Z_test_all, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(
-                    deb_dir, base_deb_dir, unseen_texts, train_sub_texts, y_sub
-                )
-                Z_unseen_deb = Z_test_all
-                Z_te_deb = np.zeros((0, Z_unseen_deb.shape[1]), dtype=np.float32)
+                Z_u_deb, Z_tr_deb, W_p_deb, b_p_deb, W_c_deb, b_c_deb, deb_labels = extract_deberta_checkpoint(deb_dir, base_deb_dir, unseen_texts, train_sub_texts, y_sub)
+                Z_te_deb = np.zeros((0, Z_u_deb.shape[1]), dtype=np.float32)
             else:
                 continue
-
-            if N_unseen > 0 and len(Z_unseen_deb) == N_unseen:
-                features_unseen_dict[deb_key] = Z_unseen_deb.astype(np.float16)
-
             if W_p_deb is None and not is_smoke:
                 raise RuntimeError(f"Required classification head W_p is None for {deb_dir}")
-            update_hybrid_groups(Z_te_deb, prior_scales.get(deb_key, 0.80), Z_unseen_deb if N_unseen > 0 else None)
-
-            w_tot_deb = get_model_weight(deb_key, default=0.28)
-            twin_ratio_deb = get_model_twin_ratio(deb_key, default=0.25)
-            w_plain_deb = w_tot_deb * (1.0 - twin_ratio_deb)
-            w_twin_deb = w_tot_deb * twin_ratio_deb
-            lp_p_deb = None
-            lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-            lp_u_deb = np.zeros((0, K), dtype=np.float32)
-            lp_u_c_deb = np.zeros((0, K), dtype=np.float32)
-
-            if run_submission and len(Z_te_deb) > 0:
-                if W_p_deb is not None:
-                    lp_p_deb = log_softmax(align_cols(Z_te_deb @ W_p_deb.T + b_p_deb, deb_labels))
-                if W_c_deb is not None and tracker_test is not None:
-                    lp_c_blend = compute_multires_centered_blend(Z_te_deb, tracker_test.groups, W_c_deb, b_c_deb, deb_labels, weights=(w85, w72, w60))
-
-            if run_benchmark and len(Z_unseen_deb) > 0:
-                if W_p_deb is not None:
-                    lp_u_deb = log_softmax(align_cols(Z_unseen_deb @ W_p_deb.T + b_p_deb, deb_labels))
-                if W_c_deb is not None and tracker_unseen is not None:
-                    lp_u_c_deb = compute_multires_centered_blend(Z_unseen_deb, tracker_unseen.groups, W_c_deb, b_c_deb, deb_labels, weights=(w85, w72, w60))
-
-            if W_p_deb is not None:
-                lp_m_te = _combine_plain_and_twin_lp(lp_p_deb, lp_c_blend if W_c_deb is not None else None, w_plain_deb, w_twin_deb) if (run_submission and lp_p_deb is not None and len(lp_p_deb) == N_test) else np.zeros((0, K), dtype=np.float32)
-                lp_m_u = _combine_plain_and_twin_lp(lp_u_deb, lp_u_c_deb if W_c_deb is not None else None, w_plain_deb, w_twin_deb) if (run_benchmark and len(lp_u_deb) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                aud_name = "DeBERTa-v3-Large" if deb_key == "deberta_p2" else "DeBERTa-InHouse"
-                auditor.add_model(aud_name, weight=w_tot_deb, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
-
-            apply_wpca_and_spectral(
-                model_key=deb_key,
-                Z_te_mat=Z_te_deb,
-                Z_tr_mat=Z_tr_deb,
-                Z_u_mat=Z_unseen_deb if N_unseen > 0 else None,
-                dp_w=dp_weights.get("deberta", 0.20),
-                prior_scale=prior_scales.get(deb_key, 0.80),
-                d_target=256,
-                se_floor=se_floors.get(deb_key, 0.10)
+            _register_checkpoint_outputs(
+                model_key=deb_key, disp_name="DeBERTa-v3-Large" if deb_key == "deberta_p2" else "DeBERTa-InHouse",
+                Z_te=Z_te_deb, Z_u=Z_u_deb, Z_tr=Z_tr_deb, W_p=W_p_deb, b_p=b_p_deb, W_c=W_c_deb, b_c=b_c_deb,
+                ckpt_labels=deb_labels, w_tot=get_model_weight(deb_key, default=0.28),
+                dp_key="deberta", dp_default=0.20, prior_default=0.80, se_default=0.10, auto_align=False,
             )
-
-            del Z_tr_deb, Z_te_deb, Z_test_all
-            if "Z_unseen_deb" in locals():
-                del Z_unseen_deb
+            del Z_tr_deb, Z_te_deb, Z_u_deb
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1539,244 +1154,71 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         # OPTIONAL CAUSAL LLM TRUNKS: Gemma-2-9B, Llama-3.1-8B, Mistral-7B-v0.3
         # ==============================================================================
         opt_causal_specs = [
-            ("gemma2_9b_ts", "gemma2", 3584, 42, 24, "Gemma-2-9B"),
-            ("llama31_8b_ts", "llama", 4096, 32, 24, "Llama-3.1-8B"),
-            ("llama3_8b_v5", "llama", 4096, 32, 24, "Llama-3-8B-v5"),
-            ("mistral_7b_ts", "mistral", 4096, 32, 24, "Mistral-7B"),
+            ("gemma2_9b_ts", "gemma2", 3584, 42, 24, "Gemma-2-9B", "gemma2_9b"),
+            ("llama31_8b_ts", "llama", 4096, 32, 24, "Llama-3.1-8B", "llama3_8b"),
+            ("llama3_8b_v5", "llama", 4096, 32, 24, "Llama-3-8B-v5", "llama3_8b"),
+            ("mistral_7b_ts", "mistral", 4096, 32, 24, "Mistral-7B", "mistral_7b"),
         ]
-        base_name_map = {
-            "gemma2_9b_ts": "gemma2_9b",
-            "llama31_8b_ts": "llama3_8b",
-            "llama3_8b_v5": "llama3_8b",
-            "mistral_7b_ts": "mistral_7b",
-        }
-        for opt_key, opt_family, opt_hidden, opt_layers, opt_default_keep, opt_disp_name in opt_causal_specs:
+        for opt_key, opt_fam, opt_h, opt_l, opt_keep, opt_disp, base_k in opt_causal_specs:
             if opt_key not in ckpts:
                 continue
-            opt_ckpt_dir = ckpts[opt_key]
-            base_opt_dir = (
-                verified_bases.get(opt_key)
-                or verified_bases.get(base_name_map.get(opt_key, ""))
-                or find_base_model(input_dir, opt_family, opt_hidden, opt_layers)
-            )
+            base_opt_dir = verified_bases.get(opt_key) or verified_bases.get(base_k) or find_base_model(input_dir, opt_fam, opt_h, opt_l)
             if not base_opt_dir:
-                print(f"[Pipeline] Base model for {opt_disp_name} ({opt_family}, h={opt_hidden}, l={opt_layers}) not found; skipping {opt_key}.")
+                print(f"[Pipeline] Base model for {opt_disp} not found; skipping {opt_key}.")
                 continue
-
-            print(f"[Pipeline] Loading Trunk: {opt_disp_name} ({opt_key}) from base {base_opt_dir}...")
-            meta_opt = read_checkpoint_meta(opt_ckpt_dir, default_keep=opt_default_keep, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
-            opt_trunk = UniversalLoRATrunkLoader(
-                base_opt_dir,
-                keep_layers=meta_opt["keep"],
-                layers=meta_opt["layers"],
-                max_len=meta_opt["max_len"],
-            )
-
-            merged = merge_lora(opt_trunk.model, opt_ckpt_dir, sign=+1.0)
-            if not merged:
-                print(f"[Pipeline] Failed to merge LoRA for {opt_key}; skipping.")
-                opt_trunk.free_memory()
-                del opt_trunk
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-
-            heads_sd = load_head_file(opt_ckpt_dir)
-            opt_trunk.load_norm_weights(heads_sd)
-            W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd)
-
-            w_tot = get_model_weight(opt_key, default=0.20)
-            twin_ratio_opt = get_model_twin_ratio(opt_key, default=0.25)
-            w_comp_p = w_tot * (1.0 - twin_ratio_opt)
-            w_comp_c = w_tot * twin_ratio_opt
-            w_comp_tot = w_tot
-
-            opt_labels = meta_opt["labels"]
-            gate_passed = True
-
-            # Single pass for test + unseen benchmark (Pure Inference)
-            Z_te, Z_unseen, Z_tr = _extract_trunk(opt_trunk, end_id=meta_opt.get("end_id"))
-            if N_unseen > 0:
-                features_unseen_dict[opt_key] = Z_unseen.astype(np.float16)
-
-            # Auto-align label order directly on Z_unseen
-            cand_orders = [opt_labels]
-            if sorted(LABELS) not in cand_orders:
-                cand_orders.append(sorted(LABELS))
-            if list(LABELS) not in cand_orders:
-                cand_orders.append(list(LABELS))
-
-            best_align_order = opt_labels
-            best_solo_bacc = -1.0
-            best_lp_u = None
-            if W_p is not None and N_unseen > 0:
-                for cand_o in cand_orders:
-                    try:
-                        trial_lp_p = log_softmax(align_cols(Z_unseen @ W_p.T + b_p, cand_o))
-                        if W_c is not None and tracker_unseen is not None:
-                            trial_lp_c = compute_multires_centered_blend(Z_unseen, tracker_unseen.groups, W_c, b_c, cand_o, weights=(w85, w72, w60))
-                            trial_lp = _combine_plain_and_twin_lp(trial_lp_p, trial_lp_c, w_comp_p, w_comp_c)
-                        else:
-                            trial_lp = trial_lp_p
-                        trial_acc = float(balanced_accuracy_score(y_unseen, trial_lp.argmax(axis=1)))
-                        if trial_acc > best_solo_bacc:
-                            best_solo_bacc = trial_acc
-                            best_align_order = cand_o
-                            best_lp_u = trial_lp
-                    except Exception:
-                        continue
-
-            solo_bacc = best_solo_bacc if best_solo_bacc >= 0 else 0.0
-            lp_u = best_lp_u if best_lp_u is not None else (log_softmax(align_cols(Z_unseen @ W_p.T + b_p, opt_labels)) if (W_p is not None and N_unseen > 0) else np.zeros((0, K), dtype=np.float32))
-            opt_labels = best_align_order
-            align_name = "canonical" if best_align_order == list(LABELS) else "alphabetical" if best_align_order == sorted(LABELS) else "custom"
-            print(f"[Pipeline] {opt_key}: solo unseen BAcc = {solo_bacc:.4f} (alignment: {align_name})")
-
-            # Free trunk memory immediately before downstream DP/Spectral math
+            print(f"[Pipeline] Loading Trunk: {opt_disp} ({opt_key}) from base {base_opt_dir}...")
+            meta_opt = read_checkpoint_meta(ckpts[opt_key], default_keep=opt_keep, default_layers=[2, 4, 6, 8, 12, 16, 20, 24], default_max_len=447)
+            opt_trunk = UniversalLoRATrunkLoader(base_opt_dir, keep_layers=meta_opt["keep"], layers=meta_opt["layers"], max_len=meta_opt["max_len"])
+            _extract_shared_lora_ckpt(opt_trunk, opt_key, ckpts[opt_key], opt_disp, opt_keep, [2, 4, 6, 8, 12, 16, 20, 24], 0.20, opt_key, 0.05, 0.40, 0.25, allow_multifold=False, auto_align=True, required=False)
             opt_trunk.free_memory()
             del opt_trunk
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            gate_passed = True
-            if len(auditor.models) > 0 and N_unseen > 0:
-                lift = auditor.evaluate_marginal_lift(candidate_unseen_lp=lp_u, weight=w_comp_tot)
-                if lift < -0.002:
-                    print(f"[Pipeline] {opt_key}: marginal lift {lift:+.4f} < -0.002 -> skipping blend.")
-                    gate_passed = False
-
-            if gate_passed and ("Z_te" in locals() or "Z_unseen" in locals()):
-                pr_sc = prior_scales.get(opt_key, 0.40)
-                update_hybrid_groups(Z_te if 'Z_te' in locals() else None, pr_sc, Z_unseen if ('Z_unseen' in locals() and N_unseen > 0) else None)
-
-                lp_p = None
-                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                if run_submission and 'Z_te' in locals() and len(Z_te) > 0:
-                    lp_p = log_softmax(align_cols(Z_te @ W_p.T + b_p, opt_labels)) if W_p is not None else None
-                    if W_c is not None and tracker_test is not None:
-                        lp_c_blend = compute_multires_centered_blend(Z_te, tracker_test.groups, W_c, b_c, opt_labels, weights=(w85, w72, w60))
-
-                apply_wpca_and_spectral(
-                    model_key=opt_key,
-                    Z_te_mat=Z_te if 'Z_te' in locals() else np.zeros((0, 4096), dtype=np.float32),
-                    Z_tr_mat=Z_tr if 'Z_tr' in locals() else np.zeros((0, 4096), dtype=np.float32),
-                    Z_u_mat=Z_unseen if (N_unseen > 0 and 'Z_unseen' in locals() and len(Z_unseen) == N_unseen) else None,
-                    dp_w=dp_weights.get(opt_key, 0.05),
-                    prior_scale=pr_sc,
-                    d_target=256,
-                    se_floor=se_floors.get(opt_key, 0.25)
-                )
-
-                if W_p is not None:
-                    lp_m_te = _combine_plain_and_twin_lp(lp_p, lp_c_blend if W_c is not None else None, w_comp_p, w_comp_c) if (run_submission and lp_p is not None and len(lp_p) == N_test) else np.zeros((0, K), dtype=np.float32)
-                    lp_m_u = _combine_plain_and_twin_lp(lp_u, None, w_comp_p, w_comp_c) if (run_benchmark and N_unseen > 0 and 'lp_u' in locals() and lp_u is not None and len(lp_u) == N_unseen) else np.zeros((0, K), dtype=np.float32)
-                    auditor.add_model(opt_disp_name, weight=w_tot, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
-            elif not gate_passed:
-                print(f"[Pipeline] {opt_key} excluded from active blend, but preserving inference for cache.")
-                if W_p is not None and "lp_u" in locals() and lp_u is not None and len(lp_u) == N_unseen:
-                    lp_m_u = _combine_plain_and_twin_lp(lp_u, None, w_comp_p, w_comp_c)
-                    auditor.add_model(opt_disp_name, weight=0.0, unseen_log_probs=lp_m_u, test_log_probs=np.zeros((N_test, K), dtype=np.float32))
-
-            if "heads_sd" in locals():
-                del heads_sd
-            if "Z_tr" in locals():
-                del Z_tr
-            if "Z_te" in locals():
-                del Z_te
-            if "Z_unseen" in locals():
-                del Z_unseen
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
         # ==============================================================================
-        # TRUNK 8: BGE-M3 (Dense 1024-dim Bidirectional CLS Encoder)
+        # TRUNK 8: BGE-M3 (v2 8-Layer Drop-<s> Mean-Pool + Ridge, or v1 CLS fallback)
         # ==============================================================================
         if "bge_m3" in ckpts:
             bge_dir = ckpts["bge_m3"]
             print(f"[Pipeline] Loading Trunk 8: BGE-M3 from {bge_dir}...")
             try:
-                import torch.nn.functional as F
                 from transformers import AutoTokenizer, AutoModel
+                raw_meta_bge = json.loads((bge_dir / "meta.json").read_text(encoding="utf-8")) if (bge_dir / "meta.json").exists() else {}
+                heads_sd = load_head_file(bge_dir) if ((bge_dir / "heads.safetensors").exists() or (bge_dir / "heads.pt").exists()) else {}
                 bge_tok = AutoTokenizer.from_pretrained(str(bge_dir))
-                bge_model = AutoModel.from_pretrained(
-                    str(bge_dir),
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                )
+                bge_model = AutoModel.from_pretrained(str(bge_dir), torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
                 bge_dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                 bge_model = bge_model.to(bge_dev)
                 bge_model.eval()
 
-                def _extract_bge_dense(texts: list[str], bsize: int = 16) -> np.ndarray:
-                    embs = []
-                    with torch.no_grad():
-                        for i in range(0, len(texts), bsize):
-                            batch = texts[i : i + bsize]
-                            enc = bge_tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(bge_dev)
-                            out = bge_model(**enc)
-                            cls_repr = out.last_hidden_state[:, 0]
-                            cls_norm = F.normalize(cls_repr, p=2, dim=-1)
-                            embs.append(cls_norm.cpu().float().numpy())
-                    return np.vstack(embs) if embs else np.zeros((0, 1024), dtype=np.float32)
+                Z_bge_te, is_bge_v2 = _extract_bge_features(bge_model, bge_tok, bge_dev, test_texts, heads_sd, raw_meta_bge) if (run_submission and N_test > 0) else (np.zeros((0, 1024), dtype=np.float32), False)
+                Z_bge_u, is_bge_v2_u = _extract_bge_features(bge_model, bge_tok, bge_dev, unseen_texts, heads_sd, raw_meta_bge) if (run_benchmark and N_unseen > 0) else (np.zeros((0, 1024), dtype=np.float32), is_bge_v2)
+                is_bge_v2 = is_bge_v2 or is_bge_v2_u
+                Z_bge_tr, _ = _extract_bge_features(bge_model, bge_tok, bge_dev, train_sub_texts, heads_sd, raw_meta_bge) if (extract_train_wpca and N_tr_sub > 0) else (np.zeros((0, Z_bge_u.shape[1] if len(Z_bge_u) > 0 else 1024), dtype=np.float32), is_bge_v2)
 
-                Z_bge_te = _extract_bge_dense(test_texts) if (run_submission and N_test > 0) else np.zeros((0, 1024), dtype=np.float32)
-                Z_bge_u = _extract_bge_dense(unseen_texts) if (run_benchmark and N_unseen > 0) else np.zeros((0, 1024), dtype=np.float32)
-                Z_bge_tr = _extract_bge_dense(train_sub_texts) if (extract_train_wpca and N_tr_sub > 0) else np.zeros((0, 1024), dtype=np.float32)
-
-                if N_unseen > 0 and len(Z_bge_u) == N_unseen:
-                    features_unseen_dict["bge_m3"] = Z_bge_u.astype(np.float16)
-
-                # Free BGE model from GPU immediately
                 del bge_model, bge_tok
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                # Check if trained classification head exists for BGE-M3
-                heads_sd = load_head_file(bge_dir) if ((bge_dir / "heads.safetensors").exists() or (bge_dir / "heads.pt").exists()) else {}
                 W_p, b_p, W_c, b_c = resolve_head_tensors(heads_sd) if heads_sd else (None, None, None, None)
-
-                w_tot_bge = get_model_weight("bge_m3", default=0.16)
-                twin_ratio_bge = get_model_twin_ratio("bge_m3", default=0.25)
-                w_bge_p = w_tot_bge * (1.0 - twin_ratio_bge)
-                w_bge_c = w_tot_bge * twin_ratio_bge
-
-                pr_sc = prior_scales.get("bge_m3", 0.60)
-                update_hybrid_groups(Z_bge_te, pr_sc, Z_bge_u if N_unseen > 0 else None)
-
-                lp_p_bge = None
-                lp_c_blend = np.zeros((N_test, K), dtype=np.float32)
-                if run_submission and len(Z_bge_te) > 0:
-                    if W_p is not None:
-                        lp_p_bge = log_softmax(align_cols(Z_bge_te @ W_p.T + b_p, LABELS))
-                    if W_c is not None and tracker_test is not None:
-                        lp_c_blend = compute_multires_centered_blend(Z_bge_te, tracker_test.groups, W_c, b_c, LABELS, weights=(w85, w72, w60))
-
-                apply_wpca_and_spectral(
-                    model_key="bge_m3",
-                    Z_te_mat=Z_bge_te,
-                    Z_tr_mat=Z_bge_tr,
-                    Z_u_mat=Z_bge_u if N_unseen > 0 else None,
-                    dp_w=dp_weights.get("bge_m3", 0.10),
-                    prior_scale=pr_sc,
-                    d_target=256,
-                    se_floor=se_floors.get("bge_m3", 0.20)
-                )
-
+                bge_labels = raw_meta_bge.get("labels", list(LABELS)) if isinstance(raw_meta_bge, dict) else list(LABELS)
                 if W_p is not None:
-                    lp_m_te = _combine_plain_and_twin_lp(lp_p_bge, lp_c_blend if W_c is not None else None, w_bge_p, w_bge_c) if (run_submission and lp_p_bge is not None and len(lp_p_bge) == N_test) else np.zeros((0, K), dtype=np.float32)
-                    lp_m_u = np.zeros((0, K), dtype=np.float32)
-                    if run_benchmark and N_unseen > 0 and len(Z_bge_u) == N_unseen:
-                        lp_u_bge = log_softmax(align_cols(Z_bge_u @ W_p.T + b_p, LABELS))
-                        lp_u_c_bge = compute_multires_centered_blend(Z_bge_u, tracker_unseen.groups, W_c, b_c, LABELS, weights=(w85, w72, w60)) if (W_c is not None and tracker_unseen is not None) else None
-                        lp_m_u = _combine_plain_and_twin_lp(lp_u_bge, lp_u_c_bge, w_bge_p, w_bge_c)
-                    auditor.add_model("BGE-M3", weight=w_tot_bge, unseen_log_probs=lp_m_u, test_log_probs=lp_m_te)
+                    _register_checkpoint_outputs(
+                        model_key="bge_m3",
+                        disp_name="BGE-M3-v2" if is_bge_v2 else "BGE-M3",
+                        Z_te=Z_bge_te, Z_u=Z_bge_u, Z_tr=Z_bge_tr,
+                        W_p=W_p, b_p=b_p, W_c=W_c, b_c=b_c,
+                        ckpt_labels=bge_labels,
+                        w_tot=get_model_weight("bge_m3", default=0.23),
+                        dp_key="bge_m3", dp_default=0.10, prior_default=0.60, se_default=0.20,
+                        auto_align=False,
+                    )
                 else:
-                    print(f"[Pipeline] BGE-M3 classification head not found; embeddings utilized for hybrid distance graph and spectral bank.")
-
-                del Z_bge_tr, Z_bge_te, Z_bge_u
+                    print("[Pipeline] BGE-M3 classification head not found; embeddings utilized for distance graph.")
+                    update_hybrid_groups(Z_bge_te, prior_scales.get("bge_m3", 0.60), Z_bge_u if N_unseen > 0 else None)
+                del Z_bge_tr, Z_bge_te, Z_bge_u, heads_sd
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -1900,19 +1342,26 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             test_log_probs=lp_sb_te,
         )
 
-    # 4. MODULE 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration
-    print("[Pipeline] Module 4: Flat Per-Model Log-Space Ensemble & Dynamic Unseen Calibration...")
-    lock_prior = cfg.get("lock_prior_weights", False)
+    # 4. MODULE 4: Calibrated L-BFGS Log-Linear Ensemble & Postprocessing
+    print("[Pipeline] Module 4: Calibrated L-BFGS Log-Linear Ensemble...")
+    lock_prior = bool(cfg.get("lock_prior_weights", False))
     optimize_on_unseen = (N_unseen >= 36 and not is_smoke and not lock_prior)
+    post_cfg_eff = dict(post_cfg)
     if len(auditor.models) > 0:
         P_mix, active_weights_map, df_ablation = auditor.optimize_weights_and_blend(
             working_dir=working_dir,
             optimize_on_unseen=optimize_on_unseen,
             lock_prior_weights=lock_prior,
+            calibration_cfg=cfg,
+            claude_spec_logits_u=claude_spec_logits_u if "claude_spec_logits_u" in locals() else None,
+            claude_classes=claude_classes if "claude_classes" in locals() else None,
         )
         norm_map = getattr(auditor, "normalized_weights_map", active_weights_map)
         shares_str = ", ".join([f"'{k}': {w*100.0:.1f}%" for k, w in norm_map.items() if w > 0.0])
-        print(f"[Pipeline] Single-truth greedy ensemble active weights (shares): {{{shares_str}}}")
+        print(f"[Pipeline] Calibrated ensemble active weights: {{{shares_str}}}")
+        fitted_art = getattr(auditor, "fitted_artifact", None)
+        if optimize_on_unseen and isinstance(fitted_art, dict) and claude_spec_logits_u is not None and "mean_gw" in fitted_art:
+            post_cfg_eff["claude_specialist_weight"] = float(fitted_art["mean_gw"])
         R_main = P_mix
         P_mix_u = getattr(auditor, "P_mix_unseen", np.zeros((0, K), dtype=np.float64)) if run_benchmark else np.zeros((0, K), dtype=np.float64)
     else:
@@ -1929,7 +1378,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         P_final = run_full_inference_pipeline(
             P_mix=P_mix,
             texts=test_texts,
-            post_cfg=post_cfg,
+            post_cfg=post_cfg_eff,
             R_main=R_main,
             claude_spec_logits=claude_spec_logits if "claude_spec_logits" in locals() else None,
             claude_classes=claude_classes if "claude_classes" in locals() else None,
@@ -1948,7 +1397,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         P_final_u = run_full_inference_pipeline(
             P_mix=P_mix_u,
             texts=unseen_texts,
-            post_cfg=post_cfg,
+            post_cfg=post_cfg_eff,
             R_main=P_mix_u,
             claude_spec_logits=claude_spec_logits_u if "claude_spec_logits_u" in locals() else None,
             claude_classes=claude_classes if "claude_classes" in locals() else None,
@@ -1963,7 +1412,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         post_unseen_bacc = float(balanced_accuracy_score(y_unseen, P_final_u.argmax(axis=1)))
         lift_post = post_unseen_bacc - raw_unseen_bacc
         print("=" * 70)
-        print(f"[Pipeline Benchmark Validation] 100% Symmetrical Pipeline Parity Evaluation:")
+        print("[Pipeline Benchmark Validation] Symmetrical Pipeline Parity Evaluation:")
         print(f"  - Pre-Postprocessing Ensemble Raw BAcc : {raw_unseen_bacc:.4f} ({raw_unseen_bacc*100:.2f}%)")
         print(f"  - Full Postprocessed Benchmark BAcc     : {post_unseen_bacc:.4f} ({post_unseen_bacc*100:.2f}%)")
         print(f"  - Downstream Postprocessing Lift       : {lift_post:+.4f} ({lift_post*100:+.2f}%)")
@@ -1999,7 +1448,7 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         )
         print(f"[Pipeline Benchmark] Exported clean benchmark predictions: {bench_pred_file} ({bench_pred_file.stat().st_size} bytes)")
 
-    # Auditing and forward stepwise ablation report
+    # Auditing and report generation
     test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
     auditor.print_and_save_report(working_dir, final_test_preds=test_final_preds)
 
@@ -2011,30 +1460,18 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
         print(f"{'Ensemble Configuration':<30} | {'Models Used':<12} | {'Raw BAcc':<10} | {'+Sinkhorn':<10} | {'Full Post-Processed'}")
         print("-" * 95)
         raw_full = float(balanced_accuracy_score(y_unseen, P_mix_u.argmax(axis=1))) if len(P_mix_u) > 0 else 0.0
-        sink_full = _fast_sinkhorn_bacc(np.log(np.clip(P_mix_u, 1e-9, 1.0)), y_unseen, iters=200) if len(P_mix_u) >= 18 else raw_full
+        sink_alpha = float(post_cfg_eff.get("sinkhorn_alpha", 0.50))
+        sink_full = float(balanced_accuracy_score(y_unseen, damped_sinkhorn(P_mix_u, alpha=sink_alpha).argmax(axis=1))) if len(P_mix_u) >= 18 else raw_full
         post_full = float(balanced_accuracy_score(y_unseen, P_final_u.argmax(axis=1))) if len(P_final_u) > 0 else 0.0
-        print(f"{'Full Production Ensemble':<30} | {len(auditor.models):>2d} / {len(auditor.models):<7d} | {raw_full:<10.4f} | {sink_full:<10.4f} | {post_full:<10.4f} (+{(post_full - raw_full)*100:+.2f}%)")
-
-        greedy_test_lp, greedy_u_lp, greedy_names = auditor.get_greedy_ensemble()
-        if len(greedy_names) > 0 and len(greedy_u_lp) == len(y_unseen):
-            raw_greedy = float(balanced_accuracy_score(y_unseen, greedy_u_lp.argmax(axis=1)))
-            sink_greedy = _fast_sinkhorn_bacc(greedy_u_lp, y_unseen, iters=200)
-            P_greedy_mix_u = softmax(greedy_u_lp, axis=1)
-            P_greedy_final_u = run_full_inference_pipeline(
-                P_mix=P_greedy_mix_u,
-                texts=unseen_texts,
-                post_cfg=post_cfg,
-                R_main=P_greedy_mix_u,
-                claude_spec_logits=claude_spec_logits_u if "claude_spec_logits_u" in locals() else None,
-                claude_classes=claude_classes if "claude_classes" in locals() else None,
-                log_p_handwriting=log_p_handwriting_unseen if "log_p_handwriting_unseen" in locals() else None,
-                rule_flags=rule_flags_unseen if "rule_flags_unseen" in locals() else None,
-                train_texts=train_ref_texts,
-                y_train=train_ref_y,
-                train_prior=train_prior,
+        n_active = sum(1 for m in auditor.models if m.get("weight", 0.0) > 0.0)
+        print(f"{'Calibrated Ensemble':<30} | {n_active:>2d} / {len(auditor.models):<7d} | {raw_full:<10.4f} | {sink_full:<10.4f} | {post_full:<10.4f} (+{(post_full - raw_full)*100:+.2f}%)")
+        fitted_art = getattr(auditor, "fitted_artifact", None)
+        if isinstance(fitted_art, dict) and "oof_bacc_raw" in fitted_art:
+            print(
+                f"{'5-Fold OOF L-BFGS':<30} | {len(fitted_art['model_names']):>2d} / {len(auditor.models):<7d} | "
+                f"{fitted_art['oof_bacc_raw']:<10.4f} | {fitted_art['oof_bacc_sink']:<10.4f} | "
+                f"{fitted_art['oof_bacc_nested_claude']:<10.4f} (NLL={fitted_art['oof_nll_raw']:.4f})"
             )
-            post_greedy = float(balanced_accuracy_score(y_unseen, P_greedy_final_u.argmax(axis=1)))
-            print(f"{'Greedy Optimal Subset':<30} | {len(greedy_names):>2d} / {len(auditor.models):<7d} | {raw_greedy:<10.4f} | {sink_greedy:<10.4f} | {post_greedy:<10.4f} (+{(post_greedy - raw_greedy)*100:+.2f}%)")
         print("=" * 95 + "\n")
 
     # Generate Submission Artifacts
@@ -2089,6 +1526,12 @@ def run_submission_pipeline(cfg: Optional[Dict[str, Any]] = None) -> Tuple[pd.Da
             cache_dict["claude_spec_logits_u"] = claude_spec_logits_u.astype(np.float32)
         if "claude_classes" in locals() and claude_classes is not None:
             cache_dict["claude_classes"] = np.array(claude_classes, dtype=object)
+        if "fitted_art" in locals() and isinstance(fitted_art, dict):
+            cache_dict["cal_model_names"] = np.array(fitted_art.get("model_names", []), dtype=object)
+            cache_dict["cal_T_m"] = np.asarray(fitted_art.get("mean_T_m", []), dtype=np.float64)
+            cache_dict["cal_w_m"] = np.asarray(fitted_art.get("mean_w_m", []), dtype=np.float64)
+            cache_dict["cal_T_global"] = np.array([float(fitted_art.get("mean_T_global", 1.0))], dtype=np.float64)
+            cache_dict["cal_gw"] = np.array([float(fitted_art.get("mean_gw", 0.0))], dtype=np.float64)
         cache_dict["num_extra"] = np.array([0], dtype=np.int32)
 
         cache_file_path = working_dir / "local_eval_cache.npz"

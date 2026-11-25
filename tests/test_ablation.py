@@ -723,3 +723,73 @@ def test_build_unseen_holdout_dataset_prompt_grouped_sampling(tmp_path: Path):
     assert "prompt_id" in df_unseen.columns
 
 
+def test_calibrated_branch_a_alias_resolution_and_parity(tmp_path: Path):
+    """Verify Branch A applies pre-calibrated temperatures/weights seamlessly across display and canonical names."""
+    rng = np.random.default_rng(7)
+    N = 18
+    y = np.arange(K, dtype=int)
+    lp_a = rng.normal(0.0, 1.0, size=(N, K))
+    lp_b = rng.normal(0.0, 1.0, size=(N, K))
+    lp_a[np.arange(N), y] += 3.0
+    lp_b[np.arange(N), y] += 2.0
+
+    auditor = UnseenStepwiseAuditor(y_unseen=y, groups_unseen=np.arange(N), N_test=N)
+    auditor.add_model("bge_m3", "Neural", 0.5, lp_a, lp_a)
+    auditor.add_model("svc_4view", "Statistical", 0.5, lp_b, lp_b)
+
+    cal_cfg = {
+        "clip_min": 1e-4,
+        "mean_T_m": {"BGE-M3-v2": 1.2, "LinearSVC (4-View)": 0.8},
+        "mean_w_m": {"BGE-M3-v2": 0.7, "LinearSVC (4-View)": 0.3},
+        "mean_T_global": 1.1,
+    }
+    P_mix, w_map, _ = auditor.optimize_weights_and_blend(
+        working_dir=tmp_path,
+        optimize_on_unseen=False,
+        lock_prior_weights=True,
+        calibration_cfg=cal_cfg,
+    )
+    assert np.isclose(w_map["bge_m3"], 0.7, atol=1e-6)
+    assert np.isclose(w_map["svc_4view"], 0.3, atol=1e-6)
+    assert np.allclose(P_mix.sum(axis=1), 1.0, atol=1e-6)
+
+
+def test_auto_prune_and_fit_lbfgs_dynamic_selection(tmp_path: Path):
+    """Verify Branch B / auto_prune_and_fit_lbfgs prunes chance-level poison models and returns calibrated simplex weights."""
+    from namethatllm.ablation import auto_prune_and_fit_lbfgs
+
+    rng = np.random.default_rng(11)
+    N = 90
+    y = np.tile(np.arange(K), 5)
+    groups = np.repeat(np.arange(15), 6)
+
+    sig_1 = rng.normal(0.0, 0.5, size=(N, K))
+    sig_1[np.arange(N), y] += 3.5
+    sig_2 = rng.normal(0.0, 0.5, size=(N, K))
+    sig_2[np.arange(N), y] += 3.0
+    noise = rng.normal(0.0, 2.5, size=(N, K))
+
+    fit_res, dropped = auto_prune_and_fit_lbfgs(
+        raw_lps_list=[sig_1, sig_2, noise],
+        y=y,
+        groups=groups,
+        model_names=["Strong-1", "Strong-2", "Chance-Noise"],
+        lambdas=(0.10, 0.20),
+    )
+    assert len(fit_res["model_names"]) >= 2
+    assert np.isclose(sum(fit_res["mean_w_m"].values()), 1.0, atol=1e-6)
+
+    auditor = UnseenStepwiseAuditor(y_unseen=y, groups_unseen=groups, N_test=N)
+    auditor.add_model("Strong-1", "Neural", 0.4, sig_1, sig_1)
+    auditor.add_model("Strong-2", "Neural", 0.4, sig_2, sig_2)
+    auditor.add_model("Chance-Noise", "Neural", 0.2, noise, noise)
+    P_mix, w_map, _ = auditor.optimize_weights_and_blend(
+        working_dir=tmp_path,
+        optimize_on_unseen=True,
+        lock_prior_weights=False,
+    )
+    assert w_map["Chance-Noise"] == 0.0
+    assert np.isclose(sum(w_map.values()), 1.0, atol=1e-6)
+    assert P_mix.shape == (N, K)
+
+

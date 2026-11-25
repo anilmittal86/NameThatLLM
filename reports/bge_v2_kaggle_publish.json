@@ -1,0 +1,45 @@
+{
+  "metrics": {
+    "bench_neural_bacc": 0.49166666666666664,
+    "bench_plain_ridge_bacc": 0.4972222222222223,
+    "bench_plain_blend_bacc": 0.5066666666666666,
+    "bench_plain_blend_nll": 1.6048082113265991,
+    "bench_plain_blend_gem4": 0.5475,
+    "bench_plain_blend_gem_ret": 0.97,
+    "bench_plain_blend_sister_37_38": 0.5700000000000001,
+    "plain_blend_w_neural": 0.35,
+    "plain_ridge_alpha": 0.25,
+    "gold_oof5_plain_bacc": 0.5133830474770072,
+    "gold_oof5_centered_bacc": 0.5737583892617448,
+    "centered_ridge_alpha": 1.0
+  },
+  "files_summary": [
+    {
+      "name": "dataset-metadata.json",
+      "bytes": 5211
+    },
+    {
+      "name": "heads.safetensors",
+      "bytes": 1246888
+    },
+    {
+      "name": "meta.json",
+      "bytes": 1821
+    },
+    {
+      "name": "README.md",
+      "bytes": 4803
+    },
+    {
+      "name": "training_report.json",
+      "bytes": 9573
+    }
+  ],
+  "kaggle": {
+    "new_slug": "anilmittal/ntl-bge-m3-v2-multilayer-lora",
+    "ready": true,
+    "deleted_old_slug": "anilmittal/ntl-inhouse-bge-m3-lora",
+    "files_csv": "name,size,creationDate\nREADME.md,4736,2026-11-25 10:56:03.262000\nconfig.json,744,2026-11-25 10:56:03.262000\nheads.safetensors,1246888,2026-11-25 10:56:03.314000\nmeta.json,1744,2026-11-25 10:56:03.269000\nmodel.safetensors,1135554344,2026-11-25 10:56:17.654000\ntokenizer.json,17098085,2026-11-25 10:56:03.429000\ntokenizer_config.json,409,2026-11-25 10:56:03.255000\ntraining_report.json,8980,2026-11-25 10:56:03.283000\nwPCA_bank.npz,9868575,2026-11-25 10:56:03.417000\n",
+    "mine_csv": "ref,title,size,lastUpdated,downloadCount,voteCount,usabilityRating\nanilmittal/ntl-deberta-frozen-gemini-features,NTL DeBERTa Frozen Gemini Features (37k),1194435355,2026-11-16 08:56:53.960000,291,0,0.4117647\nanilmittal/ntl-inhouse-two-stage-lora24,NTL Qwen3-14B Two-Stage Champion Backbone,385936227,2026-11-12 10:15:42.833000,0,0,0.625\nanilmittal/ntl-clean-master-pool,NTL Clean Master Pool 267k,111741624,2026-11-17 11:15:40.530000,0,0,0.23529412\nanilmittal/ntl-clean-benchmark-1800,NTL Clean Benchmark 1800,888823,2026-11-13 02:31:56.523000,0,0,0.23529412\nanilmittal/ntl-statistical-heads,NTL Statistical Heads,337037665,2026-11-18 13:05:58.090000,0,0,0.25\nanilmittal/ntl-deberta-gemini-specialist,NTL DeBERTa Gemini Specialist & Gate,54125220,2026-11-17 06:15:12.333000,0,0,0.47058824\nanilmittal/ntl-qwen14b-gemini-specialist,NTL Qwen3-14B Gemini Specialist Gate,40496720,2026-11-17 06:13:17.713000,0,0,0.5\nanilmittal/ntl-pool-120k,NTL Clean Pool 120k,50352261,2026-11-11 03:44:48.583000,0,0,0.23529412\nanilmittal/ntl-bge-m3-v2-multilayer-lora,NTL BGE-M3 v2 Multi-Layer LoRA,0,2026-11-25 10:56:01.173000,0,0,0.625\n"
+  }
+}

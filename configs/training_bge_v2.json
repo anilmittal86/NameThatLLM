@@ -1,0 +1,67 @@
+{
+  "version": "bge_m3_v2_stage1_targeted",
+  "backbone": "BAAI/bge-m3",
+  "precision": "bf16",
+  "max_len": 512,
+  "hidden_size": 1024,
+  "architecture": {
+    "tap_layers": [5, 6, 8, 10, 11, 15, 17, 20],
+    "pooling": "mean_drop_cls",
+    "drop_first_token": true,
+    "per_layer_layernorm": true,
+    "feature_dim": 8192,
+    "msd_dropouts": [0.1, 0.2, 0.3, 0.4, 0.5]
+  },
+  "lora": {
+    "r": 32,
+    "alpha": 64,
+    "dropout": 0.05,
+    "target_modules": ["query", "key", "value", "dense"],
+    "layers_to_transform": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+    "layers_pattern": "layer",
+    "lora_plus_ratio": 2.0
+  },
+  "loss": {
+    "family_margin": 0.35,
+    "label_smoothing": 0.05,
+    "boost_hard_sisters": true,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "match_weight_clip": [0.5, 2.5]
+  },
+  "stage1": {
+    "epochs": 1,
+    "batch_size": 48,
+    "max_tokens_per_forward": 8192,
+    "eval_every_samples": 25000,
+    "lr_lora": 1.2e-4,
+    "lr_head": 6.0e-4,
+    "warmup_ratio": 0.05,
+    "min_lr_ratio": 0.1,
+    "seed": 42,
+    "class_quotas": {
+      "gpt-5.5": 11500,
+      "gpt-5.6-luna": 10500,
+      "gpt-5.6-sol": 16000,
+      "gpt-5.6-terra": 18679,
+      "gpt-6-astra": 11500,
+      "gemini-3.1-pro-preview": 10500,
+      "gemini-3.6-flash": 11000,
+      "gemini-3.7-flash": 14000,
+      "gemini-3.8-flash": 18000,
+      "claude-opus-4-6": 11500,
+      "claude-opus-4-8": 10500,
+      "claude-opus-5": 11500,
+      "claude-sonnet-5": 11500,
+      "claude-fable-5": 18000,
+      "qwen3.8-max": 14000,
+      "glm-5.3": 18000,
+      "glm-5.3-flash": 17000,
+      "kimi-k3": 20000
+    }
+  },
+  "output": {
+    "checkpoint_dir": "/checkpoints/export_bge_m3_v2",
+    "ridge_probe_samples": 36000
+  }
+}

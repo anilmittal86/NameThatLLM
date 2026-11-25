@@ -53,7 +53,7 @@ class TestCompilerAndIntegration(unittest.TestCase):
         pkg_dir = self.repo_root / "src" / "namethatllm"
         src_defs = set()
         for py_file in pkg_dir.glob("*.py"):
-            if py_file.name in ("__init__.py", "trainer.py", "bge_trainer.py", "layer_probing.py", "experiment_logger.py"):
+            if py_file.name in ("__init__.py", "trainer.py", "layer_probing.py", "experiment_logger.py"):
                 continue
             tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=py_file.name)
             for node in tree.body:
@@ -647,18 +647,32 @@ class TestCompilerAndIntegration(unittest.TestCase):
         ms = data.get("model_sources", [])
 
         expected_datasets = [
-            "alexchilton/ntl-ts-gemma2-9b",
-            "alexchilton/ntl-ts-llama31-8b",
-            "alexchilton/ntl-ts-mistral7b",
-            "masterstar/bge-m3",
+            "anilmittal/ntl-statistical-heads",
+            "anilmittal/ntl-clean-benchmark-1800",
+            "willrice/name-that-llm-openrouter-harvest",
+            "zbigniewkirchner/ntl-qwen3-8b-lora-claude-head",
+            "nishantdahal/ntl-handwriting-blend",
+            "dhruvtibarewal/nlm-l24-adapters-v5",
+            "dhruvtibarewal/nlm-matched-clean",
+            "anilmittal/ntl-inhouse-two-stage-lora24",
+            "anilmittal/ntl-bge-m3-v2-multilayer-lora",
         ]
         for ed in expected_datasets:
             self.assertIn(ed, ds, f"Missing required dataset {ed} in kernel-metadata.json")
 
+        for legacy_ds in (
+            "masterstar/bge-m3",
+            "alexchilton/ntl-ts-gemma2-9b",
+            "alexchilton/ntl-ts-llama31-8b",
+            "alexchilton/ntl-ts-mistral7b",
+            "nishantdahal/ntl-two-stage-lora",
+            "kirilltym/ntl-spectral-style-heads-paired-4404",
+        ):
+            self.assertNotIn(legacy_ds, ds, f"Legacy unused dataset {legacy_ds} still in kernel-metadata.json")
+
         expected_models = [
-            "google/gemma-2/Transformers/gemma-2-9b/2",
-            "alexchilton/llama-3-1-8b-base/Transformers/default/1",
-            "alexchilton/mistral-7b-v0-3-base/Transformers/default/1",
+            "qwen-lm/qwen-3/Transformers/8b-base/1",
+            "qwen-lm/qwen-3/Transformers/14b-base/1",
         ]
         for em in expected_models:
             self.assertIn(em, ms, f"Missing required model {em} in kernel-metadata.json")

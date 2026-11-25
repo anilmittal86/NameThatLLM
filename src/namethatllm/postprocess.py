@@ -491,6 +491,30 @@ def apply_curly_quote_shield(P_mix: np.ndarray, test_texts: list[str], multiplie
 # =============================================================================
 
 
+def damped_sinkhorn(P: np.ndarray, alpha: float = 0.50, iters: int = 100, eps_val: float = 1e-12) -> np.ndarray:
+    """
+    Damped Sinkhorn-Knopp column marginal projection onto a smoothed target prior:
+        c_target = (1 - alpha) * mean(P, axis=0) + alpha * (1 / K)
+    Guarantees strict row normalization (row sums == 1.0) while preventing uniform collapse
+    when test class priors diverge from uniform.
+    """
+    if len(P) < 2:
+        return P
+    P_eps = np.clip(P.astype(np.float64), eps_val, 1.0)
+    n_rows, n_cols = P_eps.shape
+    p_bar = P_eps.mean(axis=0)
+    c_target = (1.0 - float(alpha)) * p_bar + float(alpha) * (1.0 / n_cols)
+    c_target = c_target / max(float(c_target.sum()), eps_val)
+    r = np.ones(n_rows, dtype=np.float64)
+    c = n_rows * c_target
+    u = np.ones(n_rows, dtype=np.float64)
+    for _ in range(int(iters)):
+        v = c / np.maximum(np.dot(P_eps.T, u), eps_val)
+        u = r / np.maximum(np.dot(P_eps, v), eps_val)
+    S = u[:, None] * P_eps * v[None, :]
+    return S / np.maximum(S.sum(axis=1, keepdims=True), eps_val)
+
+
 def sinkhorn_balancing(
     P: np.ndarray,
     iters: int = 100,
@@ -806,13 +830,13 @@ def run_full_inference_pipeline(
             gate_weight=gate_weight,
         )
 
-    # 2. Unified Handwriting & Orthographic Shield
+    # 2. Unified Handwriting & Orthographic Shield (defaults to 0.0 uncalibrated extra penalties)
     default_curly_multiplier = float(np.exp(-1.0))
     multiplier = float(post_cfg.get("curly_quote_multiplier", default_curly_multiplier))
-    multi_em_dash_log_pen = float(post_cfg.get("multi_em_dash_log_penalty", -0.45))
-    straight_contr_log_pen = float(post_cfg.get("straight_contr_log_penalty", -0.60))
-    curly_contr_log_pen = float(post_cfg.get("curly_contr_log_penalty", -0.40))
-    continuous_hw_weight = float(post_cfg.get("continuous_hw_weight", 0.04))
+    multi_em_dash_log_pen = float(post_cfg.get("multi_em_dash_log_penalty", 0.0))
+    straight_contr_log_pen = float(post_cfg.get("straight_contr_log_penalty", 0.0))
+    curly_contr_log_pen = float(post_cfg.get("curly_contr_log_penalty", 0.0))
+    continuous_hw_weight = float(post_cfg.get("continuous_hw_weight", 0.0))
 
     P_curr = apply_unified_handwriting_shield(
         P_mix=P_curr,
@@ -826,18 +850,22 @@ def run_full_inference_pipeline(
         continuous_hw_weight=continuous_hw_weight,
     )
 
-    # 3. Sinkhorn Mass Balancing
+    # 3. Sinkhorn Mass Balancing (canonical damped_sinkhorn default when sinkhorn_alpha configured)
     sinkhorn_iters = int(post_cfg.get("sinkhorn_iterations", 100))
-    sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
-    sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
-
-    P_curr = sinkhorn_balancing(
-        P_curr,
-        iters=sinkhorn_iters,
-        sinkhorn_strength=sinkhorn_strength,
-        target_mix=sinkhorn_target_mix,
-        train_prior=train_prior,
-    )
+    sinkhorn_mode = str(post_cfg.get("sinkhorn_mode", "damped" if "sinkhorn_alpha" in post_cfg else "soft")).lower()
+    if sinkhorn_mode == "damped":
+        sinkhorn_alpha = float(post_cfg.get("sinkhorn_alpha", 0.50))
+        P_curr = damped_sinkhorn(P_curr, alpha=sinkhorn_alpha, iters=sinkhorn_iters)
+    else:
+        sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
+        sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
+        P_curr = sinkhorn_balancing(
+            P_curr,
+            iters=sinkhorn_iters,
+            sinkhorn_strength=sinkhorn_strength,
+            target_mix=sinkhorn_target_mix,
+            train_prior=train_prior,
+        )
 
     # 4. TypoBayes 37-Marker Postprocessing
     if post_cfg.get("enable_typobayes", True) and train_texts and y_train is not None and len(train_texts) > 0:

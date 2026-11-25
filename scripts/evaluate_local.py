@@ -55,7 +55,7 @@ WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKSPACE_DIR / "src"))
 
 
-from namethatllm.ablation import UnseenStepwiseAuditor, _ablation_sinkhorn
+from namethatllm.ablation import UnseenStepwiseAuditor
 from namethatllm.config import FAMILIES, LAB2I, LABELS, K
 from namethatllm.lexical_engine import run_lexical_engine
 
@@ -72,6 +72,9 @@ CANONICAL_NAME_MAP: dict[str, str] = {
     "Qwen3-8B In-House": "qwen3_8b_inhouse",
     "qwen3_8b_v5": "qwen3_8b_v5",
     "qwen3_14b_v5": "qwen3_14b_v5",
+    "qwen3_14b_ts": "qwen3_14b_ts",
+    "BGE-M3": "bge_m3",
+    "BGE-M3-v2": "bge_m3",
     "wpca_dp": "wpca_dp",
     "spectral_bank": "spectral_bank",
 }
@@ -80,7 +83,8 @@ CANONICAL_NAME_MAP: dict[str, str] = {
 from namethatllm.postprocess import (
     apply_claude_specialist_gate,
     apply_unified_handwriting_shield,
-    sinkhorn_balancing,
+    damped_sinkhorn,
+    run_full_inference_pipeline,
 )
 try:
     from namethatllm.postprocess import apply_typobayes_postprocess
@@ -302,11 +306,11 @@ def evaluate_prompt_split(
 
             bacc_shield = float(balanced_accuracy_score(y_val, preds_shield))
 
-            # Stage 5: + 300-Step Sinkhorn Balancing
+            # Stage 5: + Damped Sinkhorn Balancing
 
-            sink_iters = post_cfg.get("sinkhorn_iterations", 300)
+            sink_iters = int(post_cfg.get("sinkhorn_iterations", 100))
 
-            p_final = sinkhorn_balancing(p_shield.copy(), iters=sink_iters)
+            p_final = damped_sinkhorn(p_shield.copy(), alpha=float(post_cfg.get("sinkhorn_alpha", 0.50)), iters=sink_iters)
 
             preds_final = p_final.argmax(axis=1)
 
@@ -400,14 +404,14 @@ def generate_synthetic_cache(
     # 10 Simulated models with realistic accuracies and characteristics
 
     models_spec = [
-        ("Qwen3-14B Part-2", "Main", 0.50, 0.88, 3.2),
-        ("Qwen2.5-14B Part-2", "Main", 0.35, 0.78, 2.4),
-        ("DeBERTa-v3-Large", "Main", 0.30, 0.74, 2.2),
-        ("Qwen3-8B Claude Head", "Comp", 0.16, 0.70, 2.0),
-        ("Qwen3-8B In-Style", "Comp", 0.20, 0.68, 1.9),
-        ("Qwen3-14B In-House", "Comp", 0.45, 0.76, 2.3),
-        ("LinearSVC (4-View)", "Main", 0.85, 0.65, 1.7),
-        ("Lexical Comp (5-View)", "Comp", 0.15, 0.60, 1.5),
+        ("BGE-M3-v2", "Main", 0.23, 0.85, 3.0),
+        ("Qwen3-14B In-House", "Main", 0.18, 0.82, 2.8),
+        ("qwen3_8b_v5", "Main", 0.17, 0.80, 2.7),
+        ("qwen3_14b_ts", "Main", 0.17, 0.80, 2.6),
+        ("Qwen3-14B Part-2", "Main", 0.17, 0.84, 2.9),
+        ("LinearSVC (4-View)", "Main", 0.08, 0.65, 1.7),
+        ("DeBERTa-v3-Large", "Comp", 0.10, 0.72, 2.0),
+        ("Lexical Comp (5-View)", "Comp", 0.10, 0.60, 1.5),
         ("Poison-Adversarial", "Comp", 0.20, 0.05, -3.0),
     ]
 
@@ -637,7 +641,8 @@ def print_npz_ablation_diagnostics(
                 cum_lp += w_i * lp_i
 
         P = softmax(cum_lp, axis=1)
-        P_s = _ablation_sinkhorn(P, iters=100, y_true=y_unseen)
+        sink_alpha = float(post_cfg.get("sinkhorn_alpha", 0.50)) if post_cfg else 0.50
+        P_s = damped_sinkhorn(P, alpha=sink_alpha, iters=100)
         bacc = float(balanced_accuracy_score(y_unseen, P_s.argmax(axis=1)))
 
         nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(y_unseen)), y_unseen], 1e-9, 1.0))))
@@ -718,8 +723,7 @@ def print_per_class_accuracy_table(
     if len(y_true) < 18 or len(models) == 0:
         return pd.DataFrame()
 
-    # Reorder models to canonical order: svc_4view, lexical_5v, qwen3_14b_p2, qwen3_14b_inhouse, deberta_p2, qwen3_14b_v5
-    canonical_order = ["svc_4view", "lexical_5v", "qwen3_14b_p2", "qwen3_14b_inhouse", "deberta_p2", "qwen3_14b_v5"]
+    canonical_order = ["bge_m3", "qwen3_14b_inhouse", "qwen3_8b_v5", "qwen3_14b_ts", "qwen3_14b_p2", "svc_4view"]
 
     def model_sort_key(m):
         n = m["name"]
@@ -731,69 +735,62 @@ def print_per_class_accuracy_table(
     clean_models = [m for m in models if "v5" not in m["name"].lower() and float(active_weights_map.get(m["name"], m["weight"])) > 0]
     prod_models = [m for m in models if float(active_weights_map.get(m["name"], m["weight"])) > 0]
 
-    def _apply_full_postprocessing(base_lp: np.ndarray) -> np.ndarray:
-        P = softmax(base_lp, axis=1)
+    def _apply_full_postprocessing(base_lp: np.ndarray, is_probs: bool = False) -> np.ndarray:
+        P = base_lp if is_probs else softmax(base_lp, axis=1)
+        unseen_texts = list(data["unseen_texts"]) if (data is not None and "unseen_texts" in data) else [""] * len(P)
         if data is not None:
-            if "claude_spec_logits_unseen" in data:
-                claude_spec_u = data["claude_spec_logits_unseen"]
-                claude_classes = list(data["claude_classes"]) if "claude_classes" in data else None
-                P = apply_claude_specialist_gate(
-                    P_mix=P,
-                    R_main=P,
-                    claude_spec_logits=claude_spec_u,
-                    claude_classes=claude_classes,
-                    labels=LABELS,
-                    claude_cols=FAMILIES["claude"],
-                    gate_weight=post_cfg.get("claude_specialist_weight", 0.15) if post_cfg else 0.15,
-                )
-            for fam_k, weight_default in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
-                spec_key = f"{fam_k}_spec_logits_unseen"
-                if spec_key in data:
-                    P = apply_family_specialist_lora_gate(
-                        P_mix=P,
-                        R_main=P,
-                        spec_logits=data[spec_key],
-                        spec_classes=list(data[f"{fam_k}_classes"]) if f"{fam_k}_classes" in data else None,
-                        labels=LABELS,
-                        family_cols=FAMILIES[fam_k],
-                        gate_weight=float(post_cfg.get(f"{fam_k}_specialist_weight", weight_default)) if post_cfg else weight_default,
-                    )
-            if "unseen_texts" in data:
-                unseen_texts = list(data["unseen_texts"])
-                P = apply_unified_handwriting_shield(
-                    P_mix=P,
-                    test_texts=unseen_texts,
-                    log_p_handwriting=None,
-                    rule_flags=None,
-                    curly_quote_multiplier=post_cfg.get("curly_quote_multiplier", float(np.exp(-1.0))) if post_cfg else float(np.exp(-1.0)),
-                )
-            if "groups_unseen" in data and len(data["groups_unseen"]) == len(P) and apply_cluster_uniqueness_repulsion is not None:
-                P = apply_cluster_uniqueness_repulsion(
-                    P_mix=P,
-                    groups=data["groups_unseen"],
-                    strength=post_cfg.get("cluster_repulsion_strength", 0.35) if post_cfg else 0.35,
-                    iters=3,
-                )
-        return _ablation_sinkhorn(P, iters=60, y_true=y_true)
+            claude_spec_u = (
+                data["claude_spec_logits_unseen"]
+                if "claude_spec_logits_unseen" in data
+                else data.get("claude_spec_logits_u")
+            )
+            claude_classes_u = list(data["claude_classes"]) if "claude_classes" in data else None
+        else:
+            claude_spec_u = None
+            claude_classes_u = None
+        eff_post = dict(post_cfg) if post_cfg else {}
+        eff_post["enable_typobayes"] = False
+        eff_post.setdefault("sinkhorn_mode", "damped")
+        eff_post.setdefault("sinkhorn_alpha", 0.50)
+        return run_full_inference_pipeline(
+            P_mix=P,
+            texts=unseen_texts,
+            post_cfg=eff_post,
+            R_main=P,
+            claude_spec_logits=claude_spec_u,
+            claude_classes=claude_classes_u,
+        )
 
-    # Helper function for Sinkhorn balanced accuracy
+    # Helper function for Sinkhorn balanced accuracy (reuses fitted calibration if available)
+    fitted_art = getattr(auditor, "fitted_artifact", None)
+    has_cal = isinstance(fitted_art, dict) and "mean_T_m" in fitted_art and "mean_T_global" in fitted_art
+
+    def _blend_subset_probs(subset_models: list[dict[str, Any]], extra_lp: np.ndarray) -> np.ndarray:
+        if has_cal and len(subset_models) > 0 and all(sm["name"] in fitted_art["mean_T_m"] for sm in subset_models):
+            from namethatllm.ablation import pool_calibrated_log_probs
+
+            sub_names = [sm["name"] for sm in subset_models]
+            raw_ws = np.array([max(0.0, float(active_weights_map.get(sm["name"], sm["weight"]))) for sm in subset_models], dtype=np.float64)
+            w_sum = max(float(raw_ws.sum()), 1e-12)
+            sub_w = {n: float(raw_ws[idx] / w_sum) for idx, n in enumerate(sub_names)}
+            return pool_calibrated_log_probs(
+                [sm["unseen_lp"] for sm in subset_models],
+                sub_names,
+                fitted_art["mean_T_m"],
+                sub_w,
+                float(fitted_art["mean_T_global"]),
+                clip_min=float(fitted_art.get("clip_min", 1e-4)),
+            )
+        raw_lp = extra_lp.copy()
+        for sm in subset_models:
+            raw_lp += float(active_weights_map.get(sm["name"], sm["weight"])) * sm["unseen_lp"]
+        return softmax(raw_lp, axis=1)
+
     def calc_sinkhorn_bacc(lp: np.ndarray) -> float:
         P_s = _apply_full_postprocessing(lp)
         preds = P_s.argmax(axis=1)
         recs = [(preds[y_true == c] == c).mean() for c in range(K) if (y_true == c).sum() > 0]
         return float(np.mean(recs)) if len(recs) > 0 else 0.0
-
-    # Clean Ensemble predictions (5 models)
-    clean_lp = np.zeros((len(y_true), K), dtype=np.float64)
-    for m in clean_models:
-        w = float(active_weights_map.get(m["name"], m["weight"]))
-        clean_lp += w * m["unseen_lp"]
-
-    # Production Ensemble predictions (all active models including qwen3_14b_v5 with its full weight)
-    prod_lp = np.zeros((len(y_true), K), dtype=np.float64)
-    for m in prod_models:
-        w = float(active_weights_map.get(m["name"], m["weight"]))
-        prod_lp += w * m["unseen_lp"]
 
     extra_unseen_lp = np.zeros((len(y_true), K), dtype=np.float64)
     if data is not None:
@@ -807,20 +804,24 @@ def print_per_class_accuracy_table(
                     ex_u_lp = np.asarray(data[f"extra_{ex_idx}_unseen_lp"], dtype=np.float64)
                     extra_unseen_lp += ex_w * ex_u_lp
 
-    prod_lp += extra_unseen_lp
-    clean_lp += extra_unseen_lp
-
-    P_clean = _apply_full_postprocessing(clean_lp)
+    P_clean_base = _blend_subset_probs(clean_models, extra_unseen_lp)
+    P_clean = _apply_full_postprocessing(P_clean_base, is_probs=True)
     clean_preds = P_clean.argmax(axis=1)
 
-    P_prod = _apply_full_postprocessing(prod_lp)
+    P_prod_base = (
+        auditor.P_mix_unseen.copy()
+        if getattr(auditor, "P_mix_unseen", None) is not None and len(auditor.P_mix_unseen) == len(y_true)
+        else _blend_subset_probs(prod_models, extra_unseen_lp)
+    )
+    P_prod = _apply_full_postprocessing(P_prod_base, is_probs=True)
     prod_preds = P_prod.argmax(axis=1)
     full_prod_bacc = float(np.mean([(prod_preds[y_true == c] == c).mean() for c in range(K)]))
 
-    # Per-model predictions after 60-step Sinkhorn
+    # Per-model predictions after damped Sinkhorn
+    sink_alpha = float(post_cfg.get("sinkhorn_alpha", 0.50)) if post_cfg else 0.50
     model_preds: dict[str, np.ndarray] = {}
     for m in models:
-        P_m = _ablation_sinkhorn(softmax(m["unseen_lp"], axis=1), iters=60, y_true=y_true)
+        P_m = damped_sinkhorn(softmax(m["unseen_lp"], axis=1), alpha=sink_alpha, iters=100)
         model_preds[m["name"]] = P_m.argmax(axis=1)
 
     # 1. Vote Share: weight * std(LP)
@@ -836,11 +837,9 @@ def print_per_class_accuracy_table(
     loo_drops = {}
     for i, m in enumerate(models):
         sub_models = [sm for sm in models if sm["name"] != m["name"]]
-        sub_lp = extra_unseen_lp.copy()
-        for sm in sub_models:
-            w_sm = float(active_weights_map.get(sm["name"], sm["weight"]))
-            sub_lp += w_sm * sm["unseen_lp"]
-        sub_bacc = calc_sinkhorn_bacc(sub_lp)
+        P_sub = _apply_full_postprocessing(_blend_subset_probs(sub_models, extra_unseen_lp), is_probs=True)
+        preds_sub = P_sub.argmax(axis=1)
+        sub_bacc = float(np.mean([(preds_sub[y_true == c] == c).mean() for c in range(K) if (y_true == c).sum() > 0]))
         loo_drops[m["name"]] = (full_prod_bacc - sub_bacc) * 100
 
     # 3. Shapley Value Attribution (Accuracy Lift across all 2^M coalitions)
@@ -853,10 +852,10 @@ def print_per_class_accuracy_table(
                 if len(subset) == 0:
                     v_coalition[subset] = 1.0 / float(K)
                 else:
-                    c_lp = extra_unseen_lp.copy()
-                    for idx in subset:
-                        c_lp += float(active_weights_map.get(models[idx]["name"], models[idx]["weight"])) * models[idx]["unseen_lp"]
-                    v_coalition[subset] = calc_sinkhorn_bacc(c_lp)
+                    sub_ms = [models[idx] for idx in subset]
+                    P_coal = _apply_full_postprocessing(_blend_subset_probs(sub_ms, extra_unseen_lp), is_probs=True)
+                    preds_coal = P_coal.argmax(axis=1)
+                    v_coalition[subset] = float(np.mean([(preds_coal[y_true == c] == c).mean() for c in range(K) if (y_true == c).sum() > 0]))
 
         for i in range(M):
             sh = 0.0
@@ -1054,7 +1053,7 @@ def print_stepwise_greedy_table(data: dict[str, Any]) -> None:
 
     def fast_sinkhorn_bacc(lp: np.ndarray) -> float:
         P = softmax(lp, axis=1)
-        P_s = _ablation_sinkhorn(P, iters=60, y_true=y)
+        P_s = damped_sinkhorn(P, alpha=0.50, iters=60)
         return float(balanced_accuracy_score(y, P_s.argmax(axis=1)))
 
     weight_grid = [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00]
@@ -1328,13 +1327,18 @@ def evaluate_from_cache(
 
         optimize_on_unseen = N_unseen >= 36
 
-        # 1. Caruana Greedy Stepwise Selection with Smooth NLL Tie-Breaking
+        claude_spec_u = data["claude_spec_logits_u"] if "claude_spec_logits_u" in data else None
+        claude_classes = list(data["claude_classes"]) if "claude_classes" in data else None
 
+        # 1. Calibrated 5-Fold GroupKFold L-BFGS Pooling / Locked Artifact Mode
         P_mix, active_weights_map, df_ablation = auditor.optimize_weights_and_blend(
             working_dir=report_dir,
             extra_test_log_probs=extra_streams,
             optimize_on_unseen=optimize_on_unseen,
             lock_prior_weights=lock_priors,
+            calibration_cfg=cfg,
+            claude_spec_logits_u=claude_spec_u,
+            claude_classes=claude_classes,
         )
 
         for raw_name in model_names:
@@ -1353,122 +1357,48 @@ def evaluate_from_cache(
             if raw_ex_name not in active_weights_map:
                 active_weights_map[raw_ex_name] = 0.0
 
+        # 2. Unified Postprocessing (Claude Gate + Curly Shield + Damped Sinkhorn)
+        post_cfg_eff = dict(post_cfg)
+        post_cfg_eff.setdefault("enable_typobayes", False)
+        post_cfg_eff.setdefault("sinkhorn_mode", "damped")
+        post_cfg_eff.setdefault("sinkhorn_alpha", 0.50)
+        fitted_art = getattr(auditor, "fitted_artifact", None)
+        if optimize_on_unseen and isinstance(fitted_art, dict) and "mean_gw" in fitted_art:
+            post_cfg_eff["claude_specialist_weight"] = float(fitted_art["mean_gw"])
+
         R_main = P_mix.copy()
-
-        # 2. Claude Specialist Gate
-
-        gate_weight = post_cfg.get("claude_specialist_weight", 0.15)
-
         claude_spec = data["claude_spec_logits"] if "claude_spec_logits" in data else None
-
-        claude_classes = list(data["claude_classes"]) if "claude_classes" in data else None
-
-        if claude_spec is not None:
-            P_mix = apply_claude_specialist_gate(
-                P_mix=P_mix,
-                R_main=R_main,
-                claude_spec_logits=claude_spec,
-                claude_classes=claude_classes,
-                labels=LABELS,
-                claude_cols=FAMILIES["claude"],
-                gate_weight=gate_weight,
-            )
-
-        # 2a. Family-Specialist LoRA Gates (GPT, Gemini, GLM)
-        for fam_k, weight_default in [("gpt", 0.55), ("gemini", 0.65), ("glm", 0.70)]:
-            spec_key = f"{fam_k}_spec_logits"
-            if spec_key in data:
-                P_mix = apply_family_specialist_lora_gate(
-                    P_mix=P_mix,
-                    R_main=R_main,
-                    spec_logits=data[spec_key],
-                    spec_classes=list(data[f"{fam_k}_classes"]) if f"{fam_k}_classes" in data else None,
-                    labels=LABELS,
-                    family_cols=FAMILIES[fam_k],
-                    gate_weight=float(post_cfg.get(f"{fam_k}_specialist_weight", weight_default)),
-                )
-
-        # 3. Unified Handwriting & Orthographic Shield
-
         test_texts = list(data["test_texts"]) if "test_texts" in data else [""] * N_test
-
         rule_flags = data["rule_flags_test"] if "rule_flags_test" in data else None
-
         log_p_hw = data["log_p_handwriting"] if "log_p_handwriting" in data else None
 
-        multiplier = post_cfg.get("curly_quote_multiplier", float(np.exp(-1.0)))
+        train_texts_list: list[str] = []
+        y_train_arr = np.array([], dtype=int)
+        if post_cfg_eff.get("enable_typobayes", False):
+            train_texts_list = list(data["train_texts"]) if "train_texts" in data else []
+            y_train_arr = data["y_train"].astype(int) if "y_train" in data else np.array([], dtype=int)
+            default_train_csv = WORKSPACE_DIR / "local_data" / "train.csv"
+            if len(train_texts_list) == 0 and default_train_csv.exists():
+                try:
+                    df_tr_local = pd.read_csv(default_train_csv)
+                    if "text" in df_tr_local.columns and "model" in df_tr_local.columns:
+                        train_texts_list = df_tr_local["text"].fillna("").astype(str).tolist()
+                        y_train_arr = np.array([LAB2I[m] for m in df_tr_local["model"].values if m in LAB2I], dtype=int)
+                except Exception:
+                    pass
 
-        P_mix = apply_unified_handwriting_shield(
+        P_final = run_full_inference_pipeline(
             P_mix=P_mix,
-            test_texts=test_texts,
+            texts=test_texts,
+            post_cfg=post_cfg_eff,
+            R_main=R_main,
+            claude_spec_logits=claude_spec,
+            claude_classes=claude_classes,
             log_p_handwriting=log_p_hw,
             rule_flags=rule_flags,
-            curly_quote_multiplier=multiplier,
-            multi_em_dash_log_penalty=post_cfg.get("multi_em_dash_log_penalty", 0.0),
-            straight_contr_log_penalty=post_cfg.get("straight_contr_log_penalty", 0.0),
-            curly_contr_log_penalty=post_cfg.get("curly_contr_log_penalty", 0.0),
-            continuous_hw_weight=post_cfg.get("continuous_hw_weight", 0.0),
+            train_texts=train_texts_list,
+            y_train=y_train_arr if len(y_train_arr) == len(train_texts_list) else y_unseen,
         )
-
-        # 3b. Cavity Cluster Uniqueness Repulsion
-
-        groups_065 = data.get("groups_065", data.get("groups_085", None))
-
-        if groups_065 is not None and apply_cluster_uniqueness_repulsion is not None:
-            P_mix = apply_cluster_uniqueness_repulsion(
-                P_mix=P_mix,
-                groups=groups_065,
-                strength=post_cfg.get("cluster_repulsion_strength", 0.35),
-                iters=3,
-            )
-
-        # Load train_texts and y_train if available in data or fallback to local_data/train.csv
-
-        train_texts_list = list(data["train_texts"]) if "train_texts" in data else []
-
-        y_train_arr = data["y_train"].astype(int) if "y_train" in data else np.array([], dtype=int)
-
-        default_train_csv = WORKSPACE_DIR / "local_data" / "train.csv"
-
-        if len(train_texts_list) == 0 and default_train_csv.exists():
-            try:
-                df_tr_local = pd.read_csv(default_train_csv)
-
-                if "text" in df_tr_local.columns and "model" in df_tr_local.columns:
-                    train_texts_list = df_tr_local["text"].fillna("").astype(str).tolist()
-
-                    y_train_arr = np.array([LAB2I[m] for m in df_tr_local["model"].values if m in LAB2I], dtype=int)
-
-            except Exception:
-                pass
-
-        # 4. Sinkhorn Mass Balancing (with soft prior-shrunk balancing option)
-        sinkhorn_iters = post_cfg.get("sinkhorn_iterations", 100)
-        sinkhorn_strength = float(post_cfg.get("sinkhorn_strength", 0.65))
-        sinkhorn_target_mix = float(post_cfg.get("sinkhorn_target_mix", 0.35))
-        if len(y_train_arr) > 0:
-            train_prior = np.bincount(y_train_arr, minlength=18).astype(np.float64) + 1.0
-        elif len(y_unseen) > 0:
-            train_prior = np.bincount(y_unseen, minlength=18).astype(np.float64) + 1.0
-        else:
-            train_prior = None
-
-        P_final = sinkhorn_balancing(
-            P_mix, iters=sinkhorn_iters, sinkhorn_strength=sinkhorn_strength, target_mix=sinkhorn_target_mix, train_prior=train_prior
-        )
-
-        # 5. TypoBayes 37-Marker Hierarchical Beta-Bernoulli Postprocessing
-        if post_cfg.get("enable_typobayes", True) and "test_texts" in data and len(train_texts_list) > 0:
-            P_final = apply_typobayes_postprocess(
-                P_final,
-                train_texts=train_texts_list,
-                y_train=y_train_arr if len(y_train_arr) == len(train_texts_list) else y_unseen,
-                test_texts=test_texts,
-                labels=LABELS,
-                kappa=float(post_cfg.get("typobayes_kappa", 24.0)),
-                evidence_scale=float(post_cfg.get("typobayes_evidence_scale", 1.2)),
-                evidence_cap=float(post_cfg.get("typobayes_evidence_cap", 0.30)),
-            )
 
         test_final_preds = P_final.argmax(axis=1) if len(P_final) > 0 else np.array([])
 
@@ -2299,13 +2229,89 @@ Attribution performance across varying prompt grouping densities:
     }
 
 
+def calibrate_ensemble_from_cache(
+    cache_path: Path,
+    bge_preds_path: Path | None = None,
+    config_path: Path = Path("configs/production_ensemble.json"),
+    lam: float = 0.20,
+    clip_min: float = 1e-4,
+    sinkhorn_alpha: float = 0.50,
+    auto_prune: bool = False,
+    lock_config: bool = False,
+) -> dict[str, Any]:
+    """Run 5-fold GroupKFold L-BFGS pooling (with optional BGE-M3 v2 stream & config locking)."""
+    from sklearn.metrics import balanced_accuracy_score
+    from namethatllm.ablation import auto_prune_and_fit_lbfgs, fit_lbfgs_log_linear_pooling, pool_calibrated_log_probs
+
+    with np.load(cache_path, allow_pickle=True) as cache:
+        y_unseen = cache["y_unseen"].astype(int)
+        all_names = [str(x) for x in cache["model_names"]]
+        groups = cache["groups_072_u"] if "groups_072_u" in cache else cache["groups_unseen"]
+        spec_logits = cache["claude_spec_logits_u"] if "claude_spec_logits_u" in cache else None
+        claude_classes = [str(x) for x in cache["claude_classes"]] if "claude_classes" in cache else None
+        unseen_texts = [str(x) for x in cache["unseen_texts"]] if "unseen_texts" in cache else None
+        lp_by_name = {name: cache[f"m_{i}_unseen_lp"].astype(np.float64) for i, name in enumerate(all_names)}
+
+    if bge_preds_path is not None and bge_preds_path.exists():
+        with np.load(bge_preds_path, allow_pickle=True) as z:
+            if "y_bench" in z and not np.array_equal(y_unseen, z["y_bench"]):
+                raise ValueError("Benchmark label mismatch between cache and BGE-M3 v2 predictions.")
+            ln = z["bench_neural_logits"].astype(np.float64)
+            lr = z["bench_ridge_logits"].astype(np.float64)
+        lp_by_name["BGE-M3-v2"] = 0.35 * ln + 0.65 * (lr - lr.mean()) * (ln.std() / max(float(lr.std()), 1e-12))
+
+    if auto_prune:
+        cands = [n for n in lp_by_name if n != "Qwen3-8B Claude Head"]
+        fit_res, dropped = auto_prune_and_fit_lbfgs(
+            [lp_by_name[n] for n in cands], y_unseen, groups, cands,
+            spec_logits=spec_logits, claude_classes=claude_classes, clip_min=clip_min, sinkhorn_alpha=sinkhorn_alpha,
+        )
+        print(f"[Calibrate] Auto-pruned {len(dropped)} models: {dropped}")
+    else:
+        cfg_cur = load_config(config_path)
+        active = [n for n in cfg_cur.get("model_names", list(lp_by_name)) if n in lp_by_name]
+        fit_res = fit_lbfgs_log_linear_pooling(
+            [lp_by_name[n] for n in active], y_unseen, groups, active,
+            spec_logits=spec_logits, claude_classes=claude_classes, lam=lam, clip_min=clip_min, sinkhorn_alpha=sinkhorn_alpha,
+        )
+
+    m_names = fit_res["model_names"]
+    P_cal = pool_calibrated_log_probs(
+        [lp_by_name[n] for n in m_names], m_names, fit_res["mean_T_m"], fit_res["mean_w_m"], fit_res["mean_T_global"], clip_min=clip_min
+    )
+    gw = round(float(fit_res["mean_gw"]), 4)
+    if spec_logits is not None and gw > 0.0:
+        P_cal = apply_claude_specialist_gate(P_mix=P_cal, R_main=P_cal, claude_spec_logits=spec_logits, claude_classes=claude_classes, gate_weight=gw)
+    if unseen_texts is not None and len(unseen_texts) == len(P_cal):
+        P_cal = apply_unified_handwriting_shield(P_mix=P_cal, test_texts=unseen_texts, curly_quote_multiplier=float(np.exp(-1.0)))
+    b_full = float(balanced_accuracy_score(y_unseen, damped_sinkhorn(P_cal, alpha=sinkhorn_alpha).argmax(axis=1)))
+    print(f"[Calibrate] M={len(m_names)} OOF Raw={fit_res['oof_bacc_raw']:.4f} (NLL={fit_res['oof_nll_raw']:.4f}) | +Curly+Claude+Sink={b_full:.4f} | gw={gw:.4f}")
+
+    if lock_config and config_path.exists():
+        prod_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        prod_cfg.update({
+            "models": {CANONICAL_NAME_MAP.get(n, n): float(fit_res["mean_w_m"][n]) for n in m_names},
+            "model_names": list(m_names),
+            "mean_T_m": {n: float(fit_res["mean_T_m"][n]) for n in m_names},
+            "mean_w_m": {n: float(fit_res["mean_w_m"][n]) for n in m_names},
+            "mean_T_global": float(fit_res["mean_T_global"]),
+            "mean_gw": gw,
+            "clip_min": float(clip_min),
+            "lambda_reg": float(fit_res["lam"]),
+        })
+        prod_cfg.setdefault("postprocess", {})["claude_specialist_weight"] = gw
+        config_path.write_text(json.dumps(prod_cfg, indent=2) + "\n", encoding="utf-8")
+        print(f"[Calibrate] Updated {config_path}")
+    return fit_res
+
+
 def main():
     parser = argparse.ArgumentParser(description="NameThatLLM - Fail-Fast Local Evaluation & Ablation Harness")
     parser.add_argument(
         "--mode",
-        choices=["split", "cache", "simulate", "stepwise", "matrix", "benchmark"],
+        choices=["split", "cache", "simulate", "stepwise", "matrix", "benchmark", "calibrate"],
         default="split",
-        help="Evaluation mode: 'split' (prompt-grouped holdout), 'cache' (replay local_eval_cache.npz), 'simulate' (synthetic cache), 'stepwise' (zero-leakage stepwise analysis), 'matrix' (full factorial ablation matrix), or 'benchmark' (1,800-sample unleaked benchmark).",
+        help="Evaluation mode: 'split', 'cache', 'simulate', 'stepwise', 'matrix', 'benchmark', or 'calibrate'.",
     )
 
     parser.add_argument(
@@ -2351,6 +2357,10 @@ def main():
         default="C:/Users/anil/.gemini/antigravity/brain/3fc37c66-8b30-4f1c-9198-eabf6c04d89f",
         help="Path to agent brain artifact directory for publishing reports.",
     )
+    parser.add_argument("--bge-preds", type=str, default="reports/bge_v2_stage1_preds.npz", help="Optional BGE-M3 v2 stage-1 predictions npz for --mode calibrate.")
+    parser.add_argument("--lam", type=float, default=0.20, help="L2 simplex pooling regularization for --mode calibrate.")
+    parser.add_argument("--auto-prune", action="store_true", help="Run automated OOF backward pruning in --mode calibrate.")
+    parser.add_argument("--lock-config", action="store_true", help="Write calibrated pooling parameters to --config in --mode calibrate.")
 
     args = parser.parse_args()
 
@@ -2412,6 +2422,15 @@ def main():
             parquet_path=Path(args.benchmark_parquet),
             preds_path=Path(args.benchmark_preds),
             artifact_dir=Path(args.artifact_dir) if args.artifact_dir else None,
+        )
+    elif args.mode == "calibrate":
+        calibrate_ensemble_from_cache(
+            cache_path=Path(args.cache_file),
+            bge_preds_path=Path(args.bge_preds) if args.bge_preds else None,
+            config_path=Path(args.config) if args.config else Path("configs/production_ensemble.json"),
+            lam=args.lam,
+            auto_prune=args.auto_prune,
+            lock_config=args.lock_config,
         )
 
 

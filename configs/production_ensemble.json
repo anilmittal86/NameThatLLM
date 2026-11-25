@@ -1,7 +1,7 @@
 {
-  "version": "2.1.0",
+  "version": "2.2.0",
   "name": "production_ensemble",
-  "description": "Unified 6-Model L2-Regularized Simplex Log-Linear Production Ensemble with Nested Claude Specialist Gate & Damped Sinkhorn Balancing",
+  "description": "6-Model L2-Regularized Simplex Log-Linear Ensemble (BGE-M3 v2 + Qwen3-14B In-House/TS/Part-2 + Qwen3-8B v5 + LinearSVC) with Nested Claude Specialist Gate, Curly-Quote Shield, and Damped Sinkhorn",
   "run_benchmark": true,
   "run_submission": false,
   "lock_prior_weights": false,
@@ -54,71 +54,61 @@
     ]
   },
   "checkpoints": [
-    "qwen3_14b_ts",
-    "qwen3_14b_v5",
-    "qwen3_14b_p2",
-    "qwen3_14b_p1",
     "qwen3_14b_inhouse",
-    "qwen25_14b_p2",
-    "qwen25_14b_inhouse",
-    "deberta_p2",
-    "deberta_inhouse",
+    "qwen3_14b_p2",
+    "qwen3_14b_ts",
     "qwen3_8b_v5",
     "qwen3_8b_claude",
-    "gemma2_9b_ts",
-    "llama31_8b_ts",
-    "llama3_8b_v5",
-    "mistral_7b_ts",
     "bge_m3"
   ],
   "models": {
-    "svc_4view": 0.12374343741936364,
-    "qwen3_14b_p2": 0.19640348395823065,
-    "qwen3_14b_inhouse": 0.2074718332662997,
-    "qwen3_14b_ts": 0.19610219156073835,
-    "qwen3_8b_v5": 0.21251481639297637,
-    "deberta_p2": 0.06376423740239132
+    "bge_m3": 0.23194213492092192,
+    "qwen3_14b_inhouse": 0.1774279626725343,
+    "qwen3_8b_v5": 0.17286574370122226,
+    "qwen3_14b_ts": 0.17232213139241154,
+    "qwen3_14b_p2": 0.16549165965093515,
+    "svc_4view": 0.07995036766197458
   },
   "postprocess": {
-    "claude_specialist_weight": 0.068,
+    "claude_specialist_weight": 0.16,
     "curly_quote_multiplier": 0.36787944117144233,
-    "sinkhorn_iterations": 100,
+    "multi_em_dash_log_penalty": 0.0,
+    "straight_contr_log_penalty": 0.0,
+    "curly_contr_log_penalty": 0.0,
+    "continuous_hw_weight": 0.0,
+    "sinkhorn_mode": "damped",
     "sinkhorn_alpha": 0.5,
-    "sinkhorn_strength": 0.5,
-    "sinkhorn_target_mix": 0.5,
-    "enable_typobayes": true,
-    "typobayes_kappa": 24.0,
-    "typobayes_evidence_scale": 1.2,
-    "typobayes_evidence_cap": 0.3,
+    "sinkhorn_iterations": 100,
+    "enable_typobayes": false,
     "max_cluster_size": 14
   },
   "model_names": [
-    "LinearSVC (4-View)",
-    "Qwen3-14B Part-2",
+    "BGE-M3-v2",
     "qwen3_14b_inhouse",
-    "qwen3_14b_ts",
     "qwen3_8b_v5",
-    "DeBERTa-v3-Large"
+    "qwen3_14b_ts",
+    "Qwen3-14B Part-2",
+    "LinearSVC (4-View)"
   ],
   "clip_min": 0.0001,
   "mean_T_m": {
-    "LinearSVC (4-View)": 0.24948368928479123,
-    "Qwen3-14B Part-2": 1.5805728241372603,
-    "qwen3_14b_inhouse": 0.693269691428654,
-    "qwen3_14b_ts": 2.370627201088438,
-    "qwen3_8b_v5": 1.4794251572915302,
-    "DeBERTa-v3-Large": 1.9495653587065107
+    "BGE-M3-v2": 1.2746615838285924,
+    "qwen3_14b_inhouse": 0.6932696897607727,
+    "qwen3_8b_v5": 1.4794251523109438,
+    "qwen3_14b_ts": 2.370627186943864,
+    "Qwen3-14B Part-2": 1.5805728135076544,
+    "LinearSVC (4-View)": 0.2494836885990151
   },
   "mean_w_m": {
-    "LinearSVC (4-View)": 0.12374343741936364,
-    "Qwen3-14B Part-2": 0.19640348395823065,
-    "qwen3_14b_inhouse": 0.2074718332662997,
-    "qwen3_14b_ts": 0.19610219156073835,
-    "qwen3_8b_v5": 0.21251481639297637,
-    "DeBERTa-v3-Large": 0.06376423740239132
+    "BGE-M3-v2": 0.23194213492092192,
+    "qwen3_14b_inhouse": 0.1774279626725343,
+    "qwen3_8b_v5": 0.17286574370122226,
+    "qwen3_14b_ts": 0.17232213139241154,
+    "Qwen3-14B Part-2": 0.16549165965093515,
+    "LinearSVC (4-View)": 0.07995036766197458
   },
-  "mean_T_global": 0.8352501866668017,
-  "mean_gw": 0.068,
+  "mean_T_global": 0.7995393300638752,
+  "mean_gw": 0.16,
   "claude_classes": [
     "claude-fable-5",
     "claude-opus-4-6",
@@ -127,6 +117,13 @@
     "claude-sonnet-5"
   ],
   "sinkhorn_alpha": 0.5,
-  "lambda_reg": 0.1,
-  "label_smoothing_eps": 0.05
+  "lambda_reg": 0.2,
+  "label_smoothing_eps": 0.05,
+  "oof_metrics": {
+    "raw_bacc": 0.5972222222222221,
+    "raw_nll": 1.1229524512509108,
+    "damped_sinkhorn_bacc": 0.5994444444444444,
+    "nested_claude_sinkhorn_bacc": 0.5988888888888889,
+    "curly_shield_sinkhorn_bacc": 0.6000000000000001
+  }
 }

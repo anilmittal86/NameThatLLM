@@ -1451,7 +1451,7 @@ if modal is not None:
 
     @app.function(
         gpu="A10G",
-        timeout=7200,  # 2 hours execution budget
+        timeout=14400,
         image=bge_image,
         volumes={
             "/checkpoints": checkpoints_volume,
@@ -1459,37 +1459,54 @@ if modal is not None:
         },
     )
     def train_bge_cloud_worker(
-        config_path: str = "configs/training_bge.json",
+        config_path: str = "configs/training_bge_v2.json",
         max_samples: int | None = None,
     ) -> dict[str, Any]:
-        """Ephemeral Two-Stage LoRA fine-tuning for BGE-M3 (560M) on an NVIDIA A10G."""
-        from namethatllm.bge_trainer import run_bge_training_pipeline
+        """Thin Modal cloud wrapper executing unified encoder Stage-1 LoRA training in trainer.py."""
+        import os
 
-        p_cfg = Path(config_path)
-        if not p_cfg.exists():
-            p_cfg = Path("/root") / config_path
-        if not p_cfg.exists():
-            p_cfg = repo_root / config_path
-        with open(p_cfg, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        from namethatllm.trainer import run_encoder_stage1
 
+        p_cfg = next((p for p in (Path(config_path), Path("/root") / config_path, repo_root / config_path) if p.exists()), None)
+        if p_cfg is None:
+            raise FileNotFoundError(f"Training config not found: {config_path}")
+        cfg = json.loads(p_cfg.read_text(encoding="utf-8"))
         if max_samples is not None:
             cfg.setdefault("stage1", {})["max_samples"] = max_samples
 
-        out_p = Path("/checkpoints/export_bge_m3_lora")
-        out_p.mkdir(parents=True, exist_ok=True)
-        cfg["output_dir"] = str(out_p)
-
-        datasets_dir = Path("/datasets")
-        print(f"[Modal BGE Worker] Starting BGE-M3 training with datasets in {datasets_dir}...")
-        meta = run_bge_training_pipeline(
+        res = run_encoder_stage1(
             config=cfg,
-            datasets_dir=datasets_dir,
-            output_dir=out_p,
+            datasets_dir=Path("/datasets"),
+            on_checkpoint_saved=checkpoints_volume.commit,
         )
         checkpoints_volume.commit()
-        print(f"[Modal BGE Worker] Checkpoints committed successfully to {out_p}!")
-        return meta
+        return res
+
+    @app.function(
+        gpu="A10G",
+        timeout=1200,
+        image=bge_image,
+        volumes={
+            "/checkpoints": checkpoints_volume,
+            "/datasets": datasets_volume,
+        },
+    )
+    def package_bge_cloud_worker(config_path: str = "configs/training_bge_v2.json") -> dict[str, Any]:
+        """Thin Modal cloud wrapper packaging merged FP16 encoder + Ridge heads in trainer.py."""
+        from namethatllm.trainer import package_encoder_ridge_checkpoint
+
+        p_cfg = next((p for p in (Path(config_path), Path("/root") / config_path, repo_root / config_path) if p.exists()), None)
+        if p_cfg is None:
+            raise FileNotFoundError(f"Config not found: {config_path}")
+        cfg = json.loads(p_cfg.read_text(encoding="utf-8"))
+        res = package_encoder_ridge_checkpoint(
+            cfg=cfg,
+            datasets_dir=Path("/datasets"),
+            on_checkpoint_saved=checkpoints_volume.commit,
+        )
+        checkpoints_volume.commit()
+        return res
 
     @app.function(
         gpu="A10G",
@@ -1501,253 +1518,93 @@ if modal is not None:
         },
     )
     def eval_bge_cloud_worker(
-        checkpoint_dir: str = "/checkpoints/export_bge_m3_lora",
+        checkpoint_dir: str = "/checkpoints/export_bge_m3_v2/final",
         eval_path: str = "/datasets/clean_benchmark_1800_rows.parquet",
     ) -> dict[str, Any]:
-        """Runs fast inference on the clean 1,800-sample benchmark using BGE-M3 LoRA + Dual Heads on an A10G GPU."""
-        import json
-        import torch
-        import torch.nn.functional as F
+        """Thin Modal cloud wrapper evaluating multi-layer encoder checkpoints via trainer.py."""
         import numpy as np
         import pandas as pd
-        from pathlib import Path
-        from torch.utils.data import DataLoader
-        from transformers import AutoTokenizer, AutoModel
-        from peft import PeftModel
+        import torch
         from safetensors.torch import load_file
-        from sklearn.metrics import balanced_accuracy_score, confusion_matrix, classification_report
-        from namethatllm.config import LABELS, LAB2I, FAMILIES
-        from namethatllm.bge_trainer import BGEClassifier, NTLDataset, make_collate_fn
+        from transformers import AutoModel, AutoTokenizer
+        from namethatllm.config import K, LAB2I, LABELS, FAMILIES
+        from namethatllm.postprocess import damped_sinkhorn
+        from namethatllm.trainer import MultiLayerLoRAClassifier, compute_detailed_metrics, extract_features_and_logits
 
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        print(f"[Modal BGE Eval] Running on device: {device}")
-
         ckpt = Path(checkpoint_dir)
-        meta_p = ckpt / "training_meta.json"
-        if meta_p.exists():
-            with open(meta_p, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        else:
-            meta = {}
+        meta = json.loads((ckpt / "meta.json").read_text(encoding="utf-8")) if (ckpt / "meta.json").exists() else {}
+        cfg_m = meta.get("cfg", {})
+        tap_layers = [int(x) for x in cfg_m.get("layers", [5, 6, 8, 10, 11, 15, 17, 20])]
+        max_len = int(cfg_m.get("max_len", 512))
+        backbone_src = str(ckpt) if (ckpt / "config.json").exists() else str(meta.get("backbone", "BAAI/bge-m3"))
 
-        backbone_name = meta.get("backbone", "BAAI/bge-m3")
-        max_len = int(meta.get("config", {}).get("max_len", 512))
-        hidden_size = int(meta.get("hidden_size", 1024))
-        num_classes = int(meta.get("num_classes", 18))
+        tok = AutoTokenizer.from_pretrained(backbone_src)
+        base = AutoModel.from_pretrained(backbone_src, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32).to(device).eval()
+        hidden_size = int(getattr(base.config, "hidden_size", 1024))
+        model = MultiLayerLoRAClassifier(backbone=base, hidden_size=hidden_size, layers=tap_layers, num_classes=K).to(device).eval()
+        model.norms.float()
+        model.plain_head.float()
 
-        print(f"[Modal BGE Eval] Loading tokenizer and base model: {backbone_name}...")
-        tokenizer = AutoTokenizer.from_pretrained(backbone_name)
-        base_model = AutoModel.from_pretrained(backbone_name).to(device)
-
-        print(f"[Modal BGE Eval] Loading LoRA adapter from {ckpt}...")
-        peft_backbone = PeftModel.from_pretrained(base_model, str(ckpt)).to(device)
-
-        model = BGEClassifier(backbone=peft_backbone, hidden_size=hidden_size, num_classes=num_classes)
-
-        heads_p = ckpt / "heads_best.safetensors"
-        if not heads_p.exists():
-            heads_p = ckpt / "heads.safetensors"
-        print(f"[Modal BGE Eval] Loading classification heads from {heads_p}...")
-        head_tensors = load_file(str(heads_p))
-        model.plain_head.weight.data.copy_(head_tensors["plain.weight"])
-        model.plain_head.bias.data.copy_(head_tensors["plain.bias"])
-        model.centered_head.weight.data.copy_(head_tensors["centered.weight"])
-        model.centered_head.bias.data.copy_(head_tensors["centered.bias"])
-        model.to(device)
-        model.eval()
-
-        print(f"[Modal BGE Eval] Loading benchmark dataset from {eval_path}...")
-        p_eval = Path(eval_path)
-        if not p_eval.exists():
-            p_eval = Path("/root") / eval_path
-        df_eval = pd.read_parquet(p_eval) if str(p_eval).endswith(".parquet") else pd.read_csv(p_eval)
-        print(f"[Modal BGE Eval] Loaded {len(df_eval)} samples across {df_eval['model'].nunique()} classes.")
-
-        val_pids = (
-            df_eval["prompt_canon"].values
-            if "prompt_canon" in df_eval.columns
-            else (df_eval["prompt_id"].values if "prompt_id" in df_eval.columns else np.zeros(len(df_eval), dtype=np.int64))
-        )
-        val_dataset = NTLDataset(
-            texts=df_eval["text"].tolist(),
-            labels=df_eval["model"].map(LAB2I).values,
-            prompt_ids=val_pids,
-            tokenizer=tokenizer,
-            max_len=max_len,
-        )
-        collate = make_collate_fn(tokenizer, max_len=max_len)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate, num_workers=2)
-
-        all_logits_p, all_logits_c, all_probs_m, all_labels = [], [], [], []
+        hd = load_file(str(ckpt / "heads.safetensors"), device=str(device))
         with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                labels = batch["labels"].to(device)
+            for i in range(len(tap_layers)):
+                model.norms[i].weight.copy_(hd[f"norms.{i}.weight"].float())
+                model.norms[i].bias.copy_(hd[f"norms.{i}.bias"].float())
+            model.plain_head.weight.copy_(hd["plain.weight"].float())
+            model.plain_head.bias.copy_(hd["plain.bias"].float())
 
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    Z = model.forward_features(input_ids, attention_mask)
-                    logits_p = model.predict_plain(Z)
-                    Z_c = Z - Z.mean(dim=0, keepdim=True)
-                    logits_c = model.predict_centered(Z_c)
+        p_eval = Path(eval_path) if Path(eval_path).exists() else Path("/root") / eval_path
+        df_eval = pd.read_parquet(p_eval) if str(p_eval).endswith(".parquet") else pd.read_csv(p_eval)
+        y_true = np.array([LAB2I[m] for m in df_eval["model"].tolist()], dtype=np.int64)
+        _, logits_p = extract_features_and_logits(model, df_eval["text"].astype(str).tolist(), tok, max_len=max_len, device=device)
 
-                    prob_p = F.softmax(logits_p, dim=-1)
-                    prob_c = F.softmax(logits_c, dim=-1)
-                    prob_m = 0.5 * prob_p + 0.5 * prob_c
-
-                all_logits_p.append(logits_p.cpu().float().numpy())
-                all_logits_c.append(logits_c.cpu().float().numpy())
-                all_probs_m.append(prob_m.cpu().float().numpy())
-                all_labels.append(labels.cpu().numpy())
-
-        y_true = np.concatenate(all_labels)
-        logits_p = np.concatenate(all_logits_p, axis=0)
-        logits_c = np.concatenate(all_logits_c, axis=0)
-        probs_m = np.concatenate(all_probs_m, axis=0)
-
-        preds_p = logits_p.argmax(axis=-1)
-        preds_c = logits_c.argmax(axis=-1)
-        preds_m = probs_m.argmax(axis=-1)
-
-        bacc_p = float(balanced_accuracy_score(y_true, preds_p))
-        bacc_c = float(balanced_accuracy_score(y_true, preds_c))
-        bacc_m = float(balanced_accuracy_score(y_true, preds_m))
-
-        # Sinkhorn-balanced accuracy
-        def sinkhorn_knopp(P: np.ndarray, max_iter: int = 50) -> np.ndarray:
-            N, K_dim = P.shape
-            r = np.ones(N) / N
-            c = np.ones(K_dim) / K_dim
-            P_adj = np.copy(P)
-            for _ in range(max_iter):
-                u = r / (P_adj.sum(axis=1) + 1e-12)
-                P_adj = P_adj * u[:, None]
-                v = c / (P_adj.sum(axis=0) + 1e-12)
-                P_adj = P_adj * v[None, :]
-            return P_adj
-
-        probs_sinkhorn = sinkhorn_knopp(probs_m)
-        preds_sinkhorn = probs_sinkhorn.argmax(axis=-1)
-        bacc_sinkhorn = float(balanced_accuracy_score(y_true, preds_sinkhorn))
-
-        cm_p = confusion_matrix(y_true, preds_p, labels=list(range(num_classes))).tolist()
-        cm_c = confusion_matrix(y_true, preds_c, labels=list(range(num_classes))).tolist()
-        cm_m = confusion_matrix(y_true, preds_m, labels=list(range(num_classes))).tolist()
-        cm_s = confusion_matrix(y_true, preds_sinkhorn, labels=list(range(num_classes))).tolist()
-
-        # Gemini Family Analysis
-        gemini_indices = FAMILIES["gemini"]  # [5, 6, 7, 8]
-        gemini_names = [LABELS[i] for i in gemini_indices]
-        cm_m_np = np.array(cm_m)
-        gemini_cm = cm_m_np[np.ix_(gemini_indices, gemini_indices)].tolist()
-
-        # Detailed per-class metrics
-        report_m = classification_report(y_true, preds_m, target_names=LABELS, output_dict=True)
-
+        metrics = compute_detailed_metrics(logits_p, y_true)
+        shifted = logits_p - logits_p.max(axis=1, keepdims=True)
+        probs = np.exp(shifted) / np.sum(np.exp(shifted), axis=1, keepdims=True)
+        probs_sinkhorn = damped_sinkhorn(probs, alpha=0.50, iters=100)
         return {
-            "bacc_plain": bacc_p,
-            "bacc_centered": bacc_c,
-            "bacc_merged": bacc_m,
-            "bacc_sinkhorn": bacc_sinkhorn,
-            "confusion_matrix_plain": cm_p,
-            "confusion_matrix_centered": cm_c,
-            "confusion_matrix_merged": cm_m,
-            "confusion_matrix_sinkhorn": cm_s,
-            "gemini_confusion_matrix": gemini_cm,
-            "gemini_classes": gemini_names,
-            "classification_report": report_m,
-            "labels": LABELS,
-            "y_true": y_true.tolist(),
-            "preds_merged": preds_m.tolist(),
-            "preds_plain": preds_p.tolist(),
-            "preds_centered": preds_c.tolist(),
-            "preds_sinkhorn": preds_sinkhorn.tolist(),
-            "logits_plain": logits_p.tolist(),
-            "logits_centered": logits_c.tolist(),
-            "probs_merged": probs_m.tolist(),
-            "probs_sinkhorn": probs_sinkhorn.tolist(),
+            "bacc_plain": metrics["bacc"],
+            "nll_plain": metrics["nll"],
+            "gemini_within_bacc": metrics["gem_within_bacc"],
+            "gemini_confusion_matrix": metrics["gemini_4x4"],
+            "gemini_classes": [LABELS[i] for i in FAMILIES["gemini"]],
+            "probs_sinkhorn_shape": list(probs_sinkhorn.shape),
         }
 
-    @app.local_entrypoint()
-    def main(
-        mode: str = "run",
-        config: str = "configs/training_lora.json",
-        backbone: str = "Qwen/Qwen2.5-0.5B",
-        eval_data: str = "local_data/clean_benchmark_1800_rows.parquet",
-        save_preds: str = "local_data/clean_benchmark_1800_predictions.npz",
-        family: str = "glm",
-        samples_per_class: int = 0,
-    ):
-        """Entrypoint for: modal run scripts/modal_trainer.py [--mode test|smoke|sync|run|eval|train-family-gate] [--config ...] [--backbone ...] [--eval-data ...] [--save-preds ...] [--family glm|gpt|claude|gemini|all]"""
-        if mode == "test":
-            print("[Modal Launcher] Dispatching cloud test suite to Modal A100...")
-            res = test_cloud_worker.remote()
-            print(f"[Modal Launcher] Test result: {res}")
-        elif mode == "smoke":
-            print(f"[Modal Launcher] Dispatching fast 2-minute smoke test to Modal A100 (backbone: {backbone})...")
-            res = smoke_cloud_worker.remote(backbone=backbone)
-            print(f"[Modal Launcher] Smoke test succeeded! Checkpoint: {res}")
-        elif mode == "sync":
-            print("[Modal Launcher] Syncing and downloading all datasets (train.csv, pool files, pool_120k)...")
-            res = sync_cloud_datasets.remote()
-            print(f"[Modal Launcher] Datasets ready in /datasets volume! Deduplicated pool rows: {res:,}")
-        elif mode == "push-dataset":
-            heads_p = Path("checkpoints/export_champion_qwen3_14b/heads.safetensors")
-            heads_bytes = heads_p.read_bytes() if heads_p.exists() else None
-            print(f"[Modal Launcher] Pushing restored heads.safetensors ({len(heads_bytes) if heads_bytes else 0:,} bytes) to Kaggle dataset via cloud...")
-            res = push_kaggle_dataset_worker.remote(heads_bytes=heads_bytes)
-            print(f"[Modal Launcher] Dataset push result:\n{res}")
-        elif mode == "eval":
-            import numpy as np
-            import pandas as pd
-            from namethatllm.config import LAB2I
+    def _dispatch_modal_command(
+        cmd: str,
+        config: str,
+        backbone: str,
+        eval_data: str,
+        save_preds: str,
+        family: str,
+        samples_per_class: int,
+    ) -> None:
+        import numpy as np
+        import pandas as pd
+        from namethatllm.config import LAB2I
 
+        if cmd == "test":
+            print(f"[Modal Launcher] Test result: {test_cloud_worker.remote()}")
+        elif cmd == "smoke":
+            print(f"[Modal Launcher] Smoke test succeeded! Checkpoint: {smoke_cloud_worker.remote(backbone=backbone)}")
+        elif cmd == "sync":
+            print(f"[Modal Launcher] Deduplicated pool rows: {sync_cloud_datasets.remote():,}")
+        elif cmd == "push-dataset":
+            heads_p = Path("checkpoints/export_champion_qwen3_14b/heads.safetensors")
+            res = push_kaggle_dataset_worker.remote(heads_bytes=heads_p.read_bytes() if heads_p.exists() else None)
+            print(f"[Modal Launcher] Dataset push result:\n{res}")
+        elif cmd == "eval":
             texts, labels, groups = None, None, None
             if eval_data and Path(eval_data).exists():
-                print(f"[Modal Launcher] Loading evaluation dataset from {eval_data}...")
-                if str(eval_data).endswith(".parquet"):
-                    df_eval = pd.read_parquet(eval_data)
-                else:
-                    df_eval = pd.read_csv(eval_data)
+                df_eval = pd.read_parquet(eval_data) if str(eval_data).endswith(".parquet") else pd.read_csv(eval_data)
                 texts = df_eval["text"].tolist()
                 labels = [LAB2I[m] for m in df_eval["model"].tolist()]
-                if "prompt_canon" in df_eval.columns:
-                    groups = df_eval["prompt_canon"].tolist()
-                elif "prompt_id" in df_eval.columns:
-                    groups = df_eval["prompt_id"].tolist()
-                print(f"[Modal Launcher] Loaded {len(texts)} samples across {len(set(labels))} classes from {eval_data}.")
-            else:
-                cache_p = Path("local_data/local_eval_cache.npz")
-                if not cache_p.exists():
-                    cache_p = Path("local_data/v76_output/local_eval_cache.npz")
-                if cache_p.exists():
-                    cache = np.load(cache_p, allow_pickle=True)
-                    texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
-                    labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
-                    groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
-                    print(f"[Modal Launcher] Loaded {len(texts) if texts else 0} unseen holdout texts from {cache_p}...")
-                else:
-                    print("[Modal Launcher] Evaluating on default holdout dataset...")
-
-            print("[Modal Launcher] Verifying / syncing specialist checkpoints on Modal...")
-            sync_res = sync_specialists_worker.remote()
-            print(f"[Modal Launcher] Specialists sync status: {sync_res}")
-
-            res = eval_cloud_worker.remote(
-                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
-                texts=texts,
-                labels=labels,
-                groups=groups,
-            )
-            print("\n" + "=" * 80)
-            print("[Modal Launcher] Evaluation Accuracy Summary:")
-            print(f"  Plain Head BAcc       : {res.get('acc_plain', 0.0)*100:.2f}%")
-            print(f"  Centered Head BAcc    : {res.get('acc_centered', 0.0)*100:.2f}%")
-            print(f"  Blended Head BAcc     : {res.get('acc_blended', 0.0)*100:.2f}%")
-            print(f"  Plain + Sinkhorn BAcc : {res.get('acc_plain_sinkhorn', 0.0)*100:.2f}%")
-            print(f"  Sinkhorn-Balanced BAcc: {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
-            print("=" * 80 + "\n")
-
+                groups = df_eval["prompt_canon"].tolist() if "prompt_canon" in df_eval.columns else (df_eval["prompt_id"].tolist() if "prompt_id" in df_eval.columns else None)
+            sync_specialists_worker.remote()
+            res = eval_cloud_worker.remote(checkpoint_dir="/checkpoints/export_champion_qwen3_14b", texts=texts, labels=labels, groups=groups)
+            print(f"[Modal Launcher] Plain={res.get('acc_plain', 0.0)*100:.2f}% | Centered={res.get('acc_centered', 0.0)*100:.2f}% | Sinkhorn={res.get('acc_sinkhorn', 0.0)*100:.2f}%")
             if save_preds:
                 out_p = Path(save_preds)
                 out_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1760,65 +1617,19 @@ if modal is not None:
                     logits_blend=np.array(res.get("logits_blend", [])),
                     probs_plain_sinkhorn=np.array(res.get("probs_plain_sinkhorn", [])),
                     probs_sinkhorn=np.array(res.get("probs_sinkhorn", [])),
-                    spec_logits_gemini=np.array(res.get("spec_logits_gemini", [])),
-                    spec_logits_glm=np.array(res.get("spec_logits_glm", [])),
-                    spec_logits_gpt=np.array(res.get("spec_logits_gpt", [])),
-                    spec_logits_claude=np.array(res.get("spec_logits_claude", [])),
-                    spec_classes_gemini=np.array(res.get("spec_classes_gemini", [])),
-                    spec_classes_glm=np.array(res.get("spec_classes_glm", [])),
-                    spec_classes_gpt=np.array(res.get("spec_classes_gpt", [])),
-                    spec_classes_claude=np.array(res.get("spec_classes_claude", [])),
                 )
-                print(f"[Modal Launcher] Saved evaluation predictions to {out_p} ({out_p.stat().st_size:,} bytes).")
-        elif mode == "reexport":
-            print("[Modal Launcher] Launching A100-80GB head re-export with trace-scaled Ridge & centered bias...")
-            import numpy as np
-            cache_p = Path("local_data/local_eval_cache.npz")
-            if not cache_p.exists():
-                cache_p = Path("local_data/v76_output/local_eval_cache.npz")
-            if cache_p.exists():
-                cache = np.load(cache_p, allow_pickle=True)
-                texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
-                labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
-                groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
-            else:
-                texts, labels, groups = None, None, None
-            res = reexport_heads_worker.remote(
-                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
-                unseen_texts=texts,
-                y_unseen=labels,
-                groups_unseen=groups,
-            )
-            print("[Modal Launcher] Re-export finished successfully!")
-            print(f"  Legacy Unscaled BAcc   : {res.get('bacc_old', 0.0)*100:.2f}%")
-            print(f"  Pure Neural BAcc       : {res.get('bacc_pure_n', 0.0)*100:.2f}%")
-            print(f"  Centered & Scaled BAcc : {res.get('bacc_new', 0.0)*100:.2f}%")
-            print(f"  Centered Head BAcc     : {res.get('acc_centered', 0.0)*100:.2f}%")
-            print(f"  Blended Head BAcc      : {res.get('acc_blended', 0.0)*100:.2f}%")
-            print(f"  Sinkhorn Balanced BAcc : {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
-            print(f"  Net Lift (Plain)       : {res.get('lift', 0.0)*100:+.2f}%")
-        elif mode in ["train-family-gate", "train-gemini-gate"]:
-            import numpy as np
-            import pandas as pd
-            from namethatllm.config import LAB2I
-
-            target_fam = "gemini" if mode == "train-gemini-gate" else family
+        elif cmd == "reexport":
+            res = reexport_heads_worker.remote(checkpoint_dir="/checkpoints/export_champion_qwen3_14b")
+            print(f"[Modal Launcher] Re-export complete! Centered={res.get('acc_centered', 0.0)*100:.2f}% | Sinkhorn={res.get('acc_sinkhorn', 0.0)*100:.2f}%")
+        elif cmd in ("train-family-gate", "train-gemini-gate"):
+            target_fam = "gemini" if cmd == "train-gemini-gate" else family
             fams_to_train = ["glm", "gpt", "claude"] if target_fam == "all" else [target_fam]
-
             eval_p = Path(eval_data)
-            if not eval_p.exists():
-                raise FileNotFoundError(f"Evaluation benchmark not found at {eval_data}")
             df_eval = pd.read_parquet(eval_p) if str(eval_p).endswith(".parquet") else pd.read_csv(eval_p)
             texts = df_eval["text"].tolist()
             labels = [LAB2I[m] for m in df_eval["model"].tolist()]
             groups = df_eval["prompt_canon"].tolist() if "prompt_canon" in df_eval.columns else None
-
-            print(f"[Modal Launcher] Loaded {len(texts)} benchmark samples for zero-leakage training & evaluation.")
-
             for fam_name in fams_to_train:
-                print("\n" + "=" * 80)
-                print(f"[Modal Launcher] Launching A100-80GB {fam_name.upper()} Gate Training...")
-                print("=" * 80)
                 res = train_family_gate_worker.remote(
                     target_family=fam_name,
                     checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
@@ -1828,97 +1639,66 @@ if modal is not None:
                     eval_labels=labels,
                     eval_groups=groups,
                 )
-                print("\n" + "=" * 80)
-                print(f"[Modal Launcher] {fam_name.upper()} Gate Training & Benchmark Results:")
-                print(f"  {fam_name.upper()} Within-Family BAcc : {res.get('within_family_balanced_acc', 0.0)*100:.2f}% (Baseline: {res.get('plain_within_family_acc', 0.0)*100:.2f}%)")
-                print(f"  Within-Family Lift       : {res.get('delta_within_family', 0.0)*100:+.2f}%")
-                print(f"  Best Ridge Alpha         : {res.get('best_alpha', 0.0)}")
                 pipe = res.get("pipe_results", {})
-                print(f"  Champion Plain Solo BAcc : {pipe.get('plain_solo_bacc', 0.0)*100:.2f}%")
-                print(f"  Gated + Sinkhorn BAcc    : {pipe.get('best_pipe_bacc', 0.0)*100:.2f}%")
-                print(f"  Optimal Gate Weight      : {pipe.get('best_gate_weight', 0.0)}")
-                print(f"  Net Lift over Plain Solo : {pipe.get('lift_over_plain', 0.0)*100:+.2f}%")
-                print("=" * 80 + "\n")
-
-                if save_preds and "spec_logits" in res:
-                    out_p = Path(save_preds)
-                    curr_data = {}
-                    if out_p.exists():
-                        existing = np.load(out_p, allow_pickle=True)
-                        for k in existing.keys():
-                            curr_data[k] = existing[k]
-                    curr_data[f"spec_logits_{fam_name}"] = np.array(res["spec_logits"])
-                    curr_data[f"spec_classes_{fam_name}"] = np.array(res["spec_classes"])
-                    np.savez_compressed(out_p, **curr_data)
-                    print(f"[Modal Launcher] Updated {fam_name.upper()} Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
-        elif mode == "train-bge":
-            cfg_p = "configs/training_bge.json" if config == "configs/training_lora.json" else config
-            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Training with config: {cfg_p}...")
+                print(f"[Modal Launcher] {fam_name.upper()} Gate BAcc={pipe.get('best_pipe_bacc', 0.0)*100:.2f}% (gw={pipe.get('best_gate_weight', 0.0)})")
+        elif cmd == "train-bge":
+            cfg_p = "configs/training_bge_v2.json" if config == "configs/training_lora.json" else config
             res = train_bge_cloud_worker.remote(config_path=cfg_p)
-            print(f"[Modal Launcher] BGE-M3 Training Complete! Best Val BAcc: {res.get('best_val_bacc', 0.0):.4f}")
-        elif mode == "eval-bge":
-            import numpy as np
-            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Benchmark Evaluation...")
-            cloud_eval_p = "/datasets/clean_benchmark_1800_rows.parquet"
-            res = eval_bge_cloud_worker.remote(
-                checkpoint_dir="/checkpoints/export_bge_m3_lora",
-                eval_path=cloud_eval_p,
-            )
-            print("\n" + "=" * 80)
-            print("[Modal Launcher] BGE-M3 1,800 Clean Benchmark Evaluation Results:")
-            print(f"  Plain Head BAcc       : {res.get('bacc_plain', 0.0)*100:.2f}%")
-            print(f"  Centered Head BAcc    : {res.get('bacc_centered', 0.0)*100:.2f}%")
-            print(f"  Merged Dual Head BAcc : {res.get('bacc_merged', 0.0)*100:.2f}%")
-            print(f"  Sinkhorn Balanced BAcc: {res.get('bacc_sinkhorn', 0.0)*100:.2f}%")
-            print("=" * 80)
-
-            gem_cm = np.array(res.get("gemini_confusion_matrix", []))
-            gem_names = res.get("gemini_classes", [])
-            print("\n[Gemini Family Confusion Matrix (Rows: Ground Truth, Cols: Predicted)]")
-            hdr = f"{'True / Pred':<24} | " + " | ".join(f"{name[:12]:<12}" for name in gem_names)
-            print(hdr)
-            print("-" * len(hdr))
-            for i, name in enumerate(gem_names):
-                row_str = " | ".join(f"{gem_cm[i, j]:<12}" for j in range(len(gem_names)))
-                print(f"{name:<24} | {row_str}")
-
-            save_path = save_preds or "local_data/bge_clean_benchmark_1800_predictions.npz"
-            if save_path:
-                out_p = Path(save_path)
-                out_p.parent.mkdir(parents=True, exist_ok=True)
+            arrays = res.pop("arrays", {})
+            out_json = repo_root / "reports" / "bge_v2_stage1_report.json"
+            out_json.parent.mkdir(parents=True, exist_ok=True)
+            out_json.write_text(json.dumps(res, indent=2), encoding="utf-8")
+            if arrays:
                 np.savez_compressed(
-                    out_p,
-                    labels=np.array(res.get("y_true", [])),
-                    preds_plain=np.array(res.get("preds_plain", [])),
-                    preds_centered=np.array(res.get("preds_centered", [])),
-                    preds_merged=np.array(res.get("preds_merged", [])),
-                    preds_sinkhorn=np.array(res.get("preds_sinkhorn", [])),
-                    probs_merged=np.array(res.get("probs_merged", [])),
-                    probs_sinkhorn=np.array(res.get("probs_sinkhorn", [])),
-                    confusion_matrix_merged=np.array(res.get("confusion_matrix_merged", [])),
-                    confusion_matrix_plain=np.array(res.get("confusion_matrix_plain", [])),
-                    confusion_matrix_centered=np.array(res.get("confusion_matrix_centered", [])),
-                    gemini_confusion_matrix=gem_cm,
+                    repo_root / "reports" / "bge_v2_stage1_preds.npz",
+                    y_bench=np.array(arrays["y_bench"], dtype=np.int64),
+                    bench_neural_logits=np.array(arrays["bench_neural_logits"], dtype=np.float32),
+                    bench_ridge_logits=np.array(arrays["bench_ridge_logits"], dtype=np.float32),
+                    y_gold=np.array(arrays["y_gold"], dtype=np.int64),
+                    gold_oof_centered_logits=np.array(arrays["gold_oof_centered_logits"], dtype=np.float32),
                 )
-                print(f"\n[Modal Launcher] Saved BGE benchmark predictions to {out_p} ({out_p.stat().st_size:,} bytes).")
+            print(f"[Modal Launcher] Encoder Stage-1 Complete! Best Neural BAcc={res.get('best_neural_bench_bacc', 0.0)*100:.2f}%")
+        elif cmd == "package-bge":
+            cfg_p = "configs/training_bge_v2.json" if config == "configs/training_lora.json" else config
+            res = package_bge_cloud_worker.remote(config_path=cfg_p)
+            print(f"[Modal Launcher] Packaged checkpoint metrics: {res.get('metrics', {})}")
+        elif cmd == "eval-bge":
+            res = eval_bge_cloud_worker.remote(eval_path="/datasets/clean_benchmark_1800_rows.parquet")
+            print(f"[Modal Launcher] BGE Eval Plain BAcc={res.get('bacc_plain', 0.0)*100:.2f}% | NLL={res.get('nll_plain', 0.0):.4f}")
         else:
-            print(f"[Modal Launcher] Launching A100-80GB cloud training with config: {config}")
-            res = train_cloud_worker.remote(config_path=config)
-            print(f"[Modal Launcher] Cloud job finished successfully. Result: {res}")
+            print(f"[Modal Launcher] Cloud training finished: {train_cloud_worker.remote(config_path=config)}")
+
+    @app.local_entrypoint()
+    def main(
+        mode: str = "run",
+        config: str = "configs/training_lora.json",
+        backbone: str = "Qwen/Qwen2.5-0.5B",
+        eval_data: str = "local_data/clean_benchmark_1800_rows.parquet",
+        save_preds: str = "local_data/clean_benchmark_1800_predictions.npz",
+        family: str = "glm",
+        samples_per_class: int = 0,
+    ):
+        """Entrypoint for Modal CLI dispatch."""
+        _dispatch_modal_command(mode, config, backbone, eval_data, save_preds, family, samples_per_class)
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Modal Cloud Launcher for NameThatLLM Training")
-    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "smoke", "test", "sync", "eval", "reexport", "push-dataset", "train-gemini-gate", "train-family-gate", "train-bge", "eval-bge"], help="Command (run, smoke, test, sync, eval, reexport, push-dataset, train-gemini-gate, train-family-gate, train-bge, eval-bge)")
-    parser.add_argument("--family", default="all", choices=["all", "glm", "gpt", "claude", "gemini"], help="Target family for gate training (glm, gpt, claude, gemini, all)")
-    parser.add_argument("--samples-per-class", type=int, default=0, help="Samples per family class (0 = default)")
-    parser.add_argument("--config", default="configs/training_lora.json", help="Path to training config json")
-    parser.add_argument("--backbone", default="Qwen/Qwen2.5-0.5B", help="Backbone model for smoke test")
-    parser.add_argument("--eval-data", default="local_data/clean_benchmark_1800_rows.parquet", help="Path to evaluation parquet/csv")
-    parser.add_argument("--save-preds", default="local_data/clean_benchmark_1800_predictions.npz", help="Path to save evaluation predictions npz")
-    parser.add_argument("--spawn", action="store_true", help="Spawn asynchronously on deployed app and exit immediately")
+    parser.add_argument(
+        "cmd",
+        nargs="?",
+        default="run",
+        choices=["run", "smoke", "test", "sync", "eval", "reexport", "push-dataset", "train-gemini-gate", "train-family-gate", "train-bge", "package-bge", "eval-bge"],
+    )
+    parser.add_argument("--family", default="all", choices=["all", "glm", "gpt", "claude", "gemini"])
+    parser.add_argument("--samples-per-class", type=int, default=0)
+    parser.add_argument("--config", default="configs/training_lora.json")
+    parser.add_argument("--backbone", default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--eval-data", default="local_data/clean_benchmark_1800_rows.parquet")
+    parser.add_argument("--save-preds", default="local_data/clean_benchmark_1800_predictions.npz")
+    parser.add_argument("--spawn", action="store_true")
     args = parser.parse_args()
 
     if modal is None:
@@ -1926,228 +1706,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.spawn:
-        f = modal.Function.from_name("ntl-inhouse-trainer", "train_cloud_worker")
-        call = f.spawn(config_path=args.config)
+        call = modal.Function.from_name("ntl-inhouse-trainer", "train_cloud_worker").spawn(config_path=args.config)
         print(f"[Modal] Spawned detached training task on A100 GPU! Call ID: {call.object_id}")
         sys.exit(0)
 
     with modal.enable_output(), app.run():
-        if args.cmd == "test":
-            test_cloud_worker.remote()
-        elif args.cmd == "smoke":
-            smoke_cloud_worker.remote(backbone=args.backbone)
-        elif args.cmd == "sync":
-            sync_cloud_datasets.remote()
-        elif args.cmd == "push-dataset":
-            heads_p = Path("checkpoints/export_champion_qwen3_14b/heads.safetensors")
-            heads_bytes = heads_p.read_bytes() if heads_p.exists() else None
-            print(f"[Modal Launcher] Pushing restored heads.safetensors ({len(heads_bytes) if heads_bytes else 0:,} bytes) to Kaggle dataset via cloud...")
-            res = push_kaggle_dataset_worker.remote(heads_bytes=heads_bytes)
-            print(f"[Modal Launcher] Dataset push result:\n{res}")
-        elif args.cmd == "eval":
-            import numpy as np
-            import pandas as pd
-            from namethatllm.config import LAB2I
-
-            texts, labels, groups = None, None, None
-            eval_path = args.eval_data or "local_data/clean_benchmark_1800_rows.parquet"
-            if eval_path and Path(eval_path).exists():
-                print(f"[Modal Launcher] Loading evaluation dataset from {eval_path}...")
-                if str(eval_path).endswith(".parquet"):
-                    df_eval = pd.read_parquet(eval_path)
-                else:
-                    df_eval = pd.read_csv(eval_path)
-                texts = df_eval["text"].tolist()
-                labels = [LAB2I[m] for m in df_eval["model"].tolist()]
-                if "prompt_canon" in df_eval.columns:
-                    groups = df_eval["prompt_canon"].tolist()
-                elif "prompt_id" in df_eval.columns:
-                    groups = df_eval["prompt_id"].tolist()
-                print(f"[Modal Launcher] Loaded {len(texts)} samples across {len(set(labels))} classes from {eval_path}.")
-            else:
-                cache_p = Path("local_data/local_eval_cache.npz")
-                if not cache_p.exists():
-                    cache_p = Path("local_data/v76_output/local_eval_cache.npz")
-                if cache_p.exists():
-                    cache = np.load(cache_p, allow_pickle=True)
-                    texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
-                    labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
-                    groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
-                    print(f"[Modal Launcher] Loaded {len(texts) if texts else 0} unseen holdout texts from {cache_p}...")
-                else:
-                    print("[Modal Launcher] Evaluating on default holdout dataset...")
-
-            print("[Modal Launcher] Verifying / syncing specialist checkpoints on Modal...")
-            sync_res = sync_specialists_worker.remote()
-            print(f"[Modal Launcher] Specialists sync status: {sync_res}")
-
-            res = eval_cloud_worker.remote(
-                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
-                texts=texts,
-                labels=labels,
-                groups=groups,
-            )
-            print("\n" + "=" * 80)
-            print("[Modal Launcher] Evaluation Accuracy Summary:")
-            print(f"  Plain Head BAcc       : {res.get('acc_plain', 0.0)*100:.2f}%")
-            print(f"  Centered Head BAcc    : {res.get('acc_centered', 0.0)*100:.2f}%")
-            print(f"  Blended Head BAcc     : {res.get('acc_blended', 0.0)*100:.2f}%")
-            print(f"  Plain + Sinkhorn BAcc : {res.get('acc_plain_sinkhorn', 0.0)*100:.2f}%")
-            print(f"  Sinkhorn-Balanced BAcc: {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
-            print("=" * 80 + "\n")
-
-            if args.save_preds:
-                out_p = Path(args.save_preds)
-                out_p.parent.mkdir(parents=True, exist_ok=True)
-                np.savez_compressed(
-                    out_p,
-                    labels=np.array(labels) if labels is not None else np.array([]),
-                    groups=np.array(groups) if groups is not None else np.array([]),
-                    logits_plain=np.array(res.get("logits_plain", [])),
-                    logits_centered=np.array(res.get("logits_centered", [])),
-                    logits_blend=np.array(res.get("logits_blend", [])),
-                    probs_plain_sinkhorn=np.array(res.get("probs_plain_sinkhorn", [])),
-                    probs_sinkhorn=np.array(res.get("probs_sinkhorn", [])),
-                    spec_logits_gemini=np.array(res.get("spec_logits_gemini", [])),
-                    spec_logits_glm=np.array(res.get("spec_logits_glm", [])),
-                    spec_logits_gpt=np.array(res.get("spec_logits_gpt", [])),
-                    spec_logits_claude=np.array(res.get("spec_logits_claude", [])),
-                    spec_classes_gemini=np.array(res.get("spec_classes_gemini", [])),
-                    spec_classes_glm=np.array(res.get("spec_classes_glm", [])),
-                    spec_classes_gpt=np.array(res.get("spec_classes_gpt", [])),
-                    spec_classes_claude=np.array(res.get("spec_classes_claude", [])),
-                )
-                print(f"[Modal Launcher] Saved evaluation predictions to {out_p} ({out_p.stat().st_size:,} bytes).")
-        elif args.cmd == "reexport":
-            print("[Modal Launcher] Launching A100-80GB head re-export with trace-scaled Ridge & centered bias...")
-            import numpy as np
-            cache_p = Path("local_data/local_eval_cache.npz")
-            if not cache_p.exists():
-                cache_p = Path("local_data/v76_output/local_eval_cache.npz")
-            if cache_p.exists():
-                cache = np.load(cache_p, allow_pickle=True)
-                texts = cache["unseen_texts"].tolist() if "unseen_texts" in cache else None
-                labels = cache["y_unseen"].tolist() if "y_unseen" in cache else None
-                groups = cache["groups_unseen"].tolist() if "groups_unseen" in cache else None
-            else:
-                texts, labels, groups = None, None, None
-            res = reexport_heads_worker.remote(
-                checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
-                unseen_texts=texts,
-                y_unseen=labels,
-                groups_unseen=groups,
-            )
-            print("[Modal Launcher] Re-export finished successfully!")
-            print(f"  Legacy Unscaled BAcc   : {res.get('bacc_old', 0.0)*100:.2f}%")
-            print(f"  Pure Neural BAcc       : {res.get('bacc_pure_n', 0.0)*100:.2f}%")
-            print(f"  Centered & Scaled BAcc : {res.get('bacc_new', 0.0)*100:.2f}%")
-            print(f"  Centered Head BAcc     : {res.get('acc_centered', 0.0)*100:.2f}%")
-            print(f"  Blended Head BAcc      : {res.get('acc_blended', 0.0)*100:.2f}%")
-            print(f"  Sinkhorn Balanced BAcc : {res.get('acc_sinkhorn', 0.0)*100:.2f}%")
-            print(f"  Net Lift (Plain)       : {res.get('lift', 0.0)*100:+.2f}%")
-        elif args.cmd in ["train-family-gate", "train-gemini-gate"]:
-            import numpy as np
-            import pandas as pd
-            from namethatllm.config import LAB2I
-
-            target_fam = "gemini" if args.cmd == "train-gemini-gate" else args.family
-            fams_to_train = ["glm", "gpt", "claude"] if target_fam == "all" else [target_fam]
-
-            eval_path = args.eval_data or "local_data/clean_benchmark_1800_rows.parquet"
-            if not Path(eval_path).exists():
-                raise FileNotFoundError(f"Evaluation benchmark not found at {eval_path}")
-            df_eval = pd.read_parquet(eval_path) if str(eval_path).endswith(".parquet") else pd.read_csv(eval_path)
-            texts = df_eval["text"].tolist()
-            labels = [LAB2I[m] for m in df_eval["model"].tolist()]
-            groups = df_eval["prompt_canon"].tolist() if "prompt_canon" in df_eval.columns else None
-
-            print(f"[Modal Launcher] Loaded {len(texts)} benchmark samples for zero-leakage training & evaluation.")
-
-            for fam_name in fams_to_train:
-                print("\n" + "=" * 80)
-                print(f"[Modal Launcher] Launching A100-80GB {fam_name.upper()} Gate Training...")
-                print("=" * 80)
-                res = train_family_gate_worker.remote(
-                    target_family=fam_name,
-                    checkpoint_dir="/checkpoints/export_champion_qwen3_14b",
-                    samples_per_class=args.samples_per_class,
-                    negative_ratio=0.10,
-                    eval_texts=texts,
-                    eval_labels=labels,
-                    eval_groups=groups,
-                )
-                print("\n" + "=" * 80)
-                print(f"[Modal Launcher] {fam_name.upper()} Gate Training & Benchmark Results:")
-                print(f"  {fam_name.upper()} Within-Family BAcc : {res.get('within_family_balanced_acc', 0.0)*100:.2f}% (Baseline: {res.get('plain_within_family_acc', 0.0)*100:.2f}%)")
-                print(f"  Within-Family Lift       : {res.get('delta_within_family', 0.0)*100:+.2f}%")
-                print(f"  Best Ridge Alpha         : {res.get('best_alpha', 0.0)}")
-                pipe = res.get("pipe_results", {})
-                print(f"  Champion Plain Solo BAcc : {pipe.get('plain_solo_bacc', 0.0)*100:.2f}%")
-                print(f"  Gated + Sinkhorn BAcc    : {pipe.get('best_pipe_bacc', 0.0)*100:.2f}%")
-                print(f"  Optimal Gate Weight      : {pipe.get('best_gate_weight', 0.0)}")
-                print(f"  Net Lift over Plain Solo : {pipe.get('lift_over_plain', 0.0)*100:+.2f}%")
-                print("=" * 80 + "\n")
-
-                if args.save_preds and "spec_logits" in res:
-                    out_p = Path(args.save_preds)
-                    curr_data = {}
-                    if out_p.exists():
-                        existing = np.load(out_p, allow_pickle=True)
-                        for k in existing.keys():
-                            curr_data[k] = existing[k]
-                    curr_data[f"spec_logits_{fam_name}"] = np.array(res["spec_logits"])
-                    curr_data[f"spec_classes_{fam_name}"] = np.array(res["spec_classes"])
-                    np.savez_compressed(out_p, **curr_data)
-                    print(f"[Modal Launcher] Updated {fam_name.upper()} Gate logits in {out_p} ({out_p.stat().st_size:,} bytes).")
-        elif args.cmd == "train-bge":
-            cfg_p = "configs/training_bge.json" if args.config == "configs/training_lora.json" else args.config
-            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Training with config: {cfg_p}...")
-            res = train_bge_cloud_worker.remote(config_path=cfg_p)
-            print(f"[Modal Launcher] BGE-M3 Training Complete! Best Val BAcc: {res.get('best_val_bacc', 0.0):.4f}")
-        elif args.cmd == "eval-bge":
-            import numpy as np
-            print(f"[Modal Launcher] Launching Ephemeral A10G BGE-M3 Benchmark Evaluation...")
-            cloud_eval_p = "/datasets/clean_benchmark_1800_rows.parquet"
-            res = eval_bge_cloud_worker.remote(
-                checkpoint_dir="/checkpoints/export_bge_m3_lora",
-                eval_path=cloud_eval_p,
-            )
-            print("\n" + "=" * 80)
-            print("[Modal Launcher] BGE-M3 1,800 Clean Benchmark Evaluation Results:")
-            print(f"  Plain Head BAcc       : {res.get('bacc_plain', 0.0)*100:.2f}%")
-            print(f"  Centered Head BAcc    : {res.get('bacc_centered', 0.0)*100:.2f}%")
-            print(f"  Merged Dual Head BAcc : {res.get('bacc_merged', 0.0)*100:.2f}%")
-            print(f"  Sinkhorn Balanced BAcc: {res.get('bacc_sinkhorn', 0.0)*100:.2f}%")
-            print("=" * 80)
-
-            gem_cm = np.array(res.get("gemini_confusion_matrix", []))
-            gem_names = res.get("gemini_classes", [])
-            print("\n[Gemini Family Confusion Matrix (Rows: Ground Truth, Cols: Predicted)]")
-            hdr = f"{'True / Pred':<24} | " + " | ".join(f"{name[:12]:<12}" for name in gem_names)
-            print(hdr)
-            print("-" * len(hdr))
-            for i, name in enumerate(gem_names):
-                row_str = " | ".join(f"{gem_cm[i, j]:<12}" for j in range(len(gem_names)))
-                print(f"{name:<24} | {row_str}")
-
-            save_path = args.save_preds or "local_data/bge_clean_benchmark_1800_predictions.npz"
-            if save_path:
-                out_p = Path(save_path)
-                out_p.parent.mkdir(parents=True, exist_ok=True)
-                np.savez_compressed(
-                    out_p,
-                    labels=np.array(res.get("y_true", [])),
-                    preds_plain=np.array(res.get("preds_plain", [])),
-                    preds_centered=np.array(res.get("preds_centered", [])),
-                    preds_merged=np.array(res.get("preds_merged", [])),
-                    preds_sinkhorn=np.array(res.get("preds_sinkhorn", [])),
-                    probs_merged=np.array(res.get("probs_merged", [])),
-                    probs_sinkhorn=np.array(res.get("probs_sinkhorn", [])),
-                    confusion_matrix_merged=np.array(res.get("confusion_matrix_merged", [])),
-                    confusion_matrix_plain=np.array(res.get("confusion_matrix_plain", [])),
-                    confusion_matrix_centered=np.array(res.get("confusion_matrix_centered", [])),
-                    gemini_confusion_matrix=gem_cm,
-                )
-                print(f"\n[Modal Launcher] Saved BGE benchmark predictions to {out_p} ({out_p.stat().st_size:,} bytes).")
-        else:
-            train_cloud_worker.remote(config_path=args.config)
+        _dispatch_modal_command(args.cmd, args.config, args.backbone, args.eval_data, args.save_preds, args.family, args.samples_per_class)

@@ -325,5 +325,84 @@ class TestGemmaAndBGEPipeline(unittest.TestCase):
             self.assertEqual(len(df_unseen_out["model"].unique()), K)
 
 
+class TestBGEV2AndCheckpointFilter(unittest.TestCase):
+    def test_extract_bge_features_v2_multilayer_drop_cls(self):
+        """Verify _extract_bge_features v2 extracts drop-CLS LayerNorm-pooled multi-layer tensor."""
+        from namethatllm.pipeline import _extract_bge_features
+
+        torch.manual_seed(7)
+        B, L, H = 3, 5, 16
+        hs = [torch.randn(B, L, H) for _ in range(4)]
+
+        class DummyBGEModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Cfg", (), {"hidden_size": H})()
+
+            def forward(self, input_ids=None, attention_mask=None, output_hidden_states=False, **kwargs):
+                row_idx = input_ids[:, 0]
+                return type("Out", (), {"hidden_states": [t[row_idx] for t in hs]})()
+
+        masks_by_idx = {
+            0: [1, 1, 1, 0, 0],
+            1: [1, 1, 0, 0, 0],
+            2: [1, 1, 1, 1, 0],
+        }
+
+        def dummy_tok(chunk, padding=True, truncation=True, max_length=512, return_tensors="pt"):
+            row_ids = [int(str(s).split(":")[0]) for s in chunk]
+            attn = torch.tensor([masks_by_idx[i] for i in row_ids], dtype=torch.long)
+            ids = torch.tensor([[i] + list(range(1, L)) for i in row_ids], dtype=torch.long)
+            return {"input_ids": ids, "attention_mask": attn}
+
+        heads_sd = {
+            "norms.0.weight": torch.ones(H),
+            "norms.0.bias": torch.zeros(H),
+            "norms.1.weight": torch.full((H,), 2.0),
+            "norms.1.bias": torch.full((H,), 0.5),
+        }
+        meta_bge = {
+            "layers": [1, 3],
+            "pooling": "mean_drop_cls",
+            "drop_first_token": True,
+            "per_layer_layernorm": True,
+            "max_len": 512,
+        }
+        texts_in = ["0:aaa", "1:b", "2:cccccc"]
+        Z, is_v2 = _extract_bge_features(DummyBGEModel(), dummy_tok, torch.device("cpu"), texts_in, heads_sd, meta_bge, bsize=2)
+        self.assertTrue(is_v2)
+        self.assertEqual(Z.shape, (3, 2 * H))
+
+        # Manual check across all 3 rows (CLS token 0 dropped, per-row padding excluded)
+        mask_no_cls = torch.tensor(
+            [[0.0, float(v[1]), float(v[2]), float(v[3]), float(v[4])] for v in (masks_by_idx[0], masks_by_idx[1], masks_by_idx[2])]
+        ).unsqueeze(-1)
+        den = mask_no_cls.sum(dim=1)
+        exp0 = F.layer_norm((hs[1] * mask_no_cls).sum(dim=1) / den, (H,), heads_sd["norms.0.weight"], heads_sd["norms.0.bias"])
+        exp1 = F.layer_norm((hs[3] * mask_no_cls).sum(dim=1) / den, (H,), heads_sd["norms.1.weight"], heads_sd["norms.1.bias"])
+        np.testing.assert_allclose(Z, torch.cat([exp0, exp1], dim=1).numpy(), atol=1e-5)
+
+    def test_find_checkpoints_prioritizes_bge_v2_without_inhouse_collision(self):
+        """Verify bge_m3 folder matching never collides with inhouse pattern and honors fold priority."""
+        from namethatllm.config import find_checkpoints
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
+            inp = Path(tmp_dir)
+            d1 = inp / "export_bge_m3_v2"
+            d1.mkdir()
+            (d1 / "heads.safetensors").write_bytes(b"")
+            d2 = inp / "qwen3_14b_inhouse"
+            d2.mkdir()
+            (d2 / "heads.safetensors").write_bytes(b"")
+            d3 = inp / "deberta_inhouse"
+            d3.mkdir()
+            (d3 / "heads.safetensors").write_bytes(b"")
+
+            ckpts = find_checkpoints(inp)
+            self.assertEqual(ckpts.get("bge_m3"), d1)
+            self.assertEqual(ckpts.get("qwen3_14b_inhouse"), d2)
+            self.assertEqual(ckpts.get("deberta_inhouse"), d3)
+
+
 if __name__ == "__main__":
     unittest.main()

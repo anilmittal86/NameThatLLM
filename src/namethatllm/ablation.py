@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Set
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize, minimize_scalar
 from scipy.spatial.distance import squareform
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -25,17 +26,296 @@ from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import GroupKFold, KFold
 
 from .config import LABELS, K, LAB2I, softmax, log_softmax
+from .postprocess import apply_claude_specialist_gate, damped_sinkhorn
+
 
 def _ablation_sinkhorn(P: np.ndarray, iters: int = 200, eps: float = 1e-12, **kwargs) -> np.ndarray:
-    """Fast vectorized Sinkhorn mass balancing for balanced multiclass prediction."""
+    """Fast uniform Sinkhorn mass balancing delegating to canonical damped_sinkhorn."""
     if len(P) < 18:
         return P
-    P = np.clip(P.astype(np.float64), eps, 1.0)
-    target_col = 1.0 / P.shape[1]
-    for _ in range(iters):
-        P /= P.sum(axis=1, keepdims=True).clip(min=eps)
-        P /= (P.sum(axis=0, keepdims=True) / (target_col * P.shape[0])).clip(min=eps)
-    return P / P.sum(axis=1, keepdims=True).clip(min=eps)
+    return damped_sinkhorn(P, alpha=1.0, iters=iters, eps_val=eps)
+
+
+def _clip_and_log_probs(raw_lps_list: List[np.ndarray], clip_min: float = 1e-4) -> np.ndarray:
+    """Converts (M, N, K) raw logits or log-probs into probability-clipped log probabilities."""
+    raw_arr = np.asarray(raw_lps_list, dtype=np.float64)
+    M = raw_arr.shape[0]
+    P_clipped = np.zeros_like(raw_arr, dtype=np.float64)
+    for m in range(M):
+        p_m = softmax(raw_arr[m], axis=1)
+        p_m = np.clip(p_m, clip_min, 1.0)
+        p_m /= np.maximum(p_m.sum(axis=1, keepdims=True), 1e-12)
+        P_clipped[m] = p_m
+    return np.log(P_clipped)
+
+
+def _lbfgs_loss_and_grad(theta: np.ndarray, Z_tr: np.ndarray, Y_smooth: np.ndarray, lam: float, M: int) -> Tuple[float, np.ndarray]:
+    """Label-smoothed NLL + uniform L2 simplex regularization objective and analytic gradient."""
+    N_tr = len(Y_smooth)
+    w = softmax(theta)
+    U = np.tensordot(w, Z_tr, axes=(0, 0))
+    P = softmax(U, axis=1)
+    nll = float(-np.mean(np.sum(Y_smooth * np.log(np.clip(P, 1e-12, 1.0)), axis=1)))
+    reg = float(lam) * float(np.sum((w - 1.0 / M) ** 2))
+    loss = nll + reg
+    G = (P - Y_smooth) / max(1, N_tr)
+    grad_w_nll = np.tensordot(Z_tr, G, axes=((1, 2), (0, 1)))
+    grad_w_reg = 2.0 * float(lam) * (w - 1.0 / M)
+    d_w = grad_w_nll + grad_w_reg
+    grad_theta = w * (d_w - np.dot(w, d_w))
+    return loss, grad_theta
+
+
+def pool_calibrated_log_probs(
+    raw_lps_list: List[np.ndarray],
+    model_names: List[str],
+    mean_T_m: Dict[str, float],
+    mean_w_m: Dict[str, float],
+    mean_T_global: float = 1.0,
+    clip_min: float = 1e-4,
+) -> np.ndarray:
+    """Applies pre-calibrated per-model temperatures T_m, simplex weights w_m, and global T_global."""
+    if not raw_lps_list:
+        return np.zeros((0, K), dtype=np.float64)
+    n_rows = len(raw_lps_list[0])
+    if n_rows == 0:
+        return np.zeros((0, K), dtype=np.float64)
+
+    log_P = _clip_and_log_probs(raw_lps_list, clip_min=clip_min)
+    weights = np.array([max(0.0, float(mean_w_m.get(name, 0.0))) for name in model_names], dtype=np.float64)
+    w_sum = float(weights.sum())
+    if w_sum <= 1e-12:
+        weights = np.full(len(model_names), 1.0 / max(1, len(model_names)), dtype=np.float64)
+    else:
+        weights = weights / w_sum
+
+    U = np.zeros((n_rows, K), dtype=np.float64)
+    for m, name in enumerate(model_names):
+        if weights[m] <= 0.0:
+            continue
+        T_m = max(1e-3, float(mean_T_m.get(name, 1.0)))
+        Z_m = log_softmax(log_P[m] / T_m, axis=1)
+        U += weights[m] * Z_m
+
+    T_g = max(1e-3, float(mean_T_global))
+    return softmax(U / T_g, axis=1)
+
+
+def fit_lbfgs_log_linear_pooling(
+    raw_lps_list: List[np.ndarray],
+    y: np.ndarray,
+    groups: Optional[np.ndarray],
+    model_names: List[str],
+    spec_logits: Optional[np.ndarray] = None,
+    claude_classes: Optional[list] = None,
+    lam: float = 0.20,
+    eps: float = 0.05,
+    sinkhorn_alpha: float = 0.50,
+    clip_min: float = 1e-4,
+    n_splits: int = 5,
+) -> Dict[str, Any]:
+    """Fits 5-fold GroupKFold L-BFGS log-linear pooling with per-model T_m, global T_g, and optional Claude gate."""
+    log_P = _clip_and_log_probs(raw_lps_list, clip_min=clip_min)
+    M, N, K_cls = log_P.shape
+    y_arr = np.asarray(y, dtype=int)
+
+    if groups is not None and len(groups) == N and len(np.unique(groups)) >= 2:
+        k_folds = min(n_splits, len(np.unique(groups)))
+        splits = list(GroupKFold(n_splits=k_folds).split(log_P[0], y_arr, groups=groups))
+    else:
+        k_folds = min(n_splits, max(2, N // max(1, K_cls)))
+        splits = list(KFold(n_splits=k_folds, shuffle=True, random_state=42).split(log_P[0]))
+
+    trial_gws = [0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20]
+    oof_blended_lp = np.zeros((N, K_cls), dtype=np.float64)
+    oof_post_probs = np.zeros((N, K_cls), dtype=np.float64)
+    fold_weights, fold_model_temps, fold_global_temps, fold_stds, fold_gws = [], [], [], [], []
+
+    for tr_idx, val_idx in splits:
+        N_tr = len(tr_idx)
+        y_tr = y_arr[tr_idx]
+        Z_fold = np.zeros_like(log_P)
+        model_temps = np.ones(M, dtype=np.float64)
+        model_stds = np.zeros(M, dtype=np.float64)
+
+        for m in range(M):
+            lpm_tr = log_P[m, tr_idx, :]
+            res_t = minimize_scalar(
+                lambda T: float(-np.mean(log_softmax(lpm_tr / T, axis=1)[np.arange(N_tr), y_tr])),
+                bounds=(0.05, 10.0),
+                method="bounded",
+            )
+            T_opt = float(res_t.x)
+            model_temps[m] = T_opt
+            Z_fold[m] = log_softmax(log_P[m] / T_opt, axis=1)
+            model_stds[m] = float(np.std(Z_fold[m, tr_idx, :]))
+
+        fold_model_temps.append(model_temps)
+        fold_stds.append(model_stds)
+
+        Y_smooth = np.full((N_tr, K_cls), float(eps) / K_cls, dtype=np.float64)
+        Y_smooth[np.arange(N_tr), y_tr] += 1.0 - float(eps)
+        Z_tr = Z_fold[:, tr_idx, :]
+
+        if M == 1:
+            w_k = np.array([1.0], dtype=np.float64)
+        else:
+            res_w = minimize(
+                fun=lambda th: _lbfgs_loss_and_grad(th, Z_tr, Y_smooth, lam, M),
+                x0=np.zeros(M, dtype=np.float64),
+                method="L-BFGS-B",
+                jac=True,
+                options={"maxiter": 500, "ftol": 1e-9},
+            )
+            w_k = softmax(res_w.x)
+        fold_weights.append(w_k)
+
+        U_tr = np.tensordot(w_k, Z_tr, axes=(0, 0))
+        res_tg = minimize_scalar(
+            lambda T_g: float(-np.mean(log_softmax(U_tr / T_g, axis=1)[np.arange(N_tr), y_tr])),
+            bounds=(0.1, 5.0),
+            method="bounded",
+        )
+        T_global_opt = float(res_tg.x)
+        fold_global_temps.append(T_global_opt)
+
+        P_tr = softmax(U_tr / T_global_opt, axis=1)
+        best_gw_fold = 0.0
+        if spec_logits is not None and claude_classes is not None and len(spec_logits) == N:
+            best_bacc_tr = float(balanced_accuracy_score(y_tr, damped_sinkhorn(P_tr, alpha=sinkhorn_alpha).argmax(axis=1)))
+            for trial_gw in trial_gws:
+                P_tr_g = apply_claude_specialist_gate(
+                    P_mix=P_tr,
+                    R_main=P_tr,
+                    claude_spec_logits=spec_logits[tr_idx],
+                    claude_classes=claude_classes,
+                    gate_weight=trial_gw,
+                )
+                b_tr = float(balanced_accuracy_score(y_tr, damped_sinkhorn(P_tr_g, alpha=sinkhorn_alpha).argmax(axis=1)))
+                if b_tr > best_bacc_tr:
+                    best_bacc_tr = b_tr
+                    best_gw_fold = trial_gw
+        fold_gws.append(best_gw_fold)
+
+        U_val = np.tensordot(w_k, Z_fold[:, val_idx, :], axes=(0, 0)) / T_global_opt
+        P_val = softmax(U_val, axis=1)
+        oof_blended_lp[val_idx] = log_softmax(U_val, axis=1)
+        if best_gw_fold > 0.0 and spec_logits is not None and claude_classes is not None:
+            oof_post_probs[val_idx] = apply_claude_specialist_gate(
+                P_mix=P_val,
+                R_main=P_val,
+                claude_spec_logits=spec_logits[val_idx],
+                claude_classes=claude_classes,
+                gate_weight=best_gw_fold,
+            )
+        else:
+            oof_post_probs[val_idx] = P_val
+
+    P_oof_raw = softmax(oof_blended_lp, axis=1)
+    oof_bacc_raw = float(balanced_accuracy_score(y_arr, P_oof_raw.argmax(axis=1)))
+    oof_nll_raw = float(-np.mean(oof_blended_lp[np.arange(N), y_arr]))
+    P_oof_sink = damped_sinkhorn(P_oof_raw, alpha=sinkhorn_alpha)
+    oof_bacc_sink = float(balanced_accuracy_score(y_arr, P_oof_sink.argmax(axis=1)))
+    P_oof_sink_cl = damped_sinkhorn(oof_post_probs, alpha=sinkhorn_alpha)
+    oof_bacc_nested_claude = float(balanced_accuracy_score(y_arr, P_oof_sink_cl.argmax(axis=1)))
+
+    avg_w = np.mean(fold_weights, axis=0)
+    avg_temps = np.mean(fold_model_temps, axis=0)
+    avg_stds = np.mean(fold_stds, axis=0)
+    avg_tg = float(np.mean(fold_global_temps))
+    avg_gw = float(np.mean(fold_gws))
+
+    use_claude_score = spec_logits is not None and claude_classes is not None and len(spec_logits) == N
+    primary_bacc = oof_bacc_nested_claude if use_claude_score else oof_bacc_sink
+    composite_oof_score = primary_bacc - 0.05 * oof_nll_raw
+
+    return {
+        "model_names": list(model_names),
+        "lam": float(lam),
+        "eps": float(eps),
+        "clip_min": float(clip_min),
+        "sinkhorn_alpha": float(sinkhorn_alpha),
+        "mean_T_m": {name: float(avg_temps[i]) for i, name in enumerate(model_names)},
+        "mean_w_m": {name: float(avg_w[i]) for i, name in enumerate(model_names)},
+        "mean_stds": {name: float(avg_stds[i]) for i, name in enumerate(model_names)},
+        "fold_weights": np.array(fold_weights),
+        "mean_T_global": avg_tg,
+        "mean_gw": avg_gw,
+        "oof_bacc_raw": oof_bacc_raw,
+        "oof_nll_raw": oof_nll_raw,
+        "oof_bacc_sink": oof_bacc_sink,
+        "oof_bacc_nested_claude": oof_bacc_nested_claude,
+        "composite_oof_score": float(composite_oof_score),
+        "P_oof_raw": P_oof_raw,
+        "P_oof_sink": P_oof_sink,
+        "P_oof_sink_claude": P_oof_sink_cl,
+    }
+
+
+def auto_prune_and_fit_lbfgs(
+    raw_lps_list: List[np.ndarray],
+    y: np.ndarray,
+    groups: Optional[np.ndarray],
+    model_names: List[str],
+    spec_logits: Optional[np.ndarray] = None,
+    claude_classes: Optional[list] = None,
+    lambdas: Tuple[float, ...] = (0.05, 0.10, 0.20),
+    eps: float = 0.05,
+    sinkhorn_alpha: float = 0.50,
+    clip_min: float = 1e-4,
+    pruning_tol: float = 1e-4,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Automatically selects active models and regularization strength lambda via 5-fold GroupKFold L-BFGS
+    pooling + OOF backward pruning optimizing combined OOF BAcc + NLL (without any hardcoded model count).
+    Returns (best_fit_dict, dropped_model_names).
+    """
+    active_idx = list(range(len(model_names)))
+    dropped_names: List[str] = []
+
+    def _fit_best_lam(indices: List[int]) -> Dict[str, Any]:
+        sub_names = [model_names[i] for i in indices]
+        sub_lps = [raw_lps_list[i] for i in indices]
+        fits = [
+            fit_lbfgs_log_linear_pooling(
+                sub_lps, y, groups, sub_names,
+                spec_logits=spec_logits, claude_classes=claude_classes,
+                lam=lam, eps=eps, sinkhorn_alpha=sinkhorn_alpha, clip_min=clip_min,
+            )
+            for lam in lambdas
+        ]
+        return max(fits, key=lambda d: d["composite_oof_score"])
+
+    cur_fit = _fit_best_lam(active_idx)
+    while len(active_idx) > 1:
+        cur_score = cur_fit["composite_oof_score"]
+        cur_names = [model_names[i] for i in active_idx]
+        zero_drop = [i for i, nm in zip(active_idx, cur_names) if cur_fit["mean_w_m"].get(nm, 0.0) < 1e-3]
+
+        best_cand_fit = None
+        best_rm_idx = None
+        best_cand_score = -1e9
+        candidates_to_test = zero_drop[:1] if zero_drop else active_idx
+        for rm_i in candidates_to_test:
+            trial_idx = [j for j in active_idx if j != rm_i]
+            trial_fit = _fit_best_lam(trial_idx)
+            if trial_fit["composite_oof_score"] > best_cand_score:
+                best_cand_score = trial_fit["composite_oof_score"]
+                best_rm_idx = rm_i
+                best_cand_fit = trial_fit
+
+        should_drop = (best_rm_idx is not None) and (
+            (bool(zero_drop) and best_cand_score >= cur_score - pruning_tol)
+            or (best_cand_score > cur_score + 1e-6)
+        )
+        if should_drop:
+            dropped_names.append(model_names[best_rm_idx])
+            active_idx.remove(best_rm_idx)
+            cur_fit = best_cand_fit
+        else:
+            break
+
+    return cur_fit, dropped_names
 
 def _fast_sinkhorn_bacc(lp_mat: np.ndarray, y_true: np.ndarray, iters: int = 40) -> float:
     """Computes balanced accuracy after fast Sinkhorn mass equalization."""
@@ -362,253 +642,253 @@ class UnseenStepwiseAuditor:
         optimize_on_unseen: bool = True,
         lock_prior_weights: bool = False,
         extra_unseen_log_probs: Optional[List[Tuple[str, float, np.ndarray]]] = None,
+        calibration_cfg: Optional[Dict[str, Any]] = None,
+        claude_spec_logits_u: Optional[np.ndarray] = None,
+        claude_classes: Optional[list] = None,
         **kwargs,
     ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
+        """
+        Calibrated Log-Linear Pooling & Automated OOF Selection Engine.
+        1. When `lock_prior_weights` is True (or `optimize_on_unseen` is False / N < 36):
+           applies pre-calibrated per-model temperatures `mean_T_m`, weights `mean_w_m`, and
+           `mean_T_global` if present in `calibration_cfg`; otherwise blends using model weights.
+        2. When `optimize_on_unseen` is True and `len(y_unseen) >= 36`:
+           runs 5-fold GroupKFold L-BFGS log-linear pooling with per-model T_m calibration,
+           global T_g, and automated OOF backward pruning over all candidate models (no fixed count).
+        """
         if lock_prior_weights:
             optimize_on_unseen = False
-        """
-        1. Runs Greedy Forward Stepwise Selection + Coordinate Line Search on `df_unseen`
-           to determine each model's optimal individual weight `w_star` (>= 0.0).
-        2. Any model that fails to improve unseen balanced accuracy gets `w_star = 0.0` (PRUNED).
-        3. Combines all active models + extra_test_log_probs (wpca_dp, spectral_bank) directly
-           in flat log-probability space:
-               LOGIT_FLAT = sum_m (w_star[m] * test_lp[m])
-        """
+
         if len(self.models) == 0:
             self.P_mix_unseen = np.zeros((0, K), dtype=np.float64)
             return np.ones((self.N_test, K), dtype=np.float64) / float(K), {}, pd.DataFrame()
 
+        for m in self.models:
+            m["prior_weight"] = m.get("prior_weight", m["weight"])
+
         extra_u_lp_base = np.zeros((len(self.y_unseen), K), dtype=np.float64)
+        extra_u_weight_tot = 0.0
         if extra_unseen_log_probs and len(self.y_unseen) > 0:
-            for ex_name, w_ex, lp_ex in extra_unseen_log_probs:
+            for _, w_ex, lp_ex in extra_unseen_log_probs:
                 if len(lp_ex) == len(self.y_unseen) and w_ex > 0.0:
                     extra_u_lp_base += float(w_ex) * log_softmax(lp_ex, axis=1)
+                    extra_u_weight_tot += float(w_ex)
 
+        # Branch A: Pre-calibrated config mode or small/frozen holdout fallback
         if not optimize_on_unseen or len(self.y_unseen) < 36:
-            weights_map = {m["name"]: float(m["weight"]) for m in self.models}
-            logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
-            logit_flat_u = extra_u_lp_base.copy() if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
-            for m in self.models:
-                logit_flat += m["weight"] * m["test_lp"]
-                if len(m["unseen_lp"]) == len(self.y_unseen):
-                    logit_flat_u += m["weight"] * m["unseen_lp"]
-            if extra_test_log_probs:
-                for ex_name, w_ex, lp_ex in extra_test_log_probs:
-                    if len(lp_ex) == self.N_test and w_ex > 0.0:
-                        logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
-                        weights_map[ex_name] = float(w_ex)
-            P_mix = softmax(logit_flat, axis=1)
-            self.P_mix_unseen = softmax(logit_flat_u, axis=1) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
+            alias_to_disp = {
+                "svc_4view": "LinearSVC (4-View)",
+                "lexical_5v": "Lexical Comp (5-View)",
+                "qwen3_14b_p2": "Qwen3-14B Part-2",
+                "qwen3_14b_p1": "Qwen3-14B Part-1",
+                "qwen25_14b_p2": "Qwen2.5-14B Part-2",
+                "deberta_p2": "DeBERTa-v3-Large",
+                "bge_m3": "BGE-M3-v2",
+            }
+            disp_to_canon = {v: k for k, v in alias_to_disp.items()}
+
+            def _resolve_cal_entry(name: str, mapping: Dict[str, Any]) -> Optional[str]:
+                for cand in (name, alias_to_disp.get(name), disp_to_canon.get(name), "BGE-M3" if name in ("bge_m3", "BGE-M3-v2") else None):
+                    if cand and cand in mapping:
+                        return cand
+                return None
+
+            mean_T_m = calibration_cfg.get("mean_T_m", {}) if calibration_cfg else {}
+            mean_w_m = calibration_cfg.get("mean_w_m", {}) if calibration_cfg else {}
+            clip_min = float(calibration_cfg.get("clip_min", 1e-4)) if calibration_cfg else 1e-4
+            resolved_keys = {
+                m["name"]: (_resolve_cal_entry(m["name"], mean_T_m), _resolve_cal_entry(m["name"], mean_w_m))
+                for m in self.models
+            }
+            matched_models = [m for m in self.models if all(resolved_keys[m["name"]])]
+
+            if calibration_cfg and "mean_T_global" in calibration_cfg and len(matched_models) > 0:
+                m_names = [m["name"] for m in matched_models]
+                raw_w = np.array([max(0.0, float(mean_w_m[resolved_keys[n][1]])) for n in m_names], dtype=np.float64)
+                w_norm = raw_w / max(float(raw_w.sum()), 1e-12)
+                norm_map = {n: float(w_norm[i]) for i, n in enumerate(m_names)}
+                t_map = {n: float(mean_T_m[resolved_keys[n][0]]) for n in m_names}
+                weights_map: Dict[str, float] = {}
+                for m in self.models:
+                    w_val = norm_map.get(m["name"], 0.0)
+                    m["learned_weight"] = w_val
+                    m["weight"] = w_val
+                    weights_map[m["name"]] = w_val
+
+                P_mix = (
+                    pool_calibrated_log_probs(
+                        [m["test_lp"] for m in matched_models],
+                        m_names,
+                        t_map,
+                        norm_map,
+                        mean_T_global=float(calibration_cfg["mean_T_global"]),
+                        clip_min=clip_min,
+                    )
+                    if self.N_test > 0
+                    else np.zeros((0, K), dtype=np.float64)
+                )
+                self.P_mix_unseen = (
+                    pool_calibrated_log_probs(
+                        [m["unseen_lp"] for m in matched_models],
+                        m_names,
+                        t_map,
+                        norm_map,
+                        mean_T_global=float(calibration_cfg["mean_T_global"]),
+                        clip_min=clip_min,
+                    )
+                    if len(self.y_unseen) > 0
+                    else np.zeros((0, K), dtype=np.float64)
+                )
+                self.normalized_weights_map = dict(weights_map)
+                self.fitted_artifact = {
+                    "model_names": m_names,
+                    "mean_T_m": dict(t_map),
+                    "mean_w_m": dict(norm_map),
+                    "mean_T_global": float(calibration_cfg["mean_T_global"]),
+                    "clip_min": clip_min,
+                }
+            else:
+                weights_map = {m["name"]: float(m["weight"]) for m in self.models}
+                logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
+                logit_flat_u = extra_u_lp_base.copy() if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
+                for m in self.models:
+                    logit_flat += m["weight"] * m["test_lp"]
+                    if len(m["unseen_lp"]) == len(self.y_unseen):
+                        logit_flat_u += m["weight"] * m["unseen_lp"]
+                if extra_test_log_probs:
+                    for ex_name, w_ex, lp_ex in extra_test_log_probs:
+                        if len(lp_ex) == self.N_test and w_ex > 0.0:
+                            logit_flat += float(w_ex) * log_softmax(lp_ex, axis=1)
+                            weights_map[ex_name] = float(w_ex)
+                P_mix = softmax(logit_flat, axis=1)
+                self.P_mix_unseen = softmax(logit_flat_u, axis=1) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
+
             df_summary = pd.DataFrame([
-                {"model": m["name"], "tier": m["tier"], "prior_weight": m.get("prior_weight", m["weight"]), "learned_weight": m["weight"]}
+                {"model": m["name"], "tier": m["tier"], "prior_weight": m["prior_weight"], "learned_weight": m["weight"]}
                 for m in self.models
             ])
             return P_mix, weights_map, df_summary
 
-        def _composite_obj(lp_mat: np.ndarray, y_target: Optional[np.ndarray] = None) -> Tuple[float, float]:
-            y_use = self.y_unseen if y_target is None else y_target
-            P = softmax(lp_mat, axis=1)
-            P_s = _ablation_sinkhorn(P, iters=60) if len(P) >= 18 else P
-            bacc = float(balanced_accuracy_score(y_use, P_s.argmax(axis=1)))
-            nll = float(-np.mean(np.log(np.clip(P_s[np.arange(len(y_use)), y_use], 1e-9, 1.0))))
-            return bacc - 0.015 * nll, bacc
+        # Branch B: Dynamic 5-Fold GroupKFold L-BFGS Pooling + Automated OOF Backward Pruning
+        chance_floor = 1.0 / float(K)
+        valid_pool = [m for m in self.models if m["solo_unseen_bacc"] > chance_floor]
+        if not valid_pool:
+            valid_pool = list(self.models)
+        cand_names = [m["name"] for m in valid_pool]
+        cand_u_lps = [m["unseen_lp"] for m in valid_pool]
+        pre_pruned = [m["name"] for m in self.models if m not in valid_pool]
+        clip_min = float(calibration_cfg.get("clip_min", 1e-4)) if calibration_cfg else 1e-4
+        eps = float(calibration_cfg.get("label_smoothing_eps", 0.05)) if calibration_cfg else 0.05
+        sink_alpha = float(calibration_cfg.get("sinkhorn_alpha", 0.50)) if calibration_cfg else 0.50
 
-        M = len(self.models)
-        order = sorted(range(M), key=lambda i: self.models[i]["solo_unseen_sinkhorn_bacc"], reverse=True)
+        best_fit, dropped_names = auto_prune_and_fit_lbfgs(
+            raw_lps_list=cand_u_lps,
+            y=self.y_unseen,
+            groups=self.groups_unseen,
+            model_names=cand_names,
+            spec_logits=claude_spec_logits_u,
+            claude_classes=claude_classes,
+            lambdas=(0.05, 0.10, 0.20),
+            eps=eps,
+            sinkhorn_alpha=sink_alpha,
+            clip_min=clip_min,
+        )
+        dropped_names = pre_pruned + dropped_names
 
-        active_weights = np.zeros(M, dtype=np.float64)
-        first_idx = order[0]
-        anchor_w = 1.0 if self.models[first_idx]["weight"] <= 0.0 else float(self.models[first_idx]["weight"])
-        active_weights[first_idx] = anchor_w
-        cum_u_lp = extra_u_lp_base + active_weights[first_idx] * self.models[first_idx]["unseen_lp"]
-        best_obj, best_bacc = _composite_obj(cum_u_lp)
+        kept_names = best_fit["model_names"]
+        kept_weights = best_fit["mean_w_m"]
+        kept_temps = best_fit["mean_T_m"]
+        T_global_opt = float(best_fit["mean_T_global"])
+        self.fitted_artifact = best_fit
 
-        remaining = list(order[1:])
-        base_grid = [0.05, 0.10, 0.15, 0.20, 0.25, 0.35, 0.50, 0.65, 0.80, 1.00, 1.25, 1.50]
-
-        chosen_indices = [first_idx]
-        cur_test_lp = active_weights[first_idx] * self.models[first_idx]["test_lp"].copy()
-        prev_test_preds = _ablation_sinkhorn(softmax(cur_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
-        step_records = [{
-            "step": 1,
-            "model": self.models[first_idx]["name"],
-            "raw_weight": anchor_w,
-            "cumul_raw": float(balanced_accuracy_score(self.y_unseen, cum_u_lp.argmax(axis=1))),
-            "cumul_sink": best_bacc,
-            "marginal_lift": 0.0,
-            "test_rows_flipped": self.N_test,
-        }]
-
-        step_idx = 2
-        while remaining:
-            step_best_idx = None
-            step_best_w = 0.0
-            step_best_obj = best_obj
-            step_best_bacc = best_bacc
-
-            for idx in remaining:
-                u_lp = self.models[idx]["unseen_lp"]
-                p_w = self.models[idx]["weight"]
-                weights_to_test = list(base_grid)
-                if p_w > 0.0:
-                    for mult in [0.25, 0.50, 1.00, 1.25]:
-                        weights_to_test.append(round(p_w * mult, 3))
-                weights_to_test = sorted(list(set(w for w in weights_to_test if w > 0.0)))
-
-                for cand_w in weights_to_test:
-                    trial_lp = cum_u_lp + cand_w * u_lp
-                    obj_val, bacc_val = _composite_obj(trial_lp)
-                    if obj_val > step_best_obj + 1e-6:
-                        step_best_obj = obj_val
-                        step_best_bacc = bacc_val
-                        step_best_idx = idx
-                        step_best_w = cand_w
-
-            if step_best_idx is not None and step_best_w > 0.0:
-                lift = step_best_bacc - best_bacc
-                active_weights[step_best_idx] = step_best_w
-                cum_u_lp = cum_u_lp + step_best_w * self.models[step_best_idx]["unseen_lp"]
-                best_obj = step_best_obj
-                best_bacc = step_best_bacc
-                remaining.remove(step_best_idx)
-                chosen_indices.append(step_best_idx)
-
-                cur_test_lp += step_best_w * self.models[step_best_idx]["test_lp"]
-                cur_test_preds = _ablation_sinkhorn(softmax(cur_test_lp, axis=1), iters=40).argmax(axis=1) if self.N_test > 0 else np.array([])
-                flips = int((cur_test_preds != prev_test_preds).sum()) if len(cur_test_preds) == len(prev_test_preds) else 0
-                prev_test_preds = cur_test_preds
-
-                step_records.append({
-                    "step": step_idx,
-                    "model": self.models[step_best_idx]["name"],
-                    "raw_weight": step_best_w,
-                    "cumul_raw": float(balanced_accuracy_score(self.y_unseen, cum_u_lp.argmax(axis=1))),
-                    "cumul_sink": best_bacc,
-                    "marginal_lift": lift,
-                    "test_rows_flipped": flips,
-                })
-                step_idx += 1
-            else:
-                break
-
-        # Calculate single-truth normalized weights across active models
-        tot_act = sum(active_weights[ci] for ci in chosen_indices)
-        if extra_test_log_probs:
-            tot_act += sum(max(0.0, float(w_ex)) for _, w_ex, _ in extra_test_log_probs)
-        act_scale = (1.0 / tot_act) if tot_act > 0.0 else 1.0
-
-        weights_map: Dict[str, float] = {}
-        normalized_weights_map: Dict[str, float] = {}
-        logit_flat = np.zeros((self.N_test, K), dtype=np.float64)
-        logit_flat_u = (extra_u_lp_base * act_scale) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
-
+        # Map kept weights across registered models
+        weights_map = {}
+        normalized_weights_map = {}
+        chosen_indices = []
         for idx, m in enumerate(self.models):
-            m["prior_weight"] = m.get("prior_weight", m["weight"])
-            raw_w = float(active_weights[idx])
-            norm_w = float(raw_w * act_scale)
-            m["learned_weight"] = norm_w
-            m["weight"] = norm_w
-            weights_map[m["name"]] = raw_w
-            normalized_weights_map[m["name"]] = norm_w
-            if norm_w > 0.0:
-                logit_flat += norm_w * m["test_lp"]
-                if len(m["unseen_lp"]) == len(self.y_unseen):
-                    logit_flat_u += norm_w * m["unseen_lp"]
+            w_val = float(kept_weights.get(m["name"], 0.0)) if m["name"] in kept_names else 0.0
+            m["learned_weight"] = w_val
+            m["weight"] = w_val
+            weights_map[m["name"]] = w_val
+            normalized_weights_map[m["name"]] = w_val
+            if w_val > 0.0:
+                chosen_indices.append(idx)
 
-        if extra_test_log_probs:
-            for ex_name, w_ex, lp_ex in extra_test_log_probs:
-                if len(lp_ex) == self.N_test and w_ex > 0.0:
-                    norm_ex_w = float(w_ex) * act_scale
-                    logit_flat += norm_ex_w * log_softmax(lp_ex, axis=1)
-                    weights_map[ex_name] = float(w_ex)
-                    normalized_weights_map[ex_name] = norm_ex_w
+        kept_models = [m for m in self.models if m["name"] in kept_names and weights_map[m["name"]] > 0.0]
+        kept_m_names = [m["name"] for m in kept_models]
+        P_mix_base = (
+            pool_calibrated_log_probs(
+                [m["test_lp"] for m in kept_models],
+                kept_m_names,
+                kept_temps,
+                kept_weights,
+                mean_T_global=T_global_opt,
+                clip_min=clip_min,
+            )
+            if self.N_test > 0
+            else np.zeros((0, K), dtype=np.float64)
+        )
+        P_u_base = pool_calibrated_log_probs(
+            [m["unseen_lp"] for m in kept_models],
+            kept_m_names,
+            kept_temps,
+            kept_weights,
+            mean_T_global=T_global_opt,
+            clip_min=clip_min,
+        )
 
-        self.greedy_step_records = step_records
+        # Incorporate auxiliary external streams (e.g., wpca_dp / spectral_bank) cleanly if passed
+        if extra_test_log_probs or (extra_unseen_log_probs and extra_u_weight_tot > 0.0):
+            base_te_lp = np.log(np.clip(P_mix_base, 1e-12, 1.0)) if self.N_test > 0 else np.zeros((0, K), dtype=np.float64)
+            base_u_lp = np.log(np.clip(P_u_base, 1e-12, 1.0))
+            ext_te_tot = 0.0
+            ext_te_lp = np.zeros((self.N_test, K), dtype=np.float64)
+            if extra_test_log_probs:
+                for ex_name, w_ex, lp_ex in extra_test_log_probs:
+                    if len(lp_ex) == self.N_test and w_ex > 0.0:
+                        ext_te_lp += float(w_ex) * log_softmax(lp_ex, axis=1)
+                        ext_te_tot += float(w_ex)
+                        weights_map[ex_name] = float(w_ex)
+                        normalized_weights_map[ex_name] = float(w_ex) / max(1.0 + float(w_ex), 1e-8)
+            P_mix = softmax((base_te_lp + ext_te_lp) / max(1.0 + ext_te_tot, 1.0), axis=1) if self.N_test > 0 else P_mix_base
+            self.P_mix_unseen = softmax((base_u_lp + extra_u_lp_base) / max(1.0 + extra_u_weight_tot, 1.0), axis=1)
+        else:
+            P_mix = P_mix_base
+            self.P_mix_unseen = P_u_base
+
+        # Populate report state & log concise 5-fold OOF diagnostics
         self.greedy_model_indices = chosen_indices
-        self.greedy_model_names = [self.models[ci]["name"] for ci in chosen_indices]
-        self.greedy_raw_weights = {self.models[ci]["name"]: float(active_weights[ci]) for ci in chosen_indices}
-        self.greedy_norm_weights = {self.models[ci]["name"]: normalized_weights_map[self.models[ci]["name"]] for ci in chosen_indices}
-        self.greedy_unseen_lp = logit_flat_u
-        self.greedy_test_lp = logit_flat
-        self.greedy_unseen_bacc_raw = float(balanced_accuracy_score(self.y_unseen, logit_flat_u.argmax(axis=1))) if len(self.y_unseen) > 0 else 0.0
-        self.greedy_unseen_bacc_sink = best_bacc
+        self.greedy_model_names = kept_m_names
+        self.greedy_raw_weights = {n: float(kept_weights[n]) for n in kept_m_names}
+        self.greedy_norm_weights = {n: float(kept_weights[n]) for n in kept_m_names}
+        self.greedy_unseen_lp = np.log(np.clip(self.P_mix_unseen, 1e-12, 1.0))
+        self.greedy_test_lp = np.log(np.clip(P_mix, 1e-12, 1.0)) if self.N_test > 0 else np.zeros((0, K), dtype=np.float64)
+        self.greedy_unseen_bacc_raw = float(best_fit["oof_bacc_raw"])
+        self.greedy_unseen_bacc_sink = float(best_fit["oof_bacc_sink"])
         self.normalized_weights_map = normalized_weights_map
 
-        in_sample_bacc = _fast_sinkhorn_bacc(logit_flat_u, self.y_unseen, iters=200) if len(self.y_unseen) >= 18 else best_bacc
+        # Build clean step records in descending weight order for reporting
+        step_records = []
+        for s_i, n in enumerate(sorted(kept_m_names, key=lambda x: -kept_weights[x]), 1):
+            step_records.append({
+                "step": s_i,
+                "model": n,
+                "raw_weight": float(kept_weights[n]),
+                "cumul_raw": float(best_fit["oof_bacc_raw"]),
+                "cumul_sink": float(best_fit["oof_bacc_sink"]),
+                "marginal_lift": 0.0 if s_i == 1 else float(best_fit["oof_bacc_sink"] - self.models[0]["solo_unseen_sinkhorn_bacc"]),
+                "test_rows_flipped": 0,
+            })
+        self.greedy_step_records = step_records
 
-        # 5-fold GroupKFold OOF Unseen BAcc calculation
-        oof_bacc = in_sample_bacc
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=UserWarning)
-                groups = self.groups_unseen if len(self.groups_unseen) == len(self.y_unseen) else np.arange(len(self.y_unseen))
-                n_groups = len(np.unique(groups))
-                if n_groups >= 2:
-                    n_splits = min(5, n_groups)
-                    gkf = GroupKFold(n_splits=n_splits)
-                    splits = list(gkf.split(self.y_unseen, self.y_unseen, groups=groups))
-                else:
-                    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-                    splits = list(kf.split(self.y_unseen))
+        print(
+            f"[Ablation L-BFGS] lam={best_fit['lam']:.2f} | Pruned={dropped_names or 'None'} | "
+            f"OOF Raw={best_fit['oof_bacc_raw']:.4f} (NLL={best_fit['oof_nll_raw']:.4f}) | "
+            f"+Sink={best_fit['oof_bacc_sink']:.4f} | Tg={T_global_opt:.3f}"
+        )
 
-                oof_lp = np.zeros((len(self.y_unseen), K), dtype=np.float64)
-                for tr_idx, val_idx in splits:
-                    y_tr = self.y_unseen[tr_idx]
-                    ex_tr = extra_u_lp_base[tr_idx]
-                    ex_val = extra_u_lp_base[val_idx]
-
-                    fold_order = sorted(
-                        range(M),
-                        key=lambda i: _fast_sinkhorn_bacc(self.models[i]["unseen_lp"][tr_idx], y_tr, iters=40) if len(tr_idx) >= 18 else 0.0,
-                        reverse=True,
-                    )
-                    fold_w = np.zeros(M, dtype=np.float64)
-                    f_first = fold_order[0]
-                    fold_w[f_first] = self.models[f_first]["weight"]
-                    f_cum_lp = ex_tr + fold_w[f_first] * self.models[f_first]["unseen_lp"][tr_idx]
-                    f_obj, _ = _composite_obj(f_cum_lp, y_target=y_tr)
-
-                    f_rem = list(fold_order[1:])
-                    while f_rem:
-                        s_best_idx = None
-                        s_best_w = 0.0
-                        s_best_obj = f_obj
-                        for idx in f_rem:
-                            u_lp_tr = self.models[idx]["unseen_lp"][tr_idx]
-                            for cand_w in base_grid:
-                                t_lp = f_cum_lp + cand_w * u_lp_tr
-                                obj_val, _ = _composite_obj(t_lp, y_target=y_tr)
-                                if obj_val > s_best_obj + 1e-6:
-                                    s_best_obj = obj_val
-                                    s_best_idx = idx
-                                    s_best_w = cand_w
-                        if s_best_idx is not None and s_best_w > 0.0:
-                            fold_w[s_best_idx] = s_best_w
-                            f_cum_lp = f_cum_lp + s_best_w * self.models[s_best_idx]["unseen_lp"][tr_idx]
-                            f_obj = s_best_obj
-                            f_rem.remove(s_best_idx)
-                        else:
-                            break
-
-                    f_tot = sum(fold_w)
-                    f_scale = (1.0 / f_tot) if f_tot > 0.0 else 1.0
-                    fold_val_lp = (ex_val.copy() * f_scale) if len(ex_val) > 0 else np.zeros((len(val_idx), K), dtype=np.float64)
-                    for idx, m in enumerate(self.models):
-                        if fold_w[idx] > 0.0:
-                            fold_val_lp += (fold_w[idx] * f_scale) * m["unseen_lp"][val_idx]
-                    oof_lp[val_idx] = fold_val_lp
-
-                oof_bacc = _fast_sinkhorn_bacc(oof_lp, self.y_unseen, iters=200)
-        except Exception as e:
-            print(f"[Ablation Warning] OOF GroupKFold computation failed ({e}), using in-sample BAcc fallback.")
-            oof_bacc = in_sample_bacc
-
-        print(f"[Ablation] In-Sample Unseen BAcc: {in_sample_bacc:.4f} | 5-Fold GroupKFold OOF Unseen BAcc: {oof_bacc:.4f}")
-
-        P_mix = softmax(logit_flat, axis=1)
-        self.P_mix_unseen = softmax(logit_flat_u, axis=1) if len(self.y_unseen) > 0 else np.zeros((0, K), dtype=np.float64)
         df_summary = pd.DataFrame([
-            {"model": m["name"], "tier": m["tier"], "prior_weight": m.get("prior_weight", m["weight"]), "learned_weight": m["weight"]}
+            {"model": m["name"], "tier": m["tier"], "prior_weight": m["prior_weight"], "learned_weight": m["weight"]}
             for m in self.models
         ])
         return P_mix, weights_map, df_summary

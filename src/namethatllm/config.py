@@ -141,7 +141,8 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
     fam_target = model_family.lower()
     for cfg_p in input_dir.rglob('config.json'):
         try:
-            cfg = json.load(open(cfg_p))
+            with open(cfg_p, encoding='utf-8') as f:
+                cfg = json.load(f)
             m_type = str(cfg.get('model_type', '')).lower()
             h_dim = cfg.get('hidden_size', 0)
             n_lay = cfg.get('num_hidden_layers', 0)
@@ -173,32 +174,16 @@ def find_base_model(input_dir: Path, model_family: str, hidden_sz: int, num_laye
             continue
     return candidates[0] if candidates else None
 
-class CheckpointInfo(tuple):
-    """Tuple subclass supporting both 2-element (dim, keep) and 3-element (dim, keep, backbone) unpacking."""
-    def __iter__(self):
-        try:
-            import sys
-            import dis
-            f = sys._getframe(1)
-            for i in dis.get_instructions(f.f_code):
-                if i.offset == f.f_lasti and i.opname.startswith('UNPACK_SEQUENCE'):
-                    if i.argval == 2:
-                        return iter(self[:2])
-                    elif i.argval == 3:
-                        return iter(self[:3])
-        except Exception:
-            pass
-        return super().__iter__()
-
-def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
-    """Returns (head_feature_dim, keep_layers) for checkpoint directory without full model loading."""
+def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int, str]:
+    """Returns (head_feature_dim, keep_layers, backbone) without loading model weights."""
     dim = 0
     keep = 0
     backbone = ""
     meta_p = ckpt_dir / "meta.json"
     if meta_p.exists():
         try:
-            m = json.load(open(meta_p))
+            with open(meta_p, encoding='utf-8') as f:
+                m = json.load(f)
             cfg = m.get("cfg", m)
             keep = int(cfg.get("keep", 0))
             backbone = str(m.get("backbone", cfg.get("backbone", ""))).lower()
@@ -208,7 +193,8 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
     adapter_p = ckpt_dir / "adapter_config.json"
     if adapter_p.exists():
         try:
-            ac = json.load(open(adapter_p))
+            with open(adapter_p, encoding='utf-8') as f:
+                ac = json.load(f)
             base_model = str(ac.get("base_model_name_or_path", "")).lower()
             if not backbone and base_model:
                 backbone = base_model
@@ -238,127 +224,123 @@ def _inspect_checkpoint_dim_and_keep(ckpt_dir: Path) -> Tuple[int, int]:
                         break
         except Exception:
             pass
-    return CheckpointInfo((dim, keep, backbone))
+    return dim, keep, backbone
+
+_FOLD_MARKER_TOKENS = ("_f0", "_f1", "_f2", "_f3", "_f4")
+_INHOUSE_TOKENS = ("inhouse", "ntl-inhouse", "export_lora24", "export_champion", "lora-peft-training", "peft_training")
+_FOLD_PRIORITY_RULES = (
+    (("q14v5",), "qwen3_14b_v5"),
+    (("ts_q3b14",), "qwen3_14b_ts"),
+    (("q8v5",), "qwen3_8b_v5"),
+    (("ts_q3b8", "ts8_s7", "l24x_q3b8"), "qwen3_8b_ts"),
+    (("ll8v5",), "llama3_8b_v5"),
+    (("ts_llama8",), "llama3_8b_ts"),
+    (("ts_q25_7b", "l24x_q25_7b"), "qwen25_7b_ts"),
+    (("gemma2", "gemma_2", "gemma-2", "ts_gemma", "ts-gemma"), "gemma2_9b_ts"),
+    (("llama31", "llama_31", "llama-3.1", "ts_llama31", "ts-llama31"), "llama31_8b_ts"),
+    (("mistral", "ts_mistral", "ts-mistral"), "mistral_7b_ts"),
+    (("bge_m3", "bge-m3", "bgem3"), "bge_m3"),
+)
+
+
+def _classify_inhouse_checkpoint(ckpt_dir: Path, p_str: str) -> Optional[str]:
+    """Routes in-house fine-tuned checkpoints using dim/keep/backbone metadata."""
+    if "family_gate" in p_str or "/gate" in p_str or "\\gate" in p_str:
+        return None
+    if any(tok in p_str for tok in ("bge_m3", "bge-m3", "bgem3")):
+        return "bge_m3"
+    dim, keep, backbone = _inspect_checkpoint_dim_and_keep(ckpt_dir)
+    if "2.5" in backbone or "qwen25" in backbone or (dim == 40960 and (keep >= 30 or "25" in p_str or "qwen25" in p_str)):
+        return "qwen25_14b_inhouse"
+    if dim == 40960 or "14b" in p_str or "14b" in backbone:
+        return "qwen3_14b_inhouse"
+    if dim == 8192 or "deberta" in p_str or "deberta" in backbone:
+        return "deberta_inhouse"
+    if dim in (32768, 28672) or ("8b" in p_str or "8b" in backbone) or ("14b" not in p_str and "14b" not in backbone):
+        return "qwen3_8b_inhouse"
+    return None
+
 
 def find_checkpoints(input_dir: Path) -> Dict[str, Path]:
     """Finds all fine-tuned LoRA and head checkpoints across safetensors and PyTorch formats."""
-    ckpts = {}
+    ckpts: Dict[str, Path] = {}
 
-    # 1. Check for heads.safetensors and heads.pt files
-    head_candidates = list(input_dir.rglob('heads.safetensors')) + list(input_dir.rglob('heads.pt'))
+    head_candidates = list(input_dir.rglob("heads.safetensors")) + list(input_dir.rglob("heads.pt"))
     for p in head_candidates:
-        p_str = str(p).lower().replace('\\', '/')
-        is_fold = ('_f0' in p_str or '_f1' in p_str or '_f2' in p_str or '_f3' in p_str or '_f4' in p_str)
+        p_str = str(p).lower().replace("\\", "/")
+        is_fold = any(tok in p_str for tok in _FOLD_MARKER_TOKENS)
 
-        if 'lora_qwen3_14b' in p_str or 'qwen3_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen3' in p_str):
-            ckpts['qwen3_14b_p2'] = p.parent
-        elif 'lora_qwen25_14b' in p_str or 'qwen25_14b_part2' in p_str or ('14b' in p_str and 'part2' in p_str and 'qwen2' in p_str):
-            ckpts['qwen25_14b_p2'] = p.parent
-        elif 'q14v5' in p_str:
-            if 'qwen3_14b_v5' not in ckpts or (not is_fold):
-                ckpts['qwen3_14b_v5'] = p.parent
-        elif 'ts_q3b14' in p_str:
-            if 'qwen3_14b_ts' not in ckpts or (not is_fold):
-                ckpts['qwen3_14b_ts'] = p.parent
-        elif 'lora14b_v1' in p_str:
-            ckpts['qwen3_14b_p1'] = p.parent
-        elif any(token in p_str for token in ('inhouse', 'ntl-inhouse', 'export_lora24', 'export_champion', 'lora-peft-training', 'peft_training')):
-            if "family_gate" in p_str or "/gate" in p_str or "\\gate" in p_str:
-                continue
-            dim, keep, backbone = _inspect_checkpoint_dim_and_keep(p.parent)
-            if '2.5' in backbone or 'qwen25' in backbone or (dim == 40960 and (keep >= 30 or '25' in p_str or 'qwen25' in p_str)):
-                ckpts['qwen25_14b_inhouse'] = p.parent
-            elif dim == 40960 or '14b' in p_str or '14b' in backbone:
-                ckpts['qwen3_14b_inhouse'] = p.parent
-            elif dim == 8192 or 'deberta' in p_str or 'deberta' in backbone:
-                ckpts['deberta_inhouse'] = p.parent
-            elif dim in (32768, 28672) or ('8b' in p_str or '8b' in backbone) or ('14b' not in p_str and '14b' not in backbone and dim != 40960):
-                ckpts['qwen3_8b_inhouse'] = p.parent
-        elif 'q8v5' in p_str:
-            if 'qwen3_8b_v5' not in ckpts or (not is_fold):
-                ckpts['qwen3_8b_v5'] = p.parent
-        elif 'ts_q3b8' in p_str or 'ts8_s7' in p_str or 'l24x_q3b8' in p_str:
-            if 'qwen3_8b_ts' not in ckpts or (not is_fold):
-                ckpts['qwen3_8b_ts'] = p.parent
-        elif 'll8v5' in p_str:
-            if 'llama3_8b_v5' not in ckpts or (not is_fold):
-                ckpts['llama3_8b_v5'] = p.parent
-        elif 'ts_llama8' in p_str:
-            if 'llama3_8b_ts' not in ckpts or (not is_fold):
-                ckpts['llama3_8b_ts'] = p.parent
-        elif 'lora8b_v1' in p_str:
-            ckpts['qwen3_8b_p1'] = p.parent
-        elif 'ts_q25_7b' in p_str or 'l24x_q25_7b' in p_str:
-            if 'qwen25_7b_ts' not in ckpts or (not is_fold):
-                ckpts['qwen25_7b_ts'] = p.parent
-        elif any(t in p_str for t in ('gemma2', 'gemma_2', 'gemma-2', 'ts_gemma', 'ts-gemma')):
-            if 'gemma2_9b_ts' not in ckpts or (not is_fold):
-                ckpts['gemma2_9b_ts'] = p.parent
-        elif any(t in p_str for t in ('llama31', 'llama_31', 'llama-3.1', 'ts_llama31', 'ts-llama31')):
-            if 'llama31_8b_ts' not in ckpts or (not is_fold):
-                ckpts['llama31_8b_ts'] = p.parent
-        elif any(t in p_str for t in ('mistral', 'ts_mistral', 'ts-mistral')):
-            if 'mistral_7b_ts' not in ckpts or (not is_fold):
-                ckpts['mistral_7b_ts'] = p.parent
-        elif any(t in p_str for t in ('bge_m3', 'bge-m3', 'bgem3')):
-            if 'bge_m3' not in ckpts or (not is_fold):
-                ckpts['bge_m3'] = p.parent
-        elif 'instyle' in p_str:
-            ckpts['instyle'] = p.parent
+        if "lora_qwen3_14b" in p_str or "qwen3_14b_part2" in p_str or ("14b" in p_str and "part2" in p_str and "qwen3" in p_str):
+            ckpts["qwen3_14b_p2"] = p.parent
+        elif "lora_qwen25_14b" in p_str or "qwen25_14b_part2" in p_str or ("14b" in p_str and "part2" in p_str and "qwen2" in p_str):
+            ckpts["qwen25_14b_p2"] = p.parent
+        elif "lora14b_v1" in p_str:
+            ckpts["qwen3_14b_p1"] = p.parent
+        elif "lora8b_v1" in p_str:
+            ckpts["qwen3_8b_p1"] = p.parent
+        elif any(token in p_str for token in _INHOUSE_TOKENS):
+            key = _classify_inhouse_checkpoint(p.parent, p_str)
+            if key:
+                ckpts[key] = p.parent
+        elif "instyle" in p_str:
+            ckpts["instyle"] = p.parent
+        else:
+            for tokens, key in _FOLD_PRIORITY_RULES:
+                if any(tok in p_str for tok in tokens):
+                    if key not in ckpts or not is_fold:
+                        ckpts[key] = p.parent
+                    break
 
     # 2. Check for Claude specialist head
-    for p in input_dir.rglob('claude_head.safetensors'):
-        ckpts['qwen3_8b_claude'] = p.parent
+    for p in input_dir.rglob("claude_head.safetensors"):
+        ckpts["qwen3_8b_claude"] = p.parent
         break
-    if 'qwen3_8b_claude' not in ckpts:
-        for p in input_dir.rglob('readouts.npz'):
-            if 'claude' in str(p).lower():
-                ckpts['qwen3_8b_claude'] = p.parent
+    if "qwen3_8b_claude" not in ckpts:
+        for p in input_dir.rglob("readouts.npz"):
+            if "claude" in str(p).lower():
+                ckpts["qwen3_8b_claude"] = p.parent
                 break
 
     # 3. Check for DeBERTa sequence classification head
-    for p in list(input_dir.rglob('head.safetensors')) + list(input_dir.rglob('heads.safetensors')):
-        if 'deberta' in str(p).lower():
-            ckpts['deberta_p2'] = p.parent
+    for p in list(input_dir.rglob("head.safetensors")) + list(input_dir.rglob("heads.safetensors")):
+        if "deberta" in str(p).lower():
+            ckpts["deberta_p2"] = p.parent
             break
 
-    # 4. Fallback search for instyle
-    if 'instyle' not in ckpts:
-        for p in input_dir.rglob('*'):
-            p_s = str(p).lower().replace('\\', '/')
-            if 'instyle' in p_s and ((p / 'adapter_model.safetensors').exists() or (p / 'adapter' / 'adapter_model.safetensors').exists() or (p / 'heads.safetensors').exists() or (p / 'heads.pt').exists()):
-                ckpts['instyle'] = p
+    # 4. Fallback adapter/config discovery
+    if "instyle" not in ckpts:
+        for p in input_dir.rglob("*"):
+            p_s = str(p).lower().replace("\\", "/")
+            if "instyle" in p_s and any(
+                (p / rel).exists()
+                for rel in ("adapter_model.safetensors", "adapter/adapter_model.safetensors", "heads.safetensors", "heads.pt")
+            ):
+                ckpts["instyle"] = p
                 break
 
-    # 5. Fallback search for q14v5 / ts_q3b14 adapter
-    if 'qwen3_14b_ts' not in ckpts:
-        for p in input_dir.rglob('adapter_model.safetensors'):
-            p_s = str(p).lower().replace('\\', '/')
-            if 'q14v5' in p_s or 'ts_q3b14' in p_s:
-                ckpts['qwen3_14b_ts'] = p.parent
+    if "qwen3_14b_ts" not in ckpts:
+        for p in input_dir.rglob("adapter_model.safetensors"):
+            p_s = str(p).lower().replace("\\", "/")
+            if "q14v5" in p_s or "ts_q3b14" in p_s:
+                ckpts["qwen3_14b_ts"] = p.parent
                 break
 
-    # 6. Fallback search for bge_m3 base or fine-tuned directory
-    if 'bge_m3' not in ckpts:
-        for p in input_dir.rglob('config.json'):
-            p_s = str(p.parent).lower().replace('\\', '/')
-            if any(t in p_s for t in ('bge-m3', 'bge_m3', 'bgem3')):
-                ckpts['bge_m3'] = p.parent
+    if "bge_m3" not in ckpts:
+        for p in input_dir.rglob("config.json"):
+            p_s = str(p.parent).lower().replace("\\", "/")
+            if any(t in p_s for t in ("bge-m3", "bge_m3", "bgem3")):
+                ckpts["bge_m3"] = p.parent
                 break
 
-    # 7. Fallback search for gemma2_9b adapter
-    if 'gemma2_9b_ts' not in ckpts:
-        for p in input_dir.rglob('heads.safetensors'):
-            p_s = str(p.parent).lower().replace('\\', '/')
-            if any(t in p_s for t in ('gemma2', 'gemma_2', 'gemma-2', 'ts_gemma', 'ts-gemma')):
-                ckpts['gemma2_9b_ts'] = p.parent
-                break
-        if 'gemma2_9b_ts' not in ckpts:
-            for p in input_dir.rglob('adapter_model.safetensors'):
-                p_s = str(p.parent).lower().replace('\\', '/')
-                if any(t in p_s for t in ('gemma2', 'gemma_2', 'gemma-2', 'ts_gemma', 'ts-gemma')):
-                    ckpts['gemma2_9b_ts'] = p.parent.parent if p.parent.name == 'adapter' else p.parent
+    if "gemma2_9b_ts" not in ckpts:
+        for fname in ("heads.safetensors", "adapter_model.safetensors"):
+            for p in input_dir.rglob(fname):
+                p_s = str(p.parent).lower().replace("\\", "/")
+                if any(t in p_s for t in ("gemma2", "gemma_2", "gemma-2", "ts_gemma", "ts-gemma")):
+                    ckpts["gemma2_9b_ts"] = p.parent.parent if p.parent.name == "adapter" else p.parent
                     break
+            if "gemma2_9b_ts" in ckpts:
+                break
 
     return ckpts
 

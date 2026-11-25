@@ -530,6 +530,47 @@ class TestTrainer(unittest.TestCase):
             self.assertEqual(keep, 27)
             self.assertEqual(backbone, "qwen3-14b")
 
+    def test_encoder_stage1_and_trace_ridge_solvers_in_trainer(self):
+        """Verify unified encoder Stage-1 helpers and single trace-scaled Ridge eigensolver in trainer.py."""
+        from namethatllm.trainer import (
+            build_targeted_epoch_indices,
+            compute_detailed_metrics,
+            gpu_trace_ridge_eval,
+            solve_trace_ridge_wb,
+        )
+
+        # 1. Quota-balanced sliding epoch indexing
+        labels = np.repeat(np.arange(K, dtype=np.int64), 4)
+        quotas = {m: 2 for m in LABELS}
+        quotas[LABELS[0]] = 6  # exercise oversampling (> n_avail)
+        idx_ep0 = build_targeted_epoch_indices(labels, quotas, epoch=0, seed=42)
+        idx_ep1 = build_targeted_epoch_indices(labels, quotas, epoch=1, seed=42)
+        self.assertEqual(len(idx_ep0), 2 * (K - 1) + 6)
+        self.assertFalse(np.array_equal(idx_ep0, idx_ep1))
+
+        # 2. Dual (N < D) and Primal (N >= D) trace-scaled Ridge solver consistency
+        rng = np.random.default_rng(7)
+        for n_tr, dim in ((36, 64), (80, 16)):
+            y_tr = np.tile(np.arange(K, dtype=np.int64), (n_tr // K) + 1)[:n_tr]
+            Z_tr = rng.normal(0.0, 0.3, size=(n_tr, dim)).astype(np.float32)
+            Z_tr[np.arange(n_tr), y_tr % dim] += 2.5
+            wb_map = solve_trace_ridge_wb(Z_tr, y_tr, alphas=[0.25], device=torch.device("cpu"))
+            W, b = wb_map[0.25]
+            self.assertEqual(W.shape, (K, dim))
+            self.assertEqual(b.shape, (K,))
+            lg_map = gpu_trace_ridge_eval(Z_tr, y_tr, Z_tr, alphas=[0.25], device=torch.device("cpu"))
+            np.testing.assert_allclose(lg_map[0.25], Z_tr @ W.T + b, atol=1e-5)
+
+        # 3. Detailed metrics breakdown
+        y_eval = np.repeat(np.arange(K, dtype=np.int64), 3)
+        logits_eval = np.zeros((len(y_eval), K), dtype=np.float32)
+        logits_eval[np.arange(len(y_eval)), y_eval] = 5.0
+        det = compute_detailed_metrics(logits_eval, y_eval)
+        self.assertAlmostEqual(det["bacc"], 1.0, places=5)
+        self.assertAlmostEqual(det["gem_within_bacc"], 1.0, places=5)
+        self.assertEqual(det["zero_recall_classes"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

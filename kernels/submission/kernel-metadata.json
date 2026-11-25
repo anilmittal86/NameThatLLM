@@ -16,28 +16,18 @@
     "anilmittal/ntl-clean-benchmark-1800",
     "willrice/name-that-llm-openrouter-harvest",
     "zbigniewkirchner/ntl-qwen3-8b-lora-claude-head",
-    "nishantdahal/ntl-two-stage-lora",
     "nishantdahal/ntl-handwriting-blend",
-    "kirilltym/ntl-spectral-style-heads-paired-4404",
     "dhruvtibarewal/nlm-l24-adapters-v5",
     "dhruvtibarewal/nlm-matched-clean",
     "anilmittal/ntl-inhouse-two-stage-lora24",
-    "alexchilton/ntl-ts-gemma2-9b",
-    "alexchilton/ntl-ts-llama31-8b",
-    "alexchilton/ntl-ts-mistral7b",
-    "masterstar/bge-m3"
+    "anilmittal/ntl-bge-m3-v2-multilayer-lora"
   ],
   "competition_sources": [
     "name-that-llm"
   ],
   "kernel_sources": [],
   "model_sources": [
-    "angelndevil2/deberta-v3-large/Transformers/default/1",
     "qwen-lm/qwen-3/Transformers/8b-base/1",
-    "qwen-lm/qwen-3/Transformers/14b-base/1",
-    "qwen-lm/qwen2.5/Transformers/14b/1",
-    "google/gemma-2/Transformers/gemma-2-9b/2",
-    "alexchilton/llama-3-1-8b-base/Transformers/default/1",
-    "alexchilton/mistral-7b-v0-3-base/Transformers/default/1"
+    "qwen-lm/qwen-3/Transformers/14b-base/1"
   ]
 }
