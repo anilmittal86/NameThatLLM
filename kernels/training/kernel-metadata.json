@@ -10,17 +10,13 @@
   "enable_internet": false,
   "dataset_sources": [
     "anilmittal/ntl-clean-master-pool",
-    "anilmittal/ntl-clean-benchmark-1800",
-    "anilmittal/ntl-inhouse-two-stage-lora24"
+    "anilmittal/ntl-clean-benchmark-1800"
   ],
   "competition_sources": [
     "name-that-llm"
   ],
   "kernel_sources": [],
   "model_sources": [
-    "qwen-lm/qwen-3/Transformers/14b-base/1",
-    "qwen-lm/qwen2.5/Transformers/14b/1",
-    "qwen-lm/qwen-3/Transformers/8b-base/1",
-    "angelndevil2/deberta-v3-large/Transformers/default/1"
+    "qwen-lm/qwen-3/Transformers/14b-base/1"
   ]
 }

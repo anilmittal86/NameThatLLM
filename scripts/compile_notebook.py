@@ -22,11 +22,13 @@ SUBMISSION_MODULES = [
 ]
 
 TRAINING_MODULES = [
-    "config.py",
-    "wpca_gaussian.py",
-    "neural_extractor.py",
-    "ablation.py",
-    "trainer.py",
+    "config.py", "lexical_engine.py", "wpca_gaussian.py", "neural_extractor.py",
+    "postprocess.py", "ablation.py", "layer_probing.py", "experiment_logger.py",
+    "training/backbones/base.py", "training/losses.py", "training/modeling.py",
+    "training/data.py", "training/evaluation.py", "training/embeddings.py",
+    "training/gates.py", "training/backbones/qwen.py", "training/backbones/deberta.py",
+    "training/backbones/bge.py", "training/backbones/__init__.py",
+    "training/engine.py", "trainer.py",
 ]
 
 def strip_internal_imports(source: str) -> str:

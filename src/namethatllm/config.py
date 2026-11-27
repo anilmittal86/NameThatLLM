@@ -48,6 +48,7 @@ SPECIALIST_GROUPS = {
 PRIOR_SCALES = {
     "qwen3_14b_p2": 1.00,
     "qwen3_14b_inhouse": 1.00,
+    "qwen3_14b_inhouse_v2": 1.00,
     "qwen25_14b_p2": 0.85,
     "qwen25_14b_inhouse": 0.85,
     "deberta_p2": 0.80,
@@ -128,7 +129,7 @@ def resolve_all_pool_files(input_dir: Optional[Path] = None) -> List[Path]:
     if input_dir is None:
         input_dir = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
     pool_files: List[Path] = []
-    pool_patterns = ['clean_master_pool.parquet', 'ntl_clean_master_pool.parquet', 'nlm_pool_v5.parquet', 'pool_v4.parquet', 'nlm_matched_clean.parquet', 'nlm_pool_v2.parquet']
+    pool_patterns = ['clean_master_pool_v2.parquet', 'clean_master_pool.parquet', 'ntl_clean_master_pool.parquet', 'nlm_pool_v5.parquet', 'pool_v4.parquet', 'nlm_matched_clean.parquet', 'nlm_pool_v2.parquet']
     for pat in pool_patterns:
         for p in input_dir.rglob(pat):
             if p not in pool_files:
@@ -245,7 +246,7 @@ _FOLD_PRIORITY_RULES = (
 
 def _classify_inhouse_checkpoint(ckpt_dir: Path, p_str: str) -> Optional[str]:
     """Routes in-house fine-tuned checkpoints using dim/keep/backbone metadata."""
-    if "family_gate" in p_str or "/gate" in p_str or "\\gate" in p_str:
+    if any(skip in p_str for skip in ("family_gate", "/gate", "\\gate", "stage1_best", "stage1_last")):
         return None
     if any(tok in p_str for tok in ("bge_m3", "bge-m3", "bgem3")):
         return "bge_m3"
@@ -253,6 +254,8 @@ def _classify_inhouse_checkpoint(ckpt_dir: Path, p_str: str) -> Optional[str]:
     if "2.5" in backbone or "qwen25" in backbone or (dim == 40960 and (keep >= 30 or "25" in p_str or "qwen25" in p_str)):
         return "qwen25_14b_inhouse"
     if dim == 40960 or "14b" in p_str or "14b" in backbone:
+        if any(v2_tok in p_str for v2_tok in ("inhouse_v2", "inhouse-v2", "14b_v2", "14b-v2")):
+            return "qwen3_14b_inhouse_v2"
         return "qwen3_14b_inhouse"
     if dim == 8192 or "deberta" in p_str or "deberta" in backbone:
         return "deberta_inhouse"
@@ -349,7 +352,7 @@ def find_fold_adapters(input_dir: Optional[Path], prefix: str) -> List[Path]:
     if input_dir is None:
         input_dir = Path('/kaggle/input') if Path('/kaggle/input').exists() else Path('.')
 
-    matches: Set[Path] = set()
+    matches: set[Path] = set()
     prefix_lower = prefix.lower()
 
     candidate_files = (

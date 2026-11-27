@@ -218,7 +218,7 @@ The codebase lives in `src/namethatllm/` as a modular PyPA package with five dec
 
 ### Module 5: Two-Stage LoRA Training (`trainer.py`)
 - **Cloud Training on Modal A100-80GB**: Qwen3-14B-Base (truncated to 27 layers) with FlashAttention-2, achieving ~800 passages/min.
-- **267k Clean Master Pool (`local_data/clean_master_pool.parquet`)**: Pristine, decontaminated pool globally deduplicated across verified official APIs with 0% corrupt Gemini routing rows and 0% leakage into the benchmark.
+- **166k Clean Master Pool V2 (`local_data/clean_master_pool_v2.parquet`)**: Pristine, decontaminated pool (`166,346` rows) globally deduplicated with newline restoration, `prompt_canon` gap tracking, `source_fidelity` weighting, and 0% leakage into train/benchmark.
 - **Hard-Class Upweighting** ($1.40\times$) and **Sibling Margin Penalty Boosts** (Gemini Flash $1.5\times$, GPT-5.6 Triad $1.4\times$, GLM Sisters $1.4\times$).
 - **Stage 2**: Prompt-grouped fine-tuning with SupCon repulsion and Stochastic Weight Averaging.
 - **Inference-Compliant Export**: Produces `adapter/`, `heads.safetensors`, `meta.json`, `wPCA_bank.npz`, and 5-fold `stage2_cv_report.json`.
@@ -249,7 +249,7 @@ The codebase lives in `src/namethatllm/` as a modular PyPA package with five dec
 
 | Dataset File | Role | Samples | Quality & Decontamination Guarantees |
 | :--- | :--- | :---: | :--- |
-| [`local_data/clean_master_pool.parquet`](local_data/clean_master_pool.parquet) | **In-House Model Training** (LoRA backbones & specialists) | **267,346** | **100% Decontaminated**. All 11,966 corrupt and proxy-misrouted Gemini 3.7 passages have been purged and quarantined. Merges verified direct official APIs (`prvsiyan`, `seyitkaangunes`), in-style punctuation-filtered passages (`prvsiyan_instyle`), and style-weighted samples (`crtproduction`). Strictly mapped to the 18 canonical competition classes. |
+| [`local_data/clean_master_pool_v2.parquet`](local_data/clean_master_pool_v2.parquet) | **In-House Model Training** (LoRA backbones & specialists) | **166,346** | **100% Decontaminated V2**. Repaired `\n` formatting, purged corrupt proxy-misrouted rows, added `prompt_canon` and `source_fidelity`, and verified 0% overlap with `train.csv` and `clean_benchmark_1800_rows.parquet`. Strictly mapped to the 18 canonical competition classes. |
 | [`local_data/clean_benchmark_1800_rows.parquet`](local_data/clean_benchmark_1800_rows.parquet) | **Local Offline Evaluation & CV Scoring** | **1,800** | **Strictly Unseen & Unleaked**. Perfectly balanced across all 18 canonical models (100 rows per class). Has **0.00% leakage** / overlap with `clean_master_pool.parquet`, providing an authentic offline benchmark signal. |
 
 > [!WARNING]
@@ -268,7 +268,7 @@ NameThatLLM/
 ├── TRAINING.md                          # In-depth training guide & mathematical formulations
 ├── TUTORIAL.md                          # Technical masterclass & mathematical foundations
 ├── local_data/                          # Clean data directory (STRICTLY these two files)
-│   ├── clean_master_pool.parquet        # Approved 267k clean training pool
+│   ├── clean_master_pool_v2.parquet     # Approved 166k V2 clean training pool
 │   ├── clean_benchmark_1800_rows.parquet# Approved 1,800 unseen holdout benchmark
 │   └── quarantine/                      # Purged corrupt Gemini 3.7 records (DO NOT USE)
 ├── configs/

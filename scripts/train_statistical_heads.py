@@ -129,7 +129,7 @@ def write_kaggle_metadata(out_dir: Path, dataset_slug: str = "ntl-statistical-he
 def main():
     parser = argparse.ArgumentParser(description="Train statistical heads (wPCA, Spectral Bank, Lexical Engine) offline.")
     parser.add_argument("--train_path", type=str, default="local_data/train.csv", help="Path to train.csv")
-    parser.add_argument("--pool_paths", nargs="*", default=["local_data/clean_master_pool.parquet", "local_data/pool_v4.parquet"], help="Paths to pool parquet files")
+    parser.add_argument("--pool_paths", nargs="*", default=["local_data/clean_master_pool_v2.parquet"], help="Paths to pool parquet files")
     parser.add_argument("--unseen_path", type=str, default="local_data/clean_benchmark_1800_rows.parquet", help="Path to unseen benchmark for hash quarantining")
     parser.add_argument("--out_dir", type=str, default="local_data/statistical_heads", help="Output directory for serialized artifacts")
     parser.add_argument("--qwen_tok_dir", type=str, default="", help="Directory with Qwen fast tokenizer files (vocab.json)")
